@@ -395,9 +395,9 @@ void NRDReblurIntegration::CreatePoolTextures(uint32_t w, uint32_t h)
 		d3dDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
 
 		PoolTexture& pt = isPermanent ? m_permanentPool[poolIdx] : m_transientPool[poolIdx];
-		// (46p) Save GPU Memory: a transient texture of the same format and size another instance (or nobody in this one) holds
-		// is shared (transient contents never outlive a Denoise call).
-		if (!isPermanent && globals::features::upscaling.settings.saveVramNrdShared) {
+		// (46p) Save GPU Memory (always, 47m): a transient texture of the same format and size another instance (or nobody in this
+		// one) holds is shared (transient contents never outlive a Denoise call).
+		if (!isPermanent) {
 			std::shared_ptr<SharedTransient> found;
 			for (auto& weak : s_sharedTransient) {
 				auto entry = weak.lock();
@@ -426,7 +426,7 @@ void NRDReblurIntegration::CreatePoolTextures(uint32_t w, uint32_t h)
 		uavDesc.Format = fmt;
 		uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
 		DX::ThrowIfFailed(device->CreateUnorderedAccessView(pt.texture.get(), &uavDesc, pt.uav.put()));
-		if (!isPermanent && globals::features::upscaling.settings.saveVramNrdShared) {
+		if (!isPermanent) {
 			auto entry = std::make_shared<SharedTransient>();
 			entry->texture = pt;
 			entry->format = fmt;

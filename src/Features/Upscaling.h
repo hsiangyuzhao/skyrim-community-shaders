@@ -177,7 +177,6 @@ public:
 		uint qualityMode = 1;  // Default to Quality (1=Quality, 2=Balanced, 3=Performance, 4=Ultra Performance, 0=Native AA)
 		uint frameGenerationMode = 1;
 		uint frameGenerationBackend = static_cast<uint>(FrameGenerationBackend::kFSR3FG);
-		uint frameGenerationForceEnable = 0;
 		// DLSS-G presentation multiplier: presented frames per rendered frame (2 = one generated
 		// frame, the only mode before multi-frame generation). The saved value is a preference;
 		// what actually runs is clamped to what DLSS-G reports this session, without rewriting
@@ -225,34 +224,11 @@ public:
 		// placement only when the engine probes are missing) and the GPU-aware frame-start pacer runs.
 		// Extra CPU time the pacer keeps in hand (ms). More = safer for frame rate, less = lower lag.
 		float reflexPacerMarginMs = 1.0f;
-		// (46n) Time the frame spent blocked inside D3D11 waiting for the GPU (Map / Flush / GetData) moves to the frame-start
-		// sleep (learned over a few frames), and is not counted as CPU work the pacer must keep in hand.
-		bool reflexPacerStallFeedback = true;
-		// (46o) F1a: the main thread's wait in the render segments (wall - thread CPU time) counts as a wait for the GPU too.
-		bool reflexPacerHiddenWaits = true;
-		// (46o) F1b: when the pacer stays locked out (no sleep for 30 frames while the GPU is behind), its reserved lead shrinks.
-		bool reflexPacerBackstop = true;
-		// (46p) The frame-start sleep ends once the previous frame is done on the GPU (+ slack); learned sleep that was cut, or frames
-		// slower than the GPU period, decay it fast; a frame right after a GPU spike does not feed it. Off = 46o.
-		bool reflexPacerNoOverSleep = true;
 		// (46p) The predicted completion from the median phase of the last GPU completions instead of the last one alone. Off = 46o.
+		// (47m) The other pacer switches (46n GPU waits to frame start, 46o hidden waits / backstop, 46p never over-sleep) are
+		// always on now, as are all of 46p/46q "Save GPU Memory" (render-resolution buffers, resident memory, RR / SSGI / mask
+		// textures only when used, shared NRD scratch, render-rect copies, lazy-shader precompile); DLSS-G memory is always retained.
 		bool reflexPacerSmoothPhase = false;
-		// (46p) GPU memory and copies (Advanced / Diagnostics > Save GPU Memory); each off = 46o.
-		bool keepGpuMemoryResident = true;   // our RT D3D12 resources HIGH residency priority, our D3D11 render targets / UAVs HIGH eviction priority
-		bool saveVramRROnly = true;          // DLSS RR-only interop textures only while RR is on (A2)
-		bool saveVramSsgi = true;            // SSGI's indirect-light textures only while GI / specular GI is on (A1)
-		bool saveVramFreeRtWhenOff = true;   // Ray Tracing switched off / a denoiser not in use: its textures and buffers go (A8)
-		bool saveVramFreeFgWhenOff = false;  // frame generation switched off in this menu: DLSS-G's resources go (A9; off by default: experiment)
-		bool saveVramUpscalerMasks = true;   // the D3D11 reactive / transparency masks only for FSR (A7)
-		bool saveVramNrdShared = true;       // NRD instances share their transient (scratch) pool textures (A5; from the next pool creation)
-		bool copyRenderedAreaOnly = true;    // per-frame interop copies only of the render rect (item 7)
-		bool precompileLazyShaders = true;   // first-use shaders compiled behind the first loading screen (item 9)
-		// (46q) Render-resolution sizing (Save GPU Memory): our buffers that only ever hold the rendered area are allocated at the
-		// render size of the current upscaling mode (+2 texels) instead of the output size; a mode / quality change re-creates them
-		// (one history reset). B = the small set (RT shadow work + denoiser, Screen Space Shadows, LLF clusters, upscaler inputs),
-		// C = SSRT / NRD / SSGI. Off = 46p (output size).
-		bool renderResBuffers = true;
-		bool renderResSsrt = true;
 
 		NeuralRenderingSettings neuralRendering;
 	};
@@ -298,8 +274,9 @@ public:
 	// Timing and scaling
 	double refreshRate = 0.0f;
 	float2 resolutionScale = { 1.0f, 1.0f };
-	/// (46q) The size render-resolution buffers are allocated at: a_ssrtSet = category C (SSRT / NRD / SSGI) else B. The output
-	/// size when that switch is off or nothing upscales (or before the first frame). Grows at once, shrinks after 60 steady frames.
+	/// (46q) The size render-resolution buffers are allocated at. The output size when nothing upscales (or before the first
+	/// frame). Grows at once, shrinks after 60 steady frames. a_ssrtSet = category C (SSRT / NRD / SSGI) else B: both sets are
+	/// always at render resolution since 47m (the switches are gone), so it no longer changes the result.
 	[[nodiscard]] std::pair<uint32_t, uint32_t> GetRenderAllocSize(bool a_ssrtSet) const;
 	uint32_t renderAllocW = 0, renderAllocH = 0;
 	uint32_t renderAllocPendingW = 0, renderAllocPendingH = 0, renderAllocPendingFrames = 0;
@@ -389,7 +366,7 @@ public:
 
 	void CopySharedD3D12Resources();
 	/// (46p) Copy Only the Rendered Area: copies the render rect (+1 texel, clamped to the output size) of a_src into a_dst
-	/// (output-sized colour textures, no depth-stencil / MSAA); a full CopyResource with the switch off.
+	/// (output-sized colour textures, no depth-stencil / MSAA); a full CopyResource when nothing upscales.
 	void CopyRenderedArea(ID3D11DeviceContext* a_context, ID3D11Resource* a_dst, ID3D11Resource* a_src) const;
 	void PostDisplay();
 	void PerformUpscaling();
@@ -444,7 +421,7 @@ public:
 	bool IsDLSSGBackend() const;
 	bool IsDLSSGAvailable() const;
 	bool IsDLSSGMapRenderingContext();
-	void PresentFrameGeneration(bool a_useFrameGeneration, bool a_retainDLSSGResourcesWhenOff = true);
+	void PresentFrameGeneration(bool a_useFrameGeneration);
 	void CheckFrameConstants();
 	void SetUIBuffer();
 	HANDLE GetFrameLatencyWaitableObject() const;

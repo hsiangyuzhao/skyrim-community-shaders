@@ -48,18 +48,18 @@ namespace Util::LatencyPacer
 		int spikeSkip = 0;
 		float doneIntervalMs = -1.0f; ///< (46p) the last single-frame GPU completion interval the waiter saw (-1 = none yet)
 		float phaseShiftMs = 0.0f;    ///< (46p) smoothed minus raw predicted completion (computed always; used with Smooth GPU Phase)
+		float learnedCapMs = 0.0f;    ///< (47m) cap on the learned sleep: 1.5 x the largest of the last 60 learned waits, at most 20 ms (0 = none fed yet)
+		float learnedCutMs = 0.0f;    ///< (47m) learned sleep not taken: it would have run past the previous frame's predicted completion
 	};
 
-	/// (46o) The pacer's switches for one frame.
+	/// (46o) The pacer's switches for one frame. (47m) Always on, no switches any more: (46n) GPU waits moved to the frame
+	/// start, (46o) hidden GPU waits counted and the unlock backstop, (46p) never over-sleep (fence-bounded sleep, fast decay,
+	/// spike skip).
 	struct Options
 	{
 		bool enabled = false;        ///< sleep (else measure only)
 		float marginMs = 1.0f;
-		bool stallFeedback = true;   ///< (46n) "Move GPU Waits to Frame Start": waits grow the learned frame-start sleep
-		bool hiddenWaits = false;    ///< (46o) F1a "Count Hidden GPU Waits": the render segments' wall - thread CPU time is a wait too
-		bool backstop = false;       ///< (46o) F1b "Unlock Backstop"
 		bool paused = false;         ///< (46o) game paused / loading screen / map open: the samples are cleared when it ends
-		bool noOverSleep = false;    ///< (46p) "Never Over-Sleep": the sleep ends once the previous frame is done on the GPU (+ slack), fast decay, spike skip
 		bool smoothPhase = false;    ///< (46p) "Smooth GPU Phase": the predicted completion from the median phase of the last completions
 	};
 

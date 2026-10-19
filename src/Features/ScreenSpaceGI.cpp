@@ -622,9 +622,9 @@ void ScreenSpaceGI::SetupResources()
 
 bool ScreenSpaceGI::IlTexturesOmitted() const
 {
-	// (46p) Save GPU Memory: with Indirect Lighting and specular GI off nothing reads these (radiance only under GI, the
-	// IL / specular histories only feed GI outputs; the AO path checks them for finiteness only, and a null SRV reads 0).
-	return ilCreateFailed || (globals::features::upscaling.settings.saveVramSsgi && !settings.EnableGI && !settings.EnableExperimentalSpecularGI);
+	// (46p) Save GPU Memory (always, 47m): with Indirect Lighting and specular GI off nothing reads these (radiance only under GI,
+	// the IL / specular histories only feed GI outputs; the AO path checks them for finiteness only, and a null SRV reads 0).
+	return ilCreateFailed || (!settings.EnableGI && !settings.EnableExperimentalSpecularGI);
 }
 
 void ScreenSpaceGI::CreateIlTextures()

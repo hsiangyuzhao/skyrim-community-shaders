@@ -254,11 +254,9 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		// the copy allows one more buffer to enter the old presentation mode.
 		useFrameGeneration = UpdateDLSSGPresentationState(frameGenerationRequested, mapMenuOpen, mapRenderingContext);
 		// SR inputs are evaluate-local now, so a short FG suspension can retain
-		// resources without exposing DLSS-G to SR's depth/MV tags.
-		// (46p) Save GPU Memory > Free Frame Generation Memory When Off: switched off in the menu (not a pause / menu
-		// suspension), DLSS-G is told not to retain its resources, so eOff frees them; eOn makes them again.
-		const bool userTurnedFgOff = upscaling.settings.frameGenerationMode == 0;
-		upscaling.PresentFrameGeneration(useFrameGeneration, !(upscaling.settings.saveVramFreeFgWhenOff && userTurnedFgOff));
+		// resources without exposing DLSS-G to SR's depth/MV tags. (47m) Always retained (the 46p "Free Frame Generation
+		// Memory When Off" experiment is gone).
+		upscaling.PresentFrameGeneration(useFrameGeneration);
 
 		// The interposer can advance the native swap-chain index when its mode
 		// changes. Re-query it after SetOptions instead of carrying the index from
@@ -899,7 +897,7 @@ void DX12SwapChain::CreateSharedResources()
 	reactiveMaskShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
 	transparencyCompositionMaskShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
 
-	// (46p) The Ray Reconstruction-only six: here as before when wanted (DLSS RR on, or Save GPU Memory off), else none.
+	// (46p) The Ray Reconstruction-only six: here as before when wanted (DLSS RR on), else none.
 	packedNormalShared12.reset();  // (46p) the old size's go first; a failed creation leaves none (logged once)
 	colorBeforeTransparencySnapshot.reset();
 	specHitDistanceShared12.reset();

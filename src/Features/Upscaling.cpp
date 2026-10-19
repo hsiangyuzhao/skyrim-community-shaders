@@ -58,7 +58,6 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	qualityMode,
 	frameGenerationMode,
 	frameGenerationBackend,
-	frameGenerationForceEnable,
 	frameGenerationMultiplier,
 	frameGenerationAllowInMenus,
 	streamlineLogLevel,
@@ -70,22 +69,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	reflexMode,
 	reflexFrameLimit,
 	reflexPacerMarginMs,
-	reflexPacerStallFeedback,
-	reflexPacerHiddenWaits,
-	reflexPacerBackstop,
-	reflexPacerNoOverSleep,
 	reflexPacerSmoothPhase,
-	keepGpuMemoryResident,
-	saveVramRROnly,
-	saveVramSsgi,
-	saveVramFreeRtWhenOff,
-	saveVramFreeFgWhenOff,
-	saveVramUpscalerMasks,
-	saveVramNrdShared,
-	copyRenderedAreaOnly,
-	precompileLazyShaders,
-	renderResBuffers,
-	renderResSsrt,
 	neuralRendering);
 
 decltype(&D3D11CreateDeviceAndSwapChain) ptrD3D11CreateDeviceAndSwapChainUpscaling;
@@ -135,8 +119,6 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChainUpscaling(
 	// if (shouldProxy) {
 	// 	if (upscaling.settings.frameGenerationMode)
 	// 		if (refreshRate >= 120)
-	// 			shouldProxy = true;
-	// 		else if (upscaling.settings.frameGenerationForceEnable)
 	// 			shouldProxy = true;
 	// 		else
 	// 			shouldProxy = false;
@@ -631,114 +613,12 @@ void Upscaling::DrawAdvancedSettings()
 		ImGui::TextUnformatted("Takes effect after a restart.");
 	}
 
-	// (46r) The frame-pacing and memory switches: kept for A/B tests, defaults are the tested ones.
 	if (!globals::game::isVR && streamline.featureReflex) {
-		bool reset = false;
-		if (Util::BeginABSwitchGroup("Frame pacing", reset)) {
-			if (reset) {
-				const Settings d{};
-				settings.reflexPacerStallFeedback = d.reflexPacerStallFeedback;
-				settings.reflexPacerHiddenWaits = d.reflexPacerHiddenWaits;
-				settings.reflexPacerBackstop = d.reflexPacerBackstop;
-				settings.reflexPacerNoOverSleep = d.reflexPacerNoOverSleep;
-				settings.reflexPacerSmoothPhase = d.reflexPacerSmoothPhase;
-			}
-			ImGui::Checkbox("Pacer: Move GPU Waits to Frame Start", &settings.reflexPacerStallFeedback);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("On (default): when the game stops in the middle of a frame to wait for the graphics card (one slow 'Map' every");
-				ImGui::TextUnformatted("frame), the pacer learns that wait and takes it at the start of the frame instead, before input is read.");
-			}
-			ImGui::Checkbox("Pacer: Count Hidden GPU Waits", &settings.reflexPacerHiddenWaits);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("On (default): waiting for the graphics card inside ordinary drawing calls (wall time minus the main thread's real");
-				ImGui::TextUnformatted("CPU time) is not counted as CPU work and is moved to the frame start like the 'Map' waits. Prevents uneven");
-				ImGui::TextUnformatted("long / short frames.");
-			}
-			ImGui::Checkbox("Pacer: Unlock Backstop", &settings.reflexPacerBackstop);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("On (default), a safety net: if the pacer has not slept for 30 frames while the graphics card is behind, it trims its");
-				ImGui::TextUnformatted("CPU reserve 0.5 ms per frame until it sleeps again, and hands it back at once if frames get slower.");
-			}
-			ImGui::Checkbox("Pacer: Never Over-Sleep", &settings.reflexPacerNoOverSleep);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("On (default): the pacer's learned extra sleep never runs past the moment the graphics card finishes the previous");
-				ImGui::TextUnformatted("frame (that would only leave the card idle), and shrinks fast when it was cut or frames are slower than the card.");
-			}
-			ImGui::Checkbox("Pacer: Smooth GPU Phase", &settings.reflexPacerSmoothPhase);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Off (default). On: predicts when the graphics card finishes a frame from the last several finishes instead of");
-				ImGui::TextUnformatted("only the last one, so the pacer's sleep jitters less from frame to frame.");
-			}
-			ImGui::TreePop();
-		}
-	}
-
-	{
-		bool reset = false;
-		if (Util::BeginABSwitchGroup("Save GPU Memory", reset)) {
-			if (reset) {
-				const Settings d{};
-				settings.keepGpuMemoryResident = d.keepGpuMemoryResident;
-				settings.saveVramRROnly = d.saveVramRROnly;
-				settings.saveVramSsgi = d.saveVramSsgi;
-				settings.saveVramFreeRtWhenOff = d.saveVramFreeRtWhenOff;
-				settings.saveVramFreeFgWhenOff = d.saveVramFreeFgWhenOff;
-				settings.saveVramUpscalerMasks = d.saveVramUpscalerMasks;
-				settings.saveVramNrdShared = d.saveVramNrdShared;
-				settings.copyRenderedAreaOnly = d.copyRenderedAreaOnly;
-				settings.renderResBuffers = d.renderResBuffers;
-				settings.renderResSsrt = d.renderResSsrt;
-				settings.precompileLazyShaders = d.precompileLazyShaders;
-			}
-			ImGui::Checkbox("Keep Our GPU Memory Resident", &settings.keepGpuMemoryResident);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("When video memory runs full, Windows moves memory out to system RAM, and whatever the card then needs from there");
-				ImGui::TextUnformatted("is read slowly. On (default): our ray-tracing memory and our work / history textures are the last to be moved");
-				ImGui::TextUnformatted("(game textures go first). Ray tracing: at once; the rest: for textures made after switching (restart for all).");
-			}
-			ImGui::Checkbox("Ray Reconstruction Textures Only With RR", &settings.saveVramRROnly);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted("On (default): six 4K hand-over textures only DLSS Ray Reconstruction reads (about 250 MB) exist only while RR is on.");
-			ImGui::Checkbox("SSGI Light Textures Only With GI", &settings.saveVramSsgi);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted("On (default): with SSGI's Indirect Lighting and specular GI both off, their textures (about 390 MB at 4K) are not kept. AO is unchanged.");
-			ImGui::Checkbox("Free Ray Tracing Memory When Off", &settings.saveVramFreeRtWhenOff);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted("On (default): ray tracing switched off gives back its textures and buffers; the shadow denoiser not in use gives back its own.");
-			ImGui::Checkbox("Free Frame Generation Memory When Off", &settings.saveVramFreeFgWhenOff);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Experiment, off by default: frame generation switched off in this menu gives back DLSS-G's memory (about 700 MB");
-				ImGui::TextUnformatted("at 4K); switching it on again makes it anew (a short hitch). Pause menus and the map are not affected.");
-			}
-			ImGui::Checkbox("Upscaler Masks Only For FSR", &settings.saveVramUpscalerMasks);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted("On (default): two 4K mask textures only FSR reads are not kept with DLSS (DLSS has its own copies).");
-			ImGui::Checkbox("NRD Denoisers Share Scratch Textures", &settings.saveVramNrdShared);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted("On (default): the NRD denoisers (SSRT REBLUR diffuse / specular, RT SIGMA) share their scratch textures (about 90 MB). Restart to apply.");
-			ImGui::Checkbox("Copy Only the Rendered Area", &settings.copyRenderedAreaOnly);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("On (default): the per-frame hand-over copies to DLSS (colour, motion, depth, RR inputs) copy only the part of the");
-				ImGui::TextUnformatted("picture that is rendered instead of the whole 4K texture. Depth buffers are always copied whole (a D3D11 rule).");
-			}
-			ImGui::Checkbox("Size Buffers to Render Resolution", &settings.renderResBuffers);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("On (default): ray tracing's shadow work textures and denoisers, and Subsurface Scattering's textures, are made at the");
-				ImGui::TextUnformatted("size the game really renders instead of 4K. Same picture. Changing the DLSS quality mode or this box re-makes them");
-				ImGui::TextUnformatted("on the spot (their history restarts once). Off: always 4K.");
-			}
-			ImGui::Checkbox("SSRT/SSGI Buffers at Render Resolution", &settings.renderResSsrt);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("On (default): Screen Space Ray Tracing's textures, its REBLUR denoisers and NRD's guides at the render size, and");
-				ImGui::TextUnformatted("SSRT's textures only while SSRT is on. Same picture; a quality-mode change restarts their history once.");
-				ImGui::TextUnformatted("Off: 4K and always allocated. (SSGI's own textures stay 4K.)");
-				const auto [w, h] = GetRenderAllocSize(true);
-				ImGui::Text("Now allocated at %ux%u.", w, h);
-			}
-			ImGui::Checkbox("Precompile Lazy Shaders", &settings.precompileLazyShaders);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted("On (default): shaders first needed right after a loading screen (deferred composite, screen-space shadows) are prepared during the first loading screen.");
-			ImGui::TreePop();
+		// (46p) Kept as an A/B switch in Advanced (47m); the other frame-pacing and Save GPU Memory switches are always on now.
+		ImGui::Checkbox("Pacer: Smooth GPU Phase", &settings.reflexPacerSmoothPhase);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted("Off (default). On: predicts when the graphics card finishes a frame from the last several finishes instead of");
+			ImGui::TextUnformatted("only the last one, so the pacer's sleep jitters less from frame to frame.");
 		}
 	}
 
@@ -747,9 +627,10 @@ void Upscaling::DrawAdvancedSettings()
 			const auto& pacer = Util::LatencyPacer::Last();
 			if (pacer.tracking)
 				ImGui::TextWrapped("Pacer: %d frame(s) on the GPU at frame start (%d after the wait), GPU period %.1f ms, CPU reserve %.1f ms (backstop -%.1f), slept %.1f ms "
-								   "(+%.1f ms bound, cut %.1f ms), waited inside D3D11 %.1f ms, hidden wait %.1f ms (learned %.1f ms, fast decay %.1f)",
+								   "(+%.1f ms bound, cut %.1f ms), waited inside D3D11 %.1f ms, hidden wait %.1f ms (learned %.1f ms of at most %.1f, not taken %.1f, "
+								   "fast decay %.1f)",
 					pacer.inFlight, pacer.inFlightAfter, pacer.gpuPeriodMs, pacer.leadMs, pacer.backstopMs, pacer.sleepMs, pacer.capWaitMs, pacer.overSleepCutMs,
-					pacer.stallMs, pacer.hiddenWaitMs, pacer.correctionMs, pacer.decayMs);
+					pacer.stallMs, pacer.hiddenWaitMs, pacer.correctionMs, pacer.learnedCapMs, pacer.learnedCutMs, pacer.decayMs);
 			else
 				ImGui::TextDisabled("Pacer: waiting for the D3D12 swap chain");
 			if (!Util::EngineTiming::ProbesInstalled())
@@ -985,7 +866,6 @@ void Upscaling::LoadSettings(json& o_json)
 	HDROutput::StashLegacyUpscalingJson(o_json);
 	settings = o_json;
 	PinNeuralRenderingOptions(settings.neuralRendering);
-	Util::FrameTrace::SetKeepResident(settings.keepGpuMemoryResident);  // (46p) before the first resources are made
 
 	// (45o) Sharpening is one RCAS strength (0 = off). Once, from a profile that still has the old method
 	// (45a-45n: 0 Off, 1 RCAS, 2 NIS) or only the NIS strength (before 45a: 0 = off, else NIS): Off -> 0,
@@ -1140,10 +1020,9 @@ void Upscaling::CreateUpscalingTextureResources(UpscaleMethod a_upscalemethod, b
 
 	texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
 
-	// (46p) Save GPU Memory: DLSS writes its masks into the D3D12 interop pair (reactiveMaskShared12 / transparencyCompositionMaskShared12);
-	// these two D3D11 ones are read only by FSR.
-	const bool masksWanted = a_upscalemethod == UpscaleMethod::kFSR || (a_upscalemethod == UpscaleMethod::kDLSS && !settings.saveVramUpscalerMasks);
-	if (masksWanted) {
+	// (46p) Save GPU Memory (always, 47m): DLSS writes its masks into the D3D12 interop pair (reactiveMaskShared12 /
+	// transparencyCompositionMaskShared12); these two D3D11 ones are read only by FSR.
+	if (a_upscalemethod == UpscaleMethod::kFSR) {
 		texDesc.Format = DXGI_FORMAT_R8_UNORM;
 		srvDesc.Format = texDesc.Format;
 		uavDesc.Format = texDesc.Format;
@@ -1190,8 +1069,7 @@ void Upscaling::DestroyUpscalingTextureResources(UpscaleMethod a_upscalemethod)
 	// correctly, but by hand: null the three views, then `delete`. As unique_ptrs a single
 	// reset() does the same thing, and the members can no longer be leaked by a future edit
 	// that forgets the delete.
-	if ((a_upscalemethod != UpscaleMethod::kDLSS && a_upscalemethod != UpscaleMethod::kFSR) ||
-		(a_upscalemethod == UpscaleMethod::kDLSS && settings.saveVramUpscalerMasks)) {  // (46p) not read with DLSS
+	if (a_upscalemethod != UpscaleMethod::kFSR) {  // (46p) not read with DLSS either (Save GPU Memory, always since 47m)
 		reactiveMaskTexture.reset();
 		transparencyCompositionMaskTexture.reset();
 	}
@@ -1207,7 +1085,7 @@ void Upscaling::CopyRenderedArea(ID3D11DeviceContext* a_context, ID3D11Resource*
 	if (!a_context || !a_dst || !a_src)
 		return;
 	const auto screenSize = globals::state->screenSize;
-	if (!settings.copyRenderedAreaOnly || (resolutionScale.x >= 1.0f && resolutionScale.y >= 1.0f) || screenSize.x < 1.0f || screenSize.y < 1.0f) {
+	if ((resolutionScale.x >= 1.0f && resolutionScale.y >= 1.0f) || screenSize.x < 1.0f || screenSize.y < 1.0f) {
 		a_context->CopyResource(a_dst, a_src);
 		return;
 	}
@@ -1220,9 +1098,9 @@ void Upscaling::CopyRenderedArea(ID3D11DeviceContext* a_context, ID3D11Resource*
 
 void Upscaling::CheckResources(UpscaleMethod a_upscalemethod)
 {
-	// (46p) Save GPU Memory: the RR-only interop textures follow Ray Reconstruction (created at once when it goes on).
+	// (46p) Save GPU Memory (always, 47m): the RR-only interop textures follow Ray Reconstruction (created at once when it goes on).
 	if (d3d12SwapChainActive)
-		dx12SwapChain.SetRRResourcesWanted(settings.enableDLSSRR || !settings.saveVramRROnly);
+		dx12SwapChain.SetRRResourcesWanted(settings.enableDLSSRR);
 
 	static auto previousUpscaleMode = UpscaleMethod::kTAA;
 	static bool previousFrameGenMode = false;
@@ -1684,13 +1562,9 @@ void Upscaling::CopySharedD3D12Resources()
 		D3D11_VIEWPORT viewport = {};
 		viewport.TopLeftX = 0.0f;
 		viewport.TopLeftY = 0.0f;
-		viewport.Width = screenSize.x;
-		viewport.Height = screenSize.y;
-		if (settings.copyRenderedAreaOnly) {
-			// (46p) The render rect (+1 texel): DLSS / DLSS-G read the shared depth only inside it.
-			viewport.Width = std::min(screenSize.x, std::ceil(screenSize.x * resolutionScale.x) + 1.0f);
-			viewport.Height = std::min(screenSize.y, std::ceil(screenSize.y * resolutionScale.y) + 1.0f);
-		}
+		// (46p) The render rect (+1 texel): DLSS / DLSS-G read the shared depth only inside it (Copy Only the Rendered Area, always since 47m).
+		viewport.Width = std::min(screenSize.x, std::ceil(screenSize.x * resolutionScale.x) + 1.0f);
+		viewport.Height = std::min(screenSize.y, std::ceil(screenSize.y * resolutionScale.y) + 1.0f);
 		viewport.MinDepth = 0.0f;
 		viewport.MaxDepth = 1.0f;
 		context->RSSetViewports(1, &viewport);
@@ -1850,16 +1724,15 @@ std::string Upscaling::DescribeLatencyForTrace()
 	auto modeName = [](uint m) { return m < 3 ? kModes[m] : "not applied"; };
 	return std::format(
 		"Reflex available {}, functions ready {}, PCL ready {}; mode set {} / applied {}; frame limit set {} / effective {} / applied {} fps (presented); "
-		"pacer {} (margin {:.1f} ms, GPU waits moved to frame start {}, (46o) count hidden GPU waits {}, unlock backstop {}, (46p) never over-sleep {}, "
-		"smooth GPU phase {}), markers at render start {} (probes {}); "
+		"pacer {} (margin {:.1f} ms, smooth GPU phase {}; 47m: learned sleep capped at 1.5 x recent waits and bounded by the predicted completion), "
+		"markers at render start {} (probes {}); "
 		"lowLatencyAvailable {}, latencyReportAvailable {}; "
 		"frame generation requested {} at {}x; spin limiter {} (fallback without Reflex, syncInterval 0 path); refresh {:.0f} Hz",
 		streamline.featureReflex ? "yes" : "no", streamline.reflexFunctionsReady ? "yes" : "no", streamline.pclFunctionsReady ? "yes" : "no",
 		modeName(std::min(settings.reflexMode, 2u)), modeName(modeApplied), settings.reflexFrameLimit, GetEffectiveReflexFrameLimit(),
 		reflexFrameLimitApplied == UINT_MAX ? -1 : static_cast<int>(reflexFrameLimitApplied),
-		IsLatencyPacerEnabled() ? "on" : "off", settings.reflexPacerMarginMs, settings.reflexPacerStallFeedback ? "on" : "off",
-		settings.reflexPacerHiddenWaits ? "on" : "off", settings.reflexPacerBackstop ? "on" : "off", settings.reflexPacerNoOverSleep ? "on" : "off",
-		settings.reflexPacerSmoothPhase ? "on" : "off", WantsReflexMarkersAtRenderStart() ? "on" : "off",
+		IsLatencyPacerEnabled() ? "on" : "off", settings.reflexPacerMarginMs, settings.reflexPacerSmoothPhase ? "on" : "off",
+		WantsReflexMarkersAtRenderStart() ? "on" : "off",
 		Util::EngineTiming::ProbesInstalled() ? "installed" : Util::EngineTiming::ProbeStatus(),
 		stateOk ? (state.lowLatencyAvailable ? "yes" : "no") : "?", stateOk ? (state.latencyReportAvailable ? "yes" : "no") : "?",
 		IsFrameGenerationRequestedNow() ? "yes" : "no", GetFrameGenerationAppliedMultiplier(), streamline.reflexFunctionsReady ? "off" : "on",
@@ -2166,7 +2039,7 @@ bool Upscaling::IsDLSSGMapRenderingContext()
 		ui->IsMenuOpen(RE::MapMenu::MENU_NAME);
 }
 
-void Upscaling::PresentFrameGeneration(bool a_useFrameGeneration, bool a_retainDLSSGResourcesWhenOff)
+void Upscaling::PresentFrameGeneration(bool a_useFrameGeneration)
 {
 	if (!IsDLSSGBackend()) {
 		fidelityFX.Present(a_useFrameGeneration);
@@ -2182,7 +2055,8 @@ void Upscaling::PresentFrameGeneration(bool a_useFrameGeneration, bool a_retainD
 		return;
 	}
 
-	streamline.SetDLSSGMode(a_useFrameGeneration, a_retainDLSSGResourcesWhenOff, GetRequestedDLSSGFramesToGenerate());
+	// (47m) DLSS-G's resources are always retained when it is off (the 46p "free when off" experiment is gone).
+	streamline.SetDLSSGMode(a_useFrameGeneration, true, GetRequestedDLSSGFramesToGenerate());
 }
 
 void Upscaling::CheckFrameConstants()
@@ -2743,17 +2617,16 @@ void Upscaling::UpdateRenderAllocSize()
 	} else {
 		renderAllocPendingFrames = 0;
 	}
-	Util::FrameTrace::On46qRenderRes(settings.renderResBuffers ? 1 : 0, settings.renderResSsrt ? 1 : 0, renderAllocW, renderAllocH);
+	Util::FrameTrace::On46qRenderRes(1, 1, renderAllocW, renderAllocH);  // fixed (47m): both render-resolution sets always on
 }
 
-std::pair<uint32_t, uint32_t> Upscaling::GetRenderAllocSize(bool a_ssrtSet) const
+std::pair<uint32_t, uint32_t> Upscaling::GetRenderAllocSize(bool /*a_ssrtSet*/) const
 {
 	const auto screen = globals::state->screenSize;
 	if (screen.x < 1.0f || screen.y < 1.0f)
 		return { UINT32_MAX, UINT32_MAX };  // (46q) no screen size yet: no limit (every caller takes the min with its own output size)
 	const auto sw = static_cast<uint32_t>(screen.x), sh = static_cast<uint32_t>(screen.y);
-	const bool on = a_ssrtSet ? settings.renderResSsrt : settings.renderResBuffers;
-	if (!on || renderAllocW == 0 || renderAllocH == 0 || globals::game::isVR)
+	if (renderAllocW == 0 || renderAllocH == 0 || globals::game::isVR)
 		return { sw, sh };
 	return { std::min(renderAllocW, sw), std::min(renderAllocH, sh) };
 }

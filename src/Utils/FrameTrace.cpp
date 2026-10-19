@@ -944,9 +944,9 @@ namespace Util::FrameTrace
 				out << "#   in that segment: blocked (waiting for the GPU inside D3D11, on a lock or event) or not scheduled; main_cpu_ms = the thread's CPU\n";
 				out << "#   time over the whole frame (-1 = not measured: probes off or not calibrated).\n";
 				out << "#   pacer_hidden_wait_ms = the previous frame's main-thread wait in the render segments (render_other..present) up to the submit\n";
-				out << "#   (measured while recording or with Count Hidden GPU Waits on; -1 = not measured); pacer_hidden_base_ms = the hidden wait frames\n";
+				out << "#   (measured while recording or pacing; -1 = not measured); pacer_hidden_base_ms = the hidden wait frames\n";
 				out << "#   have anyway (p25 over frames that slept 1 ms+: job joins, preemption); pacer_wait_used_ms = what was left out of its lead sample\n";
-				out << "#   (the 46n D3D11 wait, or with Count Hidden GPU Waits the larger of it and hidden - base when >= 0.5 ms and the GPU was behind at\n";
+				out << "#   (the larger of the 46n D3D11 wait and hidden - base when >= 0.5 ms and the GPU was behind at\n";
 				out << "#   that frame's start; the learned sleep takes the median of the last 3); pacer_backstop_ms = lead taken off by the Unlock Backstop.\n";
 				out << "#   stall_stack (M2, Stall Sampler on) = up to 3 samples of a main thread stuck 8 ms+ in one segment / call: seg@ms_in_it:RIP>return\n";
 				out << "#   addresses found on the stack (module+offset, nearest first; candidates, not a verified unwind), samples separated by '|'.\n";
@@ -984,6 +984,8 @@ namespace Util::FrameTrace
 				out << "# (47l) rt_wind_meshes / rt_wind_verts = Foliage sway: wind BLASes alive and their vertices; rt_wind_refits = wind BLASes refit\n";
 				out << "#   in place this frame (0 = the wind pose did not change; -1 = sway off / Ray Tracing off).\n";
 				out << "# (47l) rtao_normal_prep_gpu_ms = AONormalPrepCS (RTAO: Smooth Normals, right before the RT depth copy; -1 = not run lately).\n";
+				out << "# (47m) pacer_learned_cap_ms = cap on pacer_learned_ms: 1.5 x the largest of the last 60 learned waits, at most 20 (0 = none yet);\n";
+				out << "#   pacer_learned_cut_ms = learned sleep not taken because the frame start + half the CPU lead would pass the predicted completion.\n";
 				out << "#   rt_pw_* = the work of the RT D3D12 prep submission whose GPU time is rt_prep_gpu_ms on the same row (1 = valid; early =\n";
 				out << "#   recorded at the frame start): static BLAS builds (of which alpha-tested, triangles, MB before compaction), compactions (MB\n";
 				out << "#   written), new character shapes uploaded, own-BLAS character builds / refits, merged character BLAS builds (triangles) /\n";
@@ -1083,7 +1085,8 @@ namespace Util::FrameTrace
 					   "vf_grid_x,vf_grid_y,vf_grid_z,vf_grid_far_z,"
 					   "water_prep_gpu_ms,water_draw_gpu_ms,rt_pl_water_rays,"  // (47j)
 					   "rt_wind_meshes,rt_wind_verts,rt_wind_refits,"  // (47l)
-					   "rtao_normal_prep_gpu_ms\n";  // (47l) the last one
+					   "rtao_normal_prep_gpu_ms,"  // (47l)
+					   "pacer_learned_cap_ms,pacer_learned_cut_ms\n";  // (47m) the last ones
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
 					std::string s = std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{},{}", t.scene,
@@ -1260,6 +1263,9 @@ namespace Util::FrameTrace
 					// (47l) RTAO: AONormalPrepCS GPU time, after rt_wind_refits (the old last column).
 					extra.pop_back();
 					extra += std::format(",{:.3f}\n", r.aoNormalPrepGpuMs);
+					// (47m) The pacer's learned-sleep cap and the part of it not taken, after rtao_normal_prep_gpu_ms (the old last column).
+					extra.pop_back();
+					extra += std::format(",{:.3f},{:.3f}\n", r.pacer.learnedCapMs, r.pacer.learnedCutMs);
 					if (it == a_reflex.end()) {
 						out << (r.reflexFrame == UINT32_MAX ? std::string("-1") : std::to_string(r.reflexFrame)) << ",-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" << engineColumns(r) << extra;
 						continue;
@@ -2792,13 +2798,6 @@ namespace Util::FrameTrace
 		return text.empty() ? std::string("nothing tagged") : text;
 	}
 
-	namespace
-	{
-		std::atomic<bool> g_keepResident{ true };
-	}
-
-	void SetKeepResident(bool a_on) { g_keepResident.store(a_on, std::memory_order_relaxed); }
-
 	uint64_t OurD3D11LiveBytes()
 	{
 		uint64_t live = 0;
@@ -2825,8 +2824,8 @@ namespace Util::FrameTrace
 			feature = FeatureEntry(name.empty() ? kVramNoScope : name);
 		}
 		TagObject(a_resource, owner, a_bytes, feature);
-		// (46p) Keep Our GPU Memory Resident: our render targets / UAVs (histories, interop, work textures) are evicted last.
-		if (a_target && a_resource && (owner == VramOwner::D3D11Ours || owner == VramOwner::D3D11Shared) && g_keepResident.load(std::memory_order_relaxed)) {
+		// (46p) Keep Our GPU Memory Resident (always, 47m): our render targets / UAVs (histories, interop, work textures) are evicted last.
+		if (a_target && a_resource && (owner == VramOwner::D3D11Ours || owner == VramOwner::D3D11Shared)) {
 			winrt::com_ptr<IDXGIResource> dxgi;
 			if (SUCCEEDED(a_resource->QueryInterface(IID_PPV_ARGS(dxgi.put()))))
 				dxgi->SetEvictionPriority(DXGI_RESOURCE_PRIORITY_HIGH);

@@ -60,6 +60,17 @@ namespace Util::LatencyPacer
 		constexpr float kStallGain = 0.5f;       // share of a frame's wait added to the learned sleep
 		constexpr float kStallDecayMs = 0.2f;    // learned sleep given back per frame without a wait
 		constexpr float kMaxCorrectionMs = 20.0f;
+		// (47m) The learned sleep is capped relative to the waits it replaces: 1.5 x the largest of the last 60 waits fed to it
+		// (below the threshold too; spike-skipped frames are not fed). Riverwood (47l) had it at 9-12 ms fed by 1-1.5 ms
+		// waits (GPU done-intervals alternating 35 / 41 ms); steady ~10 ms waits (46n) still learn up to 15 ms.
+		constexpr size_t kFedRing = 60;
+		constexpr float kCapShare = 1.5f;
+		// Above the cap the learned sleep comes down by this much per feed (not at once: when a large wait leaves the ring the
+		// cap may drop a lot in one frame, and a sudden cut would bring the in-frame wait back in one step).
+		constexpr float kCapDecayMs = 0.5f;
+		std::array<float, kFedRing> g_fedWaits{};
+		size_t g_fedCount = 0, g_fedHead = 0;
+		float g_learnedCapMs = 0.0f;  // 0 = nothing fed since the last reset
 		DWORD g_mainThread = 0;
 		double g_stallMs = 0.0;      // this frame (since OnSimulationStart)
 		float g_lastStallMs = 0.0f;  // the last frame's, taken at its submit
@@ -82,7 +93,6 @@ namespace Util::LatencyPacer
 		// The learned sleep is fed the median of the last 3 frames' waits, so one GPU spike (its wait lands in the next frame's
 		// world pass) teaches nothing.
 		constexpr double kHiddenMinMs = 0.5;  // less is noise (preemption, page faults)
-		bool g_hiddenOn = false;
 		bool g_frameBehind = false;         // this frame started with the GPU behind (in_flight >= 1)
 		float g_lastHiddenMs = -1.0f;       // the last frame's render-segment wait (-1 = not measured)
 		float g_lastWaitMs = 0.0f;          // the last frame's wait left out of its lead
@@ -129,7 +139,7 @@ namespace Util::LatencyPacer
 		// stretches to its own frame period (36-40 ms there). So the sleep waits on the interop fence itself: it ends at the
 		// previous frame's actual completion + a small slack (nothing queued for the GPU after that: any later start only
 		// idles it). A sleep cut short that way, or frames slower than the GPU period, cut the learned sleep fast; a frame
-		// right after a GPU spike does not feed it. Off: 46o exactly.
+		// right after a GPU spike does not feed it.
 		constexpr float kSlackShare = 0.1f;      // slack after the completion: this share of the GPU period ...
 		constexpr float kSlackMinMs = 0.5f;      // ... within these bounds
 		constexpr float kSlackMaxMs = 2.0f;
@@ -139,7 +149,6 @@ namespace Util::LatencyPacer
 		constexpr float kSpikeShare = 1.5f;      // a GPU frame this many periods long is a spike
 		constexpr int kSpikeSkipFrames = 2;      // frames whose wait is not learned after one (that frame and the next)
 		HANDLE g_doneEvent = nullptr;
-		bool g_guardOn = false;                  // the last PaceFrameStart's switch (for OnD3D11Submitted)
 		int g_spikeSkip = 0;                     // frames still to skip
 		bool g_skipFeed = false;                 // the last submitted frame's wait is not learned
 		// Waiter results (under g_mutex): the longest single-frame completion gap since the main thread last looked (ms per
@@ -182,6 +191,9 @@ namespace Util::LatencyPacer
 			g_hiddenBaseMs = 0.0f;
 			g_spikeSkip = 0;  // (46p)
 			g_skipFeed = false;
+			g_fedCount = 0;  // (47m)
+			g_fedHead = 0;
+			g_learnedCapMs = 0.0f;
 		}
 
 		void CalibrateTsc(int64_t a_now)
@@ -403,61 +415,68 @@ namespace Util::LatencyPacer
 		}
 		const bool a_enabled = a_options.enabled;
 		const float a_marginMs = a_options.marginMs;
-		const bool a_stallFeedback = a_options.stallFeedback;
-		const bool guard = a_options.noOverSleep;  // (46p)
 		g_mainThread = GetCurrentThreadId();
 		FrameInfo info{};
 		info.enabled = a_enabled;
-		g_hiddenOn = a_options.hiddenWaits;
-		g_guardOn = guard;
-		EngineTiming::SetPacerWaitTracking(a_options.hiddenWaits && a_enabled);
+		EngineTiming::SetPacerWaitTracking(a_enabled);  // (46o) F1a: the hidden waits are measured while pacing
 
 		const int64_t start = Now();
 		CalibrateTsc(start);
-		// (46o) After a pause / loading screen / the map, with either 46o switch on (off / off = 46n exactly). (46p) Or Never Over-Sleep
-		// (its fast decay reads the frame period).
-		if (a_options.hiddenWaits || a_options.backstop || guard) {
-			if (a_options.paused) {
-				g_wasPaused = true;
-			} else if (g_wasPaused) {
-				g_wasPaused = false;
-				ResetLearning();
-				info.reset = true;
+		// (46o) After a pause / loading screen / the map everything learned starts over. (46p) The frame period (fast decay).
+		if (a_options.paused) {
+			g_wasPaused = true;
+		} else if (g_wasPaused) {
+			g_wasPaused = false;
+			ResetLearning();
+			info.reset = true;
+		}
+		if (g_prevStart) {
+			const float p = static_cast<float>(ToMs(start - g_prevStart));
+			if (p > 0.0f && p < 250.0f && !a_options.paused) {
+				g_periods[g_periodHead] = p;
+				g_periodHead = (g_periodHead + 1) % kPeriodRing;
+				g_periodCount = std::min(g_periodCount + 1, kPeriodRing);
+			} else {
+				g_periodCount = 0;
 			}
-			if (g_prevStart) {
-				const float p = static_cast<float>(ToMs(start - g_prevStart));
-				if (p > 0.0f && p < 250.0f && !a_options.paused) {
-					g_periods[g_periodHead] = p;
-					g_periodHead = (g_periodHead + 1) % kPeriodRing;
-					g_periodCount = std::min(g_periodCount + 1, kPeriodRing);
-				} else {
-					g_periodCount = 0;
-				}
-				float sum = 0.0f;
-				for (size_t i = 0; i < g_periodCount; ++i)
-					sum += g_periods[i];
-				g_periodMean = g_periodCount >= 8 ? sum / static_cast<float>(g_periodCount) : -1.0f;
-			}
+			float sum = 0.0f;
+			for (size_t i = 0; i < g_periodCount; ++i)
+				sum += g_periods[i];
+			g_periodMean = g_periodCount >= 8 ? sum / static_cast<float>(g_periodCount) : -1.0f;
 		}
 		g_prevStart = start;
 		// (46n) Stall feedback: the last frame's wait inside D3D11 grows the learned frame-start sleep, a frame without one shrinks it.
 		if (g_stallFresh) {
 			g_stallFresh = false;
 			// (46o) F1a: the median of the last three frames' waits (46n stall or hidden wait, the larger).
-			const float wait = a_options.hiddenWaits ? Median3(g_waitHist) : g_lastStallMs;
+			const float wait = Median3(g_waitHist);
 			// (46p) Right after a GPU spike the wait is the spike's, not a steady one: not learned (the learned sleep decays).
-			const bool skip = guard && g_skipFeed;
+			const bool skip = g_skipFeed;
 			info.spikeSkip = skip ? 1 : 0;
-			if (a_stallFeedback && !skip && wait >= kStallThresholdMs)
-				g_correctionMs = std::min(g_correctionMs + kStallGain * wait, kMaxCorrectionMs);
-			else
+			if (!skip) {
+				// (47m) The cap follows the waits being replaced: 1.5 x the largest of the last 60 fed waits (at most 20 ms).
+				g_fedWaits[g_fedHead] = wait;
+				g_fedHead = (g_fedHead + 1) % kFedRing;
+				g_fedCount = std::min(g_fedCount + 1, kFedRing);
+				float maxWait = 0.0f;
+				for (size_t i = 0; i < g_fedCount; ++i)
+					maxWait = std::max(maxWait, g_fedWaits[i]);
+				g_learnedCapMs = std::min(kMaxCorrectionMs, kCapShare * maxWait);
+			}
+			if (!skip && wait >= kStallThresholdMs) {
+				if (g_correctionMs < g_learnedCapMs)
+					g_correctionMs = std::min(g_correctionMs + kStallGain * wait, g_learnedCapMs);  // (47m) grows up to the cap
+			} else {
 				g_correctionMs = std::max(g_correctionMs - kStallDecayMs, 0.0f);
+			}
+			// (47m) Above the cap (the waits got small): down toward it on every feed, kCapDecayMs at a time.
+			if (g_fedCount > 0 && g_correctionMs > g_learnedCapMs)
+				g_correctionMs = std::max(g_correctionMs - kCapDecayMs, g_learnedCapMs);
 		}
 		g_skipFeed = false;
-		if (!a_stallFeedback)
-			g_correctionMs = 0.0f;
 		info.stallMs = g_lastStallMs;
 		info.correctionMs = g_correctionMs;
+		info.learnedCapMs = g_learnedCapMs;
 		info.hiddenWaitMs = g_lastHiddenMs;
 		info.waitUsedMs = g_lastWaitMs;
 		info.hiddenBaseMs = g_hiddenBaseMs;
@@ -494,7 +513,7 @@ namespace Util::LatencyPacer
 			newestIndex = g_completedFrames + static_cast<uint64_t>(pending);
 		}
 		// (46p) Fast decay: frames slower than the GPU period (16-frame mean) while sleep is learned.
-		if (guard && g_correctionMs > 0.0f && period > 0.0f && g_periodMean > period * (1.0f + kSlowShare)) {
+		if (g_correctionMs > 0.0f && period > 0.0f && g_periodMean > period * (1.0f + kSlowShare)) {
 			const float cut = std::min(g_correctionMs, std::max(kFastDecayMs, 0.5f * g_correctionMs));
 			g_correctionMs -= cut;
 			info.decayMs += cut;
@@ -513,7 +532,7 @@ namespace Util::LatencyPacer
 		info.leadMs = lead;
 		// (46o) F1b: the unlock backstop (decided on the last frame's sleep and GPU state).
 		float leadUsed = lead;
-		if (a_options.backstop && a_enabled && lead >= 0.0f && !a_options.paused) {
+		if (a_enabled && lead >= 0.0f && !a_options.paused) {
 			const bool locked = g_last.tracking && g_last.sleepMs < kLockSleepMs && g_last.inFlight >= 1 && period > 0.0f && g_periodMean > 0.0f &&
 			                    std::abs(g_periodMean - period) <= kPeriodTolerance * period;
 			g_lockRun = locked ? g_lockRun + 1 : 0;
@@ -552,10 +571,19 @@ namespace Util::LatencyPacer
 				const double reserveMs = static_cast<double>(leadUsed) + static_cast<double>(a_marginMs);
 				// (46n) Plus the learned wait (only while the GPU is behind: pending > 0 here).
 				const double baseMs = std::max(ToMs(predicted - start) - reserveMs, 0.0);
-				const double sleepMs = std::min(baseMs + static_cast<double>(g_correctionMs), kMaxSleepMs);
+				double sleepMs = std::min(baseMs + static_cast<double>(g_correctionMs), kMaxSleepMs);
+				if (g_correctionMs > 0.0f) {
+					// (47m) The learned part never runs the frame start (plus half the CPU lead) past the previous frame's
+					// predicted completion. baseMs already reserves the whole lead + margin, so only the learned part is trimmed.
+					const double boundMs = std::max(ToMs(predicted - start) - 0.5 * static_cast<double>(leadUsed), baseMs);
+					if (sleepMs > boundMs) {
+						info.learnedCutMs = static_cast<float>(sleepMs - boundMs);
+						sleepMs = boundMs;
+					}
+				}
 				if (sleepMs > 0.2) {
 					const int64_t target = start + static_cast<int64_t>(sleepMs * static_cast<double>(g_qpf) / 1000.0);
-					if (guard && fence && newest != 0) {
+					if (fence && newest != 0) {
 						// (46p) Never past the previous frame's completion (+ slack): the frame after it only idles the GPU.
 						const double slackMs = std::clamp(static_cast<double>(period) * kSlackShare, static_cast<double>(kSlackMinMs), static_cast<double>(kSlackMaxMs));
 						const int64_t done = SleepUntilOrDone(target, fence.get(), newest, static_cast<int64_t>(slackMs * static_cast<double>(g_qpf) / 1000.0));
@@ -651,7 +679,7 @@ namespace Util::LatencyPacer
 			return;
 		// (46n) The waits inside D3D11 are not CPU work the pacer has to keep in hand.
 		const float stall = static_cast<float>(g_stallMs);
-		// (46o) F1a: the render segments' wait so far (measured whenever it is tracked: the F7 trace shows it with F1a off too).
+		// (46o) F1a: the render segments' wait so far (tracked while pacing or recording).
 		const double hidden = EngineTiming::RenderWaitMsSoFar();
 		float wait = stall;
 		if (hidden >= 0.0 && g_last.sleepMs >= kBaseSleepMs) {
@@ -661,21 +689,16 @@ namespace Util::LatencyPacer
 			g_hiddenBaseMs = g_hiddenBaseCount >= kMinSamples ? Quantile(g_hiddenBase, g_hiddenBaseCount, 0.25f) : 0.0f;
 		}
 		const double extra = hidden - static_cast<double>(g_hiddenBaseMs);
-		if (g_hiddenOn && hidden >= 0.0 && extra >= kHiddenMinMs && g_frameBehind)
+		if (hidden >= 0.0 && extra >= kHiddenMinMs && g_frameBehind)
 			wait = std::max(wait, static_cast<float>(extra));
 		g_lastHiddenMs = static_cast<float>(hidden);
 		g_lastWaitMs = wait;
-		// (47h) The same wait for the overlay's bottleneck reading, measured whether or not F1a "Count Hidden GPU Waits" is on.
-		{
-			float gpuWait = stall;
-			if (hidden >= 0.0 && extra >= kHiddenMinMs && g_frameBehind)
-				gpuWait = std::max(gpuWait, static_cast<float>(extra));
-			g_frameGpuWaitMs = std::isfinite(gpuWait) ? std::max(gpuWait, 0.0f) : 0.0f;
-		}
+		// (47h) The same wait for the overlay's bottleneck reading.
+		g_frameGpuWaitMs = std::isfinite(wait) ? std::max(wait, 0.0f) : 0.0f;
 		// (46p) Never Over-Sleep: a GPU frame of over 1.5 periods finished since the last submit, or the GPU is in one right now
 		// (the last completion that long ago with frames still pending): this frame's wait and the next one's are not learned.
 		bool skipFeed = false;
-		if (g_guardOn) {
+		{
 			const float period = g_last.gpuPeriodMs;
 			float maxGap = -1.0f;
 			int64_t lastDone = 0;
