@@ -252,6 +252,23 @@ add_custom_command(
     COMMENT "Compiling Ray Tracing DXIL (SkinCharactersCS, cs_6_5)"
     VERBATIM
 )
+# (47l) Foliage sway: tree-animated meshes posed on the RT queue (the game's wind formula), their BLASes refit in place.
+set(CS_RT_WIND_SHADER_SOURCE
+    "${CMAKE_SOURCE_DIR}/src/Features/RayTracing/Shaders/WindFoliageCS.hlsl"
+)
+set(CS_RT_WIND_SHADER_HEADER
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/RayTracing/WindFoliageCS.dxil.h"
+)
+add_custom_command(
+    OUTPUT "${CS_RT_WIND_SHADER_HEADER}"
+    COMMAND
+        "${CS_SDK_DXC}" -nologo -T cs_6_5 -E main -O3 -WX -Qstrip_reflect -Fh
+        "${CS_RT_WIND_SHADER_HEADER}" -Vn g_WindFoliageCS
+        "${CS_RT_WIND_SHADER_SOURCE}"
+    DEPENDS "${CS_RT_WIND_SHADER_SOURCE}"
+    COMMENT "Compiling Ray Tracing DXIL (WindFoliageCS, cs_6_5)"
+    VERBATIM
+)
 # (46b) Point-light shadows: traced right after the sun, same list and TLAS.
 set(CS_RT_POINT_SHADER_SOURCE
     "${CMAKE_SOURCE_DIR}/src/Features/RayTracing/Shaders/TracePointLightsCS.hlsl"
@@ -324,6 +341,7 @@ target_sources(
         "${CS_RT_CHAR_SHADER_HEADER}"
         "${CS_RT_CHAR_ALPHA_SHADER_HEADER}"
         "${CS_RT_SKIN_SHADER_HEADER}"
+        "${CS_RT_WIND_SHADER_HEADER}"
 )
 target_include_directories(
     "${PROJECT_NAME}"

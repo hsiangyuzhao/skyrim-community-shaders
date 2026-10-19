@@ -258,6 +258,9 @@ public:
 		bool AOCharacterSelfFix = true;
 		bool SunDepthCheckTranslucent = true;
 		bool PointShadowsOnWater = true;
+		// (47l) "Point Light Shadows on Water: Skip Distant LOD Water": a frame whose only water is the distant LOD water (beyond every
+		// point-light source's reach) runs no WaterPrepCS. Off = 47k.
+		bool PointShadowsWaterLodSkip = true;
 		// (47j) AOSmoothNormals "RTAO: Smooth Normals": the AO hemisphere around last frame's G-buffer normal reprojected to this frame
 		// (AONormalPrepCS, confidence-blended toward the depth normal), not the per-facet depth normal. Off = 47i.
 		bool AOSmoothNormals = true;
@@ -266,6 +269,19 @@ public:
 		// frame, tolerances by the pixel footprint / max(N.V, 0.2), and the low-confidence fallback a depth-only smoothed normal (a
 		// sparse ring of depth normals weighted by plane agreement) instead of the raw facet. Off = 47j.
 		bool AOSmoothNormals2 = true;
+		// (47l) Outside the settings macro too. AOBlueNoise "RTAO: Blue-Noise Rays": the ray directions from Skylighting's
+		// spatiotemporal blue noise instead of interleaved gradient noise (TraceAOCS kFlagBlueNoise). AOTemporalV2 "RTAO: Temporal v2"
+		// (needs Temporal): per-pixel history length, disocclusion test against our own last-frame depth and normal, depth-weighted
+		// history taps, a statistical clamp (both terms), a history-fix blur while the history is short, and the large-scale
+		// blur's radius in world units (RTAOTemporalCS RTAO_TEMPORAL_V2, RTAOFilterCS). Both off = 47k.
+		// Blue-Noise Rays defaults off: offline (Rtao47l.cs) this asset's (r, g) pair left 1.5x the noise of the 47k IGN pair after the
+		// 5x5 filter and after the history (it is a 3D-vector blue noise; its 2D projection is not as even as IGN in a 5x5).
+		bool AOBlueNoise = false;
+		bool AOTemporalV2 = true;
+		// (47l) Outside the settings macro too. FoliageSway "Sway in RT Shadows" (under Foliage): with Foliage ray traced / Both, tree-
+		// animated leaves, bushes and branches are traced with the game's wind (a wind BLAS per mesh, posed and refit every frame).
+		// Off = 47k (frozen at their rest pose). No effect with Foliage = Shadow map.
+		bool FoliageSway = true;
 	};
 	/// (46f) RTAO modes (Settings::AOMode); with RTAO off the AO is SSGI's, exactly as before.
 	enum class AOModeKind : int
@@ -725,6 +741,10 @@ private:
 	bool charactersRequested = false;
 	std::string charactersOffReason;
 	void UpdateCharacters();
+	// (47l) Foliage sway: likewise (a wind fault switches FoliageSway off); this frame's wind into an RT frame input.
+	bool windRequested = false;
+	std::string windOffReason;
+	void FillWind(RayTracingRT::FrameInput& a_input) const;
 
 	// (46b) Point-light shadows.
 	struct alignas(16) PointDenoiseCB
@@ -790,6 +810,7 @@ private:
 	uint32_t waterPrepFrame = UINT32_MAX;     // frame of the last prep (its distances are next frame's trace input)
 	bool waterDistValid = false;              // the distance texture holds a prep (cleared when none ran last frame)
 	bool waterTraced = false;                 // this frame's point trace traced from the water (t42 / t43 bound)
+	bool waterLodSkip = false;                // (47l) distant LOD water draws do not ask for the prep this frame (out of every source's reach)
 	float waterInvViewProj[16]{};             // this frame's (the trace's) inverse view-projection
 	uint32_t waterRenderWidth = 0, waterRenderHeight = 0;
 	winrt::com_ptr<ID3D11Texture2D> waterDepthCopy;
@@ -895,8 +916,16 @@ private:
 		float Params[4];        // strength, this frame's weight in the history, history clamp slack, RT fade-in
 		float Detail[4];        // (46t) detail strength, normal weight power (0 = the 45 degree gate only), unused x2
 		float Camera[4];        // (46t) the game's CameraData (linear depth in RTAOFilterCS)
+		// (47l) Temporal v2 (RTAOCommon.hlsli; appended at byte 64, the fields above unchanged). Filled every frame.
+		float InvViewProj[16];   // 64: this frame's (jittered, camera-relative), as the trace's
+		float PrevViewProj[16];  // 128: last frame's (jittered), relative to its own camera
+		float ViewInverse[16];   // 192: this frame's view-to-world
+		float CameraDelta[4];    // 256: xyz this camera minus last frame's; w pixels per unit at linear depth 1
+		float Temporal[4];       // 272: min history weight, large-scale sigma (units), history-fix frames, max history length
+		float Clamp[4];          // 288: statistical clamp k (both terms), minimum half width detail / large-scale, unused
 	};
 	STATIC_ASSERT_ALIGNAS_16(AOCompositeCB);
+	static_assert(sizeof(AOCompositeCB) == 304, "RTAOCommon.hlsli RTAOCB");
 	static constexpr std::uint32_t kAOFlagContact = 1u, kAOFlagDarker = 2u, kAOFlagHistory = 4u, kAOFlagSplit = 8u;  // RTAO*CS.hlsl (RTAOCommon.hlsli)
 	static constexpr std::uint32_t kAOFlagDetail = 16u, kAOFlagValidity = 32u, kAOFlagDetailHistory = 64u;                         // (46t)
 	[[nodiscard]] bool AOOn() const { return settings.AO && !aoAutoOff; }
@@ -965,6 +994,29 @@ private:
 	float aoLastDetailLength = -1.0f;
 	int aoLastNormalGuided = -1;
 	int aoLastAlphaBudget = -1;
+	// (47l) RTAO: Temporal v2. History lengths (R8G8_UNORM: n / 255, large / detail) and our own last-frame geometry (R32_UINT:
+	// linear depth f16 | octahedral world normal 8:8), both ping-pong at render size, made on first use (failing that: 47k this
+	// session), released with the filter textures or when the switch goes off. Every history resets when the switch changes, at a
+	// camera cut (the camera moved more than kAOCutDistance or turned more than 60 degrees in a frame), after a gap of a frame.
+	bool EnsureAOTemporalV2();
+	void ReleaseAOTemporalV2();
+	DenoiseTexture aoV2Length[2], aoV2Geometry[2];
+	std::uint32_t aoV2Index = 0;
+	std::uint32_t aoV2Width = 0, aoV2Height = 0;
+	bool aoV2Valid = false;           // the textures at aoV2Index hold last frame's (written in frame aoV2Frame)
+	std::uint32_t aoV2Frame = 0;
+	bool aoV2Last = false;            // Temporal v2 as last composited (a change resets every history)
+	std::uint64_t aoV2Bytes = 0;
+	std::string aoV2Fault;
+	winrt::com_ptr<ID3D11ComputeShader> aoTemporalV2CS;
+	struct AOPrevCamera
+	{
+		bool valid = false;
+		std::uint32_t frame = 0;
+		float viewProj[16]{};
+		double camera[3]{};
+		float forward[3]{};
+	} aoPrevCamera;
 	/// The RTAO filter and mix (DrawAmbientOcclusion, inside its try / catch).
 	void DrawAmbientOcclusionImpl();
 };

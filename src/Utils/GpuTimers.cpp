@@ -162,6 +162,9 @@ namespace Util
 			{ "RT Point Lights: Water Prep",
 				"GPU time of the depth copy after the water and the water-distance pass (Point Light Shadows on Water), right after the "
 				"water draws. F7 column water_prep_gpu_ms." },
+			{ "RT Ambient Occlusion: Normal Prep",
+				"GPU time of the smooth normals for the ray-traced AO (RTAO: Smooth Normals: last frame's normals moved to this frame), "
+				"right before the trace. F7 column rtao_normal_prep_gpu_ms." },
 		};
 
 		static_assert(sizeof(kBucketInfo) / sizeof(kBucketInfo[0]) == static_cast<size_t>(GpuBucket::Count),

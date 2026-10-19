@@ -2,6 +2,7 @@
 
 #include "Deferred.h"
 #include "Features/RayTracing/CasterFilter.h"
+#include "Features/RayTracing/Wind.h"
 #include "Features/ScreenSpaceGI.h"
 #include "Features/ScreenSpacePointLightShadows.h"
 #include "Features/ScreenSpaceShadows.h"
@@ -248,6 +249,19 @@ namespace
 	constexpr std::uint32_t kAOTraceSmoothNormals = 512u;  // (47j) TraceAOCS: RTAO: Smooth Normals (AONormalPrepCS)
 	constexpr std::uint32_t kAOTraceSmoothNormals2 = 1024u;  // (47k) TraceAOCS: RTAO: Smooth Normals v2 (offset along Ns, projection)
 	constexpr std::uint32_t kAOFlagNormalDebug = 128u;       // (47k) RTAOCompositeCS: t5 holds this frame's Smooth Normals debug view
+	// (47l) RTAO: Blue-Noise Rays / Temporal v2.
+	constexpr std::uint32_t kAOTraceBlueNoise = 2048u;       // TraceAOCS: the directions from the blue noise (t6)
+	constexpr std::uint32_t kAOFlagTemporalV2 = 256u;        // RTAOCommon.hlsli: Temporal v2 (RTAOTemporalCS RTAO_TEMPORAL_V2, the filters' world sigma)
+	constexpr std::uint32_t kAOFlagGeometryValid = 512u;     // RTAOCommon.hlsli: last frame's geometry / history lengths valid
+	constexpr float kAOMinHistoryWeight = 0.1f;   // this frame's weight never below 1 / 10 (a = max(1 / (n + 1), 0.1))
+	constexpr float kAOHistoryFixFrames = 4.0f;   // the history fix fades out over the first 4 frames of a pixel's history
+	constexpr float kAOMaxHistoryLength = 32.0f;  // n is stored up to this (only n < 9 changes the weight)
+	constexpr float kAOClampK = 2.0f;      // statistical clamp (both terms): mean +- 2 x the 5x5 standard deviation of this frame's filtered value
+	constexpr float kAOClampMinDetail = 0.01f;  // ... at least +- 0.01 (detail term)
+	constexpr float kAOClampMinLarge = 0.02f;   // ... at least +- 0.02 (large-scale term: its 5x5 is smooth, its frame-to-frame noise is not)
+	constexpr float kAOWorldSigmaShare = 0.05f;   // the large-scale blur's sigma: 5 % of the ray length (100 units: 5 units), 2 - 10
+	constexpr float kAOCutDistance = 512.0f;      // a camera cut: moved more than this in a frame (units) ...
+	constexpr float kAOCutCos = 0.5f;             // ... or turned more than 60 degrees
 	// (47j) AONormalPrepCS.
 	struct alignas(16) AONormalConstants
 	{
@@ -1037,6 +1051,33 @@ void RayTracing::UpdateAlphaCasters()
 	const bool alphaInUse = scene.AlphaWanted() || (settings.Characters && backend.SkinAlphaAvailable());
 	if (!alphaInUse && backend.IsReady() && backend.AlphaIdle())
 		backend.ReleaseAlphaResources();
+
+	// (47l) Foliage sway. Turned on (again) by the user: an earlier automatic switch-off is forgotten; a fault of its D3D12 side
+	// switches it off (the leaves then stay frozen as in 47k, the rest of Ray Tracing goes on). No re-capture either way.
+	if (settings.FoliageSway && !windRequested) {
+		backend.ClearWindFault();
+		windOffReason.clear();
+	}
+	if (settings.FoliageSway && !backend.WindFault().empty()) {
+		windOffReason = backend.WindFault();
+		settings.FoliageSway = false;
+		logger::warn("[RayTracing] Sway in RT Shadows switched off: {}", windOffReason);
+	}
+	windRequested = settings.FoliageSway;
+	scene.SetSway(settings.FoliageSway && backend.WindAvailable());
+	if (!scene.SwayActive() && backend.IsReady() && backend.WindIdle())
+		backend.ReleaseWindResources();
+}
+
+void RayTracing::FillWind(RayTracingRT::FrameInput& a_input) const
+{
+	// (47l) This frame's wind (BSTreeManager, read once per frame at the first call: Early Prep, else the trace's own input).
+	if (!scene.SwayActive() || !globals::state)
+		return;
+	const auto wind = RayTracingWind::Compute(globals::state->frameCount);
+	a_input.windValid = wind.valid;
+	a_input.windMagnitude = wind.magnitude;
+	a_input.windTimer = wind.timer;
 }
 
 RayTracingScene::SceneConfig RayTracing::SceneConfigFromSettings() const
@@ -1245,8 +1286,12 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.AOCharacterSelfFix = read("AOCharacterSelfFix", defaults.AOCharacterSelfFix);
 		settings.SunDepthCheckTranslucent = read("SunDepthCheckTranslucent", defaults.SunDepthCheckTranslucent);
 		settings.PointShadowsOnWater = read("PointShadowsOnWater", defaults.PointShadowsOnWater);
+		settings.PointShadowsWaterLodSkip = read("PointShadowsWaterLodSkip", defaults.PointShadowsWaterLodSkip);  // (47l)
 		settings.AOSmoothNormals = read("AOSmoothNormals", defaults.AOSmoothNormals);  // (47j)
 		settings.AOSmoothNormals2 = read("AOSmoothNormals2", defaults.AOSmoothNormals2);  // (47k)
+		settings.AOBlueNoise = read("AOBlueNoise", defaults.AOBlueNoise);  // (47l)
+		settings.AOTemporalV2 = read("AOTemporalV2", defaults.AOTemporalV2);  // (47l)
+		settings.FoliageSway = read("FoliageSway", defaults.FoliageSway);  // (47l)
 	}
 	// (46o) Window Beam Guard: off once for settings saved before 46o (its rule misfired on beams that mostly hit walls).
 	if (loadedVersion < 6 && settings.PointLightsBeamGuard) {
@@ -1340,8 +1385,12 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["AOCharacterSelfFix"] = settings.AOCharacterSelfFix;  // (47h)
 	o_json["AOSmoothNormals"] = settings.AOSmoothNormals;  // (47j)
 	o_json["AOSmoothNormals2"] = settings.AOSmoothNormals2;  // (47k)
+	o_json["AOBlueNoise"] = settings.AOBlueNoise;  // (47l)
+	o_json["AOTemporalV2"] = settings.AOTemporalV2;  // (47l)
+	o_json["FoliageSway"] = settings.FoliageSway;  // (47l)
 	o_json["SunDepthCheckTranslucent"] = settings.SunDepthCheckTranslucent;
 	o_json["PointShadowsOnWater"] = settings.PointShadowsOnWater;
+	o_json["PointShadowsWaterLodSkip"] = settings.PointShadowsWaterLodSkip;  // (47l)
 }
 
 void RayTracing::RestoreDefaultSettings()
@@ -1439,6 +1488,7 @@ void RayTracing::ClearShaderCache()
 	// (46t)
 	for (auto* shader : { &aoFDownCS, &aoFBlurHCS, &aoFBlurVCS, &aoFUpCS, &aoFFullHCS, &aoFFullVCS, &aoFDetailCS, &aoDetailTemporalCS })
 		*shader = nullptr;
+	aoTemporalV2CS = nullptr;  // (47l)
 }
 
 void RayTracing::PrecompileShaders()
@@ -1477,6 +1527,8 @@ void RayTracing::PrecompileShaders()
 			GetShaderDefined(aoFDetailCS, kFilter, "RTAOFilterCS (detail)", "RTAO_DETAIL");
 			GetShaderDefined(aoDetailTemporalCS, L"Data\\Shaders\\RayTracing\\RTAOTemporalCS.hlsl", "RTAOTemporalCS (detail)", "RTAO_DETAIL_HISTORY");
 		}
+		if (settings.AOTemporal && settings.AOTemporalV2)  // (47l)
+			GetShaderDefined(aoTemporalV2CS, L"Data\\Shaders\\RayTracing\\RTAOTemporalCS.hlsl", "RTAOTemporalCS (v2)", "RTAO_TEMPORAL_V2");
 	}
 }
 
@@ -1514,6 +1566,7 @@ void RayTracing::Disable(Status a_status, std::string a_reason)
 	aoThisFrame = false;  // (46f) SSGI's own AO from the next frame on
 	aoHistoryValid = false;
 	aoDetailHistoryValid = false;  // (46t)
+	aoV2Valid = false;  // (47l)
 	RayTracingCasterFilter::Clear();
 	characters.ReleaseAll(backend);  // (45i) (a backend that is gone ignores the handles)
 	scene.ReleaseAll(backend);
@@ -1996,6 +2049,7 @@ void RayTracing::RunEarlyPrep()
 		// (46g) Leftovers in the black screen get the larger budgets (nothing visible yet).
 		input.buildCpuMs = blackScreen ? kBlackBuildCpuMs : 0.0f;
 		input.skinUploadCpuMs = blackScreen ? kBlackSkinUploadCpuMs : 0.0f;
+		FillWind(input);  // (47l)
 		earlyThisFrame = backend.PrepareFrame(input);
 		if (!earlyThisFrame && backend.HasFailed())
 			Disable(Status::Failed, backend.LastError());
@@ -2049,6 +2103,7 @@ void RayTracing::Prepass()
 	pointThisFrame = false;
 	pointK = 0;
 	waterTraced = false;  // (47i)
+	waterLodSkip = false;  // (47l) set again by this frame's point-light preparation
 	pointCpuMs = 0.0f;
 	pointHistoryValid = pointHistoryValid && pointDenoised;
 	pointDenoised = false;
@@ -2540,6 +2595,13 @@ void RayTracing::PublishCpuSplit()
 		detail.plDenoiseGpuMs = passMs(pointThisFrame && pointDenoised, Util::GpuBucket::RayTracingPointDenoise);
 		detail.plRays = pointThisFrame ? stats.pointRaysPerFrame : 0u;
 		detail.plWaterRays = pointThisFrame ? stats.pointWaterRaysPerFrame : 0;  // (47j)
+		// (47l) Foliage sway (-1 = off): wind BLASes alive, their vertices, refits recorded for this frame's trace.
+		if (scene.SwayActive()) {
+			const auto& ws = backend.GetWindStats();
+			detail.windMeshes = ws.meshes;
+			detail.windVertices = static_cast<std::int64_t>(ws.vertices);
+			detail.windRefits = activeThisFrame || earlyThisFrame ? ws.refitsLastFrame : 0;
+		}
 		detail.plCpuMs = PointLightsOn() ? pointCpuMs : -1.0f;
 		// (46c)
 		// (46h) 2 = indoors traced: point lights and / or RTAO.
@@ -2928,6 +2990,7 @@ void RayTracing::RunFrame()
 	input.skinDraws = &skinDraws;  // (45i) empty: the 45h pipelines run
 	input.buildCpuMs = blackScreen ? kBlackBuildCpuMs : 0.0f;  // (46g)
 	input.skinUploadCpuMs = blackScreen ? kBlackSkinUploadCpuMs : 0.0f;
+	FillWind(input);  // (47l)
 	input.skinBones = &skinBones;
 	input.deferWait = true;  // (45l) FinishFrame waits (after the other features' prepasses)
 	input.splitSun = settings.SplitTraceSync;  // (46m) used only with point lights traced too
@@ -3531,7 +3594,12 @@ void RayTracing::OnDrawStatesApplied(ID3D11DeviceContext* a_context)
 	const uint32_t frame = globals::state->frameCount;
 	const auto* shader = globals::state->currentShader;
 	if (shader && shader->shaderType.get() == RE::BSShader::Type::Water) {
-		if (waterEndDeferredFrame == frame) {
+		// (47l) Distant LOD water (Water technique 9, ShaderCache::WaterShaderTechniques::Lod) lies beyond the loaded cells, out of
+		// every point-light source's reach (sources within PointLightsDistance of the camera, radius at most 4096): its distances
+		// are never traced from nor matched. Frames that draw only LOD water skip the prep (and its depth copy).
+		constexpr uint32_t kWaterTechniqueLod = 9;
+		const bool lodOnly = waterLodSkip && ((globals::state->currentPixelDescriptor >> 11) & 0xF) == kWaterTechniqueLod;
+		if (waterEndDeferredFrame == frame && !lodOnly) {
 			waterSeenFrame = frame;
 			waterPrepPending = true;
 		}
@@ -3688,6 +3756,11 @@ bool RayTracing::RunAONormalPrep(ID3D11DeviceContext* a_context, ID3D11ShaderRes
 	cb.Flags[0] = settings.AOSmoothNormals2 ? 1u : 0u;
 	cb.Flags[1] = writeDebug ? static_cast<std::uint32_t>(normalView) : 0u;
 	aoNormalCB->Update(cb);
+	// (47l) F7 rtao_normal_prep_gpu_ms: its own GPU bucket. Buckets do not nest and both callers (RunFrame, RunInteriorFrame) are
+	// inside the Ray Tracing bucket's scope: that interval pauses around this one (a bucket may hold several intervals a frame).
+	auto* gpuTimers = Util::GpuPassTimers::GetSingleton();
+	gpuTimers->End(Util::GpuBucket::RayTracing);
+	gpuTimers->Begin(Util::GpuBucket::RayTracingAONormalPrep);
 	ID3D11Buffer* cbs[1] = { aoNormalCB->CB() };
 	ID3D11ShaderResourceView* srvs[4] = { a_depth, backend.DepthMaskSRV(), normal.SRV, motion.SRV };
 	ID3D11UnorderedAccessView* uavs[2] = { backend.AONormalUAV(), writeDebug ? aoNormalDebug.uav.get() : nullptr };
@@ -3701,6 +3774,8 @@ bool RayTracing::RunAONormalPrep(ID3D11DeviceContext* a_context, ID3D11ShaderRes
 	ID3D11Buffer* nullCbs[1]{};
 	a_context->CSSetShaderResources(0, 4, nullSrvs);
 	a_context->CSSetUnorderedAccessViews(0, 2, nullUavs, nullptr);
+	gpuTimers->End(Util::GpuBucket::RayTracingAONormalPrep);
+	gpuTimers->Begin(Util::GpuBucket::RayTracing);
 	if (writeDebug)
 		aoNormalDebugFrame = frame;
 	a_context->CSSetConstantBuffers(0, 1, nullCbs);
@@ -3874,6 +3949,16 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	std::memcpy(waterInvViewProj, a_input.constants.invViewProj, sizeof(waterInvViewProj));
 	waterRenderWidth = width;
 	waterRenderHeight = height;
+	// (47l) Distant LOD water may be left out of the prep this frame only when the loaded cells' edge lies farther from the camera than
+	// any point-light source reaches (sources within PointLightsDistance of the camera, radius at most 4096; 512 units of margin).
+	waterLodSkip = false;
+	if (!a_interior && settings.PointShadowsWaterLodSkip) {  // (47l) switch
+		float core[4];
+		if (scene.GetLoadedRect(core, false)) {
+			const double edge = std::min({ a_camX - core[0], a_camY - core[1], core[2] - a_camX, core[3] - a_camY });
+			waterLodSkip = edge > static_cast<double>(settings.PointLightsDistance) + 4096.0 + 512.0;
+		}
+	}
 	if (settings.PointShadowsOnWater) {
 		if (backend.EnsurePointWaterTextures()) {
 			const uint32_t frame = globals::state->frameCount;
@@ -4019,6 +4104,7 @@ void RayTracing::SwitchOffAO(std::string a_reason)
 	aoAutoOff = true;
 	aoThisFrame = false;
 	aoHistoryValid = false;
+	aoV2Valid = false;  // (47l)
 	logger::warn("[RayTracing] Ray-traced ambient occlusion switched off: {}", aoOffReason);
 }
 
@@ -4029,8 +4115,11 @@ void RayTracing::UpdateAO()
 		backend.ClearAOFault();
 		aoOffReason.clear();
 		aoExtrasFault.clear();  // (46t)
+		aoV2Fault.clear();      // (47l)
 		aoAutoOff = false;
 	}
+	if (!settings.AOTemporalV2)
+		aoV2Fault.clear();  // (47l) turned off: turning it on again retries its shader / textures
 	if (AOOn() && !backend.AOFault().empty())
 		SwitchOffAO(backend.AOFault());
 	else if (AOOn() && backend.IsReady() && !backend.AOAvailable())
@@ -4049,6 +4138,8 @@ void RayTracing::UpdateAO()
 			ReleaseAOFilter();
 		if (backend.IsReady() && backend.AOBytes())
 			backend.ReleaseAOResources();
+		if (backend.IsReady() && backend.HasAOBlueNoise())  // (47l)
+			backend.ReleaseAOBlueNoise();
 	}
 }
 
@@ -4061,6 +4152,50 @@ void RayTracing::ReleaseAOFilter()
 	d3d11Bytes -= std::min(d3d11Bytes, aoD3D11Bytes);
 	aoD3D11Bytes = 0;
 	ReleaseAOExtras();  // (46t)
+	ReleaseAOTemporalV2();  // (47l)
+}
+
+void RayTracing::ReleaseAOTemporalV2()
+{
+	for (auto* t : { &aoV2Length[0], &aoV2Length[1], &aoV2Geometry[0], &aoV2Geometry[1] })
+		*t = {};
+	aoV2Width = aoV2Height = 0;
+	aoV2Valid = false;
+	d3d11Bytes -= std::min(d3d11Bytes, aoV2Bytes);
+	aoV2Bytes = 0;
+}
+
+bool RayTracing::EnsureAOTemporalV2()
+{
+	// (47l) Optional: on failure this session keeps the 47k history (aoV2Fault), RTAO itself goes on.
+	if (!aoV2Fault.empty())
+		return false;
+	const std::uint32_t width = aoWidth, height = aoHeight;
+	if (!width || !height)
+		return false;
+	if (aoV2Length[0].texture && aoV2Length[1].texture && aoV2Geometry[0].texture && aoV2Geometry[1].texture && aoV2Width == width && aoV2Height == height)
+		return true;
+	ReleaseAOTemporalV2();
+	DenoiseTexture length0, length1, geometry0, geometry1;
+	const bool ok = CreateDenoiseTexture(this, length0.texture, length0.srv, length0.uav, width, height, DXGI_FORMAT_R8G8_UNORM, "RayTracing RTAO History Length") &&
+	                CreateDenoiseTexture(this, length1.texture, length1.srv, length1.uav, width, height, DXGI_FORMAT_R8G8_UNORM, "RayTracing RTAO History Length") &&
+	                CreateDenoiseTexture(this, geometry0.texture, geometry0.srv, geometry0.uav, width, height, DXGI_FORMAT_R32_UINT, "RayTracing RTAO Geometry") &&
+	                CreateDenoiseTexture(this, geometry1.texture, geometry1.srv, geometry1.uav, width, height, DXGI_FORMAT_R32_UINT, "RayTracing RTAO Geometry");
+	if (!ok) {
+		aoV2Fault = "could not create its history-length / geometry textures (the 47k history is used)";
+		logger::warn("[RayTracing] RTAO: Temporal v2: {}", aoV2Fault);
+		return false;
+	}
+	aoV2Length[0] = std::move(length0);
+	aoV2Length[1] = std::move(length1);
+	aoV2Geometry[0] = std::move(geometry0);
+	aoV2Geometry[1] = std::move(geometry1);
+	aoV2Width = width;
+	aoV2Height = height;
+	aoV2Valid = false;
+	aoV2Bytes = static_cast<std::uint64_t>(width) * height * (2 + 4) * 2;
+	d3d11Bytes += aoV2Bytes;
+	return true;
 }
 
 void RayTracing::ReleaseAOExtras()
@@ -4231,6 +4366,14 @@ bool RayTracing::PrepareAO(RayTracingRT::FrameInput& a_input, const float a_trac
 		flags |= kAOTraceDither8;
 	if (settings.AOCharacterSelfFix && (flags & kAOTraceCharacters))
 		flags |= kAOTraceSelfFix;
+	// (47l) RTAO: Blue-Noise Rays: the texture is made (and its upload queued into the next RTAO list) once; unavailable = IGN (the
+	// backend logged why once). Off: the texture goes (only while wanted).
+	if (settings.AOBlueNoise) {
+		if (backend.EnsureAOBlueNoise())
+			flags |= kAOTraceBlueNoise;
+	} else if (backend.HasAOBlueNoise()) {
+		backend.ReleaseAOBlueNoise();
+	}
 	aoShapeThisFrame = shape;
 	c.params[0] = static_cast<float>(frameIndex % 1024);
 	std::memcpy(&c.params[1], &flags, sizeof(float));
@@ -4365,6 +4508,61 @@ void RayTracing::DrawAmbientOcclusionImpl()
 	const std::uint32_t width = aoWidth, height = aoHeight;
 	const UINT groupsX = (width + 7) / 8, groupsY = (height + 7) / 8;
 	const UINT loX = ((width + 1) / 2 + 7) / 8, loY = ((height + 1) / 2 + 7) / 8;
+	// (47l) RTAO: Temporal v2 (needs Temporal; its shader and textures on first use, failing them this session keeps the 47k
+	// history). A change of the switch, a camera cut (moved more than kAOCutDistance or turned more than 60 degrees since the last
+	// frame) or a gap of a frame resets every history; this frame's camera is kept for the next one.
+	const std::uint32_t frameNow = globals::state->frameCount;
+	const bool wantV2 = settings.AOTemporal && settings.AOTemporalV2 && aoV2Fault.empty();
+	ID3D11ComputeShader* temporalV2 = nullptr;
+	if (wantV2) {
+		temporalV2 = GetShaderDefined(aoTemporalV2CS, L"Data\\Shaders\\RayTracing\\RTAOTemporalCS.hlsl", "RTAOTemporalCS (v2)", "RTAO_TEMPORAL_V2");
+		if (!temporalV2) {
+			aoV2Fault = "its shader did not compile (the 47k history is used)";
+			logger::warn("[RayTracing] RTAO: Temporal v2: {}", aoV2Fault);
+		}
+	}
+	const bool v2 = wantV2 && temporalV2 && EnsureAOTemporalV2();
+	if (!v2 && aoV2Length[0].texture)
+		ReleaseAOTemporalV2();
+	if (v2 != aoV2Last) {
+		aoHistoryValid = false;
+		aoDetailHistoryValid = false;
+		aoV2Valid = false;
+		aoV2Last = v2;
+	}
+	const auto& fbAO = globals::game::frameBufferCached;
+	const float4 cameraPos = fbAO.GetCameraPosAdjust(0);
+	float forward[3]{};
+	{
+		// The view direction: two points on the centre ray (the matrices as the shaders read them: row r = floats r * 4 .. r * 4 + 3).
+		float m[16];
+		std::memcpy(m, &fbAO.GetCameraViewProjInverse(0), sizeof(m));
+		float p[2][3]{};
+		for (int k = 0; k < 2; ++k) {
+			const float v[4] = { 0.0f, 0.0f, k == 0 ? 0.25f : 0.75f, 1.0f };
+			float h[4]{};
+			for (int r = 0; r < 4; ++r)
+				h[r] = m[r * 4] * v[0] + m[r * 4 + 1] * v[1] + m[r * 4 + 2] * v[2] + m[r * 4 + 3] * v[3];
+			for (int i = 0; i < 3; ++i)
+				p[k][i] = std::abs(h[3]) > 1e-20f ? h[i] / h[3] : 0.0f;
+		}
+		const float d[3] = { p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2] };
+		const float len = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+		if (len > 1e-6f && std::isfinite(len))
+			for (int i = 0; i < 3; ++i)
+				forward[i] = d[i] / len;
+	}
+	const bool prevCameraUsable = aoPrevCamera.valid && aoPrevCamera.frame + 1 == frameNow;
+	if (v2 && prevCameraUsable) {
+		const double dx = cameraPos.x - aoPrevCamera.camera[0], dy = cameraPos.y - aoPrevCamera.camera[1], dz = cameraPos.z - aoPrevCamera.camera[2];
+		const float turn = forward[0] * aoPrevCamera.forward[0] + forward[1] * aoPrevCamera.forward[1] + forward[2] * aoPrevCamera.forward[2];
+		if (dx * dx + dy * dy + dz * dz > static_cast<double>(kAOCutDistance) * kAOCutDistance || turn < kAOCutCos) {
+			aoHistoryValid = false;
+			aoDetailHistoryValid = false;
+			aoV2Valid = false;
+		}
+	}
+	const bool geometryValid = v2 && prevCameraUsable && aoV2Valid && aoV2Frame + 1 == frameNow && aoV2Width == width && aoV2Height == height;
 	const bool historyValid = settings.AOTemporal && aoHistoryValid && aoHistoryFrame + 1 == globals::state->frameCount;
 	const bool detailHistoryValid = detail && settings.AOTemporal && aoDetailHistoryValid && aoDetailHistoryFrame + 1 == globals::state->frameCount;
 	const std::uint32_t read = aoHistoryIndex, write = aoHistoryIndex ^ 1u;
@@ -4406,7 +4604,37 @@ void RayTracing::DrawAmbientOcclusionImpl()
 		cb.Camera[2] = cameraData.z;
 		cb.Camera[3] = cameraData.w;
 	}
+	// (47l) Temporal v2: its flags and constants (the matrices every frame; without last frame's camera its own matrix, unused then).
+	if (v2)
+		cb.Size[2] |= kAOFlagTemporalV2 | (geometryValid ? kAOFlagGeometryValid : 0u);
+	std::memcpy(cb.InvViewProj, &fbAO.GetCameraViewProjInverse(0), sizeof(cb.InvViewProj));
+	if (prevCameraUsable)
+		std::copy_n(aoPrevCamera.viewProj, 16, cb.PrevViewProj);
+	else
+		std::memcpy(cb.PrevViewProj, &fbAO.GetCameraViewProj(0), sizeof(cb.PrevViewProj));
+	std::memcpy(cb.ViewInverse, &fbAO.GetCameraViewInverse(0), sizeof(cb.ViewInverse));
+	cb.CameraDelta[0] = prevCameraUsable ? static_cast<float>(static_cast<double>(cameraPos.x) - aoPrevCamera.camera[0]) : 0.0f;
+	cb.CameraDelta[1] = prevCameraUsable ? static_cast<float>(static_cast<double>(cameraPos.y) - aoPrevCamera.camera[1]) : 0.0f;
+	cb.CameraDelta[2] = prevCameraUsable ? static_cast<float>(static_cast<double>(cameraPos.z) - aoPrevCamera.camera[2]) : 0.0f;
+	{
+		const float projY = std::abs(fbAO.GetCameraProj(0)._22);
+		cb.CameraDelta[3] = 0.5f * static_cast<float>(height) * (std::isfinite(projY) && projY > 1e-3f ? projY : 1.0f);
+	}
+	cb.Temporal[0] = kAOMinHistoryWeight;
+	cb.Temporal[1] = std::clamp(std::clamp(settings.AORayLength, kAORayLengthMin, kAORayLengthMax) * kAOWorldSigmaShare, 2.0f, 10.0f);
+	cb.Temporal[2] = kAOHistoryFixFrames;
+	cb.Temporal[3] = kAOMaxHistoryLength;
+	cb.Clamp[0] = kAOClampK;
+	cb.Clamp[1] = kAOClampMinDetail;
+	cb.Clamp[2] = kAOClampMinLarge;
 	aoCB->Update(cb);
+	aoPrevCamera.valid = true;
+	aoPrevCamera.frame = frameNow;
+	std::memcpy(aoPrevCamera.viewProj, &fbAO.GetCameraViewProj(0), sizeof(aoPrevCamera.viewProj));
+	aoPrevCamera.camera[0] = cameraPos.x;
+	aoPrevCamera.camera[1] = cameraPos.y;
+	aoPrevCamera.camera[2] = cameraPos.z;
+	std::copy_n(forward, 3, aoPrevCamera.forward);
 
 	ID3D11ShaderResourceView* nullSrvs[6]{};
 	ID3D11UnorderedAccessView* nullUavs[3]{};
@@ -4455,7 +4683,42 @@ void RayTracing::DrawAmbientOcclusionImpl()
 	DenoiseTexture* detailBlended = detail ? &aoDetailFiltered : nullptr;
 	ID3D11SamplerState* sampler = aoLinearSampler.get();
 	context->CSSetSamplers(0, 1, &sampler);
-	if (settings.AOTemporal) {
+	if (v2) {
+		// (47l) Temporal v2: the detail term's spatial filter first, then one pass blends both terms with their histories (history
+		// lengths, our own last-frame geometry for the disocclusion test, statistical clamp of each term, history fix) and
+		// writes this frame's geometry and lengths for the next one. Nothing is blurred after it.
+		if (detail)
+			dispatch(detailCS, { backend.AORawSRV(), depth.depthSRV, normal.SRV }, { aoDetailFiltered.uav.get() }, groupsX, groupsY);
+		const std::uint32_t v2Read = aoV2Index, v2Write = aoV2Index ^ 1u;
+		ID3D11ShaderResourceView* srvs[9] = { aoFiltered.srv.get(), aoHistory[read].srv.get(), motion.SRV, detail ? aoDetailFiltered.srv.get() : nullptr,
+			detail ? aoDetailHistory[detailRead].srv.get() : nullptr, aoV2Length[v2Read].srv.get(), aoV2Geometry[v2Read].srv.get(), depth.depthSRV, normal.SRV };
+		ID3D11UnorderedAccessView* uavs[4] = { aoHistory[write].uav.get(), detail ? aoDetailHistory[detailWrite].uav.get() : nullptr,
+			aoV2Length[v2Write].uav.get(), aoV2Geometry[v2Write].uav.get() };
+		context->CSSetShaderResources(0, 9, srvs);
+		context->CSSetUnorderedAccessViews(0, 4, uavs, nullptr);
+		context->CSSetShader(temporalV2, nullptr, 0);
+		context->Dispatch(groupsX, groupsY, 1);
+		ID3D11ShaderResourceView* nullSrvs9[9]{};
+		ID3D11UnorderedAccessView* nullUavs4[4]{};
+		context->CSSetShaderResources(0, 9, nullSrvs9);
+		context->CSSetUnorderedAccessViews(0, 4, nullUavs4, nullptr);
+		blended = &aoHistory[write];
+		aoHistoryIndex = write;
+		aoHistoryValid = true;
+		aoHistoryFrame = frameNow;
+		if (detail) {
+			detailBlended = &aoDetailHistory[detailWrite];
+			aoDetailHistoryIndex = detailWrite;
+			aoDetailHistoryValid = true;
+			aoDetailHistoryFrame = frameNow;
+		} else {
+			aoDetailHistoryValid = false;
+		}
+		aoV2Index = v2Write;
+		aoV2Valid = true;
+		aoV2Frame = frameNow;
+	} else if (settings.AOTemporal) {
+		aoV2Valid = false;  // (47l)
 		dispatch(temporal, { aoFiltered.srv.get(), aoHistory[read].srv.get(), motion.SRV }, { aoHistory[write].uav.get() }, groupsX, groupsY);
 		blended = &aoHistory[write];
 		aoHistoryIndex = write;
@@ -4463,8 +4726,11 @@ void RayTracing::DrawAmbientOcclusionImpl()
 		aoHistoryFrame = globals::state->frameCount;
 	} else {
 		aoHistoryValid = false;
+		aoV2Valid = false;  // (47l)
 	}
-	if (detail) {
+	if (v2) {
+		// (47l) The detail term was done above.
+	} else if (detail) {
 		// (46t) The detail term: this frame's near rays, 5x5 edge-aware at full resolution, then its own clamped history.
 		dispatch(detailCS, { backend.AORawSRV(), depth.depthSRV, normal.SRV }, { aoDetailFiltered.uav.get() }, groupsX, groupsY);
 		if (settings.AOTemporal) {
@@ -4665,6 +4931,7 @@ void RayTracing::RunInteriorFrame()
 	input.sun = false;
 	input.buildCpuMs = blackScreen ? kBlackBuildCpuMs : 0.0f;  // (46g)
 	input.skinUploadCpuMs = blackScreen ? kBlackSkinUploadCpuMs : 0.0f;
+	FillWind(input);  // (47l)
 	// (46h) The point lights only with their own Indoors Too (the interior may be captured for RTAO alone).
 	if (PointLightsOn() && InteriorsOn()) {
 		const std::int64_t pointStart = Qpc();
@@ -5186,11 +5453,31 @@ void RayTracing::DrawSunPage()
 				if (auto _tt = Util::HoverTooltipWrapper()) {
 					ImGui::Text("Leaves, bushes and plants with a cut-out (default: Shadow map).");
 					ImGui::Text("  Shadow map: the leaves keep the game's shadows and their screen-space contact shadows (they sway with the wind).");
-					ImGui::Text("  Ray traced: traced with their cut-out instead (sharper, but they do not sway in the shadow).");
+					ImGui::Text("  Ray traced: traced with their cut-out instead (sharper; they sway with Sway in RT Shadows on).");
 					ImGui::Text("  Both: traced AND kept in the shadow map; the darker of both wins (fullest shadow).");
 				}
+				// (47l) Foliage sway.
+				ImGui::Indent();
+				ImGui::BeginDisabled(settings.Foliage == static_cast<int>(RayTracingScene::FoliageMode::ShadowMap));
+				ImGui::Checkbox("Sway in RT Shadows", &settings.FoliageSway);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("On (default): ray-traced leaves, bushes, swaying branches and banners move with the wind in their shadow,");
+					ImGui::Text("  exactly as the game moves them (the same wind, every frame). Off: they are traced at rest (47k).");
+					ImGui::Text("  No effect while Foliage is Shadow map.");
+				}
+				ImGui::EndDisabled();
+				if (scene.SwayActive()) {
+					const auto& ws = scene.GetWindStats();
+					const auto& bs = backend.GetWindStats();
+					ImGui::TextDisabled("Swaying: %u of %u shapes, %u meshes (%llu vertices, %.1f MB), %u refits this frame%s", ws.swaying, ws.candidates,
+						bs.meshes, static_cast<unsigned long long>(bs.vertices), static_cast<double>(bs.bytes) / (1024.0 * 1024.0), bs.refitsLastFrame,
+						bs.stillLastFrame ? " (wind still)" : "");
+				}
+				if (!windOffReason.empty())
+					RtErrorLine("Sway in RT Shadows was switched off automatically", windOffReason);
+				ImGui::Unindent();
 			}
-			row("Cut-outs", settings.Cutouts, "Fences, grilles, banners and other non-plant cut-outs (default: Shadow map).",
+			row("Cut-outs", settings.Cutouts, "Fences, grilles, static (non-animated) banners and other non-plant cut-outs (default: Shadow map).",
 				"Ray traced: traced with their cut-out (the holes stay lit). (47h) Blended-only shapes with a fully opaque material (an arch, a trellis) are traced as cut-outs at half alpha.");
 			row("Characters", settings.Characters, "The player and nearby NPCs and creatures: body, clothes, armour, weapons (default: Ray traced).",
 				"Up to 16 characters within 40 m inside the ray-traced area, posed every frame.");
@@ -5408,6 +5695,16 @@ void RayTracing::DrawPointLightPage()
 				ImGui::Text("  on it: the trace also shoots rays from the water surface itself (last frame's water, extra rays only on water pixels).");
 				ImGui::Text("  Lights not traced at that pixel keep the old path. Off: as in 47g.");
 			}
+			// (47l)
+			ImGui::BeginDisabled(!settings.PointShadowsOnWater);
+			ImGui::Indent();
+			ImGui::Checkbox("Skip Distant LOD Water", &settings.PointShadowsWaterLodSkip);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default, 47l): frames whose only water is the distant (LOD) water, farther than any point light reaches, skip");
+				ImGui::Text("  the water preparation pass (a small GPU saving; nothing visible changes). Off: as in 47k.");
+			}
+			ImGui::Unindent();
+			ImGui::EndDisabled();
 			ImGui::BeginDisabled(!settings.PointLightsInteriors);
 			{
 				static constexpr int kKs[3] = { 1, 2, 4 };
@@ -5697,6 +5994,8 @@ void RayTracing::DrawAOPage()
 					settings.AOCharacterSelfFix = d.AOCharacterSelfFix;  // (47h)
 					settings.AOSmoothNormals = d.AOSmoothNormals;  // (47j)
 					settings.AOSmoothNormals2 = d.AOSmoothNormals2;  // (47k)
+					settings.AOBlueNoise = d.AOBlueNoise;  // (47l)
+					settings.AOTemporalV2 = d.AOTemporalV2;
 				}
 				ImGui::BeginDisabled(!settings.AO);
 				ImGui::Checkbox("Fine Detail (two scales)", &settings.AODetail);
@@ -5770,6 +6069,26 @@ void RayTracing::DrawAOPage()
 					ImGui::Text("  AO Debug View \"Smooth Normals: Confidence\": green = smooth normal used, red = fell back, blue = no data.");
 				}
 				ImGui::EndDisabled();
+				// (47l)
+				ImGui::Checkbox("RTAO: Blue-Noise Rays", &settings.AOBlueNoise);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("Off (default): the ray directions use the old noise pattern (47k). On: they come from the blue-noise pattern Skylighting");
+					ImGui::Text("  uses (spread evenly between neighbouring pixels and over frames; a finer, less patterned raw grain). Offline it left");
+					ImGui::Text("  somewhat more noise after the blur than the old pattern, so it is off by default: an A/B to judge by eye.");
+				}
+				ImGui::BeginDisabled(!settings.AOTemporal);
+				ImGui::Checkbox("RTAO: Temporal v2", &settings.AOTemporalV2);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("Needs Temporal. On (default): a smarter history. Each pixel remembers how many frames it has been seen and averages");
+					ImGui::Text("  more of them the longer it stays (up to 10), so still scenes get much calmer. A spot that was just uncovered (behind");
+					ImGui::Text("  a walking character, at a screen edge) is recognised by its depth and direction and starts fresh from a wider blur");
+					ImGui::Text("  of this frame instead of smearing old AO across it. Both AO parts are held close to this frame's own values (no");
+					ImGui::Text("  ghosting), and the broad AO's blur has a fixed size in the world (not in pixels): far surfaces are no longer");
+					ImGui::Text("  smeared, near ones no longer grainy. Resets at camera cuts. Off: as in 47k.");
+				}
+				ImGui::EndDisabled();
+				if (!aoV2Fault.empty())
+					RtErrorLine("RTAO: Temporal v2 was switched off automatically", aoV2Fault);
 				ImGui::EndDisabled();
 				if (!aoExtrasFault.empty())
 					RtErrorLine("Fine Detail / Full-Resolution Filter were switched off automatically", aoExtrasFault);
@@ -6264,6 +6583,10 @@ std::string RayTracing::DescribeForProfile() const
 	// (46y)
 	text += std::format(", RTAO single long ray {}, half-resolution broad term {}, point lights: screen-space shadows for non-RT casters {} (contact {:.1f})",
 		settings.AOSingleRay ? "on" : "off", settings.AOHalfResFar ? "on" : "off", settings.PointLightsSSPLSNonRT ? "on" : "off", settings.PointLightsSSPLSContact);
+	// (47l)
+	text += std::format(", RTAO smooth normals {} (v2 {}), blue-noise rays {}{}, temporal v2 {}{}", settings.AOSmoothNormals ? "on" : "off",
+		settings.AOSmoothNormals2 ? "on" : "off", settings.AOBlueNoise ? "on" : "off", settings.AOBlueNoise && !backend.HasAOBlueNoise() ? " (texture not loaded)" : "",
+		settings.AOTemporalV2 ? "on" : "off", aoV2Fault.empty() ? "" : " (switched off: " + aoV2Fault + ")");
 	// (46h)
 	static constexpr const char* kAOModesInterior[] = { "RTAO + SSGI contact AO", "darker of both" };
 	text += std::format(", RTAO indoors {} (mode {}, no distance fade: the interior's box{})", settings.AO && settings.AOInteriors ? "on" : "off",
@@ -6295,6 +6618,11 @@ std::string RayTracing::DescribeForProfile() const
 	text += std::format(", direct fill lights {}, wider window beams {}, skip lights behind portals {} (room box {}), plugin-only fills near fires {}",
 		settings.PointLightsDirectFills ? "on" : "off", settings.PointLightsWiderBeams ? "on" : "off", settings.PointLightsPortals ? "on" : "off",
 		settings.PointLightsRoomBoxes ? "on" : "off", settings.PointLightsPluginFillFixtures ? "fixtures" : "fills");
+	// (47l)
+	text += std::format(", sway in RT shadows {}{}", settings.FoliageSway ? "on" : "off",
+		settings.FoliageSway && !scene.SwayActive() ? " (not in effect: Foliage is shadow map or the wind shader is unavailable)" : "");
+	text += std::format(", point shadows on water {}, skip distant LOD water {}", settings.PointShadowsOnWater ? "on" : "off",
+		settings.PointShadowsWaterLodSkip ? "on" : "off");
 	return text;
 }
 
@@ -6391,6 +6719,24 @@ nlohmann::json RayTracing::DescribeJson() const
 		{ "sync_gpu_ms", Util::GpuPassTimers::GetSingleton()->SmoothedMs(Util::GpuBucket::RayTracingAOSync) }, { "off_reason", aoOffReason },
 		{ "interiors", settings.AOInteriors }, { "mode_interior", settings.AOModeInterior }, { "interior_wanted", AOInteriorWanted() },
 		{ "indoors_this_frame", aoInteriorThisFrame }, { "fade_in", aoRamp } };  // (46h)
+	// (47l) Foliage sway.
+	{
+		const auto& ws = scene.GetWindStats();
+		const auto& bs = backend.GetWindStats();
+		const auto wind = RayTracingWind::GetStats();
+		j["foliage_sway"] = { { "enabled", settings.FoliageSway }, { "active", scene.SwayActive() }, { "candidates", ws.candidates },
+			{ "swaying", ws.swaying }, { "waiting", ws.waiting }, { "still", ws.still }, { "meshes", bs.meshes }, { "pending", bs.pending },
+			{ "vertices", bs.vertices }, { "triangles", bs.triangles }, { "mb", static_cast<double>(bs.bytes) / (1024.0 * 1024.0) },
+			{ "scratch_mb", static_cast<double>(bs.scratchBytes) / (1024.0 * 1024.0) }, { "builds_last_frame", bs.buildsLastFrame },
+			{ "refits_last_frame", bs.refitsLastFrame }, { "refit_vertices_last_frame", bs.refitVerticesLastFrame },
+			{ "deferred_last_frame", bs.deferredLastFrame }, { "still_last_frame", bs.stillLastFrame }, { "builds_total", bs.buildsTotal },
+			{ "over_budget", bs.overBudget }, { "refused", bs.refused }, { "rekeyed", ws.rekeyed }, { "predicted_hits", ws.predictedHits },
+			{ "predicted_misses", ws.predictedMisses }, { "requests", wind.requested }, { "sampled", wind.sampled }, { "samples", wind.samplesTotal },
+			{ "read_failures", wind.readFailures }, { "manager_matches", wind.managerMatches }, { "manager_mismatches", wind.managerMismatches },
+			{ "manager_readable", wind.managerReadable }, { "wind_from_manager", wind.usingManager }, { "magnitude", wind.magnitude }, { "timer", wind.timer },
+			{ "spot_changes", wind.spotChanges }, { "copies_same", wind.copiesSame }, { "copies_different", wind.copiesDifferent },
+			{ "off_reason", windOffReason } };
+	}
 	return j;
 }
 

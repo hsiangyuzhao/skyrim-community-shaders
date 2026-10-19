@@ -110,6 +110,19 @@ namespace RayTracingScene
 		std::uint32_t failedRecord = 0;   // texcoord buffer / record table full: 45g rules (total)
 	};
 
+	/// (47l) Foliage sway: tree-animated shapes traced with their wind (a wind BLAS per engine mesh and amplitude / frequency).
+	struct WindSceneStats
+	{
+		std::uint32_t candidates = 0;   // tree-animated shapes with colours and normals in the scene (cells and objects)
+		std::uint32_t swaying = 0;      // ... traced with their wind BLAS this frame
+		std::uint32_t waiting = 0;      // ... without amplitude / frequency yet (not drawn since captured)
+		std::uint32_t still = 0;        // ... that never sway (no vertex alpha, amplitude 0, refused)
+		std::uint32_t meshes = 0;       // wind meshes (one wind BLAS each)
+		std::uint32_t newMeshes = 0;    // made this frame
+		std::uint32_t rekeyed = 0;      // shapes moved to another wind mesh (their sampled amplitude / frequency differed), total
+		std::uint32_t predictedHits = 0, predictedMisses = 0;  // TREE leaf amplitude / frequency against the first sample, total
+	};
+
 	/// (45j) Foliage (leaves, bushes, plants with a cut-out): kept in the shadow map (and its
 	/// screen-space contact shadows), ray traced with the cut-out instead, or both (min of the two).
 	enum class FoliageMode : int
@@ -402,6 +415,14 @@ namespace RayTracingScene
 		/// (45j) CPU split of the last Update / CollectInstances / DescribeMissedCasters / EndFrame.
 		[[nodiscard]] const FrameTimes& GetFrameTimes() const { return times_; }
 
+		/// (47l) Foliage sway ("Sway in RT Shadows"; the caller passes it only when the backend can pose wind meshes). No
+		/// re-capture: off releases every wind mesh on the next Update (the shapes go back to their frozen BLAS), on makes them
+		/// over the next frames. Without ray-traced Foliage it does nothing.
+		void SetSway(bool a_sway) { sway_ = a_sway; }
+		/// Wind meshes may exist (sway on, Foliage ray traced).
+		[[nodiscard]] bool SwayActive() const { return sway_ && config_.foliage != FoliageMode::ShadowMap; }
+		[[nodiscard]] const WindSceneStats& GetWindStats() const { return windStats_; }
+
 	private:
 		// (45e) Objects: one BLAS per distinct engine mesh (in the shape's own space), one TLAS
 		// instance per shape with the shape's world transform of the frame.
@@ -426,6 +447,29 @@ namespace RayTracingScene
 			RayTracingRT::BlasHandle blas = RayTracingRT::kInvalidBlas;
 			std::uint32_t users = 0;
 			std::uint32_t triangles = 0;
+			std::int8_t windAlpha = 0;  // (47l) 0 not looked at, 1 some vertex alpha > 0, -1 none (never sways)
+		};
+		// (47l) Foliage sway: one wind BLAS per engine mesh and quantized amplitude / frequency (RayTracingWind::Quantize), shared by
+		// every shape with those (their deformation, in the mesh's own space, is then the same).
+		struct WindKey
+		{
+			MeshKey mesh;
+			std::int32_t amplitude = 0;
+			std::int32_t frequency = 0;
+			bool operator==(const WindKey&) const = default;
+		};
+		struct WindKeyHash
+		{
+			std::size_t operator()(const WindKey& a_key) const noexcept
+			{
+				return MeshKeyHash()(a_key.mesh) ^ (static_cast<std::size_t>(static_cast<std::uint32_t>(a_key.amplitude)) * 0x9E3779B97F4A7C15ull) ^
+				       (static_cast<std::size_t>(static_cast<std::uint32_t>(a_key.frequency)) << 7);
+			}
+		};
+		struct WindMesh
+		{
+			RayTracingRT::BlasHandle blas = RayTracingRT::kInvalidBlas;
+			std::uint32_t users = 0;
 		};
 		struct ObjectShape
 		{
@@ -441,6 +485,17 @@ namespace RayTracingScene
 			bool alpha = false;
 			RayTracingRT::AlphaTexture texture = RayTracingRT::kInvalidAlphaTexture;
 			std::uint32_t info = RayTracingRT::kInvalidAlphaInfo;
+			// (47l) Foliage sway. A candidate: tree-animated, with vertex colours and normals. Its wind BLAS (shared, WindKey) replaces
+			// the frozen one in its instance once built (windReady, set by UpdateWind); the frozen BLAS stays its fallback.
+			bool windCandidate = false;
+			bool windRequested = false;  // its constants are asked for (RayTracingWind::Request)
+			bool windNone = false;       // never sways (no vertex alpha, amplitude 0, no wind mesh possible)
+			bool windReady = false;
+			bool windPredicted = false;  // windPrediction holds its TREE form's leaf amplitude / frequency
+			bool windSampled = false;    // its key comes from a sample (else from the prediction)
+			float windPrediction[2]{};
+			RayTracingRT::BlasHandle windBlas = RayTracingRT::kInvalidBlas;
+			WindKey windKey{};
 		};
 
 		struct TrackedRef
@@ -554,7 +609,26 @@ namespace RayTracingScene
 			bool fullPrecision = false;
 			std::uint32_t uvOffset = UINT32_MAX;     // (45h) half2 texcoord 0, when the mesh has one
 			std::uint32_t colorOffset = UINT32_MAX;  // (45h) ubyte4 vertex colour, when the mesh has one
+			std::uint32_t normalOffset = UINT32_MAX;  // (47l) ubyte4 normal, when the mesh has one
 		};
+		// (47l) Foliage sway.
+		/// Per frame after the objects: amplitude / frequency of the candidates, their wind meshes (a few new ones per frame unless
+		/// a_allowNew is false), re-keying, windReady. With sway off (or Foliage not ray traced) every wind mesh is released.
+		void UpdateWind(RayTracingRT::Backend& a_backend, std::int64_t a_deadline, bool a_allowNew);
+		void VisitWind(RayTracingRT::Backend& a_backend, ObjectShape& a_shape, std::int64_t a_deadline, bool a_allowNew);
+		/// The shape's wind mesh for a_key (made from the shape's mesh when new); false = not possible now (windNone set when never).
+		bool AcquireWind(RayTracingRT::Backend& a_backend, ObjectShape& a_shape, const WindKey& a_key, float a_amplitude, float a_frequency);
+		void ReleaseWind(RayTracingRT::Backend& a_backend, ObjectShape& a_shape);
+		/// (47l) A captured shape: whether it may sway (tree-animated, colours, normals) and its TREE form's prediction.
+		static void MarkWindCandidate(ObjectShape& a_shape, RE::BSTriShape* a_triShape);
+		bool sway_ = false;
+		std::unordered_map<WindKey, WindMesh, WindKeyHash> windMeshes_;
+		WindSceneStats windStats_{};
+		std::uint32_t windNewThisFrame_ = 0;
+		bool windPredictionOff_ = false;  // TREE predictions kept missing: only samples key wind meshes
+		bool windWasOn_ = false;          // the last UpdateWind ran with sway on (off: every shape's wind state is reset once)
+		static constexpr std::uint32_t kWindNewMeshesPerFrame = 8;       // wind meshes made per frame while playing (CPU: read + copy)
+		static constexpr std::uint32_t kWindNewMeshesTransition = 64;    // ... behind loading screens / during a held hand-off
 		bool ReadMesh(RE::BSTriShape* a_shape, bool a_landscape, RawMesh& o_mesh);
 		/// The shape if it may go into the scene (Lighting shader, opaque, casts shadows, ...); the
 		/// reason is counted otherwise.

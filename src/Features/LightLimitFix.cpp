@@ -2,6 +2,7 @@
 #include "InverseSquareLighting.h"
 #include "LinearLighting.h"
 #include "RayTracing.h"
+#include "RayTracing/Wind.h"
 
 #include "Shadercache.h"
 #include "State.h"
@@ -628,6 +629,8 @@ void LightLimitFix::Hooks::BSLightingShader_SetupGeometry::thunk(RE::BSShader* T
 	auto& singleton = globals::features::lightLimitFix;
 	singleton.BSLightingShader_SetupGeometry_Before(Pass);
 	func(This, Pass, RenderFlags);
+	// (47l) RT foliage sway: a tree-animated shape's wind constants, for the shapes Ray Tracing asked for (a flag test otherwise).
+	RayTracingWind::OnSetupGeometry(Pass);
 	singleton.BSLightingShader_SetupGeometry_After(Pass);
 }
 

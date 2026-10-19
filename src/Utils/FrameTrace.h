@@ -97,6 +97,9 @@ namespace Util::FrameTrace
 		uint32_t poolReleased = 0;     ///< pool blocks released since the previous submission
 		uint64_t submission = 0;       ///< the backend's trace submission number
 		uint32_t sampleAge = 0;        ///< submissions between this one and the frame's own (the RT GPU columns on a row are this many frames old)
+		uint32_t windBuilds = 0;       ///< (47l) wind BLAS first builds (the build-cost model skips such submissions)
+		uint32_t windRefits = 0;       ///< (47l) wind BLAS in-place refits
+		uint64_t windVertices = 0;     ///< (47l) vertices posed for them
 	};
 
 	/// (45j) Ray Tracing's CPU split this frame (ms; -1 = not run) and its counters.
@@ -175,6 +178,8 @@ namespace Util::FrameTrace
 		float syncSunGpuMs = -1, syncPlGpuMs = -1;
 		// (46p) The work of the prep submission prepGpuMs was measured on (same read-back).
 		RtPrepWork prepWork{};
+		// (47l) Foliage sway: wind meshes alive (BLASes refit in place), their vertices, refits recorded this frame (-1 = sway off / RT off).
+		int64_t windMeshes = -1, windVertices = -1, windRefits = -1;
 	};
 	void OnRayTracingDetail(const RayTracingDetail& a_detail);
 

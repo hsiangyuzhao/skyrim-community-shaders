@@ -18,6 +18,8 @@
 //   RTAO_UP                    quarter (value, weight) t5 + Raw t0 -> full-resolution far / large visibility u0
 //   RTAO_FULL [RTAO_VERTICAL]  horizontal: Raw t0 -> full (value, weight) u0; vertical: t5 -> visibility u0: 21 taps
 //   RTAO_DETAIL                Raw .a t0 -> full-resolution detail visibility u0: 5x5
+// (47l) kFlagTemporalV2 (RTAO: Temporal v2): RTAO_BLUR / RTAO_FULL take their Gaussian sigma from a world size (Temporal.y units at the
+// pixel's distance, clamped), taps spread up to 4 pixels apart past the tile (read directly). Off: the fixed pixel sigma (47k).
 // Guides: t1 the depth after the prepass (the game's), t2 NORMALROUGHNESS (view-space normal, octahedral).
 
 #include "Common/GBuffer.hlsli"
@@ -37,6 +39,11 @@ static const float kUpDepthTol = 0.1;     // upsample: neighbours up to 3 full-r
 static const float kPlaneTol = 0.02;      // 1/z against the centre's plane prediction (relative)
 static const float kGradTolLo = 0.06;     // the plane gradient's neighbours, 2 full-resolution pixels away
 static const float kGradTolFull = 0.03;   // ... 1 pixel away
+// (47l) Temporal v2: the large-scale blur's sigma from a world size, clamped (quarter-resolution / full-resolution pixels), and the
+// largest tap spacing (15 / 21 taps: at most 4 x their 47k reach).
+static const float kWorldSigmaMinLo = 1.0, kWorldSigmaMaxLo = 16.0;
+static const float kWorldSigmaMinFull = 2.0, kWorldSigmaMaxFull = 24.0;
+static const int kWorldStrideMax = 4;
 
 float LinearDepth(float a_depth)
 {
@@ -174,15 +181,39 @@ groupshared float3 g_normal[TILE_COUNT];
 	const float gradient = PlaneGradient(cDepth, cNormal, g_depth[centreSlot - slotStep], g_normal[centreSlot - slotStep], g_depth[centreSlot + slotStep],
 		g_normal[centreSlot + slotStep], kGradTolLo);
 	float sumV = 0.0, sumW = 0.0, sumG = 0.0;
-	[unroll] for (int i = -BLUR_RADIUS; i <= BLUR_RADIUS; ++i)
+	[branch] if (Size.z & kFlagTemporalV2)
 	{
-		const float spatial = exp(-(float)(i * i) / (2.0 * BLUR_SIGMA * BLUR_SIGMA));
-		const int slot = centreSlot + i * slotStep;
-		const float w = PlaneAgrees(cInv, cInv + (float)i * gradient, g_depth[slot]) ? spatial * NormalWeight(cNormal, g_normal[slot]) : 0.0;
-		const float2 s = g_signal[slot];
-		sumV += w * s.y * s.x;
-		sumW += w * s.y;
-		sumG += w;
+		// (47l) Temporal v2: the Gaussian's sigma is a world size (Temporal.y units) at this pixel's distance instead of a fixed
+		// 4 quarter-resolution pixels: far surfaces are no longer blurred over metres, near ones no longer over a few centimetres.
+		// Past the tile's reach the 15 taps are spread `stride` pixels apart and read directly (out-of-screen taps skipped).
+		const float sigma = clamp(Temporal.y * CameraDelta.w * 0.5 / max(cDepth, kMinDepth), kWorldSigmaMinLo, kWorldSigmaMaxLo);
+		const int stride = clamp((int)ceil(sigma / BLUR_SIGMA), 1, kWorldStrideMax);
+		[loop] for (int i = -BLUR_RADIUS; i <= BLUR_RADIUS; ++i)
+		{
+			const int o = i * stride;
+			const int2 q = int2(dtid.xy) + o * TAP_STEP;
+			if (any(q < 0) || any(q > maxP))
+				continue;
+			const float spatial = exp(-(float)(o * o) / (2.0 * sigma * sigma));
+			const float w = PlaneAgrees(cInv, cInv + (float)o * gradient, LoDepth[q]) ? spatial * NormalWeight(cNormal, LoNormal[q].xyz) : 0.0;
+			const float2 s = Signal[q];
+			sumV += w * s.y * s.x;
+			sumW += w * s.y;
+			sumG += w;
+		}
+	}
+	else
+	{
+		[unroll] for (int i = -BLUR_RADIUS; i <= BLUR_RADIUS; ++i)
+		{
+			const float spatial = exp(-(float)(i * i) / (2.0 * BLUR_SIGMA * BLUR_SIGMA));
+			const int slot = centreSlot + i * slotStep;
+			const float w = PlaneAgrees(cInv, cInv + (float)i * gradient, g_depth[slot]) ? spatial * NormalWeight(cNormal, g_normal[slot]) : 0.0;
+			const float2 s = g_signal[slot];
+			sumV += w * s.y * s.x;
+			sumW += w * s.y;
+			sumG += w;
+		}
 	}
 	const float2 own = g_signal[centreSlot];
 	SignalOut[dtid.xy] = sumG > 0.0 ? saturate(float2(sumW > 1e-6 ? sumV / sumW : 1.0, sumW / sumG)) : own;
@@ -278,15 +309,41 @@ groupshared float3 g_normal[TILE_COUNT];
 	const float gradient = PlaneGradient(cDepth, cNormal, g_depth[centreSlot - slotStep], g_normal[centreSlot - slotStep], g_depth[centreSlot + slotStep],
 		g_normal[centreSlot + slotStep], kGradTolFull);
 	float sumV = 0.0, sumW = 0.0, sumG = 0.0;
-	[unroll] for (int i = -FULL_RADIUS; i <= FULL_RADIUS; ++i)
+	[branch] if (Size.z & kFlagTemporalV2)
 	{
-		const float spatial = exp(-(float)(i * i) / (2.0 * FULL_SIGMA * FULL_SIGMA));
-		const int slot = centreSlot + i * slotStep;
-		const float w = PlaneAgrees(cInv, cInv + (float)i * gradient, g_depth[slot]) ? spatial * NormalWeight(cNormal, g_normal[slot]) : 0.0;
-		const float2 s = g_signal[slot];
-		sumV += w * s.y * s.x;
-		sumW += w * s.y;
-		sumG += w;
+		// (47l) Temporal v2: sigma in world units (as the quarter-resolution blur above), taps `stride` pixels apart, read directly.
+		const float sigma = clamp(Temporal.y * CameraDelta.w / max(cDepth, kMinDepth), kWorldSigmaMinFull, kWorldSigmaMaxFull);
+		const int stride = clamp((int)ceil(sigma / FULL_SIGMA), 1, kWorldStrideMax);
+		[loop] for (int i = -FULL_RADIUS; i <= FULL_RADIUS; ++i)
+		{
+			const int o = i * stride;
+			const int2 q = int2(dtid.xy) + o * TAP_STEP;
+			if (any(q < 0) || any(q > maxP))
+				continue;
+			const float spatial = exp(-(float)(o * o) / (2.0 * sigma * sigma));
+			const float w = PlaneAgrees(cInv, cInv + (float)o * gradient, LinearDepth(DepthTexture[q])) ? spatial * NormalWeight(cNormal, GNormal(q)) : 0.0;
+#	if defined(RTAO_VERTICAL)
+			const float2 s = Signal[q];
+#	else
+			const float2 s = LargeSample(Raw[q]);
+#	endif
+			sumV += w * s.y * s.x;
+			sumW += w * s.y;
+			sumG += w;
+		}
+	}
+	else
+	{
+		[unroll] for (int i = -FULL_RADIUS; i <= FULL_RADIUS; ++i)
+		{
+			const float spatial = exp(-(float)(i * i) / (2.0 * FULL_SIGMA * FULL_SIGMA));
+			const int slot = centreSlot + i * slotStep;
+			const float w = PlaneAgrees(cInv, cInv + (float)i * gradient, g_depth[slot]) ? spatial * NormalWeight(cNormal, g_normal[slot]) : 0.0;
+			const float2 s = g_signal[slot];
+			sumV += w * s.y * s.x;
+			sumW += w * s.y;
+			sumG += w;
+		}
 	}
 	const float2 own = g_signal[centreSlot];
 #	if defined(RTAO_VERTICAL)

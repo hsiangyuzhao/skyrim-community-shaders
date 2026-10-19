@@ -499,6 +499,7 @@ namespace Util::FrameTrace
 			int gpuSegStamps = -1;
 			float gpuWaterMs = -1.0f;      // (47j) GPU wall time of the water draws (stamp pairs; -1 = not read back)
 			float waterPrepGpuMs = -1.0f;  // (47j) WaterPrepCS (GpuPassTimers RayTracingWaterPrep)
+			float aoNormalPrepGpuMs = -1.0f;  // (47l) AONormalPrepCS (GpuPassTimers RayTracingAONormalPrep)
 			float postGpuMs = -1.0f;  // (46p) our post-processing chain, last GPU sample (GpuPassTimers PostProcessing)
 			Q46 q46{};             // (46q)
 			std::string vramByFeature;  // (46q) "name=MB;..." alive per feature of ours (1 MB or more)
@@ -807,6 +808,7 @@ namespace Util::FrameTrace
 			a_row.vfPassMs[4] = sample(vf, Util::GpuBucket::VolumetricFogIntegrate);
 			a_row.vfPassMs[5] = sample(vf, Util::GpuBucket::VolumetricFogHistory);
 			a_row.waterPrepGpuMs = timers->LastSampleMs(Util::GpuBucket::RayTracingWaterPrep);  // (47j) -1 once quiet
+			a_row.aoNormalPrepGpuMs = timers->LastSampleMs(Util::GpuBucket::RayTracingAONormalPrep);  // (47l) -1 once quiet
 			if (vf) {
 				a_row.vfGrid[0] = ehf.currentGridSize.x;
 				a_row.vfGrid[1] = ehf.currentGridSize.y;
@@ -979,6 +981,9 @@ namespace Util::FrameTrace
 				out << "#   segment ran on to the close).\n";
 				out << "#   (47j) water_prep_gpu_ms = WaterPrepCS (Point Light Shadows on Water); water_draw_gpu_ms = GPU wall time of the runs of water\n";
 				out << "#   draws (0 = none drawn, -1 = not read back); rt_pl_water_rays = point-light rays traced from the water surface (also in rt_pl_rays).\n";
+				out << "# (47l) rt_wind_meshes / rt_wind_verts = Foliage sway: wind BLASes alive and their vertices; rt_wind_refits = wind BLASes refit\n";
+				out << "#   in place this frame (0 = the wind pose did not change; -1 = sway off / Ray Tracing off).\n";
+				out << "# (47l) rtao_normal_prep_gpu_ms = AONormalPrepCS (RTAO: Smooth Normals, right before the RT depth copy; -1 = not run lately).\n";
 				out << "#   rt_pw_* = the work of the RT D3D12 prep submission whose GPU time is rt_prep_gpu_ms on the same row (1 = valid; early =\n";
 				out << "#   recorded at the frame start): static BLAS builds (of which alpha-tested, triangles, MB before compaction), compactions (MB\n";
 				out << "#   written), new character shapes uploaded, own-BLAS character builds / refits, merged character BLAS builds (triangles) /\n";
@@ -1076,7 +1081,9 @@ namespace Util::FrameTrace
 					   "rt_pl_fill_direct,rt_pl_fill_ambient,rt_pl_portal_away,rt_pl_portal_dropped,rt_pl_portal_boxed,"
 					   "vf_depth_gpu_ms,vf_material_gpu_ms,vf_scatter_near_gpu_ms,vf_scatter_far_gpu_ms,vf_integrate_gpu_ms,vf_history_gpu_ms,"
 					   "vf_grid_x,vf_grid_y,vf_grid_z,vf_grid_far_z,"
-					   "water_prep_gpu_ms,water_draw_gpu_ms,rt_pl_water_rays\n";  // (47j) the last three
+					   "water_prep_gpu_ms,water_draw_gpu_ms,rt_pl_water_rays,"  // (47j)
+					   "rt_wind_meshes,rt_wind_verts,rt_wind_refits,"  // (47l)
+					   "rtao_normal_prep_gpu_ms\n";  // (47l) the last one
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
 					std::string s = std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{},{}", t.scene,
@@ -1247,6 +1254,12 @@ namespace Util::FrameTrace
 					// (47j) Water prep / water draws GPU time and the rays traced from the water, after vf_grid_far_z (the old last column).
 					extra.pop_back();
 					extra += std::format(",{:.3f},{:.3f},{}\n", r.waterPrepGpuMs, r.gpuWaterMs, r.rt.plWaterRays);
+					// (47l) Foliage sway, after rt_pl_water_rays (the old last column).
+					extra.pop_back();
+					extra += std::format(",{},{},{}\n", r.rt.windMeshes, r.rt.windVertices, r.rt.windRefits);
+					// (47l) RTAO: AONormalPrepCS GPU time, after rt_wind_refits (the old last column).
+					extra.pop_back();
+					extra += std::format(",{:.3f}\n", r.aoNormalPrepGpuMs);
 					if (it == a_reflex.end()) {
 						out << (r.reflexFrame == UINT32_MAX ? std::string("-1") : std::to_string(r.reflexFrame)) << ",-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" << engineColumns(r) << extra;
 						continue;

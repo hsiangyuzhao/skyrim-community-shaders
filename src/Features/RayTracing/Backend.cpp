@@ -7,6 +7,8 @@
 #include <cstring>
 
 #include <dxgi1_4.h>
+#include <fstream>   // (47l) the RTAO blue noise file
+#include <iterator>
 
 // Generated at build time from Shaders/TraceShadowsCS.hlsl by the Windows SDK's dxc (CMakeLists.txt).
 #include "RayTracing/TraceShadowsCS.dxil.h"
@@ -392,6 +394,8 @@ namespace RayTracingRT
 			// (47j) RTAO: Smooth Normals (filled when its texture exists).
 			nullSrv.Format = kDepthMaskFormat;
 			device_->CreateShaderResourceView(nullptr, &nullSrv, StagingCpu(kDynAONormal));
+			// (47l) RTAO: Blue-Noise Rays (filled when its texture exists).
+			WriteNullAOBlueNoiseDescriptor();
 		}
 
 		// (45h) Null views in every alpha slot (the copy layers and the bindless table are filled on use).
@@ -446,6 +450,9 @@ namespace RayTracingRT
 		// (46f) RTAO: not fatal either (RTAO then stays unavailable).
 		if (!CreateAOPipeline())
 			aoPipeline_.Reset();
+		// (47l) Foliage sway: not fatal either (wind meshes then stay frozen).
+		if (!CreateWindPipeline())
+			windPipeline_.Reset();
 		return true;
 	}
 
@@ -802,7 +809,7 @@ namespace RayTracingRT
 		// Its own root signature: constants b0, TLAS t0, table (depth t1, AO u0), ray counter u1;
 		// the alpha-tested variant also: records t2, texcoords t3, table (copy layers t4, bindless game textures t0 space1), s0.
 		// 44 + 2 + 1 + 2 + 2 + 2 + 1 = 54 DWORDs.
-		D3D12_DESCRIPTOR_RANGE ranges[3]{};
+		D3D12_DESCRIPTOR_RANGE ranges[4]{};
 		ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
 		ranges[0].NumDescriptors = 1;
 		ranges[0].BaseShaderRegister = 1;
@@ -816,6 +823,11 @@ namespace RayTracingRT
 		ranges[2].NumDescriptors = 1;
 		ranges[2].BaseShaderRegister = 5;
 		ranges[2].OffsetInDescriptorsFromTableStart = kDynAONormal - kDynAO;
+		// (47l) RTAO: Blue-Noise Rays (t6).
+		ranges[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+		ranges[3].NumDescriptors = 1;
+		ranges[3].BaseShaderRegister = 6;
+		ranges[3].OffsetInDescriptorsFromTableStart = kDynAOBlueNoise - kDynAO;
 		D3D12_DESCRIPTOR_RANGE alphaRanges[2]{};
 		alphaRanges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
 		alphaRanges[0].NumDescriptors = 1;
@@ -835,7 +847,7 @@ namespace RayTracingRT
 		params[1].Descriptor.ShaderRegister = 0;
 		params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-		params[2].DescriptorTable.NumDescriptorRanges = 3;  // (47j) + the smooth normals
+		params[2].DescriptorTable.NumDescriptorRanges = 4;  // (47j) + the smooth normals, (47l) + the blue noise
 		params[2].DescriptorTable.pDescriptorRanges = ranges;
 		params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
@@ -1057,6 +1069,104 @@ namespace RayTracingRT
 		device_->CreateShaderResourceView(aoNormal_.resource12.Get(), &srvDesc, StagingCpu(kDynAONormal));
 	}
 
+	// (47l) RTAO: Blue-Noise Rays.
+	void Backend::WriteNullAOBlueNoiseDescriptor()
+	{
+		if (!stagingHeap_ || !device_)
+			return;
+		D3D12_SHADER_RESOURCE_VIEW_DESC nullSrv{};
+		nullSrv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		nullSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+		nullSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		nullSrv.Texture2DArray.MipLevels = 1;
+		nullSrv.Texture2DArray.ArraySize = 1;
+		device_->CreateShaderResourceView(nullptr, &nullSrv, StagingCpu(kDynAOBlueNoise));
+	}
+
+	bool Backend::EnsureAOBlueNoise()
+	{
+		if (aoBlueNoise_)
+			return true;
+		if (aoBlueNoiseFailed_ || !AOAvailable() || !stagingHeap_)
+			return false;
+		// Skylighting's asset (DirectX 10 DDS header: RGBA8, 2D, 64 slices of 128 x 128, one mip).
+		static constexpr const wchar_t* kPath = L"Data\\Shaders\\Skylighting\\SpatiotemporalBlueNoise\\stbn_vec3_2Dx1D_128x128x64.dds";
+		static constexpr std::uint32_t kSize = 128, kSlices = 64, kHeaderBytes = 4 + 124 + 20;
+		static constexpr std::uint64_t kSliceBytes = static_cast<std::uint64_t>(kSize) * kSize * 4;
+		static constexpr std::uint64_t kDataBytes = kSliceBytes * kSlices;
+		auto fail = [&](const std::string& a_why) {
+			aoBlueNoiseFailed_ = true;
+			logger::warn("[RayTracing] RTAO: Blue-Noise Rays unavailable ({}); the rays keep the interleaved gradient noise", a_why);
+			return false;
+		};
+		std::vector<std::uint8_t> file;
+		{
+			std::ifstream in(kPath, std::ios::binary);
+			if (!in)
+				return fail("Data\\Shaders\\Skylighting\\SpatiotemporalBlueNoise\\stbn_vec3_2Dx1D_128x128x64.dds not found");
+			file.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+		}
+		auto u32 = [&](std::size_t a_offset) {
+			std::uint32_t v = 0;
+			std::memcpy(&v, file.data() + a_offset, sizeof(v));
+			return v;
+		};
+		if (file.size() < kHeaderBytes + kDataBytes || std::memcmp(file.data(), "DDS ", 4) != 0 || std::memcmp(file.data() + 84, "DX10", 4) != 0 ||
+			u32(12) != kSize || u32(16) != kSize || u32(28) > 1u || u32(128) != static_cast<std::uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM) || u32(132) != 3u || u32(140) != kSlices)
+			return fail("unexpected file layout");
+		D3D12_HEAP_PROPERTIES heap{};
+		heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+		D3D12_RESOURCE_DESC desc{};
+		desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+		desc.Width = kSize;
+		desc.Height = kSize;
+		desc.DepthOrArraySize = static_cast<UINT16>(kSlices);
+		desc.MipLevels = 1;
+		desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		desc.SampleDesc.Count = 1;
+		desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+		ComPtr<ID3D12Resource> texture;
+		HRESULT hr = device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&texture));
+		if (FAILED(hr))
+			return fail(std::format("CreateCommittedResource ({})", HrString(hr)));
+		texture->SetName(L"CS RayTracing RTAO blue noise");
+		// Rows of 512 bytes (a multiple of D3D12_TEXTURE_DATA_PITCH_ALIGNMENT), slices 64 KiB apart (placement alignment 512): the
+		// file's own layout, copied as it is.
+		auto upload = CreateBuffer(kDataBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false);
+		void* mapped = nullptr;
+		if (!upload || FAILED(upload->Map(0, nullptr, &mapped)) || !mapped)
+			return fail("its upload buffer could not be created");
+		std::memcpy(mapped, file.data() + kHeaderBytes, kDataBytes);
+		upload->Unmap(0, nullptr);
+		Util::FrameTrace::TagVram(texture.Get(), Util::FrameTrace::VramOwner::RtOther, kDataBytes);
+		aoBlueNoise_ = std::move(texture);
+		aoBlueNoiseUpload_ = std::move(upload);
+		aoBlueNoiseCopyPending_ = true;
+		aoBlueNoiseRetirePending_ = false;
+		D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+		srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+		srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		srvDesc.Texture2DArray.MipLevels = 1;
+		srvDesc.Texture2DArray.ArraySize = kSlices;
+		device_->CreateShaderResourceView(aoBlueNoise_.Get(), &srvDesc, StagingCpu(kDynAOBlueNoise));
+		logger::info("[RayTracing] RTAO blue noise {}x{}x{} loaded", kSize, kSize, kSlices);
+		return true;
+	}
+
+	void Backend::ReleaseAOBlueNoise()
+	{
+		// A submission in flight may still read it (or copy into it): D3D12 keeps both until it is done (Retire).
+		if (aoBlueNoise_)
+			Retire(aoBlueNoise_, 0, nullptr);
+		if (aoBlueNoiseUpload_)
+			Retire(aoBlueNoiseUpload_, 0, nullptr);
+		aoBlueNoise_.Reset();
+		aoBlueNoiseUpload_.Reset();
+		aoBlueNoiseCopyPending_ = aoBlueNoiseRetirePending_ = false;
+		WriteNullAOBlueNoiseDescriptor();
+	}
+
 	bool Backend::RecordAOTrace(CommandContext& a_context, std::size_t a_index, const FrameInput& a_input, bool a_alphaFrame, D3D12_GPU_DESCRIPTOR_HANDLE a_table)
 	{
 		if (!a_input.ao || !AOAvailable() || !aoRaw_.resource12 || !aoCounter_ || !aoCounterMapped_ || !aoFence_ || !aoFence11_ || !a_context.aoList ||
@@ -1071,6 +1181,37 @@ namespace RayTracingRT
 		}
 		ID3D12DescriptorHeap* heaps[] = { descriptorHeap_.Get() };
 		list->SetDescriptorHeaps(1, heaps);
+		// (47l) RTAO: Blue-Noise Rays. The upload buffer of the copy recorded in an earlier list goes now (this list's fence value
+		// orders after that list on our queue); a pending copy goes out first in this list, then the texture stays a shader resource.
+		if (aoBlueNoiseRetirePending_) {
+			if (aoBlueNoiseUpload_)
+				Retire(aoBlueNoiseUpload_, 0, nullptr);
+			aoBlueNoiseUpload_.Reset();
+			aoBlueNoiseRetirePending_ = false;
+		}
+		if (aoBlueNoiseCopyPending_ && aoBlueNoise_ && aoBlueNoiseUpload_) {
+			const D3D12_RESOURCE_DESC desc = aoBlueNoise_->GetDesc();
+			for (UINT slice = 0; slice < desc.DepthOrArraySize; ++slice) {
+				D3D12_TEXTURE_COPY_LOCATION dst{};
+				dst.pResource = aoBlueNoise_.Get();
+				dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+				dst.SubresourceIndex = slice;
+				D3D12_TEXTURE_COPY_LOCATION src{};
+				src.pResource = aoBlueNoiseUpload_.Get();
+				src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+				src.PlacedFootprint.Offset = static_cast<UINT64>(slice) * desc.Width * desc.Height * 4;
+				src.PlacedFootprint.Footprint.Format = desc.Format;
+				src.PlacedFootprint.Footprint.Width = static_cast<UINT>(desc.Width);
+				src.PlacedFootprint.Footprint.Height = desc.Height;
+				src.PlacedFootprint.Footprint.Depth = 1;
+				src.PlacedFootprint.Footprint.RowPitch = static_cast<UINT>(desc.Width) * 4;
+				list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+			}
+			D3D12_RESOURCE_BARRIER toSrv = Transition(aoBlueNoise_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+			list->ResourceBarrier(1, &toSrv);
+			aoBlueNoiseCopyPending_ = false;
+			aoBlueNoiseRetirePending_ = true;
+		}
 		// (47j) The smooth normals texture (when it exists) is read like the depth.
 		const bool normals = aoNormal_.resource12 != nullptr;
 		D3D12_RESOURCE_BARRIER pre[3] = {
@@ -1228,6 +1369,9 @@ namespace RayTracingRT
 		pendingAOWait_ = 0;
 		aoNormal_ = {};  // (47j)
 		aoNormalWidth_ = aoNormalHeight_ = 0;
+		aoBlueNoise_.Reset();  // (47l)
+		aoBlueNoiseUpload_.Reset();
+		aoBlueNoiseCopyPending_ = aoBlueNoiseRetirePending_ = false;
 		stagingHeap_.Reset();
 		depthMask_ = {};
 		visibility_ = {};
@@ -1280,6 +1424,19 @@ namespace RayTracingRT
 		skinFault_.clear();
 		skinStats_ = {};
 		skinReady_.clear();
+		// (47l) Wind meshes (their ranges went with the pools above).
+		winds_.clear();
+		freeWinds_.clear();
+		windUploadQueue_.clear();
+		windScratch_.Reset();
+		windScratchBytes_ = 0;
+		windLive_ = 0;
+		windFault_.clear();
+		windStats_ = {};
+		windRecorded_ = false;
+		windMustSubmit_ = false;
+		windPipeline_.Reset();
+		windRootSignature_.Reset();
 		// (46m) Merged BLASes (their pool is gone with the pools above) and the sun fence.
 		skinGroups_.clear();
 		skinGroupFrame_.clear();
@@ -1403,6 +1560,11 @@ namespace RayTracingRT
 			Retire(skinScratch_, skinScratchBytes_, &skinStats_.scratchBytes);
 			skinScratch_.Reset();
 			skinScratchBytes_ = 0;
+		}
+		if (windScratch_) {  // (47l) recreated by the next refit
+			Retire(windScratch_, windScratchBytes_, &windStats_.scratchBytes);
+			windScratch_.Reset();
+			windScratchBytes_ = 0;
 		}
 		if (depthMask_.resource12)
 			Retire(depthMask_.resource12, 0, nullptr);
@@ -1827,6 +1989,13 @@ namespace RayTracingRT
 		if (a_handle >= blas_.size() || blas_[a_handle].state == BlasState::Free)
 			return;
 		auto& blas = blas_[a_handle];
+		if (blas.wind != UINT32_MAX) {
+			// (47l) A wind BLAS: its mesh's ranges (BLAS included) go behind the fence; it was never queued nor compacted.
+			ReleaseWindMesh(blas.wind);
+			blas = {};
+			freeHandles_.push_back(a_handle);
+			return;
+		}
 		if (blas.state == BlasState::Queued) {
 			std::erase(buildQueue_, a_handle);
 			stats_.blasQueued -= std::min<std::uint32_t>(stats_.blasQueued, 1);
@@ -2396,6 +2565,7 @@ namespace RayTracingRT
 				NoteSkinWork(uploadsBefore);  // (46p)
 			} else if (!skinGroups_.empty())
 				ReleaseUnseenSkinGroups();  // (46m) no character drawn; (46q) with the budget on, after a grace period
+			RecordWind(list, &a_input, kWindBuildsPerFrame, kWindUploadCpuMs);  // (47l) foliage sway: uploads, first builds, this frame's refits
 			const std::int64_t skinEnd = QpcNow();
 			stats_.cpuBuildMs = static_cast<float>(QpcToMs(buildEnd - buildStart));
 			stats_.cpuSkinMs = static_cast<float>(QpcToMs(skinEnd - buildEnd));
@@ -2410,6 +2580,10 @@ namespace RayTracingRT
 		std::uint32_t instanceCount = 0;
 		const auto maxInstances = static_cast<std::uint32_t>(instances.size() + skinDraws.size());
 		if (!EnsureTlas(maxInstances) || !EnsureInstanceBuffer(context, maxInstances)) {
+			// (47l) Wind uploads / first builds are marked done when recorded: a list holding them must run, so
+			// one that cannot takes the feature down (as the alpha record buffer below) instead of leaving BLASes never built.
+			if (windMustSubmit_)
+				return Fail("TLAS / instance buffer (with foliage sway work recorded)", E_OUTOFMEMORY);
 			list->Close();
 			return false;
 		}
@@ -2541,7 +2715,8 @@ namespace RayTracingRT
 		if (alphaFrame && !EnsureAlphaInfoBuffer(context)) {
 			// (45i) Character uploads / builds recorded in this list must run (later refits rely on
 			// them): a list that cannot be submitted takes the whole feature down instead.
-			if (skinRecorded_ && !early)
+			// (47l) Wind uploads / builds likewise (a wind BLAS is marked built when its build is recorded).
+			if ((skinRecorded_ || windMustSubmit_) && !early)
 				return Fail("alpha record buffer (with character work recorded)", E_OUTOFMEMORY);
 			// Nothing written above can be traced without its record: drop the frame's trace.
 			list->Close();
@@ -2893,6 +3068,7 @@ namespace RayTracingRT
 			NoteSkinWork(uploadsBefore);  // (46p)
 		} else if (!skinGroups_.empty())
 			ReleaseUnseenSkinGroups();  // (46m) no character drawn; (46q) with the budget on, after a grace period
+		RecordWind(list, &a_input, kWindBuildsPerFrame, kWindUploadCpuMs);  // (47l) foliage sway: uploads, first builds, this frame's refits
 		const std::int64_t skinEnd = QpcNow();
 		split.skin = static_cast<float>(QpcToMs(skinEnd - buildEnd));
 		mark = skinEnd;
@@ -3044,7 +3220,8 @@ namespace RayTracingRT
 		}
 		// (46g) Character shapes created behind a loading / black screen are uploaded here too (no draws needed).
 		const bool uploadsDue = !skinUploadQueue_.empty() && SkinAvailable();
-		if (buildQueue_.empty() && !compactionDue && !uploadsDue)
+		const bool windDue = WindWorkDue();  // (47l) wind meshes made behind a loading screen: uploaded and first built (mean pose) here
+		if (buildQueue_.empty() && !compactionDue && !uploadsDue && !windDue)
 			return false;
 		std::size_t index = kContexts;
 		for (std::size_t offset = 0; offset < kContexts; ++offset) {
@@ -3079,6 +3256,14 @@ namespace RayTracingRT
 			// Builds / copies done before anything later on the queue reads them.
 			auto barrier = UavBarrier();
 			list->ResourceBarrier(1, &barrier);
+		}
+		if (windDue) {
+			// (47l) No wind pose here (nothing is drawn): first builds only, more of them behind loading / black screens.
+			RecordWind(list, nullptr, transition_ ? kWindBuildsLoading : kWindBuildsPerFrame, std::max(a_cpuMs * 0.5f, 1.0f));
+			if (windRecorded_) {
+				auto barrier = UavBarrier();
+				list->ResourceBarrier(1, &barrier);
+			}
 		}
 		stats_.cpuSkinMs = static_cast<float>(QpcToMs(QpcNow() - buildEnd));
 		if (FAILED(hr = list->Close()))
@@ -3391,6 +3576,9 @@ namespace RayTracingRT
 	{
 		if (!a_work.valid || !std::isfinite(a_prepMs) || a_prepMs < 0.0f || a_prepMs > 1000.0f)
 			return;  // (46q) a wrapped / garbage timestamp pair does not feed the model
+		if (a_work.windBuilds > 0)
+			return;  // (47l) wind first builds are not static triangles: such a submission feeds neither the base nor the per-triangle cost
+		// (47l) Wind refits run on (nearly) every submission: they are part of the base, with or without static builds.
 		const std::uint64_t triangles = a_work.buildTriangles + a_work.groupTriangles;
 		if (triangles == 0 && a_work.compactions == 0) {
 			prepBaseEma_ = prepBaseEma_ < 0.0 ? a_prepMs : prepBaseEma_ * 0.9 + a_prepMs * 0.1;

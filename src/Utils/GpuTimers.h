@@ -100,6 +100,8 @@ namespace Util
 		VolumetricFogHistory,    // the temporal history copies (light scattering + conservative depth)
 		// (47j) Point Light Shadows on Water: WaterPrepCS (the depth copy after the water and the water distance pass).
 		RayTracingWaterPrep,
+		// (47l) RTAO: Smooth Normals: AONormalPrepCS (right before PrepareCS).
+		RayTracingAONormalPrep,
 		Count
 	};
 

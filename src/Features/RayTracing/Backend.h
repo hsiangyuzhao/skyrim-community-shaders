@@ -157,6 +157,46 @@ namespace RayTracingRT
 		std::uint64_t refused = 0;            // shapes refused: too big / bad data
 	};
 
+	// (47l) Foliage sway: a tree-animated mesh posed every frame on our queue (WindFoliageCS: the game's wind formula from the
+	// rest pose) into a vertex buffer whose BLAS (ALLOW_UPDATE | PREFER_FAST_TRACE, first built at the mean pose) is refit in
+	// place. It is a BlasHandle like any other (TLAS instances name it); an alpha-tested mesh keeps the frozen mesh's texcoords
+	// (its triangles are in the same order), so its shapes' alpha records stay as they are.
+	struct WindVertex
+	{
+		float position[3];         // the mesh's own space (as the frozen BLAS)
+		std::uint32_t normalAlpha;  // normal xyz UNORM8 as the engine stores it, vertex alpha << 24
+	};
+	static_assert(sizeof(WindVertex) == 16);
+
+	struct WindGeometry
+	{
+		std::vector<WindVertex> vertices;
+		std::vector<std::uint32_t> indices;  // the frozen mesh's, in its order
+		float amplitude = 0.0f;              // TreeParams.z
+		float frequency = 0.0f;              // TreeParams.w (leaf frequency)
+		bool opaque = true;                  // false: an alpha-tested mesh (non-opaque geometry)
+		[[nodiscard]] std::uint32_t Triangles() const { return static_cast<std::uint32_t>(indices.size() / 3); }
+		[[nodiscard]] std::uint32_t Vertices() const { return static_cast<std::uint32_t>(vertices.size()); }
+	};
+
+	struct WindStats
+	{
+		std::uint32_t meshes = 0;                 // live wind BLASes
+		std::uint32_t pending = 0;                // not uploaded or not built yet
+		std::uint64_t vertices = 0;               // of the live meshes
+		std::uint64_t triangles = 0;
+		std::uint64_t bytes = 0;                  // rest + index + posed vertices + BLASes (live meshes)
+		std::uint64_t scratchBytes = 0;
+		std::uint32_t buildsLastFrame = 0;        // first builds (mean pose)
+		std::uint32_t refitsLastFrame = 0;        // in-place refits (this frame's pose)
+		std::uint64_t refitVerticesLastFrame = 0;  // vertices posed for the refits
+		std::uint32_t deferredLastFrame = 0;      // first builds put off (per-frame cap)
+		bool stillLastFrame = false;              // no refit needed: the wind pose did not change (paused, no wind)
+		std::uint64_t buildsTotal = 0;
+		std::uint64_t overBudget = 0;             // meshes refused: VRAM budget
+		std::uint64_t refused = 0;                // meshes refused: too big / bad data / not available
+	};
+
 	/// (46g) A range carved out of one of the backend's GPU pools (GpuArena): no D3D12 resource of its own.
 	struct ArenaAlloc
 	{
@@ -316,6 +356,11 @@ namespace RayTracingRT
 		// fence before the point lights run; the D3D11 queue may then wait for the sun alone (WaitForSun) before the shadow
 		// mask passes and for the rest (WaitForTrace) only before the point lights' denoiser.
 		bool splitSun = false;
+		// (47l) Foliage sway: this frame's wind (BSTreeManager, or the shaders' last values extrapolated). false = no refit this
+		// frame (the wind BLASes keep their last pose); new wind meshes are still built (mean pose).
+		bool windValid = false;
+		float windMagnitude = 0.0f;  // TreeParams.y
+		float windTimer = 0.0f;      // WindTimers.x (Lighting) = TreeParams.x (shadow map)
 	};
 
 	/// (45k) Where the CPU time of the last ExecuteFrame went, call by call (ms). The sum of these
@@ -698,6 +743,21 @@ namespace RayTracingRT
 		/// VRAM for skinned characters (buffers + BLASes); shapes past it keep their shadow-map shadow.
 		static constexpr std::uint64_t kSkinBudgetBytes = 512ull << 20;
 
+		// (47l) Foliage sway (BackendWind.cpp). Its pipeline is created with the others; everything else on first use only.
+		/// The posing shader exists and nothing of the wind path failed.
+		[[nodiscard]] bool WindAvailable() const { return ready_ && !failed_ && windPipeline_ && windFault_.empty(); }
+		/// Takes the geometry; a BlasHandle in the Queued state, built (mean pose) over the next frames, then refit every frame the
+		/// wind moves (FrameInput::windValid). ReleaseBlas releases it like any BLAS. kInvalidBlas when refused (counted).
+		BlasHandle CreateWindBlas(std::unique_ptr<WindGeometry> a_geometry);
+		[[nodiscard]] bool WindIdle() const { return windLive_ == 0; }
+		/// The wind scratch buffer (only when WindIdle()).
+		void ReleaseWindResources();
+		[[nodiscard]] const std::string& WindFault() const { return windFault_; }
+		void ClearWindFault() { windFault_.clear(); }
+		[[nodiscard]] const WindStats& GetWindStats() const { return windStats_; }
+		/// VRAM for wind meshes (buffers + BLASes); meshes past it stay frozen.
+		static constexpr std::uint64_t kWindBudgetBytes = 384ull << 20;
+
 		// (46b) Point-light shadows. Their textures / buffers are created on first use only.
 		/// The point-light trace pipeline exists (the driver accepted it) and nothing of it failed.
 		[[nodiscard]] bool PointAvailable() const { return ready_ && !failed_ && pointPipeline_ && pointFault_.empty(); }
@@ -740,6 +800,12 @@ namespace RayTracingRT
 		void ReleaseAONormalTexture();
 		[[nodiscard]] ID3D11UnorderedAccessView* AONormalUAV() const { return aoNormal_.uav11.Get(); }
 		[[nodiscard]] bool HasAONormalTexture() const { return aoNormal_.resource12 != nullptr; }
+		/// (47l) RTAO: Blue-Noise Rays: Skylighting's spatiotemporal blue noise (128 x 128 x 64, RGBA8) as TraceAOCS t6. Read from disk and
+		/// created once (default heap; its upload goes out in the next RTAO list, then it stays a shader resource). False = not available
+		/// (missing / unexpected file, creation failed: logged once, the trace keeps the interleaved gradient noise).
+		bool EnsureAOBlueNoise();
+		void ReleaseAOBlueNoise();
+		[[nodiscard]] bool HasAOBlueNoise() const { return aoBlueNoise_ != nullptr; }
 		[[nodiscard]] ID3D11ShaderResourceView* AORawSRV() const { return aoRaw_.srv11.Get(); }
 		[[nodiscard]] const std::string& AOFault() const { return aoFault_; }
 		void ClearAOFault() { aoFault_.clear(); }
@@ -862,7 +928,56 @@ namespace RayTracingRT
 			// (45h) Alpha BLAS: its texcoords in the shared texcoord buffer (uint2 elements).
 			std::uint32_t uvOffset = UINT32_MAX;
 			std::uint32_t uvCount = 0;
+			// (47l) A wind BLAS: its WindMesh (winds_); never in the build queue, never compacted (Ready once first built).
+			std::uint32_t wind = UINT32_MAX;
 		};
+
+		// (47l) Foliage sway (BackendWind.cpp).
+		static constexpr std::uint32_t kWindMaxVertices = 65536;           // per mesh (16-bit indices in the game's data)
+		static constexpr std::uint32_t kWindMaxTriangles = 131072;
+		static constexpr std::uint32_t kWindUploadsPerFrame = 32;          // new meshes uploaded per submission (a CPU budget bounds it too)
+		static constexpr std::uint32_t kWindUploadVerticesPerFrame = 300000;
+		static constexpr std::uint32_t kWindBuildsPerFrame = 8;            // first builds per frame while playing (refits are never capped)
+		static constexpr std::uint32_t kWindBuildsLoading = 48;            // ... behind loading screens (BuildOnly)
+		static constexpr float kWindUploadCpuMs = 0.5f;                    // render-thread CPU for new meshes per frame while playing
+		struct WindMesh
+		{
+			bool live = false;
+			bool uploaded = false;  // rest + index copied, ranges allocated
+			bool built = false;     // first build recorded
+			BlasHandle handle = kInvalidBlas;
+			std::unique_ptr<WindGeometry> geometry;  // until uploaded
+			ArenaAlloc rest, index, output, blas;    // skinStaticPool_ (rest, index), skinOutputPool_ (posed), asPool_ (BLAS)
+			std::uint64_t restBytes = 0, indexBytes = 0, outputBytes = 0, blasBytes = 0;
+			std::uint64_t buildScratch = 0, updateScratch = 0;
+			std::uint32_t vertices = 0, triangles = 0;
+			float amplitude = 0.0f, frequency = 0.0f;
+			bool opaque = true;
+			bool posed = false;       // refit to a timer pose at least once (else: the mean pose of the first build)
+			double posedPhase = 0.0;  // magnitude x timer of that pose (the skip test of a still wind)
+			[[nodiscard]] std::uint64_t Bytes() const { return restBytes + indexBytes + outputBytes + blasBytes; }
+		};
+		bool CreateWindPipeline();
+		void SetWindFault(std::string a_reason);
+		/// Frees a wind mesh's ranges (behind the fence) and forgets it (from ReleaseBlas).
+		void ReleaseWindMesh(std::uint32_t a_index);
+		void UploadWindMeshes(ID3D12GraphicsCommandList4* a_list, float a_cpuMs);
+		/// Uploads, first builds (mean pose, up to a_maxBuilds) and this frame's refits (a_input.windValid). Inside the prep interval.
+		void RecordWind(ID3D12GraphicsCommandList4* a_list, const FrameInput* a_input, std::uint32_t a_maxBuilds, float a_uploadCpuMs);
+		/// Wind meshes still to upload or to build (BuildOnly has work).
+		[[nodiscard]] bool WindWorkDue() const;
+		ComPtr<ID3D12RootSignature> windRootSignature_;
+		ComPtr<ID3D12PipelineState> windPipeline_;  // WindFoliageCS
+		std::vector<WindMesh> winds_;
+		std::vector<std::uint32_t> freeWinds_;
+		std::deque<std::uint32_t> windUploadQueue_;
+		ComPtr<ID3D12Resource> windScratch_;
+		std::uint64_t windScratchBytes_ = 0;
+		std::uint32_t windLive_ = 0;
+		std::string windFault_;
+		WindStats windStats_{};
+		bool windRecorded_ = false;  // uploads / builds / refits recorded in this frame's list
+		bool windMustSubmit_ = false;  // (47l) uploads / first builds among them (marked done when recorded: the list must run; refits alone may be dropped)
 
 		// (45h) Alpha-tested casters.
 		static constexpr std::uint32_t kAlphaTextureSlots = 4096;        // bindless table (TraceShadowsCS kAlphaTextureSlots)
@@ -1305,7 +1420,8 @@ namespace RayTracingRT
 		// Block layout: sun table (depth SRV, visibility UAV), point table (depth SRV, sun visibility SRV, PLVis UAV,
 		// PLIdx UAV), RTAO table (depth SRV, AO UAV).
 		// (47i) + the point table's water views (water distance SRV, water visibility UAV) after the RTAO table (offsets 6, 7 of the point table).
-		static constexpr std::uint32_t kDynSun = 0, kDynPoint = 2, kDynAO = 6, kDynWater = 8, kDynAONormal = 10, kDynamicDescriptors = 11;  // (47j) + the RTAO smooth normals SRV (RTAO table offset 4)
+		// (47l) + the RTAO blue noise SRV (RTAO table offset 5).
+		static constexpr std::uint32_t kDynSun = 0, kDynPoint = 2, kDynAO = 6, kDynWater = 8, kDynAONormal = 10, kDynAOBlueNoise = 11, kDynamicDescriptors = 12;  // (47j) + the RTAO smooth normals SRV (RTAO table offset 4)
 		static constexpr std::uint32_t kDynamicBase = kPointDescriptorBase + kPointDescriptors;  // after the (unused) 46b point slots
 		ComPtr<ID3D12DescriptorHeap> stagingHeap_;
 		[[nodiscard]] D3D12_CPU_DESCRIPTOR_HANDLE StagingCpu(std::uint32_t a_slot) const;
@@ -1330,6 +1446,13 @@ namespace RayTracingRT
 		SharedTexture aoNormal_;  // (47j) RTAO: Smooth Normals (R32_FLOAT, packed octahedral normal)
 		std::uint32_t aoNormalWidth_ = 0, aoNormalHeight_ = 0;
 		void WriteAONormalDescriptor();
+		// (47l) RTAO: Blue-Noise Rays. The upload buffer lives until the RTAO list after the one that copied it (retired then).
+		ComPtr<ID3D12Resource> aoBlueNoise_;        // default heap, Texture2DArray RGBA8 128 x 128 x 64 (COPY_DEST until copied)
+		ComPtr<ID3D12Resource> aoBlueNoiseUpload_;  // upload heap, the file's texels (row pitch 512)
+		bool aoBlueNoiseCopyPending_ = false;       // the copy is not recorded yet
+		bool aoBlueNoiseRetirePending_ = false;     // the copy is recorded: retire the upload buffer in the next RTAO list
+		bool aoBlueNoiseFailed_ = false;            // tried and failed (logged once): IGN for this session
+		void WriteNullAOBlueNoiseDescriptor();
 		std::uint32_t aoWidth_ = 0, aoHeight_ = 0;
 		ComPtr<ID3D12Resource> aoCounter_;          // default heap, UAV: rays traced (monotonic, wraps)
 		ComPtr<ID3D12Resource> aoCounterReadback_;  // per context one uint32 copy of it

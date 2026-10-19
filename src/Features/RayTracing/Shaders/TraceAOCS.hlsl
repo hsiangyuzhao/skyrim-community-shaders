@@ -40,6 +40,9 @@
 // most kAlphaCandidateBudget candidates per ray (past it the ray counts as blocked: bounded cost). (46t) AO Alpha
 // Budget: past the budget the ray may instead count as half open (kFlagAlphaHalf) or open (kFlagAlphaOpen).
 //
+// (47l) kFlagBlueNoise "RTAO: Blue-Noise Rays": the two uniform numbers of the cosine map from Skylighting's spatiotemporal blue noise (t6)
+// instead of interleaved gradient noise (see main).
+//
 // (47h) kFlagSelfFix "RTAO: Character Self-Occlusion Fix": the character ray already starts Extra.x (6 units) along, yet near a
 // character's silhouette the ray-traced (GPU-skinned) mesh is a little off the drawn one, so a ray from a body pixel can start just
 // inside its own traced mesh and leave it through the inside of the surface (a dark band along the sides of the legs, strongest
@@ -68,6 +71,9 @@ Texture2D<float> DepthMask : register(t1);
 RWTexture2D<float4> AOOut : register(u0);  // (47h) float: RGBA16F, or RGBA8 (kFlagDither8)
 RWByteAddressBuffer RayCounter : register(u1);  // rays traced (monotonic, read back for the F7 trace)
 Texture2D<float> AONormals : register(t5);   // (47j) kFlagSmoothNormals: AONormalPrepCS output (packed octahedral world normal, 0 = none)
+// (47l) kFlagBlueNoise: Skylighting's spatiotemporal blue noise (stbn_vec3_2Dx1D_128x128x64, RGBA8: each channel uniform, the vector
+// blue in space and in time), uploaded once by the backend.
+Texture2DArray<float4> AOBlueNoise : register(t6);
 
 static const uint kFlagCharacters = 1u;   // characters are in the TLAS: the character ray
 static const uint kFlagFirstPerson = 2u;  // no character ray for pixels near the camera
@@ -80,6 +86,9 @@ static const uint kFlagDither8 = 128u;    // (47h) the output is RGBA8: dither t
 static const uint kFlagSelfFix = 256u;    // (47h) RTAO: Character Self-Occlusion Fix (see the top)
 static const uint kFlagSmoothNormals = 512u;  // (47j) RTAO: Smooth Normals (see main)
 static const uint kFlagSmoothNormals2 = 1024u;  // (47k) RTAO: Smooth Normals v2 (with kFlagSmoothNormals): offsets along Ns, projection
+static const uint kFlagBlueNoise = 2048u;       // (47l) RTAO: Blue-Noise Rays (AOBlueNoise t6)
+static const uint kBlueNoiseSize = 128u;        // the texture's width / height (wrapped by the pixel)
+static const uint kBlueNoiseSlices = 64u;       // its slices (one per frame, wrapped)
 static const uint kMaxDetailRays = 4u;
 static const float kSelfProbe = 4.0;          // (47h) CharacterAt: the probe reaches this far to either side of the pixel (units)
 static const float kSelfGrazeOffset = 1.5;    // (47h) extra ray start offset at a character pixel for a ray along the surface (units)
@@ -541,8 +550,19 @@ float3 CosineDirection(float2 u, float3 T, float3 B, float3 N)
 
 			// Cosine-weighted direction (noise changes every frame; the D3D11 filter averages it).
 			const uint frame = uint(C.Params.x);
-			const float u1 = InterleavedGradientNoise(float2(p), frame);
-			const float u2 = frac(InterleavedGradientNoise(float2(p.yx) + float2(29.0, 61.0), frame * 7u + 3u) + float(frame % 64u) * 0.6180339887);
+			float u1 = InterleavedGradientNoise(float2(p), frame);
+			float u2 = frac(InterleavedGradientNoise(float2(p.yx) + float2(29.0, 61.0), frame * 7u + 3u) + float(frame % 64u) * 0.6180339887);
+			// (47l) kFlagBlueNoise: the two numbers from the spatiotemporal blue noise instead (pixel wrapped at 128, one slice per
+			// frame): through the cosine map the directions of neighbouring pixels, and of one pixel over the frames, are spread
+			// evenly, so the spatial filter and the history average the noise out faster. Its first two channels (8-bit, each
+			// uniform) mapped to the centres of their 256 steps. The extra Fine Detail directions below keep their R2 offsets from
+			// these (a toroidal shift: each ray's pattern stays blue, a pixel's rays stay spread). Off: interleaved gradient noise (47k).
+			[branch] if (flags & kFlagBlueNoise)
+			{
+				const float2 bn = AOBlueNoise.Load(int4(int2(uint2(p) % kBlueNoiseSize), int(frame % kBlueNoiseSlices), 0)).rg;
+				u1 = (round(bn.x * 255.0) + 0.5) / 256.0;
+				u2 = (round(bn.y * 255.0) + 0.5) / 256.0;
+			}
 			// (47j) kFlagSmoothNormals: the hemisphere (every cosine direction, the Fine Detail ones too) is built around the smooth
 			// normal Ns (AONormalPrepCS: last frame's G-buffer normal reprojected, already blended toward Ng by its confidence), bent
 			// smoothly toward the depth normal N (= Ng) where they disagree; a direction below the Ng plane is mirrored above it. The
