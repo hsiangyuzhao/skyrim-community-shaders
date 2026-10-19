@@ -100,6 +100,7 @@ namespace
 		o_json["PhysBodyLine"] = a_s.PhysBodyLine;
 		o_json["PhysBeadCap"] = a_s.PhysBeadCap;
 		o_json["PhysLessGrid"] = a_s.PhysLessGrid;
+		o_json["PhysSweat2"] = a_s.PhysSweat2;  // (47l) A/B switch (not part of presets)
 		o_json["Physical47i"] = true;
 	}
 
@@ -131,7 +132,8 @@ namespace
 			o_s.UseDynamicWetness = it->get<bool>();
 		// (47j)
 		for (auto [key, value] : { std::pair{ "PhysWaterLine", &o_s.PhysWaterLine }, std::pair{ "PhysBeadsFadeIn", &o_s.PhysBeadsFadeIn }, std::pair{ "PhysBeadsShrink", &o_s.PhysBeadsShrink },
-				 std::pair{ "PhysBodyLine", &o_s.PhysBodyLine }, std::pair{ "PhysBeadCap", &o_s.PhysBeadCap }, std::pair{ "PhysLessGrid", &o_s.PhysLessGrid } }) {
+				 std::pair{ "PhysBodyLine", &o_s.PhysBodyLine }, std::pair{ "PhysBeadCap", &o_s.PhysBeadCap }, std::pair{ "PhysLessGrid", &o_s.PhysLessGrid },
+				 std::pair{ "PhysSweat2", &o_s.PhysSweat2 } }) {
 			if (auto it = a_json.find(key); it != a_json.end() && it->is_boolean())
 				*value = it->get<bool>();
 		}
@@ -409,9 +411,29 @@ float WetSkin::MaxDryMultiplier() const
 // (47f) Physical model
 // ---------------------------------------------------------------------------------------------
 
-float WetSkin::PhysBandWater(float a_p, float a_x)
+float WetSkin::PhysBandWater(float a_p, float a_x, bool a_law)
 {
-	return Phys::kHold * std::clamp(1.0f - a_p, 0.0f, 1.0f) + (Phys::kSoak - Phys::kHold) * std::clamp(a_x, 0.0f, 1.0f);
+	const float held = a_law ? PhysDryCurve(a_p) : std::clamp(1.0f - a_p, 0.0f, 1.0f);
+	return Phys::kHold * held + (Phys::kSoak - Phys::kHold) * std::clamp(a_x, 0.0f, 1.0f);
+}
+
+float WetSkin::PhysDryCurve(float a_p)
+{
+	// (47l) The held water of a swim zone drying alone by the loss law (PhysLawRate), sampled at p = u^2 (denser where it is steep).
+	if (!(a_p > 0.0f))
+		return 1.0f;
+	if (a_p >= 1.0f)
+		return 0.0f;
+	const float u = std::sqrt(a_p) * static_cast<float>(Phys::kDryCurveN);
+	const uint32_t i = std::min(static_cast<uint32_t>(u), Phys::kDryCurveN - 1);
+	const float f = u - static_cast<float>(i);
+	return Phys::kDryCurve[i] + (Phys::kDryCurve[i + 1] - Phys::kDryCurve[i]) * f;
+}
+
+float WetSkin::PhysLawRate(float a_v)
+{
+	const float u = std::max(a_v, 0.0f) + Phys::kLawVe;
+	return Phys::kLawLambda * (std::log1p(u / Phys::kLawV0) + Phys::kLawB * u * u);
 }
 
 const WetSkin::PhysicalFrame& WetSkin::GetPhysicalFrame()
@@ -461,6 +483,14 @@ void WetSkin::UpdatePhysical(PhysicalState& a_state, const PhysicalInput& a_in) 
 	const float rainCap = std::clamp(s.MaxRainWetness, 0.0f, 1.0f) * Phys::kHold;
 	const float rainRate = Phys::kRainRate * intensity * exposure * std::clamp(s.RainWetting, 0.1f, 5.0f);
 	const float flux = Phys::kHold / std::clamp(s.PhysDryTime, 10.0f, 1800.0f) * evaporation;  // um/s
+	// (47l) Sweat and Drying v2: sweat made in um/s by the body heat (not toward a target), one smooth loss law for all the water
+	// (PhysLawRate), sweat over kDripLevel x Sweat drips into the trails. Off: 47k.
+	const bool law = s.PhysSweat2;
+	const float dryTime = std::clamp(s.PhysDryTime, 10.0f, 1800.0f);
+	const float lawScale = evaporation / dryTime;                         // E(V) = lawScale x PhysLawRate(V), um/s
+	const float zoneRate = evaporation / (dryTime * Phys::kLawTauEnd);    // progress per s of a swim zone drying alone
+	const float sweatRate = Phys::kSweatRate2 * std::clamp(s.SweatWeight, 0.0f, 1.0f) * buildup * (1.0f - 0.6f * cold);  // um/s at full heat
+	const float dripLevel = Phys::kDripLevel * std::clamp(s.SweatWeight, 0.0f, 1.0f);
 	const float depth = std::max(std::isfinite(a_in.depth) ? a_in.depth : 0.0f, 0.0f);
 	const float bandHeight = std::max(std::isfinite(a_in.height) ? a_in.height : 128.0f, 32.0f) / static_cast<float>(Phys::kBands);
 	const auto submerged = [&](uint32_t a_band) { return depth > (static_cast<float>(a_band) + 0.5f) * bandHeight; };
@@ -481,10 +511,11 @@ void WetSkin::UpdatePhysical(PhysicalState& a_state, const PhysicalInput& a_in) 
 		a_state.midX = a_state.lineX;
 		a_state.dipMin = depth;
 		a_state.lineMode = lineMode;
+		a_state.dryLaw = law;
 	};
 
-	if (a_state.valid && a_state.lineMode != lineMode)
-		resetSwim();  // (47j) switched between the line and the bands: the swim water starts afresh (sweat and rain kept)
+	if (a_state.valid && (a_state.lineMode != lineMode || a_state.dryLaw != law))
+		resetSwim();  // (47j) switched between the line and the bands ((47l) or the drying law): the swim water starts afresh (sweat and rain kept)
 
 	if (!a_state.valid) {
 		// First seen: as if it had been like this for a while (a character met in the rain is wet already; nobody is
@@ -493,21 +524,50 @@ void WetSkin::UpdatePhysical(PhysicalState& a_state, const PhysicalInput& a_in) 
 		a_state.valid = true;
 		a_state.heat = exertion;
 		a_state.sweat = sweatTarget * exertion * 0.8f;
+		if (law) {
+			// (47l) Where making and losing sweat balance at this exertion (bisection; at most the drip level).
+			const float make = sweatRate * exertion;
+			float lo = 0.0f, hi = std::max(dripLevel, 0.0f);
+			if (make <= 0.0f || hi <= 0.0f) {
+				hi = 0.0f;
+			} else {
+				for (int i = 0; i < 24; ++i) {
+					const float mid = 0.5f * (lo + hi);
+					(lawScale * PhysLawRate(mid) > make ? hi : lo) = mid;
+				}
+			}
+			a_state.sweat = 0.5f * (lo + hi);
+		}
 		a_state.rain = rainRate > 0.0f ? std::min(rainCap, rainRate * 60.0f) : 0.0f;
 		resetSwim();
 	} else if (dtAll > 0.0f) {
 		// Sub-steps of at most 2 s (the shared evaporation couples the sources), at most 64 (a character back after a long
 		// absence just catches up coarser).
-		const uint32_t steps = std::clamp(static_cast<uint32_t>(std::ceil(dtAll / 2.0f)), 1u, 64u);
+		// (47l) v2: at most 0.5 s (the loss law is steep for thick water; the step itself stays stable at any length).
+		const uint32_t steps = std::clamp(static_cast<uint32_t>(std::ceil(dtAll / (law ? 0.5f : 2.0f))), 1u, 64u);
 		const float dt = dtAll / static_cast<float>(steps);
 		for (uint32_t step = 0; step < steps; ++step) {
 			// Sweat: body heat follows the exertion; production fills the skin toward the target (one way: a lower target
 			// leaves the water to evaporate).
-			const float tau = exertion > a_state.heat ? Phys::kHeatUp : Phys::kHeatDown;
-			a_state.heat += (exertion - a_state.heat) * (1.0f - std::exp(-dt / tau));
-			const float target = sweatTarget * a_state.heat;
-			if (a_state.sweat < target)
-				a_state.sweat = target + (a_state.sweat - target) * std::exp(-dt * buildup / Phys::kSweatTau);
+			if (law) {
+				// (47l) Body heat follows the exertion (8 s up, 60 s down: sweat goes on for a while after stopping); sweat is made at
+				// kSweatRate2 um/s x Sweat x Build-up x heat (x 0.4 in the cold) and lost by the shared law below; over the drip level
+				// it drips off (softplus: no kink), feeding the sweat trails.
+				const float tau = exertion > a_state.heat ? Phys::kHeatUp2 : Phys::kHeatDown2;
+				a_state.heat += (exertion - a_state.heat) * (1.0f - std::exp(-dt / tau));
+				a_state.sweat += sweatRate * a_state.heat * dt;
+				const float over = (a_state.sweat - dripLevel) / Phys::kDripSoft;
+				const float drip = Phys::kDripSoft * (over > 20.0f ? over : std::log1p(std::exp(over))) / Phys::kRunoffTau;  // um/s
+				a_state.sweat = std::max(a_state.sweat - drip * dt, std::min(a_state.sweat, dripLevel));
+				const float dripTarget = Smooth(0.2f, 1.0f, drip);
+				a_state.sweatDrip += (dripTarget - a_state.sweatDrip) * (1.0f - std::exp(-dt / (dripTarget > a_state.sweatDrip ? 6.0f : 15.0f)));
+			} else {
+				const float tau = exertion > a_state.heat ? Phys::kHeatUp : Phys::kHeatDown;
+				a_state.heat += (exertion - a_state.heat) * (1.0f - std::exp(-dt / tau));
+				const float target = sweatTarget * a_state.heat;
+				if (a_state.sweat < target)
+					a_state.sweat = target + (a_state.sweat - target) * std::exp(-dt * buildup / Phys::kSweatTau);
+			}
 
 			// Rain: what the sky reaches, up to the cap; while it rains the impacts shed water (kRainDrain), so lighter rain settles
 			// lower (equilibrium rate x kRainDrain); the water over the cap runs off. Both make trails.
@@ -526,6 +586,8 @@ void WetSkin::UpdatePhysical(PhysicalState& a_state, const PhysicalInput& a_in) 
 			// (47j) Water line: under the current surface soaked; above it, up to the water line (the deepest since dry), at most two
 			// zones that each dry evenly (WetSkin.h PhysicalState); as deep as ever: the line rises and everything below is soaked.
 			float swimMean = 0.0f;
+			float swimHeld = 0.0f;  // (47l) v2: the held part only (the water over it runs off on its own)
+			const auto heldOf = [&](float a_p) { return Phys::kHold * (law ? PhysDryCurve(a_p) : std::clamp(1.0f - a_p, 0.0f, 1.0f)); };
 			if (lineMode) {
 				auto& st = a_state;
 				st.dipMin = std::min(st.dipMin, depth);
@@ -557,7 +619,8 @@ void WetSkin::UpdatePhysical(PhysicalState& a_state, const PhysicalInput& a_in) 
 				const float under = std::min(depth, actorHeight);
 				const float zoneB = std::max(std::min(st.midHeight, actorHeight) - under, 0.0f);
 				const float zoneA = std::max(std::min(st.lineHeight, actorHeight) - std::max(std::min(st.midHeight, actorHeight), under), 0.0f);
-				swimMean = (under * Phys::kSoak + zoneB * PhysBandWater(st.midP, st.midX) + zoneA * PhysBandWater(st.lineP, st.lineX)) / actorHeight;
+				swimMean = (under * Phys::kSoak + zoneB * PhysBandWater(st.midP, st.midX, law) + zoneA * PhysBandWater(st.lineP, st.lineX, law)) / actorHeight;
+				swimHeld = (under * Phys::kHold + zoneB * heldOf(st.midP) + zoneA * heldOf(st.lineP)) / actorHeight;
 			} else {
 				float swimSum = 0.0f;
 				for (uint32_t b = 0; b < Phys::kBands; ++b) {
@@ -567,25 +630,53 @@ void WetSkin::UpdatePhysical(PhysicalState& a_state, const PhysicalInput& a_in) 
 					} else {
 						a_state.bandX[b] *= std::exp(-dt / Phys::kRunoffTau);
 					}
-					swimSum += PhysBandWater(a_state.bandP[b], a_state.bandX[b]);
+					swimSum += PhysBandWater(a_state.bandP[b], a_state.bandX[b], law);
+					swimHeld += heldOf(a_state.bandP[b]);
 				}
 				swimMean = swimSum / static_cast<float>(Phys::kBands);
+				swimHeld /= static_cast<float>(Phys::kBands);
 			}
 
 			// One evaporation flux, shared by the water there in proportion (more water: longer).
+			// (47l) v2: the loss law at the water there (sweat, rain and the mean held swim water), shared in proportion; the step is
+			// exponential in U = V + Ve (never below 0, stable at any length).
 			const float loss = flux * dt;
 			const float total = a_state.sweat + a_state.rain + swimMean;
-			if (total > 1e-4f) {
+			if (law) {
+				const float vc = a_state.sweat + a_state.rain + swimHeld;
+				if (a_state.sweat + a_state.rain > 0.0f) {
+					const float u = vc + Phys::kLawVe;
+					const float uNew = u * std::exp(-lawScale * PhysLawRate(vc) / u * dt);
+					const float f = std::clamp((uNew - Phys::kLawVe) / std::max(vc, 1e-6f), 0.0f, 1.0f);
+					a_state.sweat *= f;
+					a_state.rain *= f;
+				}
+			} else if (total > 1e-4f) {
 				a_state.sweat = std::max(a_state.sweat - loss * a_state.sweat / total, 0.0f);
 				a_state.rain = std::max(a_state.rain - loss * a_state.rain / total, 0.0f);
 			}
+			// A swim zone's (band's) drying progress. (47l) v2: its held water follows kDryCurve (progress 1 = dry skin) at the law's pace,
+			// faster or slower by the law's rate per um at the water there (the zone with this frame's sweat and rain) against the
+			// zone alone; dry skin (p >= 1): the slower classes go on at the zone's own pace.
+			const auto dryProgress = [&](float& o_p) {
+				if (law) {
+					float g = 1.0f;
+					if (o_p < 1.0f) {
+						const float hz = heldOf(o_p);
+						const float loc = hz + a_state.sweat + a_state.rain;
+						g = (PhysLawRate(loc) / (loc + Phys::kLawVe)) / std::max(PhysLawRate(hz) / (hz + Phys::kLawVe), 1e-6f);
+					}
+					o_p = std::min(o_p + zoneRate * g * dt, Phys::kMaxProgress);
+					return;
+				}
+				const float held = Phys::kHold * std::clamp(1.0f - o_p, 0.0f, 1.0f);
+				// Dry skin (p >= 1): the slower classes (hair, cloth ...) go on drying at the full flux.
+				const float share = o_p < 1.0f ? held / std::max(held + a_state.sweat + a_state.rain, 1e-3f) : 1.0f;
+				o_p = std::min(o_p + loss * share / Phys::kHold, Phys::kMaxProgress);
+			};
 			if (lineMode) {
 				auto& st = a_state;
-				const auto dryZone = [&](float& o_p) {
-					const float held = Phys::kHold * std::clamp(1.0f - o_p, 0.0f, 1.0f);
-					const float share = o_p < 1.0f ? held / std::max(held + st.sweat + st.rain, 1e-3f) : 1.0f;
-					o_p = std::min(o_p + loss * share / Phys::kHold, Phys::kMaxProgress);
-				};
+				const auto dryZone = [&](float& o_p) { dryProgress(o_p); };
 				if (st.midHeight > depth)
 					dryZone(st.midP);
 				if (st.lineHeight > st.midHeight)
@@ -605,12 +696,8 @@ void WetSkin::UpdatePhysical(PhysicalState& a_state, const PhysicalInput& a_in) 
 				continue;
 			}
 			for (uint32_t b = 0; b < Phys::kBands; ++b) {
-				if (submerged(b))
-					continue;
-				const float held = Phys::kHold * std::clamp(1.0f - a_state.bandP[b], 0.0f, 1.0f);
-				// Dry skin (p >= 1): the slower classes (hair, cloth ...) go on drying at the full flux.
-				const float share = a_state.bandP[b] < 1.0f ? held / std::max(held + a_state.sweat + a_state.rain, 1e-3f) : 1.0f;
-				a_state.bandP[b] = std::min(a_state.bandP[b] + loss * share / Phys::kHold, Phys::kMaxProgress);
+				if (!submerged(b))
+					dryProgress(a_state.bandP[b]);
 			}
 		}
 	}
@@ -620,7 +707,9 @@ void WetSkin::UpdatePhysical(PhysicalState& a_state, const PhysicalInput& a_in) 
 		a_state.wasInWater = true;
 	a_state.exposure = exposure;
 	a_state.evaporation = evaporation;
-	for (float* v : { &a_state.heat, &a_state.rainRunoff }) {
+	if (!law)
+		a_state.sweatDrip = 0.0f;
+	for (float* v : { &a_state.heat, &a_state.rainRunoff, &a_state.sweatDrip }) {
 		if (!std::isfinite(*v))
 			*v = 0.0f;
 		*v = std::clamp(*v, 0.0f, 1.0f);
@@ -693,8 +782,9 @@ WetSkin::PhysicalLook WetSkin::GetPhysicalLook(const PhysicalState& a_state) con
 	const BeadSet sweatBeads = SweatBeads(sweat * beading, size, law);
 	const BeadSet rainBeads = RainBeads(rain * beading, size, law);
 	float swimBeadWater = 0.0f, swimBeadWeight = 0.0f, swimMax = 0.0f, swimTrail = 0.0f;
+	const bool dryLaw = s.PhysSweat2 && a_state.dryLaw;  // (47l)
 	const auto addSwim = [&](float a_p, float a_x) {
-		const float v = PhysBandWater(a_p, a_x) * swimWeight;
+		const float v = PhysBandWater(a_p, a_x, dryLaw) * swimWeight;
 		swimMax = std::max(swimMax, v);
 		swimTrail = std::max(swimTrail, swimWeight > 0.0f ? std::pow(std::clamp(a_x, 0.0f, 1.0f), 0.25f) : 0.0f);
 		const float bead = v * beading * PhysSwimBeadGate(v);
@@ -749,23 +839,25 @@ WetSkin::PhysicalLook WetSkin::GetPhysicalLook(const PhysicalState& a_state) con
 	// (47k) Cap: no pixel above c_cap's presence (nor 0.75): never a full lattice where a region gathers more water.
 	const float presenceMax = law.cap ? std::min(law.cCap / law.maxCoverage, Phys::kPresenceMax) : 0.0f;
 	const float rainRunoff = law.cap ? std::max(a_state.rainRunoff, rainBeads.runoff) : a_state.rainRunoff;
+	// (47l) v2: sweat dripping over the drip level runs in trails too (with the beads' own runoff).
+	const float sweatRunoff = dryLaw ? std::max(sweatBeads.runoff, a_state.sweatDrip) : sweatBeads.runoff;
 
 	look.beadRadius = radius;
 	look.coverage = coverage;
 	look.visible = visible;
 	look.swimMax = swimMax;
-	look.sweatRunoff = sweatBeads.runoff;
+	look.sweatRunoff = sweatRunoff;
 	// Droplet tails only where water runs off.
-	look.beadTrails = std::clamp(std::max({ rainRunoff, sweatBeads.runoff, swimTrail, law.cap ? swimBeads.runoff : 0.0f }), 0.0f, 1.0f);
+	look.beadTrails = std::clamp(std::max({ rainRunoff, sweatRunoff, swimTrail, law.cap ? swimBeads.runoff : 0.0f }), 0.0f, 1.0f);
 	look.sweatLevel = std::clamp(a_state.sweat / Phys::kSweatMax, 0.0f, 1.0f);
 
 	look.params[0] = float4(sweat, rain, manualSwim, a_state.bandHeight);
 	look.params[1] = float4(beading, beading, beading, swimWeight);
-	look.params[2] = float4(drawRadius, presencePerWater, rainRunoff, sweatBeads.runoff);
+	look.params[2] = float4(drawRadius, presencePerWater, rainRunoff, sweatRunoff);
 	// (47j) Flags (Skin.hlsli WetPhysFlag): the water line, beads fading in from the film, beads shrinking out. (47k) The bead cap
 	// (presenceMax in [3].z) and the smaller bead per cell.
 	const uint32_t flags = (lineMode ? Phys::kFlagWaterLine : 0u) | (s.PhysBeadsFadeIn ? Phys::kFlagFadeIn : 0u) | (s.PhysBeadsShrink ? Phys::kFlagShrink : 0u) |
-	                       (law.cap ? Phys::kFlagBeadCap : 0u) | (s.PhysLessGrid ? Phys::kFlagLessGrid : 0u);
+	                       (law.cap ? Phys::kFlagBeadCap : 0u) | (s.PhysLessGrid ? Phys::kFlagLessGrid : 0u) | (dryLaw ? Phys::kFlagDryLaw : 0u);
 	look.params[3] = float4(drawnShare, a_state.depth, presenceMax, static_cast<float>(flags));
 	if (lineMode) {
 		// (47j) The water line height (units above the feet, 0 = none) in place of the band height; the two zones in bands 0 and 1.
@@ -858,9 +950,18 @@ void WetSkin::DrawSettings()
 		Tooltip({ "How much a fully exerted character sweats (1 = heavily). Most on the forehead, neck, chest and back, least on the legs.",
 			"Hair and gear take their own share (Hair / Gear sections); sweat never makes beads on hair or gear." });
 		ImGui::SliderFloat("Sweat Build-up", &s.SweatBuildup, 0.1f, 5.0f, "%.2fx", ImGuiSliderFlags_Logarithmic);
-		Tooltip({ "How fast sweat comes. 1: body heat follows the exertion over about 20 s, and a fully exerted character reaches",
-			"most of its sweat in about a minute. A short sprint gives a slight sheen, a long fight a few beads on the forehead.",
-			"Cold air makes less sweat. After stopping, the sweat stays and dries like any water (Drying)." });
+		if (s.PhysSweat2)
+			Tooltip({ "How fast sweat comes (x the sweat made per second). Body heat follows the exertion over about 8 s and stays up",
+				"for about a minute after stopping, so the sweat goes on for a while. Cold air makes less sweat. The sweat dries like any",
+				"water (Drying); much more than the skin can hold drips off in trails." });
+		else
+			Tooltip({ "How fast sweat comes. 1: body heat follows the exertion over about 20 s, and a fully exerted character reaches",
+				"most of its sweat in about a minute. A short sprint gives a slight sheen, a long fight a few beads on the forehead.",
+				"Cold air makes less sweat. After stopping, the sweat stays and dries like any water (Drying)." });
+		ImGui::Checkbox("Physical: Sweat and Drying v2", &s.PhysSweat2);
+		Tooltip({ "On (47l): sweat is made by body heat at a steady rate (not topped up to a target), and all water (sweat, rain, swimming)",
+			"dries by one smooth rule: thick water goes fast, a thin film slowly, so a sprint or a fight leaves a visible sheen that",
+			"fades over two to four minutes. Soaked skin still looks dry after about Dry Time. Off: 47k." });
 
 		ImGui::SeparatorText("Rain");
 		ImGui::SliderFloat("Rain Wetting", &s.RainWetting, 0.1f, 5.0f, "%.2fx", ImGuiSliderFlags_Logarithmic);
@@ -887,9 +988,14 @@ void WetSkin::DrawSettings()
 
 		ImGui::SeparatorText("Drying");
 		ImGui::SliderFloat("Dry Time (s)", &s.PhysDryTime, 10.0f, 1800.0f, "%.0f s", ImGuiSliderFlags_Logarithmic);
-		Tooltip({ "How long soaked skin takes to dry completely in neutral air. Water dries at a steady pace, so a little water dries",
-			"quickly and a lot takes longer; sweat, rain and swim water share the same pace. Rain, snow and fog (humid air) and",
-			"cold air dry slower; indoors is neutral. Hair and gear multiply it by their own Dry Time x." });
+		if (s.PhysSweat2)
+			Tooltip({ "How long soaked skin takes to look dry in neutral air (the last, invisible film is gone about half as long again).",
+				"Thick water leaves fast, a thin film slowly; sweat, rain and swim water dry by the same rule, together.",
+				"Rain, snow and fog (humid air) and cold air dry slower; indoors is neutral. Hair and gear multiply it by their own Dry Time x." });
+		else
+			Tooltip({ "How long soaked skin takes to dry completely in neutral air. Water dries at a steady pace, so a little water dries",
+				"quickly and a lot takes longer; sweat, rain and swim water share the same pace. Rain, snow and fog (humid air) and",
+				"cold air dry slower; indoors is neutral. Hair and gear multiply it by their own Dry Time x." });
 
 		ImGui::SeparatorText("Beads");
 		ImGui::SliderFloat("Beading", &s.Beading, 0.0f, 1.0f, "%.2f");
@@ -1135,21 +1241,21 @@ void WetSkin::DrawStatus()
 		// (47i) Water amounts in micrometres of water film (soaked skin holds 120).
 		const auto& phys = state->phys;
 		const auto& look = state->look;
-		ImGui::Text("Player sweat: %.0f um   (body heat %.2f)", phys.sweat, phys.heat);
+		ImGui::Text("Player sweat: %.0f um   (body heat %.2f%s)", phys.sweat, phys.heat, phys.sweatDrip > 0.05f ? ", dripping" : "");
 		ImGui::Text("Player rain: %.0f um   (rain %.0f%%, open sky %.0f%%%s)", phys.rain, physicalFrame.rainIntensity * 100.0f, phys.exposure * 100.0f,
 			phys.rainRunoff > 0.05f ? ", running off" : "");
 		const std::string inWater = phys.depth > 0.0f ? std::format("   (in the water, {:.0f} units deep)", phys.depth) : std::string();
 		if (settings.PhysWaterLine && phys.lineMode) {
 			// (47j) The water line and the one state below it.
 			if (phys.lineHeight > phys.depth)
-				ImGui::Text("Player swim: %.0f um up to %.0f units, %.0f um up to the water line at %.0f units%s", PhysBandWater(phys.midP, phys.midX), phys.midHeight,
-					PhysBandWater(phys.lineP, phys.lineX), phys.lineHeight, inWater.c_str());
+				ImGui::Text("Player swim: %.0f um up to %.0f units, %.0f um up to the water line at %.0f units%s", PhysBandWater(phys.midP, phys.midX, phys.dryLaw), phys.midHeight,
+					PhysBandWater(phys.lineP, phys.lineX, phys.dryLaw), phys.lineHeight, inWater.c_str());
 			else
 				ImGui::Text("Player swim: no water line%s", inWater.c_str());
 		} else {
 			std::string bands;
 			for (uint32_t b = 0; b < Phys::kBands; ++b)
-				bands += std::format("{}{:.0f}", b ? " " : "", PhysBandWater(phys.bandP[b], phys.bandX[b]));
+				bands += std::format("{}{:.0f}", b ? " " : "", PhysBandWater(phys.bandP[b], phys.bandX[b], phys.dryLaw));
 			ImGui::Text("Player swim, feet to head: %s um%s", bands.c_str(), inWater.c_str());
 		}
 		ImGui::Text("Oil: %.2f   Drying speed (air): %.2fx", look.oil, phys.evaporation);
@@ -1340,6 +1446,7 @@ bool WetSkin::SavePreset(const std::string& a_name)
 	j["settings"].erase("PhysBodyLine");  // (47k) A/B switches
 	j["settings"].erase("PhysBeadCap");
 	j["settings"].erase("PhysLessGrid");
+	j["settings"].erase("PhysSweat2");  // (47l) A/B switch
 	try {
 		std::ofstream o{ PresetFile(name) };
 		if (!o)
@@ -1395,6 +1502,7 @@ bool WetSkin::LoadPreset(const std::string& a_name)
 		fromPreset.PhysBodyLine = settings.PhysBodyLine;  // (47k) not part of a look
 		fromPreset.PhysBeadCap = settings.PhysBeadCap;
 		fromPreset.PhysLessGrid = settings.PhysLessGrid;
+		fromPreset.PhysSweat2 = settings.PhysSweat2;  // (47l) not part of a look
 		MigratePhysical47i(values, json(), fromPreset);  // a preset saved before 47i: from its own droplet / drying values
 		if (fromPreset.Model > static_cast<uint32_t>(Model::Physical))
 			fromPreset.Model = static_cast<uint32_t>(Model::New);

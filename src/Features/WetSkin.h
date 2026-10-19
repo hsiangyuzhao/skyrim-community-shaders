@@ -90,6 +90,8 @@ struct WetSkin : Feature
 		bool PhysBodyLine = true;      // "Physical: Water Line Follows the Body": the stored line by the bind-pose height (Skin::CharBodyHeight)
 		bool PhysBeadCap = true;       // "Physical: Bead Coalescence Cap": coverage <= 0.40 Beading^1.5, runoff keeps the coverage
 		bool PhysLessGrid = true;      // "Physical: Less Grid-like Bead Placement": bead radius 0.36 cell (was 0.42), more jitter
+		// (47l) A/B switch, on by default; off = 47k exactly. Not part of presets.
+		bool PhysSweat2 = true;        // "Physical: Sweat and Drying v2": sweat made in um/s by body heat, one smooth drying law (WetSkin::Phys kLaw*)
 		// (47i) Moved from Advanced Skin (used by every model): sweat from stamina, or from Dynamic Wetness.
 		float StartSweat = 0.75f;
 		float FullSweat = 0.15f;
@@ -251,6 +253,27 @@ struct WetSkin : Feature
 		static constexpr float kLessGridRadius = 0.36f;       // bead radius per cell (47j: 0.42)
 		static constexpr float kLessGridCoverage = 0.4072f;   // pi 0.36^2: the cell grid at presence 1
 		static constexpr float kPresenceMax = 0.75f;          // per-pixel presence never above this (Bead Coalescence Cap)
+		// (47l) Sweat and Drying v2 (specs/spec-batch47.md 47l). One loss law for every source, smooth (no regime switch):
+		//   E(V) = env x kLawLambda / Dry Time x [ln(1 + U / kLawV0) + kLawB U^2] um/s, U = V + kLawVe (V = the water there, um):
+		// thin films go slowly (linear below ~3 um), thick water fast (the U^2 term); soaked skin (200 um) is below 5 um after Dry
+		// Time (calibrated with the swim runoff), the last 0.3 um (invisible) goes in finite time. Sweat is made at kSweatRate2 um/s
+		// x Sweat x Build-up x heat (8 s up / 60 s down), and over kDripLevel x Sweat it drips (tau kRunoffTau) into the trails.
+		static constexpr uint32_t kFlagDryLaw = 32u;    // wetPhysParams[3].w: the swim zones' held water follows kDryCurve (Skin.hlsli)
+		static constexpr float kLawV0 = 3.0f;           // um
+		static constexpr float kLawB = 0.002f;          // 1 / um
+		static constexpr float kLawVe = 0.3f;           // um
+		static constexpr float kLawLambda = 18.8325f;   // calibration (Dry Time meaning)
+		static constexpr float kLawTauEnd = 1.56747f;   // Dry Time units from held 120 um to 0 (the swim zone's progress 0 .. 1)
+		static constexpr float kSweatRate2 = 2.4f;      // um/s
+		static constexpr float kHeatUp2 = 8.0f;         // s
+		static constexpr float kHeatDown2 = 60.0f;      // s
+		static constexpr float kDripLevel = 150.0f;     // um x Sweat
+		static constexpr float kDripSoft = 4.0f;        // um (softplus width: no kink)
+		static constexpr uint32_t kDryCurveN = 24;
+		/// The held water of a swim zone (share of kHold) at progress p = u^2, u = i / kDryCurveN (Skin.hlsli kPhysDryCurve).
+		static constexpr float kDryCurve[kDryCurveN + 1] = { 1.000000f, 0.986224f, 0.946868f, 0.887163f, 0.813968f, 0.734044f, 0.652900f,
+			0.574383f, 0.500785f, 0.433202f, 0.371927f, 0.316773f, 0.267314f, 0.223037f, 0.183439f, 0.148090f, 0.116668f, 0.088982f,
+			0.064987f, 0.044771f, 0.028500f, 0.016274f, 0.007911f, 0.002796f, 0.000000f };
 	};
 	/// One character's water, advanced on the CPU once per frame (Skin::GetWetness).
 	struct PhysicalState
@@ -274,6 +297,8 @@ struct WetSkin : Feature
 		float midX = 0.0f;
 		float dipMin = 0.0f;      // the lowest surface since the lower zone was last soaked
 		bool lineMode = false;     // the state above was advanced by the water-line model (a switch starts afresh)
+		bool dryLaw = false;       // (47l) the swim progress above follows kDryCurve (Sweat and Drying v2; a switch starts afresh)
+		float sweatDrip = 0.0f;    // (47l) 0..1, sweat dripping over kDripLevel x Sweat (trails)
 		float depth = 0.0f;        // current water depth above the feet (0 = not in the water)
 		bool wasInWater = false;
 		float exposure = 0.0f;     // last rain exposure (status)
@@ -320,8 +345,12 @@ struct WetSkin : Feature
 	void UpdatePhysical(PhysicalState& a_state, const PhysicalInput& a_in) const;
 	/// Turns the water into what the shader draws (CPU, once per character per frame).
 	PhysicalLook GetPhysicalLook(const PhysicalState& a_state) const;
-	/// (47i) Skin swim water of a band (um, before the Swimming weight).
-	static float PhysBandWater(float a_p, float a_x);
+	/// (47i) Skin swim water of a band (um, before the Swimming weight). (47l) a_law: the held part by kDryCurve (else linear in p).
+	static float PhysBandWater(float a_p, float a_x, bool a_law = false);
+	/// (47l) Sweat and Drying v2: the held share of a swim zone at progress a_p (kDryCurve; 0 from 1 on).
+	static float PhysDryCurve(float a_p);
+	/// (47l) The loss law's E(V) / env x Dry Time (um per Dry Time) at water a_v.
+	static float PhysLawRate(float a_v);
 	/// (47j) The character's swim bead gate (share of the swim water that beads, before Beading) at swim water a_v (um).
 	float PhysSwimBeadGate(float a_v) const;
 

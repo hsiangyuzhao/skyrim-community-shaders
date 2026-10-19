@@ -175,9 +175,25 @@ namespace Skin
 	static const uint kPhysFlagBeadCap = 8u;
 	static const uint kPhysFlagLessGrid = 16u;
 	static const float kPhysLessGridRadius = 0.36;
+	// (47l) Sweat and Drying v2 (WetSkin::Phys::kFlagDryLaw): a swim zone's held water follows the drying law's curve.
+	static const uint kPhysFlagDryLaw = 32u;
 	bool WetPhysFlag(uint a_flag)
 	{
 		return (uint(max(wetPhysParams[3].w, 0.0) + 0.5) & a_flag) != 0u;
+	}
+
+	/// (47l) The held share of a swim zone at drying progress p (0 soaked .. 1 dry; WetSkin::Phys::kDryCurve, sampled at p = u^2):
+	/// one smooth loss law, thick water fast, a thin film slowly. Class multipliers stretch p (p / m) as before.
+	static const float kPhysDryCurve[25] = { 1.000000, 0.986224, 0.946868, 0.887163, 0.813968, 0.734044, 0.652900, 0.574383, 0.500785,
+		0.433202, 0.371927, 0.316773, 0.267314, 0.223037, 0.183439, 0.148090, 0.116668, 0.088982, 0.064987, 0.044771, 0.028500, 0.016274,
+		0.007911, 0.002796, 0.000000 };
+	float WetPhysDryCurve(float p)
+	{
+		[branch] if (p >= 1.0)
+			return 0.0;
+		const float u = sqrt(saturate(p)) * 24.0;
+		const uint i = min(uint(u), 23u);
+		return lerp(kPhysDryCurve[i], kPhysDryCurve[i + 1], u - float(i));
 	}
 
 	/// The swim height profile at h units above the feet: x drying progress, y share of the above-capacity water still on,
@@ -222,7 +238,8 @@ namespace Skin
 		const float x = saturate(band.y);
 		const float excess = x > 0.0 ? pow(x, invM) : 0.0;
 		trail = x > 0.0 ? pow(x, 0.25 * invM) : 0.0;
-		const float v = lerp(kPhysHold * saturate(1.0 - band.x * invM) + (kPhysSoak - kPhysHold) * excess, kPhysSoak, band.z);
+		const float held = WetPhysFlag(kPhysFlagDryLaw) ? WetPhysDryCurve(band.x * invM) : saturate(1.0 - band.x * invM);  // (47l)
+		const float v = lerp(kPhysHold * held + (kPhysSoak - kPhysHold) * excess, kPhysSoak, band.z);
 		const float w = saturate(wetPhysParams[1].w);
 		trail = w > 0.0 ? max(trail, band.z) : 0.0;
 		return max(v * w, wetPhysParams[0].z);
