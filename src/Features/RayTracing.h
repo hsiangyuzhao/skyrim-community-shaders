@@ -138,7 +138,6 @@ public:
 		int PointLightsPerPixel = 2;         // K: 1, 2 or 4 lights traced per pixel
 		int PointLightsMaxSources = 64;
 		float PointLightsDistance = 4000.0f;  // light centre to camera (units)
-		bool PointLightsKeepSSPLS = false;   // Screen Space Point Light Shadows stay on as contact shadows for RT lights
 		float PointLightsSize = 6.0f;        // emitter radius (soft edges)
 		float PointLightsClearance = 32.0f;  // the ray stops this far before the light (its own fixture casts nothing)
 		// (46c) Interiors: the interior cell is captured and its point lights (and window beams) traced; no sun trace.
@@ -200,7 +199,6 @@ public:
 		// Shadows decides). RTAO Single Long Ray: the long direction is one closest-hit ray classified by its hit distance (same
 		// near / far result as the two segments; off = 46x). RTAO Half-Resolution Broad Term: the far part is traced on a checkerboard
 		// that alternates every frame (the filter fills the other half from the neighbours; off = 46x, default off).
-		bool PointLightsSSPLSNonRT = true;
 		float PointLightsSSPLSContact = 8.0f;
 		bool AOHalfResFar = false;  // the RTAO Custom tier's value ((47n) Single Long Ray always on: the AOSingleRay key is gone)
 		// (47h) Outside the settings macro too. AOCharacterSelfFix "RTAO: Character Self-Occlusion Fix" (TraceAOCS kFlagSelfFix).
@@ -209,8 +207,7 @@ public:
 		// PointShadowsOnWater "Point Light Shadows on Water": (47i) the point trace also traces from last frame's water surface; the
 		// Water shader uses that where its fragment matches (TracePointLightsCS kFlagWater, PointLightShadows.hlsli GetWater). All three off = 47g.
 		// (47n) The Character Self-Occlusion Fix is always on (the AOCharacterSelfFix key is gone).
-		bool SunDepthCheckTranslucent = true;
-		bool PointShadowsOnWater = true;
+		// (47o) SunDepthCheckTranslucent, PointShadowsOnWater, PointLightsSSPLSNonRT: permanent (not settings); PointLightsKeepSSPLS: gone.
 		// (47j) AOSmoothNormals "RTAO: Smooth Normals": the AO hemisphere around last frame's G-buffer normal reprojected to this frame
 		// (AONormalPrepCS, confidence-blended toward the depth normal), not the per-facet depth normal. Off = 47i. (47n) The RTAO Custom
 		// tier's value; its v2 refinements (the 47k AOSmoothNormals2) are always on.
@@ -738,6 +735,7 @@ private:
 	RayTracingRT::PointLightInput pointInput{};
 	bool pointThisFrame = false;      // the point-light trace was submitted with this frame's trace
 	bool pointSplit = false;          // debug A/B: RT point-light shadows on the left half only (not persisted)
+	bool pointWaterOn = true;         // (47o) Point Light Shadows on Water (permanent): false only after its resources failed this session
 	bool pointRequested = false;
 	std::string pointOffReason;       // why they were switched off automatically
 	std::uint32_t pointK = 0;         // K of this frame's trace (0 = none)

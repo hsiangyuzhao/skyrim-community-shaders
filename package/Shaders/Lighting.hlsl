@@ -2212,26 +2212,21 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float2 wetUV = uv * SharedData::skinData.skinDetailParams.y;
 #		endif
 	float2 dynamicWet = Skin::GetWetness(input.WorldPosition.z + FrameBuffer::CameraPosAdjust[eyeIndex].z, worldNormal.xyz);
-	// (44a) Wet Skin model (Characters > Wet Skin). "Original (pre-42c)": the 41b Advanced Skin
+	// (44a) Wet Skin model (Characters > Wet Skin). "Legacy (pre-42c)": the 41b Advanced Skin
 	// film exactly (Perlin coverage, _wet mask, half strength for skins without one); the CPU
-	// also turns the 42c character switches off. "New": one wetness per character from the
-	// manual slider, swimming (hold + dry-off), rain and sweat; soft patches; a broad sheen;
-	// droplets and rivulets on the film only.
-	const bool skinWetNew = Skin::WetSkinNewModel();
+	// also turns the 42c character switches off. (47f) "Physical": the CPU keeps each character's
+	// water; soft patches; a broad sheen; beads and rivulets on the film only. (47o) The Simple
+	// model is gone: "not Legacy" is Physical.
+	const bool skinWetNew = Skin::WetPhysical();
 	float skinFilmStrength = clamp(dynamicWet.x + dynamicWet.y + SharedData::skinData.skinParams2.y, 0.f, 2.f) * (hasSkinWetness ? 1.0 : 0.5);
-	// (42c, 4.3) Rain feeds the same film as swimming and sweat: its share of the strength is
-	// remembered so the sky occlusion can be applied to it later (the probes are sampled after
-	// the normal is final) and so it never raises the G-buffer gloss. (44a) New model: always;
-	// Original: the switch is forced off on the CPU, as before 42c.
+	// (42c, 4.3) The rain on the skin. (47o) Physical keeps the rain itself (CPU); this is only the "rain is falling on it" test of
+	// the generic wet lobes below. Legacy: none ("Rain Wets Advanced Skin" was forced off there and is gone).
 	float skinRainStrength = 0.0;
 #		if defined(WETNESS_EFFECTS)
-	if ((skinWetNew || SharedData::wetnessEffectsSettings.EnableRainSkinFilm) && inWorld)
+	if (skinWetNew && inWorld)
 		skinRainStrength = saturate(SharedData::wetnessEffectsSettings.SkinWetness * SharedData::wetnessEffectsSettings.Wetness);
 #		endif
-	float skinRainShare = 0.0;
 	float skinWetness = 0.0;
-	float skinWetDropDriver = 0.0;   // (44a) how many droplets (0..1)
-	float skinWetDropRainOnly = 0.0; // (44a) 1 when rain is what makes them (sky occlusion applies)
 	float skinWetStreakDriver = 0.0; // (44a) rivulets
 	float skinWetDropMask = 0.0;
 	float skinWetDropRim = 0.0;
@@ -2250,32 +2245,12 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	// (WETNESS_EFFECTS) or right there (without it).
 	Skin::SkinWetDetailSetup skinWetDetail = (Skin::SkinWetDetailSetup)0;
 	bool skinWetDetailPending = false;
-	bool skinWetNoOtherWet = false;  // (47c) no swimming, manual or sweat wetness: only rain
 	// (47i) Physical: the beads' presence (from the pixel's own bead water), their one fade and droplet cells per uv.
-	const bool skinWetPhysical = Skin::WetPhysical();
 	float skinPhysPresence = 0.0;
 	float skinPhysBeadFade = 0.0;
 	float skinPhysCellsPerUV = 1.0;
-	float skinPhysGrowth = 1.0;  // (47j) Beads Fade In: how far the beads here have grown in (1 = all, or off)
-	float skinPhysShrink = 0.0;  // (47j) Beads Shrink and Fade Out on (Physical)
-	[branch] if (skinWetNew && !skinWetPhysical)
-	{
-		const float worldZ = input.WorldPosition.z + FrameBuffer::CameraPosAdjust[eyeIndex].z;
-		// (44b) The same per-character function hair and gear use.
-		float wSwim, wManual, wSweat;
-		const float wDry = Skin::CharDryWetness(worldZ, dynamicWet.x, wSwim, wManual, wSweat);
-		skinWetNoOtherWet = max(max(wSwim, wManual), wSweat) <= 0.0;
-		const float wRain = saturate(skinRainStrength * Skin::wetSkinParams[0].w);
-		const float wAll = 1.0 - (1.0 - wDry) * (1.0 - wRain);
-		skinRainShare = wAll > 0.0 ? saturate((wAll - wDry) / wAll) : 0.0;
-		skinWetness = Skin::WetCoverage(wetUV, wAll, SharedData::skinData.wetParams.x, SharedData::skinData.wetParams.y, SharedData::skinData.wetParams.z);
-		skinWetMask = 1.0;
-		const float dropOthers = max(max(wSwim, wManual), wSweat * 0.5);
-		const float dropRain = wRain * saturate(Skin::wetSkinParams[5].w);
-		skinWetDropDriver = smoothstep(0.35, 0.9, max(dropOthers, dropRain));
-		skinWetDropRainOnly = dropRain > dropOthers ? 1.0 : 0.0;
-		skinWetStreakDriver = max(smoothstep(0.2, 0.85, max(wSwim, wManual)), wRain);  // (44b) still running while drying off
-	} else if (skinWetNew) {
+	float skinPhysGrowth = 1.0;  // (47j) Beads Fade In: how far the beads here have grown in (1 = all)
+	[branch] if (skinWetNew) {
 		// (47i) Physical: this pixel's water (um) from the character's sweat, rain and swim height profile, times where each
 		// gathers and the wet patches; split into bead water and film water by the beading share. The rain amount already
 		// holds the shelter (CPU): no sky occlusion on top.
@@ -2297,7 +2272,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		// (47j) Beads Fade In From the Film: the swim film breaks up between 200 and 120 um, first where the patch noise is
 		// low; the noise only while breaking up (then the swim water is over 120 um: the coverage above skipped it).
 		float breakNoise = 0.5;
-		[branch] if (Skin::WetPhysFlag(Skin::kPhysFlagFadeIn) && vSwim > Skin::kPhysBreakLo && vSwim < Skin::kPhysBreakHi && Skin::wetPhysParams[1].z > 0.0)
+		[branch] if (vSwim > Skin::kPhysBreakLo && vSwim < Skin::kPhysBreakHi && Skin::wetPhysParams[1].z > 0.0)
 			breakNoise = Skin::WetPatchNoise(wetUV, max(length(wetdUVdx), length(wetdUVdy)), SharedData::skinData.wetParams.x, SharedData::skinData.wetParams.y, SharedData::skinData.wetParams.z);
 		const float swimBeadShare = Skin::WetPhysSwimBeadShareEx(vSwim, breakNoise);
 		const float vBead = (vSweat * saturate(Skin::wetPhysParams[1].x) + vRain * saturate(Skin::wetPhysParams[1].y) + vSwim * swimBeadShare) * patch;
@@ -2320,22 +2295,18 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		float beadDrawn = 1.0;
 		[branch] if (skinPhysPresence < physPresenceRaw)
 			beadDrawn = skinPhysPresence / max(physPresenceRaw, 1e-4);
-		[branch] if (Skin::WetPhysFlag(Skin::kPhysFlagFadeIn) && vBeadSwim > 0.0)
+		[branch] if (vBeadSwim > 0.0)
 		{
 			skinPhysGrowth = 1.0 - (vBeadSwim / max(vBead, 1e-4)) * (1.0 - Skin::WetPhysBreakup(vSwim, breakNoise));
 			beadDrawn *= Skin::WetPhysGrowthShare(skinPhysGrowth);
 		}
-		skinPhysShrink = Skin::WetPhysFlag(Skin::kPhysFlagShrink) ? 1.0 : 0.0;
-		[branch] if (skinPhysShrink > 0.0)
-			beadDrawn *= Skin::WetPhysShrinkShare(skinPhysPresence);
+		beadDrawn *= Skin::WetPhysShrinkShare(skinPhysPresence);  // (47j) Beads Shrink and Fade Out ((47o) permanent)
 		skinWetness = saturate((vFilm + vBead * (1.0 - saturate(Skin::wetPhysParams[3].x) * skinPhysBeadFade * beadDrawn)) / Skin::kPhysFilmFull);
 		skinWetMask = 1.0;
-		skinWetDropDriver = skinPhysPresence > 0.0 ? 1.0 : 0.0;
-		skinWetDropRainOnly = 0.0;
 		skinWetStreakDriver = Skin::WetPhysTrail(swimTrail, sweatRegion, rainRegion) * saturate(wn * 4.0);
 	} else {
-		skinRainShare = skinRainStrength / max(skinFilmStrength + skinRainStrength, 1e-4);
-		skinWetness = Skin::PerlinNoise(wetUV, SharedData::skinData.wetParams.x, SharedData::skinData.wetParams.y, SharedData::skinData.wetParams.z, min(skinFilmStrength + skinRainStrength, 2.f));
+		// Legacy: no rain on the film (skinRainStrength is 0 here).
+		skinWetness = Skin::PerlinNoise(wetUV, SharedData::skinData.wetParams.x, SharedData::skinData.wetParams.y, SharedData::skinData.wetParams.z, min(skinFilmStrength, 2.f));
 	}
 	if ((SharedData::skinData.skinDetailParams.w > 0.0f || skinWetness > 0.0f) && skinEnabled) {
 #		if defined(FACEGEN)
@@ -2360,7 +2331,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		originalWorldNormal = worldNormal.xyz;
 		wetWorldNormal = worldNormal.xyz;
 		if (skinWetness > 0.0f && skinWetNew) {
-			// (44a) New model: the skin keeps its own normal; only the water film gets the droplet
+			// (44a) Physical: the skin keeps its own normal; only the water film gets the droplet
 			// domes (inside each bead only). Droplets and rivulets live in uv cells, so they stay
 			// put on a moving character; gravity is world down projected on the surface.
 			const float3 dPdx = wetdPdx;
@@ -2379,34 +2350,27 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			gravityUV = dot(gravityUV, gravityUV) > 1e-20 ? normalize(gravityUV) : float2(0.0, 1.0);
 
 #		if defined(FACEGEN)
-			const float cellsPerUV = 140.0 / clamp(Skin::wetSkinParams[3].x, 0.25, 4.0);
 			const float faceDroplets = saturate(Skin::wetSkinParams[3].z);
 			const float faceRivulets = saturate(Skin::wetCharParams[6].z);  // (44e) Rivulets on Face
 			const float rivuletColumnsPerUV = 11.0;  // (44b) the face uv covers the head: same size in cm
 #		else
-			const float cellsPerUV = 320.0 / clamp(Skin::wetSkinParams[3].x, 0.25, 4.0);
 			const float faceDroplets = 1.0;
 			const float faceRivulets = 1.0;
 			const float rivuletColumnsPerUV = 25.0;  // (44b) about 3 cm per rivulet column on the body
 #		endif
-			// (47c) Distance LOD (Faster Noise & Distance LOD; 1 when off): droplets and rivulets fade
-			// out on characters far away, the wet sheen and darkening stay.
+			// (47c) Distance LOD: rivulets fade out on characters far away, the wet sheen and darkening stay.
 			const float detailLOD = Skin::WetDetailLOD(wetPixelWorld);
 			// (47i) Physical: cells sized by the character's drawn bead radius, one fade for all beads (set up above).
-			const float dropCellsPerUV = skinWetPhysical ? skinPhysCellsPerUV : cellsPerUV;
+			const float dropCellsPerUV = skinPhysCellsPerUV;
 			const float footprint = max(max(length(dUVdx), length(dUVdy)) * dropCellsPerUV, 1e-6);
-			// Beads are about 0.3 cell in radius: fade them out below ~1.5 pixels (no DLSS sparkle).
-			const float dropVisibility = skinWetPhysical ? skinPhysBeadFade : Skin::WetDropVisibility(footprint) * detailLOD;
-			// More beads where water rests (shoulders, chest), fewer on undersides.
-			const float restFactor = lerp(0.7, 1.2, saturate(baseN.z * 0.5 + 0.5));
+			const float dropVisibility = skinPhysBeadFade;
 			skinWetDetail.wetUV = wetUV;
 			skinWetDetail.cellUV = wetUV * dropCellsPerUV;
 			skinWetDetail.footprint = footprint;
 			skinWetDetail.uvFootprint = max(length(dUVdx), length(dUVdy));
 			skinWetDetail.gravityUV = gravityUV;
 			skinWetDetail.alignment = alignment;
-			skinWetDetail.presence = skinWetPhysical ? skinPhysPresence * faceDroplets :
-			                                           saturate(Skin::wetSkinParams[2].w) * saturate(Skin::wetSkinParams[2].z) * skinWetDropDriver * restFactor * faceDroplets * (dropVisibility > 0.0 ? 1.0 : 0.0);
+			skinWetDetail.presence = skinPhysPresence * faceDroplets;
 			skinWetDetail.dropVisibility = dropVisibility;
 			skinWetDetail.streakDriver = skinWetStreakDriver;
 			skinWetDetail.rivuletColumnsPerUV = rivuletColumnsPerUV;
@@ -2416,8 +2380,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			skinWetDetail.tu = dot(dPdu, dPdu) > 1e-20 ? normalize(dPdu) : float3(1.0, 0.0, 0.0);
 			skinWetDetail.tv = dot(dPdv, dPdv) > 1e-20 ? normalize(dPdv) : float3(0.0, 1.0, 0.0);
 			skinWetDetail.domeStrength = clamp(Skin::wetSkinParams[5].z, 0.0, 2.0);
-			skinWetDetail.growth = skinWetPhysical ? skinPhysGrowth : 1.0;  // (47j)
-			skinWetDetail.shrink = skinWetPhysical ? skinPhysShrink : 0.0;
+			skinWetDetail.growth = skinPhysGrowth;  // (47j)
+			skinWetDetail.shrink = 1.0;             // (47j) Beads Shrink and Fade Out ((47o) permanent)
 			skinWetDetailPending = true;
 #		if !defined(WETNESS_EFFECTS)
 			// No sky occlusion without Wetness Effects: the droplets and rivulets right here.
@@ -2673,9 +2637,10 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 				float3 snowPositionMS = input.WorldPosition.xyz;
 #			endif
 				// (46d) Characters whose snow the CPU keeps with its roof test: no per-pixel sky test (it erased
-				// their snow under eaves; under a roof their snow now just stops building up).
+				// their snow under eaves; under a roof their snow now just stops building up). (47o) The roof test is permanent: every
+				// character with its own snow state (FlagCharacterSnowState).
 #			if defined(CS_SKIN)
-				const bool snowRoofsByCpu = snowOnActor && (snowFlags & DynamicSnow::FlagCharacterRoofs);
+				const bool snowRoofsByCpu = snowOnActor && (snowFlags & DynamicSnow::FlagCharacterSnowState);
 #			else
 				const bool snowRoofsByCpu = false;
 #			endif
@@ -2697,9 +2662,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 				worldNormal = normalize(lerp(worldNormal, snowGeometryNormal, dynamicSnowCoverage * 0.5));
 #		else
 				// (batch 39c) Thick snow hides the material's relief completely: its own normal is the
-				// geometry's (39b kept 20% of the normal map under full cover). (40e) Under Even Cover
-				// only SnowSmoothing of it (default 0.2): snow follows the bumps below it.
-				worldNormal = normalize(lerp(worldNormal, snowGeometryNormal, dynamicSnowCoverage * ((snowFlags & DynamicSnow::FlagCoverageSlope) ? DynamicSnow::SnowSmoothing() : 0.8)));
+				// geometry's (39b kept 20% of the normal map under full cover). (47o) The 40e Even Cover branch (never set since 44h) is gone.
+				worldNormal = normalize(lerp(worldNormal, snowGeometryNormal, dynamicSnowCoverage * 0.8));
 #		endif
 				// Snow is never smoother than SnowRoughness, and never makes a matte surface
 				// shinier: SSRT/NRD only ever see roughness go up on snow.
@@ -2773,7 +2737,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float hairClumpL = 0.0;     // (47c) clump coordinates, for Skip Invisible Work (clumps only where wet)
 	float hairClumpS = 0.0;
 #		if defined(CS_SKIN) && defined(WETNESS_EFFECTS)
-	[branch] if (skinEnabled && SharedData::hairSpecularSettings.Enabled && Skin::WetSkinNewModel() && Skin::wetCharParams[1].x > 0.5)
+	[branch] if (skinEnabled && SharedData::hairSpecularSettings.Enabled && Skin::WetPhysical() && Skin::wetCharParams[1].x > 0.5)
 	{
 		const float3 dPdx = ddx(input.WorldPosition.xyz);
 		const float3 dPdy = ddy(input.WorldPosition.xyz);
@@ -2792,9 +2756,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		const float clumpCount = clamp(Skin::wetCharParams[2].w, 16.0, 128.0);
 		hairClumpL = dot(uv, tUV);
 		hairClumpS = dot(uv, aUV) * clumpCount;
-		// (47c) Skip Invisible Work: computed below, only where the hair is wet (hairWetK > 0).
-		[branch] if (!Skin::WetSkipInvisible())
-			Skin::WetHairClump(hairClumpL, hairClumpS, hairClumpX, hairClumpR);
+		// (47c) Skip Invisible Work: the clumps are computed below, only where the hair is wet (hairWetK > 0).
 		const float sPerPixel = max(abs(dot(dUVdx, aUV)), abs(dot(dUVdy, aUV))) * clumpCount;
 		hairClumpFade = smoothstep(2.5, 5.0, 1.0 / max(sPerPixel, 1e-6));
 	}
@@ -3242,16 +3204,14 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float averageRoughness = lerp(skinSurfaceProperties.RoughnessPrimary, skinSurfaceProperties.RoughnessSecondary, skinSurfaceProperties.SecondarySpecIntensity);
 
 	float pbrWeight = 1;
-	// (42c) The rain part of the film (skinRainShare, 0 unless "Rain Wets Advanced Skin") is
-	// left out of the G-buffer gloss: SSRT/NRD see the same roughness as before 42c.
-	float pbrGlossiness = lerp(1 - averageRoughness, 1 - WATER_ROUGHNESS, saturate(Skin::GetWetnessOpticalResponse(skinSurfaceProperties.Wetness) * skinSurfaceProperties.WetnessFilmStrength) * (1.0 - skinRainShare));
-	// (44a) New model: the film's own roughness (>= 0.2) and response. Either model: the gloss the
+	// (42c) (47o) No rain share in the film any more (Legacy had "Rain Wets Advanced Skin" forced off, Physical keeps its own).
+	float pbrGlossiness = lerp(1 - averageRoughness, 1 - WATER_ROUGHNESS, saturate(Skin::GetWetnessOpticalResponse(skinSurfaceProperties.Wetness) * skinSurfaceProperties.WetnessFilmStrength));
+	// (44a) Physical: the film's own roughness (>= 0.2) and response. Either model: the gloss the
 	// reflections (SSRT / IBL) see on skin never exceeds 0.8, i.e. roughness >= 0.2 (anti-mirror).
 	[branch] if (skinWetNew)
 	{
-		// (47f) + oil (0 outside Physical). (47i) Physical: the film water's response W^0.7 (oil as before).
-		const float skinWetResponse = Skin::WetPhysical() ? max(Skin::WetFilmResponse(skinSurfaceProperties.Wetness), pow(0.9 * Skin::WetOil(), 1.3)) :
-		                                                    pow(max(saturate(skinSurfaceProperties.Wetness), 0.9 * Skin::WetOil()), 1.3);
+		// (47f) + oil. (47i) Physical: the film water's response W^0.7 (oil as before).
+		const float skinWetResponse = max(Skin::WetFilmResponse(skinSurfaceProperties.Wetness), pow(0.9 * Skin::WetOil(), 1.3));
 		const float skinWetFilmRoughness = max(lerp(Skin::wetSkinParams[1].y, Skin::wetSkinParams[1].z, skinWetResponse), 0.2);
 		pbrGlossiness = lerp(1 - averageRoughness, 1 - skinWetFilmRoughness, saturate(skinWetResponse * Skin::wetSkinParams[1].w));
 	}
@@ -3318,13 +3278,12 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	                                (SharedData::wetnessEffectsSettings.EnableRaindropFx) &&
 	                                (wetnessOcclusion > 0.5);
 
-	// (46y) Raindrops: Fast Path (Wetness Effects > Raindrops). Raindrop cells smaller than a pixel: the world size of one
-	// pixel here (the smaller of the two screen axes, so grazing ground is not cut early) against the grid; full effect up
+	// (46y) Raindrops: Fast Path and Skip Sub-Pixel Drops ((47o) permanent). Raindrop cells smaller than a pixel: the world size of
+	// one pixel here (the smaller of the two screen axes, so grazing ground is not cut early) against the grid; full effect up
 	// to half a cell per pixel, none from one cell per pixel on (the drops are sub-pixel noise there). Top level: derivatives.
-	const uint raindropFlags = SharedData::wetnessEffectsSettings.EnableVanillaRipples;
 	const float3 raindropDdx = ddx(input.WorldPosition.xyz), raindropDdy = ddy(input.WorldPosition.xyz);
 	const float raindropCellsPerPixel = sqrt(min(dot(raindropDdx, raindropDdx), dot(raindropDdy, raindropDdy))) * SharedData::wetnessEffectsSettings.RaindropGridSizeRcp;
-	const float raindropFade = (raindropFlags & WetnessEffects::kRaindropSubPixelSkip) ? saturate(2.0 - 2.0 * raindropCellsPerPixel) : 1.0;
+	const float raindropFade = saturate(2.0 - 2.0 * raindropCellsPerPixel);
 
 	if (shouldCalculateRaindrops) {
 #		if defined(SKINNED)
@@ -3334,7 +3293,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		else
 		float3 ripplePosition = !FrameBuffer::FrameParams.y ? input.ModelPosition.xyz : input.WorldPosition.xyz + FrameBuffer::CameraPosAdjust[eyeIndex].xyz;
 #		endif
-		[branch] if (raindropFlags & WetnessEffects::kRaindropFastPath)
 		{
 			// Splashes only matter where they can raise the rain wetness below (max(rainWetness, splash), splash <= Strength);
 			// skin and hair replace their rain wetness right after, so they never show. Ripples only with a strength above 0
@@ -3352,10 +3310,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 				raindropInfo = WetnessEffects::GetRainDropsFast(ripplePosition, SharedData::wetnessEffectsSettings.Time, worldNormal, rippleModifier, raindropSplashes, raindropRipples);
 				raindropInfo.w *= raindropFade;
 			}
-		}
-		else
-		{
-			raindropInfo = WetnessEffects::GetRainDrops(ripplePosition, SharedData::wetnessEffectsSettings.Time, worldNormal, flatnessAmount);
 		}
 	}
 
@@ -3377,8 +3331,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	bool gearWetNew = false;    // gear: the New per-class gear model
 	float4 gearClass = float4(1.0, 0.0, 0.0, 0.0);  // cloth, leather, metal weights; w = fur
 	float4 gearParams = 0.0;    // blended class darkening, sheen, roughness floor, dry multiplier
-	float gearSwimProgress = 0.0;
-	float charWetSwim = 0.0, charWetManual = 0.0, charWetSweat = 0.0;
 	float3 geardPdx = 0.0, geardPdy = 0.0;
 	float2 gearUVdx = 0.0, gearUVdy = 0.0;
 	float gearNormalVariance = 0.0;
@@ -3393,47 +3345,35 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #			if defined(TRUE_PBR)
 		dynamicWetness.x = lerp(dynamicWetness.x, 0.0f, pbrSurfaceProperties.Metallic);
 #			endif
-		[branch] if (Skin::WetSkinNewModel())
+		[branch] if (Skin::WetPhysical())
 		{
 			float wSwim = 0.0, wManual = 0.0, wSweat = 0.0;
 #			if defined(HAIR)
-			// (44c) Hair: its own drying time (x Hair Dry Time) and sweat share; rain weighted like skin.
+			// (44c) Hair: its own drying time (x Hair Dry Time) and sweat share.
 			charWetNew = wetCharacter;
 			[branch] if (wetCharacter && Skin::wetCharParams[1].x > 0.5)
 			{
 				hairWetActive = true;
-				[branch] if (!Skin::WetPhysical())
-				{
-					float progress;
-					const float swimHair = Skin::CharSwimClass(clamp(Skin::wetCharParams[0].z, 0.25, 4.0), progress);
-					charDryWetness = Skin::CharDryWetnessClass(charWorldZ, dynamicWetness.x, swimHair, 0.0, saturate(Skin::wetCharParams[0].w), wSwim, wManual, wSweat);
-					rainWetness *= saturate(Skin::wetSkinParams[0].w);
-				}
-				else
-				{
-					// (47i) Physical: the hair's water (um): swim from the height profile with the hair's dry multiplier, rain
-					// on the head, and its share of the sweat (manual Sweat included) as a damp hairline with the crown drier
-					// (47g: slight clumping and darkening at most; no beads on hair in any model).
-					// (47k) Water Line Follows the Body: the stored line and the hairline by the body-fixed height.
-					const float h = Skin::CharBodyHeight(input.ModelPosition.xyz, charWorldZ);
-					float hairTrail;
-					const float vSwim = Skin::WetPhysSwimWater(Skin::WetPhysBandBody(input.ModelPosition.xyz, h, charWorldZ - Skin::skinPerGeometry.z), clamp(Skin::wetCharParams[0].z, 0.25, 4.0), hairTrail);
-					const float vRain = Skin::wetPhysParams[0].y * 1.15;
-					const float hairline = lerp(1.0, 0.45, smoothstep(118.0, 126.0, h));
-					wSwim = saturate(vSwim / Skin::kPhysHold);
-					wManual = 0.0;
-					wSweat = min(Skin::wetPhysParams[0].x * saturate(Skin::wetCharParams[0].w) * hairline / Skin::kPhysHold, 0.6);
-					charDryWetness = 1.0 - (1.0 - saturate((vSwim + vRain) / Skin::kPhysHold)) * (1.0 - wSweat);
-					rainWetness = 0.0;
-				}
+				// (47i) Physical: the hair's water (um): swim from the height profile with the hair's dry multiplier, rain
+				// on the head, and its share of the sweat (manual Sweat included) as a damp hairline with the crown drier
+				// (47g: slight clumping and darkening at most; no beads on hair in any model).
+				// (47k) Water Line Follows the Body: the stored line and the hairline by the body-fixed height.
+				const float h = Skin::CharBodyHeight(input.ModelPosition.xyz, charWorldZ);
+				float hairTrail;
+				const float vSwim = Skin::WetPhysSwimWater(Skin::WetPhysBandBody(input.ModelPosition.xyz, h, charWorldZ - Skin::skinPerGeometry.z), clamp(Skin::wetCharParams[0].z, 0.25, 4.0), hairTrail);
+				const float vRain = Skin::wetPhysParams[0].y * 1.15;
+				const float hairline = lerp(1.0, 0.45, smoothstep(118.0, 126.0, h));
+				wSwim = saturate(vSwim / Skin::kPhysHold);
+				wManual = 0.0;
+				wSweat = min(Skin::wetPhysParams[0].x * saturate(Skin::wetCharParams[0].w) * hairline / Skin::kPhysHold, 0.6);
+				charDryWetness = 1.0 - (1.0 - saturate((vSwim + vRain) / Skin::kPhysHold)) * (1.0 - wSweat);
+				rainWetness = 0.0;
 			}
 			else
 				rainWetness = 0.0;  // Wet Hair off: not wet at all
 #			else
-			const float gearMode = Skin::wetCharParams[4].x;  // 0 off, 1 New, 2 42c (44b)
-			if (wetCharacter && gearMode > 1.5) {
-				charDryWetness = Skin::CharDryWetness(charWorldZ, dynamicWetness.x, wSwim, wManual, wSweat);
-			} else if (wetCharacter && gearMode > 0.5) {
+			const float gearMode = Skin::wetCharParams[4].x;  // 0 off, 1 on ((47o) the 42c gear model is gone)
+			if (wetCharacter && gearMode > 0.5) {
 				// (44c) Gear: a soft per-pixel material class (cloth / leather / metal, fur), each with
 				// its own darkening, sheen, roughness floor and drying time.
 				charWetNew = true;
@@ -3461,31 +3401,12 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #				endif
 				gearClass = Skin::GearClassWeights(m0, g0, l0, gearFur);
 				gearParams = Skin::GearClassParams(gearClass);
-				// Swimming per class (cloth stays wet longest), blended like the other parameters.
-				// (47i) Physical: its own swim water from the height profile below (the Simple clocks are not evaluated).
-				const bool gearPhysical = Skin::WetPhysical();
-				float swimGear = 0.0;
-				[branch] if (!gearPhysical)
-				{
-					float pC, pL, pM, pF;
-					const float sC = Skin::CharSwimClass(Skin::wetCharParams[7].w, pC);
-					const float sL = Skin::CharSwimClass(Skin::wetCharParams[8].w, pL);
-					const float sM = Skin::CharSwimClass(Skin::wetCharParams[9].w, pM);
-					const float sF = Skin::CharSwimClass(Skin::wetCharParams[10].w, pF);
-					swimGear = lerp(gearClass.x * sC + gearClass.y * sL + gearClass.z * sM, sF, gearClass.w);
-					gearSwimProgress = lerp(gearClass.x * pC + gearClass.y * pL + gearClass.z * pM, pF, gearClass.w);
-				}
-				// Cloth wicks water a few units above the water line (irregular tide mark), and the
-				// line recedes while drying: the top dries first, the hem last.
+				// Cloth wicks water a few units above the water line (irregular tide mark).
 				const float clothW = gearClass.x * (1.0 - gearClass.w);
 				const float wick = max(Skin::wetCharParams[4].w, 0.0) * clothW;
 				const float tide = (Skin::WetValueNoise(uv * 40.0) - 0.5) * 4.0 * clothW;
-				const float recede = 0.6 * Skin::wetSkinPerGeometry.y * gearSwimProgress;
 				// (47g) Physical: sweat makes gear wet by wicking only, cloth most, leather a little, metal not at all.
-				const float gearSweatShare = saturate(Skin::wetCharParams[5].x) * (gearPhysical ? Skin::WetGearSweatClass(gearClass) : 1.0);
-				[branch] if (!gearPhysical)
-					charDryWetness = Skin::CharDryWetnessClass(charWorldZ, dynamicWetness.x, swimGear, wick + tide - recede, gearSweatShare, wSwim, wManual, wSweat);
-				[branch] if (gearPhysical)
+				const float gearSweatShare = saturate(Skin::wetCharParams[5].x) * Skin::WetGearSweatClass(gearClass);
 				{
 					// (47i) Physical: the gear's water (um): swim from the height profile per class (its dry multiplier; cloth
 					// wicks the line up by Cloth Wicking with a tide mark), its wicking share of the sweat (manual Sweat
@@ -3513,7 +3434,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 					// grow in by the break-up.
 					const float gearSwimBead = vSwim * Skin::WetPhysSwimBeadShareEx(vSwim, 0.5);
 					gearPhysBead = vRain * saturate(Skin::wetPhysParams[1].y) + gearSwimBead;
-					gearPhysGrowth = Skin::WetPhysFlag(Skin::kPhysFlagFadeIn) && gearSwimBead > 0.0 ? 1.0 - (gearSwimBead / max(gearPhysBead, 1e-4)) * (1.0 - Skin::WetPhysBreakup(vSwim, 0.5)) : 1.0;
+					gearPhysGrowth = gearSwimBead > 0.0 ? 1.0 - (gearSwimBead / max(gearPhysBead, 1e-4)) * (1.0 - Skin::WetPhysBreakup(vSwim, 0.5)) : 1.0;
 					gearPhysTrail = saturate(max(swimTrail, Skin::wetPhysParams[2].z * rainRegion)) * saturate(charDryWetness * 4.0);
 					rainWetness = 0.0;
 				}
@@ -3532,9 +3453,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 				rainWetness = 0.0;  // Wet Gear off: no character wetness (world surfaces untouched)
 			}
 #			endif
-			charWetSwim = wSwim;
-			charWetManual = wManual;
-			charWetSweat = wSweat;
 		}
 		else
 		{
@@ -3564,7 +3482,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	// Apply occlusion and distance factors
 	puddle *= wetnessOcclusion * nearFactor;
-	const float charRainPart = saturate(puddle);  // (44c) the sky-occluded rain part (gear droplets, rivulets)
 	// (44b) Wet Skin New model, hair and gear: swimming, manual and sweat are not sky-occluded.
 	[branch] if (charDryWetness > 0.0)
 		puddle = max(puddle, 1.0 - (1.0 - saturate(puddle)) * (1.0 - saturate(charDryWetness)));
@@ -3609,7 +3526,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	// (44b) Wet Skin New model owns hair wetness: hair writes its dry G-buffer values (gloss,
 	// reflectance), so SSRT / NRD see wet hair exactly as dry hair.
 #		if defined(HAIR) && defined(CS_SKIN)
-	const bool hairWetNew = skinEnabled && Skin::WetSkinNewModel();
+	const bool hairWetNew = skinEnabled && Skin::WetPhysical();
 #		else
 	const bool hairWetNew = false;
 #		endif
@@ -3644,9 +3561,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			Hair::WetTRT = lerp(1.0, 1.0 - saturate(Skin::wetCharParams[2].x), hairWetK);
 			Hair::WetScatter = 1.0 - saturate(Skin::wetCharParams[2].y) * hairWetK;
 			Hair::WetSpecAA = hairWetSpecAA;
-			// (47c) Skip Invisible Work: the clump noise left out above for dry hair, here instead.
-			[branch] if (Skin::WetSkipInvisible())
-				Skin::WetHairClump(hairClumpL, hairClumpS, hairClumpX, hairClumpR);
+			// (47c) Skip Invisible Work: the clump noise only for wet hair, here.
+			Skin::WetHairClump(hairClumpL, hairClumpS, hairClumpX, hairClumpR);
 			// Clumps: strength from the wetness, faded out where a clump is narrower than ~3 px.
 			const float clump = saturate(Skin::wetCharParams[2].z) * smoothstep(0.3, 0.9, hairWetW) * hairClumpFade;
 			const float x = hairClumpX;
@@ -3680,11 +3596,13 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			float dropMask = 0.0, dropRim = 0.0, streak = 0.0;
 			float2 dropSlope = 0.0;
 			float3 tu = float3(1.0, 0.0, 0.0), tv = float3(0.0, 1.0, 0.0);
-			const float dropDensity = saturate(Skin::wetSkinParams[2].w) * (gearClass.z * saturate(Skin::wetCharParams[6].x) + gearClass.y * saturate(Skin::wetCharParams[5].z)) * (1.0 - gearClass.w);
+			// (47i) The class sliders (Leather / Metal Droplets). (47o) The gate no longer includes the Simple model's Droplet
+			// Density (it was > 0 for everyone who had Physical).
+			const float classDroplets = (gearClass.z * saturate(Skin::wetCharParams[6].x) + gearClass.y * saturate(Skin::wetCharParams[5].z)) * (1.0 - gearClass.w);
 			const float rivAmount = (gearClass.z * saturate(Skin::wetCharParams[6].y) + gearClass.y * saturate(Skin::wetCharParams[5].w)) * (1.0 - gearClass.w);
-			// (47c) Distance LOD (Faster Noise & Distance LOD; 1 when off): no droplets or rivulets on gear far away.
+			// (47c) Distance LOD: no droplets or rivulets on gear far away.
 			const float gearDetailLOD = Skin::WetDetailLOD(gearPixelWorld);
-			[branch] if ((dropDensity > 0.0 || rivAmount > 0.0) && wChar > 0.0 && gearDetailLOD > 0.0)
+			[branch] if ((classDroplets > 0.0 || rivAmount > 0.0) && wChar > 0.0 && gearDetailLOD > 0.0)
 			{
 				const float3 baseN = worldNormal.xyz;
 				const float uvDet = gearUVdx.x * gearUVdy.y - gearUVdx.y * gearUVdy.x;
@@ -3701,30 +3619,15 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 				tu = dot(dPdu, dPdu) > 1e-20 ? normalize(dPdu) : tu;
 				tv = dot(dPdv, dPdv) > 1e-20 ? normalize(dPdv) : tv;
 
-				const float dropOthers = max(charWetSwim, charWetManual);
-				const float dropRain = charRainPart * saturate(Skin::wetSkinParams[5].w);
-				float dropDriver = smoothstep(0.35, 0.9, max(dropOthers, dropRain));
-				const bool gearDropPhysical = Skin::WetPhysical();
 				// (47i) Physical: cells sized by the character's drawn bead radius (50.3 cm of gear per uv), one fade for all beads.
-				const float cellsPerUV = gearDropPhysical ? Skin::WetPhysCellsPerUV(50.3) : 230.0 / clamp(Skin::wetSkinParams[3].x, 0.25, 4.0);
+				const float cellsPerUV = Skin::WetPhysCellsPerUV(50.3);
 				const float footprint = max(uvFootprint * cellsPerUV, 1e-6);
-				// Beads are about 0.3 cell in radius: fade them out below ~1.5 pixels (no DLSS sparkle).
-				const float dropVisibility = gearDropPhysical ? Skin::WetPhysBeadFade(50.3, uvFootprint, gearDetailLOD) : Skin::WetDropVisibility(footprint) * gearDetailLOD;
-				const float restFactor = lerp(0.7, 1.2, saturate(baseN.z * 0.5 + 0.5));
-				float streakDriver = max(smoothstep(0.2, 0.85, dropOthers), charRainPart);
-				float presence;
-				[branch] if (gearDropPhysical)
-				{
-					// (47i) The pixel's bead water (rain and swim; no sweat beads on gear) x the character's presence per um; the
-					// class sliders (Leather / Metal Droplets) scale it.
-					const float classDroplets = (gearClass.z * saturate(Skin::wetCharParams[6].x) + gearClass.y * saturate(Skin::wetCharParams[5].z)) * (1.0 - gearClass.w);
-					// (47k) Bead Coalescence Cap: at most c_cap's presence.
-					presence = dropVisibility > 0.0 ? Skin::WetPhysPresenceCap(saturate(gearPhysBead * Skin::wetPhysParams[2].y)) * classDroplets : 0.0;
-					streakDriver = gearPhysTrail;
-				}
-				else
-					presence = dropDensity * dropDriver * restFactor * (dropVisibility > 0.0 ? 1.0 : 0.0);
-				const Skin::WetSkinDetail detail = Skin::WetSkinDroplets(uv * cellsPerUV, footprint, gravityUV, alignment, presence, streakDriver, gearDropPhysical ? gearPhysGrowth : 1.0, gearDropPhysical && Skin::WetPhysFlag(Skin::kPhysFlagShrink) ? 1.0 : 0.0);
+				const float dropVisibility = Skin::WetPhysBeadFade(50.3, uvFootprint, gearDetailLOD);
+				const float streakDriver = gearPhysTrail;
+				// (47i) The pixel's bead water (rain and swim; no sweat beads on gear) x the character's presence per um, x the class
+				// sliders. (47k) Bead Coalescence Cap: at most c_cap's presence.
+				const float presence = dropVisibility > 0.0 ? Skin::WetPhysPresenceCap(saturate(gearPhysBead * Skin::wetPhysParams[2].y)) * classDroplets : 0.0;
+				const Skin::WetSkinDetail detail = Skin::WetSkinDroplets(uv * cellsPerUV, footprint, gravityUV, alignment, presence, streakDriver, gearPhysGrowth, 1.0);
 				dropMask = detail.dropMask * dropVisibility;
 				dropRim = detail.dropRim * dropMask;
 				dropSlope = detail.dropSlope;
@@ -3767,28 +3670,12 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	}
 #		endif
 
-	// (42c) Character wetness: 4.3 occlusion for the rain-fed skin film, 4.2 darkening, 4.1 film.
+	// (42c) Character wetness: 4.2 darkening, 4.1 film. (47o) The 4.3 sky occlusion of the rain share is gone: Physical keeps the
+	// rain (and its shelter) on the CPU, Legacy had no rain on the skin.
 #		if defined(SKIN) && defined(CS_SKIN)
-	// (47c) The skin's droplets and rivulets (set up with the coverage above). Skip Invisible Work:
-	// left out where the sky is fully occluded (factor 0) and rain is the only water on this
-	// character: the occlusion below multiplies the rain droplets by exactly 0 (drop-only-from-rain
-	// = 1) and the rivulets by 1 - rainShare, which is 0 up to one division rounding (rainShare =
-	// wAll / wAll); the film then has no energy, so the bead domes in wetWorldNormal are unused.
+	// (47c) The skin's droplets and rivulets (set up with the coverage above).
 	[branch] if (skinWetDetailPending)
-	{
-		const bool rainDetailHidden = Skin::WetSkipInvisible() && skinWetNoOtherWet && saturate(wetnessOcclusion * nearFactor) <= 0.0;
-		[branch] if (!rainDetailHidden)
-			Skin::SkinWetDetail(skinWetDetail, skinWetDropMask, skinWetDropRim, skinWetStreak, wetWorldNormal);
-		else
-			wetWorldNormal = normalize(skinWetDetail.baseN);
-	}
-	// 4.3: the rain share of the Advanced Skin film follows the same sky occlusion as the rest
-	// of Wetness Effects (a character under a roof is not rained on).
-	skinSurfaceProperties.Wetness *= lerp(1.0, saturate(wetnessOcclusion * nearFactor), skinRainShare);
-	// (44a) New model: droplets made by rain, and the rain's rivulets, follow it too.
-	skinWetDropMask *= lerp(1.0, saturate(wetnessOcclusion * nearFactor), skinWetDropRainOnly);
-	skinWetDropRim *= lerp(1.0, saturate(wetnessOcclusion * nearFactor), skinWetDropRainOnly);
-	skinWetStreak *= lerp(1.0, saturate(wetnessOcclusion * nearFactor), skinRainShare);
+		Skin::SkinWetDetail(skinWetDetail, skinWetDropMask, skinWetDropRim, skinWetStreak, wetWorldNormal);
 #		endif
 
 #		if defined(WET_CHARACTER_PERM)
@@ -4012,13 +3899,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		endif  // LANDSCAPE
 	}
 #	endif  // defined(EMAT) && (defined(SKINNED) || !defined(MODELSPACENORMALS))
-
-#	if defined(DYNAMIC_SNOW_SURFACE)
-	// (batch 39c) Snow fills the material's relief, so its parallax self-shadow fades with the cover.
-	// (40e) Only by SnowSmoothing (default 0.2): the relief still shades the snow on it.
-	if (SharedData::dynamicSnowSettings.Flags & DynamicSnow::FlagCoverageSlope)
-		parallaxShadow = lerp(parallaxShadow, 1.0, dynamicSnowCoverage * DynamicSnow::SnowSmoothing());
-#	endif
 
 	if (dirShadow != 0.0 && (inWorld || inReflection))
 		dirShadow *= ShadowSampling::GetWorldShadow(input.WorldPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, eyeIndex);
@@ -4252,15 +4132,13 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	// non-RT casters, z not ray traced: screen-space and / or shadow map, w no shadow), weighted by each light's brightness here.
 	const bool ssplsCoverageView = (SharedData::ssplsSettings.Enable & ScreenSpacePointLightShadows::SettingFlags::CoverageView) != 0;
 	float4 ssplsCoverage = 0.0;
-	// (47h) "Skip Screen-Space Light Shadows on Translucent Surfaces": a forward (blended) fragment that is not the surface in the
-	// depth buffer (the tolerance of RTPointShadows::Get) gets no screen-space light shadows: the search would read the surfaces
-	// behind it. Forward surfaces that are in the depth buffer keep them.
+	// (47h) "Skip Screen-Space Light Shadows on Translucent Surfaces" ((47o) permanent): a forward (blended) fragment that is not the
+	// surface in the depth buffer (the tolerance of RTPointShadows::Get) gets no screen-space light shadows: the search would read the
+	// surfaces behind it. Forward surfaces that are in the depth buffer keep them.
 #				if defined(DEFERRED)
 	const bool ssplsHere = true;
 #				else
-	bool ssplsHere = true;
-	[branch] if (SharedData::ssplsSettings.Enable & ScreenSpacePointLightShadows::SettingFlags::SkipTranslucent)
-		ssplsHere = abs(SharedData::GetScreenDepth(screenUV, eyeIndex) - viewPosition.z) <= viewPosition.z * 0.02 + 4.0;
+	const bool ssplsHere = abs(SharedData::GetScreenDepth(screenUV, eyeIndex) - viewPosition.z) <= viewPosition.z * 0.02 + 4.0;
 #				endif
 #			endif
 	uint numClusteredLights = 0;
@@ -4276,11 +4154,10 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #			if defined(SSPLS)
 	// (47k) Max Shadowed Lights per Pixel / Skip Weak Lights: score this pixel's lights first (colour x falloff x N.L, no texture
 	// reads), keep the eight largest; the lighting loop marches SSPLS only for the top K (the K-th fading against the first one out)
-	// and skips lights far weaker than the strongest. Both off (K unlimited): nothing here, 47j exactly.
+	// and skips lights far weaker than the strongest ((47o) Skip Weak Lights permanent).
 	const uint ssplsBudget = ScreenSpacePointLightShadows::MaxShadowedLights();
-	const bool ssplsSkipWeak = (SharedData::ssplsSettings.Enable & ScreenSpacePointLightShadows::SettingFlags::SkipWeakLights) != 0;
 	float4 ssplsTopA = 0.0, ssplsTopB = 0.0;
-	[branch] if (SharedData::ssplsSettings.Enable && inWorld && ssplsHere && (ssplsBudget > 0u || ssplsSkipWeak))
+	[branch] if (SharedData::ssplsSettings.Enable && inWorld && ssplsHere)
 	{
 		[loop] for (uint scoreIndex = 0; scoreIndex < totalLightCount; scoreIndex++)
 		{
@@ -4376,21 +4253,18 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		uint ssplsSteps = round(SharedData::ssplsSettings.StepLimit * (1.0 - saturate(viewPosition.z / SharedData::ssplsSettings.MaxDistance)));
 		// (46y) Screen-Space Shadows for Non-RT Casters (the light's tag): beside RT, only occluders the ray tracer does not see.
 #				if defined(RT_POINT_SHADOWS)
+		// (47o) "Keep Screen-Space Contact Shadows" (kKeepSSPLS) was removed: beside RT only with Non-RT Casters.
 		const bool ssplsNonRT = rtShadow && (light.rtShadow & RTPointShadows::kSSPLSNonRT) != 0;
-		const bool ssplsBesideRT = ssplsNonRT || (light.rtShadow & RTPointShadows::kKeepSSPLS) != 0;
 #				else
 		const bool ssplsNonRT = false;
-		const bool ssplsBesideRT = false;
 #				endif
-		// (47k) The light budget's share of this light (1 with both switches off).
-		float ssplsWeight = 1.0;
-		[branch] if (ssplsBudget > 0u || ssplsSkipWeak)
-			ssplsWeight = ScreenSpacePointLightShadows::BudgetWeight(ScreenSpacePointLightShadows::LightScore(lightColor, lightAngle), ssplsBudget, ssplsBudgetLast, ssplsBudgetNext, ssplsTopA.x, ssplsSkipWeak);
+		// (47k) The light budget's share of this light.
+		const float ssplsWeight = ScreenSpacePointLightShadows::BudgetWeight(ScreenSpacePointLightShadows::LightScore(lightColor, lightAngle), ssplsBudget, ssplsBudgetLast, ssplsBudgetNext, ssplsTopA.x);
 		const bool ssplsRun = SharedData::ssplsSettings.Enable && inWorld && ssplsHere &&
 		                      !(light.lightFlags & LightLimitFix::LightFlags::Simple) &&
 		                      shadowComponent != 0.0 &&
 		                      lightAngle > 0.0 &&
-		                      (!rtShadow || ssplsBesideRT) &&
+		                      (!rtShadow || ssplsNonRT) &&
 		                      ssplsWeight > 0.0;
 		[branch] if (ssplsRun)
 		{
@@ -4454,12 +4328,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 				parallaxShadow = ExtendedMaterials::GetParallaxSoftShadowMultiplier(uv, mipLevel, lightDirectionTS, sh0, TexParallaxSampler, SampParallaxSampler, 0, parallaxShadowQuality, screenNoise, displacementParams);
 #				endif
 		}
-#			endif
-
-#			if defined(DYNAMIC_SNOW_SURFACE)
-		// (batch 39c) As for the sun: snow fills the relief.
-		if (SharedData::dynamicSnowSettings.Flags & DynamicSnow::FlagCoverageSlope)
-			parallaxShadow = lerp(parallaxShadow, 1.0, dynamicSnowCoverage * DynamicSnow::SnowSmoothing());
 #			endif
 
 #			if defined(TRUE_PBR)

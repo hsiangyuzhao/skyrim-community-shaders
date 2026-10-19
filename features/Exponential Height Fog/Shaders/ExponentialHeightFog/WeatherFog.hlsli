@@ -9,13 +9,12 @@
 //  - opacity along a camera ray: Cap (1 - exp(-tau)), with Cap = w x the weather's on-screen max opacity and
 //    tau = Sigma x the integral of the density from the weather's fog near distance on. Sigma is fitted so that the
 //    on-screen half-cover distance equals the game's;
-//  - density: 1 at and below the layer's base, exp(-h / ScaleHeight) above it. The base is the camera's height (47d), or
-//    (47g, Horizon Fix) a world height the camera can rise above (HorizonFix::AnchorOffset());
+//  - density: 1 at and below the layer's base, exp(-h / ScaleHeight) above it. The base is the camera's height (47d; (47o) the
+//    Horizon Fix anchor is gone);
 //  - light toward the sun through the layer has the same form, so sunlight never gets darker than the farthest
 //    mountain shows through the fog (1 - Cap).
 // Only SharedData is needed: Lighting, Effect, Water, RunGrass, DistantTree and the volumetric fog passes include it.
 
-#include "Common/HorizonFix.hlsli"  // (47f)
 #include "Common/SharedData.hlsli"
 
 namespace WeatherFog
@@ -33,11 +32,11 @@ namespace WeatherFog
 		return max(SharedData::weatherFogData.ScaleHeight, 1.0f);
 	}
 
-	/// (47g) How far the camera is above the layer's base (Horizon Fix: the base is anchored to world height); 0 = the base
-	/// is the camera's height, the 47e layer exactly.
+	/// (47g) How far the camera is above the layer's base. (47o) Always 0 (Horizon Fix's anchor is gone): the base is the camera's
+	/// height, the 47e layer exactly.
 	float Offset()
 	{
-		return HorizonFix::AnchorOffset();
+		return 0.0f;
 	}
 
 	/// Relative density at a height over the camera (1 at and below the base).
@@ -69,30 +68,21 @@ namespace WeatherFog
 	}
 
 	/// Transmittance of the layer along a camera ray up to distance a_distance: 1 - Cap (1 - exp(-tau)); 1 within the
-	/// weather's fog near distance. (47g) a_curvedSky (Horizon Fix, sky pixels): along the ray's curved path out of the air,
-	/// or to the sea and its reflection (HorizonFix::SkyLayerIntegral); a_distance is then not used.
-	float Transmittance(float3 a_direction, float a_distance, bool a_curvedSky = false)
+	/// weather's fog near distance. (47o) The Horizon Fix curved-sky path (47g) is gone.
+	float Transmittance(float3 a_direction, float a_distance)
 	{
 		const float nearDistance = max(SharedData::weatherFogData.NearDistance, 0.0f);
-		float tau;
-		[branch] if (a_curvedSky)
-		{
-			const HorizonFix::SkyRay ray = HorizonFix::MakeSkyRay(a_direction.z);
-			const float base = HorizonFix::Altitude() - Offset();
-			tau = SharedData::weatherFogData.Sigma * max(HorizonFix::SkyLayerIntegral(ray, base, ScaleHeight()) - RayDensityIntegral(a_direction, 0.0f, nearDistance), 0.0f);
-		}
-		else
-			tau = SharedData::weatherFogData.Sigma * RayDensityIntegral(a_direction, nearDistance, max(a_distance, nearDistance));
+		const float tau = SharedData::weatherFogData.Sigma * RayDensityIntegral(a_direction, nearDistance, max(a_distance, nearDistance));
 		return 1.0f - saturate(SharedData::weatherFogData.Cap) * (1.0f - exp(-tau));
 	}
 
 	/// Opacity of the layer over the part of a camera ray (camera-relative a_positionWS) beyond a_startDistance (what lies
 	/// in front of it is the volumetric fog's). a_fullOpacity = the layer's opacity over the whole ray.
-	float Opacity(float3 a_positionWS, float a_startDistance, out float a_fullOpacity, bool a_curvedSky = false)
+	float Opacity(float3 a_positionWS, float a_startDistance, out float a_fullOpacity)
 	{
 		const float distance = length(a_positionWS);
 		const float3 direction = a_positionWS / max(distance, 1e-4f);
-		const float endTransmittance = Transmittance(direction, distance, a_curvedSky);
+		const float endTransmittance = Transmittance(direction, distance);
 		a_fullOpacity = saturate(1.0f - endTransmittance);
 		float startTransmittance = 1.0f;
 		[branch] if (a_startDistance > 0.0f)

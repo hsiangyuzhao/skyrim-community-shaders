@@ -16,7 +16,8 @@ namespace LightLimitFix
 	// (47h) Ray Tracing wrote this frame's sun shadow mask and "Sun Shadow: Depth Check for Translucent Surfaces" is on.
 	static const uint kStrictFlagSunDepthCheck = 1u;
 	// (47i) "Skip Engine Water Point-Light Highlights": the engine's NUM_SPECULAR_LIGHTS water passes add nothing, and the clustered
-	// water loop also takes the engine's shadow-casting lights (Water.hlsl).
+	// water loop also takes the engine's shadow-casting lights (Water.hlsl). (47o) Permanent in Water.hlsl: the bit (still set by the
+	// C++) is no longer read.
 	static const uint kStrictFlagSkipWaterSpecular = 2u;
 
 	StructuredBuffer<Light> lights : register(t35);

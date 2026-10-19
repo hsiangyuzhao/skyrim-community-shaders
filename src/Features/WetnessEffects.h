@@ -62,8 +62,8 @@ public:
 
 		// (42c) Character wetness. Each switch applies to characters only: skin, hair,
 		// and whatever an actor wears or carries (IsActorGeometry). World surfaces keep
-		// the old model. With all three switches off the characters look as before
-		// (apart from the always-on numeric fixes, 4.4).
+		// the old model. (47o) No longer settings (not saved, no menu): GetCommonBufferData writes
+		// these defaults (and PorositySkin from Character Wetness); the fields stay for the GPU layout.
 		uint EnableWetFilm = true;       // 4.1 clear-coat water lobe on direct light
 		float WetFilmRoughness = 0.2f;   // 4.1 fixed film roughness (was 1 - wetness)
 		float WetFilmStrength = 1.0f;    // 4.1 film multiplier, 1 = physical
@@ -97,13 +97,7 @@ public:
 		float2 RainOverride = float2(0.0f, 0.0f);
 	} debugSettings;
 
-	// (46y) Raindrops: Fast Path (Raindrop Effects page). Outside Settings: Settings is copied into the FeatureData cbuffer
-	// as is, so these travel as bits 1 / 2 of the GPU copy of EnableVanillaRipples (no shader reads its bit 0).
-	// RaindropFastPath: the Lighting shader computes splashes only where they can raise the wetness and ripples only where
-	// they have strength, and skips neighbour cells out of reach (identical result). RaindropSubPixelSkip: also fades the
-	// drops out where a raindrop cell is smaller than a pixel. Both off = 46x.
-	bool RaindropFastPath = true;
-	bool RaindropSubPixelSkip = true;
+	// (46y) Raindrops: Fast Path and Skip Sub-Pixel Drops: (47o) permanent in Lighting.hlsl (their switches are gone).
 
 	Settings settings;
 	// Climate preset system

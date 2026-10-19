@@ -64,17 +64,15 @@ struct Skin : Feature
 		float SkinDetailTiling = 10.0f;
 		float BodyTilingMultiplier = 2.0f;
 		float WetFadeTime = 10.0f;
-		float StartSweat = 0.75f;
-		float FullSweat = 0.15f;
 		float Translucency = 0.1f;
 		float sssWidth = 0.2f;
 		bool UseSSS = true;
 		float FuzzStrength = 1.0f;
 		float FuzzRoughness = 0.35f;
 		float FuzzF0 = 0.045f;
-		bool UseDynamicWetness = false;
 		// (44a) Extra wetness, the Perlin wetness parameters, the film strength and the 43b
-		// coverage options moved to the Wet Skin page (WetSkin.h).
+		// coverage options moved to the Wet Skin page (WetSkin.h). (47o) StartSweat / FullSweat /
+		// UseDynamicWetness (moved there in 47i) are no longer kept here (WetSkin reads the raw JSON).
 	} settings;
 
 	struct alignas(16) SkinData
@@ -268,8 +266,6 @@ struct Skin : Feature
 		uint32_t frame = 0;       // State::frameCount of the last update
 		double clock = 0.0;       // wetClock at the last update
 		bool valid = false;
-		float timeOut = 1e6f;     // (44a) s since leaving the water (New model)
-		float maxDepth = 0.0f;    // (44a) deepest submersion since entering it
 		float4 old{};             // the Original model's sweat and swim fade (Advanced Skin WetFadeTime)
 		float4 skin{};            // skinPerGeometry
 		float4 wetSkin{};         // wetSkinPerGeometry

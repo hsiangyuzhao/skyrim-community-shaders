@@ -41,7 +41,7 @@ namespace RayTracingPointLights
 	// LightLimitFix::LightData::rtShadow (RayTracing/PointLightShadows.hlsli).
 	inline constexpr std::uint32_t kTagSourceMask = 0x7Fu;  // source slot + 1 (0 = none)
 	inline constexpr std::uint32_t kTagNative = 1u << 8;    // the engine's shadow-map light: RT replaces its shadow map
-	inline constexpr std::uint32_t kTagKeepSSPLS = 1u << 9; // keep Screen Space Point Light Shadows as contact shadows (min with RT)
+	// 1u << 9: (47o) reserved (was kTagKeepSSPLS, "Keep Screen-Space Contact Shadows", removed)
 	inline constexpr std::uint32_t kTagSplit = 1u << 10;    // debug A/B: RT on the left half of the screen only
 	// (46y) Screen-Space Shadows for Non-RT Casters: Screen Space Point Light Shadows run beside RT for this light, but an occluder
 	// sample that is a ray-traced caster (TracePointLightsCS marks those pixels) shadows only within the contact length; bits 16-23
@@ -113,8 +113,7 @@ namespace RayTracingPointLights
 	struct Config
 	{
 		// (47m) The engine's shadow-map lights are always included (RT replaces their shadow map in Lighting).
-		bool keepSSPLS = false;     // tag: keep SSPLS as contact shadows for RT lights
-		bool ssplsNonRT = false;    // (46y) tag: SSPLS beside RT for occluders the ray tracer does not see (wins over keepSSPLS)
+		bool ssplsNonRT = false;    // (46y) tag: SSPLS beside RT for occluders the ray tracer does not see
 		bool waterBed = false;      // (47h) tag: Point Light Shadows on Water
 		float ssplsContact = 8.0f;  // (46y) their contact length for traced occluders, x the ray start offset (0 - 31.875)
 		bool split = false;         // tag: debug split screen

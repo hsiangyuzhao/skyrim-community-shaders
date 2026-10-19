@@ -30,8 +30,7 @@ namespace DynamicSnow
 	// (batch 39b) 1 << 5, 6, 7 are free since 44f: bicubic prints and snowy-ground recognition are
 	// permanent, the colour guess was removed.
 	static const uint FlagSnowOnCharacters = 1 << 8;    // accumulated snow on actors and what they wear
-	// (batch 39c)
-	static const uint FlagCoverageSlope = 1 << 9;  // coverage from the geometry slope on a soft ramp (39b: normal threshold)
+	// (batch 39c) 1 << 9 (FlagCoverageSlope, "Even Cover") is free: never set since 44h, (47o) its shader code is gone.
 	static const uint FlagTrees = 1 << 10;         // snow on animated trees and foliage (Lighting, TREE_ANIM)
 	static const uint FlagGrass = 1 << 11;         // snow on grass (RunGrass)
 	static const uint FlagLodTrees = 1 << 12;      // snow on distant billboard trees (DistantTree)
@@ -40,7 +39,8 @@ namespace DynamicSnow
 	// (set with IsActorGeometry when the geometry is not skinned). Kept here rather than in
 	// Permutation.hlsli, where a new constant reshuffles fxc's output for unrelated permutations.
 	static const uint ExtraIsActorRigid = 1 << 14;
-	// (44e) Flags bit: the trail map holds time-stamped texels (TrailTime.hlsli); the current tick is in pad0.
+	// (44e) Flags bit: the trail map holds time-stamped texels (TrailTime.hlsli); the current tick is in pad0. (47o) Always with
+	// FlagTrails (the 44d refill-pass map is gone; trails are off when the time-stamp shaders fail).
 	static const uint FlagTrailTimeStamps = 1 << 14;
 	uint TrailNowTick() { return uint(SharedData::dynamicSnowSettings.pad0); }
 	// (44h) Accumulation only where the region is a cold one: the amount is scaled by the cold-region
@@ -53,7 +53,8 @@ namespace DynamicSnow
 	static const uint FlagShowColdMap = 1 << 17;
 	// (46a) Characters take their own amount from Advanced Skin's b7 (Skin::snowPerGeometry).
 	static const uint FlagCharacterSnowState = 1 << 18;
-	// (46d) Characters: the CPU roof test (no build-up under a roof) replaces the per-pixel sky test.
+	// (46d) Characters: the CPU roof test (no build-up under a roof) replaces the per-pixel sky test. (47o) Always with
+	// FlagCharacterSnowState: bit 19 is no longer read.
 	static const uint FlagCharacterRoofs = 1 << 19;
 
 #if defined(PSHADER)
@@ -119,10 +120,6 @@ namespace DynamicSnow
 		return lerp(float3(0.8, 0.08, 0.05), float3(0.05, 0.25, 0.9), saturate(scale));
 	}
 
-	// (40e) Mirrors CommonBufferData::SnowSmoothing / SteepCover (stored in pad1, see SharedData.hlsli).
-	float SnowSmoothing() { return SharedData::dynamicSnowSettings.pad1.x; }
-	float SteepCover() { return SharedData::dynamicSnowSettings.pad1.y; }
-
 	// Height is stored modulo this many units. Two surfaces exactly a multiple of it apart
 	// (14.6 m) would share prints; anything else is told apart by TrailZTolerance.
 	static const float kTrailZWrap = 1024.0;
@@ -159,30 +156,11 @@ namespace DynamicSnow
 	float GetCoverage(float3 positionWS, float3 normalWS, float3 geometryNormalWS, float skyVisibility, float viewDistance, float amount)
 	{
 		const SharedData::DynamicSnowSettings s = SharedData::dynamicSnowSettings;
-		const bool slopeModel = (s.Flags & FlagCoverageSlope) != 0;
 
-		float slope;
-		[branch] if (slopeModel)
-		{
-			// (batch 39c) The slope comes from the geometry alone, on a soft ramp that starts well
-			// below typical roof pitches. 39b gated on half geometry / half normal map against a
-			// hard 0.6 (53 degrees) threshold with a 3x ramp: thatch roofs (vertex normals 0.45..0.85
-			// on the PBR Unique Northern Vanilla Farmhouses inn, lumpy by design) straddled the
-			// threshold, so the snow followed the thatch's lumps in streaks while flatter shingles
-			// and boardwalks went fully white.
-			slope = smoothstep(s.SlopeStart, s.SlopeFull, geometryNormalWS.z);
-			// (40e) 39c gave every surface flatter than SlopeFull (57 degrees) full cover: roofs,
-			// rock faces and wall tops all went solid white, far more than 39b (which covered
-			// nothing steeper than 53 degrees and only partly up to 43). Roofs and slopes now hold
-			// an even SteepCover; the cover rises to full only towards level ground (37 -> 23
-			// degrees). The plateau spans nearly the whole thatch range, so the lumps stay even.
-			// SteepCover 1 = 39c.
-			slope *= lerp(SteepCover(), 1.0, smoothstep(0.80, 0.92, geometryNormalWS.z));
-		} else {
-			// 39b: half geometry, half normal map, hard threshold.
-			float up = lerp(geometryNormalWS.z, normalWS.z, 0.5);
-			slope = saturate((up - s.NormalThreshold) / max(1.0 - s.NormalThreshold, 1e-3));
-		}
+		// 39b: half geometry, half normal map, hard threshold. (47o) The 39c / 40e slope model (FlagCoverageSlope, never set since 44h)
+		// is gone.
+		const float up = lerp(geometryNormalWS.z, normalWS.z, 0.5);
+		const float slope = saturate((up - s.NormalThreshold) / max(1.0 - s.NormalThreshold, 1e-3));
 		[branch] if (slope <= 0.0) return 0.0;  // walls and overhangs: no noise, no sky lookup
 
 		float2 p = positionWS.xy;
@@ -195,21 +173,7 @@ namespace DynamicSnow
 		float h = slope * 0.7 + noise * 0.3;
 		float t = 1.1 - amount * 1.2;
 		float coverage = smoothstep(t - 0.1, t + 0.1, h);
-
-		[branch] if (slopeModel)
-		{
-			coverage *= slope;
-			// The normal map only shapes partial cover (up-facing detail fills first, the
-			// grooves last); full cover stays full, so a bumpy texture never punches holes.
-			float detail = normalWS.z - geometryNormalWS.z;
-			coverage = saturate(coverage + detail * 2.0 * coverage * (1.0 - coverage));
-			// (40e) At any cover, the normal map's grooves and steep facets hold less than its
-			// up-facing tops, so the cobbles, planks and stones stay readable under the snow as
-			// they did in 39b. SnowSmoothing 1 = 39c (thick snow ignores the texture).
-			coverage *= saturate(1.0 + detail * 1.5 * (1.0 - SnowSmoothing()));
-		} else {
-			coverage *= saturate(slope * 3.0);
-		}
+		coverage *= saturate(slope * 3.0);
 
 		return coverage * s.MaxCoverage * skyVisibility;
 	}
@@ -317,22 +281,11 @@ namespace DynamicSnow
 	float DecodeTrailTexel(uint v, float z)
 	{
 		const SharedData::DynamicSnowSettings s = SharedData::dynamicSnowSettings;
-		float strength;
-		float footZ;
-		[branch] if (s.Flags & FlagTrailTimeStamps)
-		{
-			// (44e) Refill computed here from the stamp's age: no decay pass.
-			bool dent;
-			const float rem = TrailTime::Remaining(v, TrailNowTick(), dent);
-			strength = dent ? rem : -rem * s.TrailRim;
-			footZ = TrailTime::FootZ(v);
-		}
-		else
-		{
-			uint code = v >> 16;
-			strength = code >= 32768 ? float(code - 32768) * (1.0 / 32767.0) : -float(code) * (s.TrailRim / 32767.0);
-			footZ = float(v & 0xFFFF) * (kTrailZWrap / 65535.0);
-		}
+		// (44e) Refill computed here from the stamp's age: no decay pass. (47o) Always (the 44d refill-pass encoding is gone).
+		bool dent;
+		const float rem = TrailTime::Remaining(v, TrailNowTick(), dent);
+		const float strength = dent ? rem : -rem * s.TrailRim;
+		const float footZ = TrailTime::FootZ(v);
 		float dz = (frac((z - footZ) / kTrailZWrap + 0.5) - 0.5) * kTrailZWrap;
 		return strength * (1.0 - smoothstep(s.TrailZTolerance * 0.5, s.TrailZTolerance, abs(dz)));
 	}

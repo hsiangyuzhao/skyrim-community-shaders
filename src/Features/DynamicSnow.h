@@ -218,7 +218,7 @@ public:
 		// (the first two are permanent in the shader, the third was removed).
 		FlagSnowOnCharacters = 1 << 8,
 		// (batch 39c)
-		FlagCoverageSlope = 1 << 9,
+		// 1 << 9: free ((47o) FlagCoverageSlope, never set since 44h; its shader code is gone)
 		FlagTrees = 1 << 10,
 		FlagGrass = 1 << 11,
 		FlagLodTrees = 1 << 12,
@@ -461,7 +461,6 @@ private:
 	int64_t committedOrigin[2]{};    ///< origin the texture content was last scrolled to
 	bool trailContentValid = false;  ///< false = clear the whole map before use
 	RE::TESWorldSpace* trailWorldSpace = nullptr;
-	float decayAccumulator = 0.0f;  ///< strength units waiting to be removed
 	std::vector<Stamp> stamps;
 	std::unordered_map<RE::FormID, ActorFeet> actorFeet;
 
@@ -484,15 +483,12 @@ private:
 	winrt::com_ptr<ID3D11UnorderedAccessView> trailUAV;
 
 	ID3D11ComputeShader* clearCS = nullptr;
-	ID3D11ComputeShader* decayCS = nullptr;
-	ID3D11ComputeShader* stampCS = nullptr;
-	// (44e) Time-stamped trail map.
+	// (44e) Time-stamped trail map ((47o) the only one: the 44d refill pass and untimed stamps are gone).
 	ID3D11ComputeShader* stampTimeCS = nullptr;
 	ID3D11ComputeShader* sweepCS = nullptr;
 	static constexpr uint32_t kTrailTicksPerRefill = 256;  ///< mirrors TrailTime::kTicksPerRefill
 	double trailClock = 0.0;              ///< game-running seconds (the refill clock)
 	float trailClockRefill = 0.0f;        ///< TrailRefillSeconds the ticks were defined with
-	bool trailContentTimeStamped = false; ///< the map content uses the time-stamped encoding
 	uint32_t sweepRow = 0;
 	bool trailMaintenancePaused = false;
 	double trailPausedAt = 0.0;

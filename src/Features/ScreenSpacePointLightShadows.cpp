@@ -14,11 +14,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	MaxDistance,
 	EnableSoftShadows,
 	SoftShadowScale,
-	SkipTranslucent,
-	MaxShadowedLights,
-	SkipWeakLights,
-	SmarterSteps,
-	SkipOnWater)
+	MaxShadowedLights)
 
 void ScreenSpacePointLightShadows::DrawSettings()
 {
@@ -44,16 +40,8 @@ void ScreenSpacePointLightShadows::DrawSettings()
 		ImGui::Text("Shadows fade out toward this distance from the camera (game units). Lower = cheaper.");
 
 	ImGui::Spacing();
-	// (47h)
-	ImGui::Checkbox("Skip Screen-Space Light Shadows on Translucent Surfaces", &settings.SkipTranslucent);
-	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("On (default): see-through and blended surfaces drawn after the solid pass (glass, blended arches, banners) get no");
-		ImGui::Text("  screen-space light shadows: those are searched in the depth of what lies BEHIND the surface and put false shadows on it.");
-		ImGui::Text("  Their ray-traced and shadow-map point-light shadows are unchanged. Water keeps its screen-space shadows. Off: as in 47g.");
-	}
-
 	// (47k) Cost
-	ImGui::SeparatorText("Cost (47k)");
+	ImGui::SeparatorText("Cost");
 	{
 		int maxLights = static_cast<int>(std::clamp(settings.MaxShadowedLights, 1u, 8u));
 		if (ImGui::SliderInt("Max Shadowed Lights per Pixel", &maxLights, 1, 8, maxLights >= 8 ? "unlimited" : "%d", ImGuiSliderFlags_AlwaysClamp))
@@ -64,22 +52,7 @@ void ScreenSpacePointLightShadows::DrawSettings()
 			ImGui::Text("  lights). The last one fades in and out smoothly, so a light dropping out of the set does not leave a seam.");
 			ImGui::Text("  Default 3. 8 = unlimited (every light, as in 47j). Rooms with many candles / braziers are much cheaper.");
 		}
-		ImGui::Checkbox("Skip Weak Lights", &settings.SkipWeakLights);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): no shadow search for a light that gives this pixel less than about 5 %% of its strongest light's");
-			ImGui::Text("  light (or almost none at all), with a soft fade. Its shadow could not be seen anyway. Off: as in 47j.");
-		}
-		ImGui::Checkbox("Smarter Steps", &settings.SmarterSteps);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): the search does not spend steps on the pixel's own 2 pixels (they were skipped anyway), steps are");
-			ImGui::Text("  at least 2 pixels apart on screen (short, distant rays need fewer), and the short contact search of lights that");
-			ImGui::Text("  have a shadow map uses 2-3 steps. Off: as in 47j.");
-		}
-		ImGui::Checkbox("Skip SSPLS on Water", &settings.SkipOnWater);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): water gets no screen-space point-light shadows (about 0.5 ms where there is much water and many lights).");
-			ImGui::Text("  Its ray-traced point-light shadows are unchanged. Off: as in 47j.");
-		}
+		// (47o) Skip on Translucent Surfaces (47h), Skip Weak Lights, Smarter Steps and Skip SSPLS on Water (47k) are permanent.
 		ImGui::TextDisabled("Max Step: the default is 4; 8 costs about 5 ms more in rooms with many lights.");
 	}
 	ImGui::Spacing();
@@ -100,11 +73,10 @@ std::string ScreenSpacePointLightShadows::DescribeForTrace() const
 		return "SSPLS not loaded";
 	const auto& s = settings;
 	const uint maxLights = std::clamp(s.MaxShadowedLights, 1u, 8u);
-	return std::format("SSPLS {} (strength {:.2f}, step limit {}, ray length {:.2f}, compare tolerance {:.2f}, max distance {:.0f}, soft shadows {} x{:.2f}, "
-					   "skip translucent {}; (47k) max shadowed lights per pixel {}, skip weak lights {}, smarter steps {}, skip on water {})",
+	return std::format("SSPLS {} (strength {:.2f}, step limit {}, ray length {:.2f}, compare tolerance {:.2f}, max distance {:.0f}, soft shadows {} x{:.2f}; "
+					   "(47k) max shadowed lights per pixel {}; skip translucent / weak lights / smarter steps / skip on water permanent (47o))",
 		s.Enable ? "on" : "off", s.Strength, s.StepLimit, s.RayLength, s.CompareToleranceScale, s.MaxDistance, s.EnableSoftShadows ? "on" : "off", s.SoftShadowScale,
-		s.SkipTranslucent ? "on" : "off", maxLights >= 8u ? std::string("unlimited") : std::to_string(maxLights), s.SkipWeakLights ? "on" : "off",
-		s.SmarterSteps ? "on" : "off", s.SkipOnWater ? "on" : "off");
+		maxLights >= 8u ? std::string("unlimited") : std::to_string(maxLights));
 }
 
 void ScreenSpacePointLightShadows::RestoreDefaultSettings()
@@ -128,10 +100,9 @@ ScreenSpacePointLightShadows::PerFrame ScreenSpacePointLightShadows::GetCommonBu
 	PerFrame data = {
 		// (45) Fixed Math / Stable Noise travel as bits of Enable (see SSPLS.hlsli SettingFlags); (45o) always on.
 		// (46y) bit 3: Ray Tracing debug view SSPLS Coverage (drawn by Lighting.hlsl; only while SSPLS is on).
-		// (47h) bit 4: Skip Screen-Space Light Shadows on Translucent Surfaces (forward Lighting draws).
-		// (47k) bits 5-7: Skip Weak Lights, Smarter Steps, Skip SSPLS on Water; bits 8-11: Max Shadowed Lights per Pixel (0 = unlimited).
-		.Enable = settings.Enable ? (1u | 2u | 4u | (globals::features::rayTracing.SSPLSCoverageView() ? 8u : 0u) | (settings.SkipTranslucent ? 16u : 0u) |
-										(settings.SkipWeakLights ? 32u : 0u) | (settings.SmarterSteps ? 64u : 0u) | (settings.SkipOnWater ? 128u : 0u) |
+		// (47h) bit 4 Skip on Translucent Surfaces, (47k) bits 5-7 Skip Weak Lights, Smarter Steps, Skip SSPLS on Water: (47o) permanent in
+		// the shaders, still set (reserved); bits 8-11: Max Shadowed Lights per Pixel (0 = unlimited).
+		.Enable = settings.Enable ? (1u | 2u | 4u | (globals::features::rayTracing.SSPLSCoverageView() ? 8u : 0u) | 16u | 32u | 64u | 128u |
 										((settings.MaxShadowedLights >= 1u && settings.MaxShadowedLights < 8u) ? (settings.MaxShadowedLights << 8) : 0u)) :
 		                            0u,
 		.Strength = settings.Strength,

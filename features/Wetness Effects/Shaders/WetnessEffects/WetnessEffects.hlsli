@@ -141,12 +141,8 @@ namespace WetnessEffects
 		return float4(rippleNormal, wetness * SharedData::wetnessEffectsSettings.SplashesStrength);
 	}
 
-	// (46y) Raindrops: Fast Path flags, packed into EnableVanillaRipples (bit 0 is the vanilla switch, which no shader reads;
-	// the FeatureData layout stays as it is).
-	static const uint kRaindropFastPath = 2u;      // GetRainDropsFast with the caller's skips (Lighting.hlsl)
-	static const uint kRaindropSubPixelSkip = 4u;  // also fade out / skip where a raindrop cell is smaller than a pixel
-
-	// (46y) Raindrops: Fast Path. GetRainDrops with only the work whose result can show:
+	// (46y) Raindrops: Fast Path ((47o) permanent in Lighting.hlsl, with Skip Sub-Pixel Drops; the full GetRainDrops above is
+	// Water.hlsl's). GetRainDrops with only the work whose result can show: GetRainDrops with only the work whose result can show:
 	//   a_splashes  the caller needs the splash term (its rain wetness is below the strongest splash: max() hides it otherwise);
 	//   a_ripples   the caller needs the ripple term (with strength 0 every ripple is the identity rotation);
 	//   a neighbour cell is skipped when its nearest point is farther from this pixel than any splash / ripple of the needed

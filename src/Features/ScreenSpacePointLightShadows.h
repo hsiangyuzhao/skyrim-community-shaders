@@ -36,16 +36,13 @@ struct ScreenSpacePointLightShadows : Feature
 		float MaxDistance = 2048.0f;
 		uint EnableSoftShadows = true;
 		float SoftShadowScale = 2.5f;
-		bool SkipTranslucent = true;  // (47h) "Skip Screen-Space Light Shadows on Translucent Surfaces" (Enable bit 4)
+		// (47o) Skip on Translucent Surfaces (47h), Skip Weak Lights, Smarter Steps, Skip SSPLS on Water (47k): permanent (Enable bits 4-7).
 		// (47k) Cost (all on / 3 by default; 8 + all off = 47j). MaxShadowedLights: only the pixel's strongest N lights (by brightness
 		// x falloff x N.L, scored without texture reads) are marched, the rest are lit unshadowed by SSPLS; 8 = every light (Enable
 		// bits 8-11, 0 = unlimited). SkipWeakLights: no march for a light under about 5 % of the pixel's strongest (or nearly black),
 		// faded (bit 5). SmarterSteps: the march starts past the receiver's own 2 pixels, steps at least 2 px apart, the 24-unit contact
 		// rays of shadow-map lights 2-3 steps (bit 6). SkipOnWater: no screen-space light shadows on water (bit 7).
 		uint MaxShadowedLights = 3;
-		bool SkipWeakLights = true;
-		bool SmarterSteps = true;
-		bool SkipOnWater = true;
 	} settings;
 	/// (47k) For the F7 trace header.
 	std::string DescribeForTrace() const;

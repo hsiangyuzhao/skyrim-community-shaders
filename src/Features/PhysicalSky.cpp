@@ -881,8 +881,6 @@ void PhysicalSky::SetupResources()
 {
 	auto device = globals::d3d::device;
 
-	horizonWarpCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<float4>());  // (47f)
-
 	logger::debug("Creating samplers...");
 	{
 		D3D11_SAMPLER_DESC samplerDesc = {};
@@ -1948,7 +1946,6 @@ void PhysicalSky::Hooks::BSSkyShader_SetupGeometry::thunk(RE::BSShader* This, RE
 	globals::features::physicalSky.ModifySky();
 	SetSunDrawFlags(Pass);
 	globals::features::physicalSky.BindGlareDepth(Pass);  // (47a)
-	globals::features::physicalSky.BindHorizonWarp(Pass);  // (47f)
 	func(This, Pass, RenderFlags);
 }
 
@@ -1956,7 +1953,6 @@ void PhysicalSky::Hooks::BSSkyShader_RestoreGeometry::thunk(RE::BSShader* This, 
 {
 	globals::features::physicalSky.RestoreSamplers();
 	globals::features::physicalSky.UnbindGlareDepth();  // (47a)
-	globals::features::physicalSky.UnbindHorizonWarp();  // (47f)
 	ClearSunDrawFlags();
 	func(This, Pass, RenderFlags);
 }
@@ -2019,47 +2015,6 @@ void PhysicalSky::UnbindGlareDepth()
 	if (glarePreviousSrv) {
 		glarePreviousSrv->Release();
 		glarePreviousSrv = nullptr;
-	}
-}
-
-// ---------------------------------------------------------------------------------------------
-// (47f) VS b11 for cloud draws. (47m) Horizon Fix's cloud dome warp is removed; the zero constants stay
-// (what every cloud draw got with Horizon Fix off) until the Lighting package drops b11 from Sky.hlsl.
-// ---------------------------------------------------------------------------------------------
-
-void PhysicalSky::BindHorizonWarp(const RE::BSRenderPass* a_pass)
-{
-	if (horizonWarpBound)
-		UnbindHorizonWarp();
-	if (!a_pass || !a_pass->shaderProperty || !horizonWarpCB)
-		return;
-	const auto* skyProperty = static_cast<const RE::BSSkyShaderProperty*>(a_pass->shaderProperty);
-	if (skyProperty->uiSkyObjectType != RE::BSSkyShaderProperty::SkyObject::SO_CLOUDS)
-		return;
-	auto* context = globals::d3d::context;
-	if (!context)
-		return;
-	// Every cloud draw gets the constants, so Sky.hlsl's VS never reads someone else's b11. fixed (47m): always zeros
-	// (x = 0: no warp; w = 0, not the 4242 key), exactly as with Horizon Fix off.
-	const float4 warp{ 0.f, 0.f, 0.f, 0.f };
-	horizonWarpCB->Update(warp);
-	horizonWarpPrevious = nullptr;
-	context->VSGetConstantBuffers(kHorizonWarpSlot, 1, &horizonWarpPrevious);  // AddRef'd; released in Unbind
-	ID3D11Buffer* buffer = horizonWarpCB->CB();
-	context->VSSetConstantBuffers(kHorizonWarpSlot, 1, &buffer);
-	horizonWarpBound = true;
-}
-
-void PhysicalSky::UnbindHorizonWarp()
-{
-	if (!horizonWarpBound)
-		return;
-	horizonWarpBound = false;
-	if (auto* context = globals::d3d::context)
-		context->VSSetConstantBuffers(kHorizonWarpSlot, 1, &horizonWarpPrevious);
-	if (horizonWarpPrevious) {
-		horizonWarpPrevious->Release();
-		horizonWarpPrevious = nullptr;
 	}
 }
 

@@ -47,7 +47,6 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	PointLightsPerPixel,
 	PointLightsMaxSources,
 	PointLightsDistance,
-	PointLightsKeepSSPLS,
 	PointLightsSize,
 	PointLightsClearance,
 	PointLightsInteriors,
@@ -1307,12 +1306,10 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.AOFullResFilter = read("AOFullResFilter", defaults.AOFullResFilter);
 		settings.AOAlphaBudget = read("AOAlphaBudget", defaults.AOAlphaBudget);
 		// (46y)
-		settings.PointLightsSSPLSNonRT = read("PointLightsSSPLSNonRT", defaults.PointLightsSSPLSNonRT);
 		settings.PointLightsSSPLSContact = read("PointLightsSSPLSContact", defaults.PointLightsSSPLSContact);
 		settings.AOHalfResFar = read("AOHalfResFar", defaults.AOHalfResFar);
-		// (47h)
-		settings.SunDepthCheckTranslucent = read("SunDepthCheckTranslucent", defaults.SunDepthCheckTranslucent);
-		settings.PointShadowsOnWater = read("PointShadowsOnWater", defaults.PointShadowsOnWater);
+		// (47h) (47o) Sun Shadow: Depth Check for Translucent Surfaces, Point Light Shadows on Water and (46y) Screen-Space Shadows for
+		// Non-RT Casters are permanent (their keys are ignored and dropped on the next save); Keep Screen-Space Contact Shadows is gone.
 		settings.AOSmoothNormals = read("AOSmoothNormals", defaults.AOSmoothNormals);  // (47j)
 		settings.AOTemporalV2 = read("AOTemporalV2", defaults.AOTemporalV2);  // (47l)
 		settings.FoliageSway = read("FoliageSway", defaults.FoliageSway);  // (47l)
@@ -1414,14 +1411,11 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["AODetailRays"] = settings.AODetailRays;
 	o_json["AOFullResFilter"] = settings.AOFullResFilter;
 	o_json["AOAlphaBudget"] = settings.AOAlphaBudget;
-	o_json["PointLightsSSPLSNonRT"] = settings.PointLightsSSPLSNonRT;  // (46y)
 	o_json["PointLightsSSPLSContact"] = settings.PointLightsSSPLSContact;
 	o_json["AOHalfResFar"] = settings.AOHalfResFar;
 	o_json["AOSmoothNormals"] = settings.AOSmoothNormals;  // (47j)
 	o_json["AOTemporalV2"] = settings.AOTemporalV2;  // (47l)
 	o_json["FoliageSway"] = settings.FoliageSway;  // (47l)
-	o_json["SunDepthCheckTranslucent"] = settings.SunDepthCheckTranslucent;
-	o_json["PointShadowsOnWater"] = settings.PointShadowsOnWater;
 	o_json["SunShadows"] = settings.SunShadows;  // (47n)
 	o_json["PointQuality"] = settings.PointQuality;
 	o_json["AOQuality"] = settings.AOQuality;
@@ -3836,7 +3830,7 @@ void RayTracing::OnEndDeferred()
 
 bool RayTracing::WaterTracking() const
 {
-	return settings.PointShadowsOnWater && PointLightsOn() && backend.PointWaterReady();
+	return pointWaterOn && PointLightsOn() && backend.PointWaterReady();
 }
 
 void RayTracing::OnDrawStatesApplied(ID3D11DeviceContext* a_context)
@@ -3888,7 +3882,7 @@ void RayTracing::PrepWaterDistance(ID3D11DeviceContext* a_context)
 			waterDepthCopy = nullptr;
 			waterDepthCopySRV = nullptr;
 			logger::warn("[RayTracing] Point Light Shadows on Water: could not create the depth copy ({}x{}, format {})", desc.Width, desc.Height, static_cast<int>(desc.Format));
-			settings.PointShadowsOnWater = false;
+			pointWaterOn = false;
 			return;
 		}
 		waterDepthCopyDesc = desc;
@@ -3897,7 +3891,7 @@ void RayTracing::PrepWaterDistance(ID3D11DeviceContext* a_context)
 		waterPrepCS.attach(static_cast<ID3D11ComputeShader*>(Util::CompileShader(L"Data\\Shaders\\RayTracing\\WaterPrepCS.hlsl", {}, "cs_5_0")));
 		if (!waterPrepCS) {
 			logger::warn("[RayTracing] Point Light Shadows on Water: WaterPrepCS did not compile; switched off");
-			settings.PointShadowsOnWater = false;
+			pointWaterOn = false;
 			return;
 		}
 	}
@@ -4114,9 +4108,8 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 		return false;
 
 	RayTracingPointLights::Config config;
-	config.keepSSPLS = settings.PointLightsKeepSSPLS;
-	config.ssplsNonRT = settings.PointLightsSSPLSNonRT;  // (46y)
-	config.waterBed = settings.PointShadowsOnWater;  // (47h)
+	config.ssplsNonRT = true;  // (46y) Screen-Space Shadows for Non-RT Casters: permanent (47o)
+	config.waterBed = pointWaterOn;  // (47h) Point Light Shadows on Water: permanent (47o) unless its resources failed
 	config.ssplsContact = settings.PointLightsSSPLSContact;
 	config.split = pointSplit;
 	const PointTierParams tier = ResolvePointTier();  // (47n)
@@ -4181,7 +4174,7 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	}
 	flags |= kPointFlagSticky;  // (46g) Stable Light Selection: fixed (47m)
 	// (46y) Screen-Space Shadows for Non-RT Casters: the trace marks the pixels whose surface is a traced caster (PLIdx.w bit 7).
-	if (settings.PointLightsSSPLSNonRT && globals::features::screenSpacePointLightShadows.loaded && globals::features::screenSpacePointLightShadows.settings.Enable)
+	if (globals::features::screenSpacePointLightShadows.loaded && globals::features::screenSpacePointLightShadows.settings.Enable)
 		flags |= kPointFlagRtSurface;
 	flags |= kPointFlagBeamCullFront;  // (46n) Window Beam Culling: fixed (47m) at "Faces Toward the Room"
 	// (47i) Point Light Shadows on Water: the water distance of last frame (its prep ran after last frame's water draws) is traced
@@ -4199,7 +4192,7 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 			waterLodSkip = edge > static_cast<double>(tier.distance) + 4096.0 + 512.0;
 		}
 	}
-	if (settings.PointShadowsOnWater) {
+	if (pointWaterOn) {
 		if (backend.EnsurePointWaterTextures()) {
 			const uint32_t frame = globals::state->frameCount;
 			if (waterPrepFrame != UINT32_MAX && frame - waterPrepFrame == 1u && waterDistValid) {
@@ -5717,13 +5710,6 @@ void RayTracing::DrawSunPage()
 				ImGui::Text("  where the ray tracer cannot resolve it. Default 8 = about 16 units near the camera. 0 = none.");
 				ImGui::Text("  Larger = softer bases, but thin posts get fatter. Everything the ray tracer does not see keeps its contact shadows.");
 			}
-			// (47h)
-			ImGui::Checkbox("Sun Shadow: Depth Check for Translucent Surfaces", &settings.SunDepthCheckTranslucent);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On (default): a see-through or blended surface drawn after the solid pass (glass, a blended arch or banner) takes the");
-				ImGui::Text("  sun shadow at its own position (the shadow cascades) where it is not the surface the ray tracer saw; before, it took");
-				ImGui::Text("  the ray-traced shadow of whatever lies behind it and could lose its sunlight. Off: as in 47g.");
-			}
 			ImGui::EndDisabled();
 			ImGui::TreePop();
 		}
@@ -5969,33 +5955,11 @@ void RayTracing::DrawPointLightPage()
 					settings.PointLightsClearance);
 				ImGui::Text("  In first person your body never blocks your own light.");
 			}
-			// (46y)
-			ImGui::Checkbox("Screen-Space Shadows for Non-RT Casters", &settings.PointLightsSSPLSNonRT);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On (default): for ray-traced lights Screen Space Point Light Shadows run as well, but only for what the ray tracer");
-				ImGui::Text("  cannot see (grass, terrain, LOD, decals): an occluder that is ray traced shadows there only within the contact length");
-				ImGui::Text("  below, so nothing is shadowed twice. Like Screen Space Shadows does for the sun. Replaces the box below while on.");
-				ImGui::Text("Off: the box below decides (46x).");
-			}
-			ImGui::BeginDisabled(!settings.PointLightsSSPLSNonRT);
+			// (46y) Screen-Space Shadows for Non-RT Casters ((47o) permanent): for ray-traced lights Screen Space Point Light Shadows run as
+			// well, but only for what the ray tracer cannot see; a traced occluder shadows only within this contact length.
 			ImGui::SliderFloat("Non-RT Casters: RT Caster Contact Length", &settings.PointLightsSSPLSContact, 0.0f, 31.875f, "%.1f x ray offset");
 			if (auto _tt = Util::HoverTooltipWrapper())
 				ImGui::Text("How close to the surface a ray-traced occluder still casts a screen-space contact shadow (the ray tracer starts a little off the surface).");
-			ImGui::EndDisabled();
-			ImGui::BeginDisabled(settings.PointLightsSSPLSNonRT);
-			ImGui::Checkbox("Keep Screen-Space Contact Shadows", &settings.PointLightsKeepSSPLS);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Off (default): Screen Space Point Light Shadows are skipped for ray-traced lights.");
-				ImGui::Text("  On: they stay on as well; the darker of both counts (small contact shadows of grass and leaves the ray tracer does not see).");
-			}
-			ImGui::EndDisabled();
-			// (47h)
-			ImGui::Checkbox("Point Light Shadows on Water", &settings.PointShadowsOnWater);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On (default): a ray-traced light that a wall hides from the water (a forge behind a stone foundation) no longer shines");
-				ImGui::Text("  on it: the trace also shoots rays from the water surface itself (last frame's water, extra rays only on water pixels).");
-				ImGui::Text("  Lights not traced at that pixel keep the old path. Off: as in 47g.");
-			}
 			// (46c, 47m: default on)
 			ImGui::BeginDisabled(!settings.PointLightsInteriors);
 			ImGui::Checkbox("Skip the Game's Shadow Maps for RT-Shadowed Lights", &settings.PointLightsSkipShadowMaps);
@@ -6678,9 +6642,9 @@ std::string RayTracing::DescribeForProfile() const
 	// (46b) (47n) the point tier in effect
 	const PointTierParams pt = ResolvePointTier();
 	const AOTierParams at = ResolveAOTier();
-	text += std::format(", point lights {} {} (K {}, max {}, distance {:.0f}, keep SSPLS {}, size {:.1f}, clearance {:.0f}{}{})",
+	text += std::format(", point lights {} {} (K {}, max {}, distance {:.0f}, size {:.1f}, clearance {:.0f}{}{})",
 		settings.PointLights ? "on" : "off", kTierNames[std::clamp(settings.PointQuality, 0, kTierCustom) + 1], pt.k, pt.maxSources, pt.distance,
-		settings.PointLightsKeepSSPLS ? "yes" : "no", settings.PointLightsSize, settings.PointLightsClearance,
+		settings.PointLightsSize, settings.PointLightsClearance,
 		pointSplit ? ", split screen" : "", pointOffReason.empty() ? "" : ", switched off: " + pointOffReason);
 	// (46c)
 	text += std::format(", indoors {} (K {}, window beams {}, skip game shadow maps {}{})", settings.PointLightsInteriors ? "on" : "off",
@@ -6705,8 +6669,8 @@ std::string RayTracing::DescribeForProfile() const
 		settings.AODetailStrength, settings.AODetailLength, at.detailRays, at.fullResFilter ? "on" : "off", kAOBudget[std::clamp(settings.AOAlphaBudget, 0, 2)],
 		aoExtrasFault.empty() ? "" : ", detail / full-res filter switched off: " + aoExtrasFault);
 	// (46y)
-	text += std::format(", RTAO half-resolution broad term {}, point lights: screen-space shadows for non-RT casters {} (contact {:.1f})", at.halfResFar ? "on" : "off",
-		settings.PointLightsSSPLSNonRT ? "on" : "off", settings.PointLightsSSPLSContact);
+	text += std::format(", RTAO half-resolution broad term {}, point lights: screen-space shadows for non-RT casters on (contact {:.1f})", at.halfResFar ? "on" : "off",
+		settings.PointLightsSSPLSContact);
 	// (47l) (47n)
 	text += std::format(", RTAO smooth normals {}{}, temporal v2 {}{}, tight history near moving things {}, SSGI contact AO ghost fix {}", at.smoothNormals ? "on" : "off",
 		aoSmoothFault.empty() ? "" : " (switched off: " + aoSmoothFault + ")", at.temporalV2 ? "on" : "off", aoV2Fault.empty() ? "" : " (switched off: " + aoV2Fault + ")",
@@ -6727,7 +6691,7 @@ std::string RayTracing::DescribeForProfile() const
 	// (47l)
 	text += std::format(", sway in RT shadows {}{}", settings.FoliageSway ? "on" : "off",
 		settings.FoliageSway && !scene.SwayActive() ? " (not in effect: Foliage is shadow map or the wind shader is unavailable)" : "");
-	text += std::format(", point shadows on water {}", settings.PointShadowsOnWater ? "on" : "off");
+	text += std::format(", point shadows on water {}", pointWaterOn ? "on" : "off (resources failed)");
 	return text;
 }
 
@@ -6803,8 +6767,8 @@ nlohmann::json RayTracing::DescribeJson() const
 		const auto& ps = pointSelector.GetStats();
 		const PointTierParams pt = ResolvePointTier();
 		j["point_lights"] = { { "enabled", settings.PointLights }, { "k", pt.k }, { "max_sources", pt.maxSources },
-			{ "distance", pt.distance }, { "keep_sspls", settings.PointLightsKeepSSPLS },
-			{ "sspls_non_rt", settings.PointLightsSSPLSNonRT }, { "sspls_contact", settings.PointLightsSSPLSContact },  // (46y)
+			{ "distance", pt.distance }, { "keep_sspls", false },
+			{ "sspls_non_rt", true }, { "sspls_contact", settings.PointLightsSSPLSContact },  // (46y)
 			{ "size", settings.PointLightsSize }, { "clearance", settings.PointLightsClearance }, { "traced", pointThisFrame }, { "sources", ps.sources },
 			{ "candidates", ps.candidates }, { "merged", ps.merged }, { "capped", ps.capped }, { "native_lights", ps.native }, { "gpu_ms", stats.lastPointGpuMs },
 			{ "rays_per_frame", stats.pointRaysPerFrame }, { "water_rays_per_frame", stats.pointWaterRaysPerFrame },  // (47j)
@@ -6853,5 +6817,5 @@ nlohmann::json RayTracing::DescribeJson() const
 bool RayTracing::SunMaskDepthCheckActive() const
 {
 	// (47h) Only within the frame the mask was written (a stale flag after Ray Tracing stopped running never applies).
-	return RtWanted() && SunOn() && settings.SunDepthCheckTranslucent && sunMaskWrittenThisFrame && globals::state && sunMaskFrame == globals::state->frameCount;
+	return RtWanted() && SunOn() && sunMaskWrittenThisFrame && globals::state && sunMaskFrame == globals::state->frameCount;
 }

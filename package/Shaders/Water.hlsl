@@ -996,14 +996,10 @@ float3 GetSunColor(float3 normal, float3 viewDirection)
 #			include "IBL/IBL.hlsli"
 #		endif
 
-// (46y) The point-light trace first: SSPLS.hlsli reads its traced-caster mark (Screen-Space Shadows for Non-RT Casters).
 #		if defined(RT_POINT_SHADOWS) && defined(LIGHT_LIMIT_FIX)
 #			include "RayTracing/PointLightShadows.hlsli"
 #		endif
-
-#		if defined(SSPLS)
-#			include "ScreenSpacePointLightShadows/SSPLS.hlsli"
-#		endif
+// (47o) "Skip SSPLS on Water" (47k) is permanent: water draws no screen-space point-light shadows (SSPLS.hlsli is not included).
 
 PS_OUTPUT main(PS_INPUT input)
 {
@@ -1069,14 +1065,11 @@ PS_OUTPUT main(PS_INPUT input)
 #			if defined(SPECULAR) && (NUM_SPECULAR_LIGHTS != 0)
 	float3 finalColor = 0.0.xxx;
 
-	// (47i) "Skip Engine Water Point-Light Highlights" (Light Limit Fix): these engine passes add nothing; the clustered water loop
-	// lights the water with every light (with ray-traced shadows where available).
-#				if defined(LIGHT_LIMIT_FIX)
-	const int specularLights = (LightLimitFix::StrictFlags & LightLimitFix::kStrictFlagSkipWaterSpecular) ? 0 : NUM_SPECULAR_LIGHTS;
-#				else
-	const int specularLights = NUM_SPECULAR_LIGHTS;
-#				endif
-	for (int lightIndex = 0; lightIndex < specularLights; ++lightIndex) {
+	// (47i) "Skip Engine Water Point-Light Highlights" (Light Limit Fix; (47m) permanent, (47o) shader side): with Light Limit Fix these
+	// engine passes add nothing (Hooks.cpp skips them); the clustered water loop lights the water with every light (with ray-traced
+	// shadows where available).
+#				if !defined(LIGHT_LIMIT_FIX)
+	for (int lightIndex = 0; lightIndex < NUM_SPECULAR_LIGHTS; ++lightIndex) {
 		float3 lightVector = LightPos[lightIndex].xyz - (PosAdjust[eyeIndex].xyz + input.WPosition.xyz);
 		float3 lightDirection = normalize(normalize(lightVector) - viewDirection);
 		float lightFade = saturate(length(lightVector) / LightPos[lightIndex].w);
@@ -1085,6 +1078,7 @@ PS_OUTPUT main(PS_INPUT input)
 		float3 lightColor = (Color::PointLight(LightColor[lightIndex].xyz) * pow(LdotN, FresnelRI.z)) * lightColorMul;
 		finalColor += lightColor;
 	}
+#				endif
 
 	finalColor *= fresnel;
 #				if defined(WETNESS_EFFECTS) && defined(DEBUG_WETNESS_EFFECTS)
@@ -1122,9 +1116,8 @@ PS_OUTPUT main(PS_INPUT input)
 		{
 			uint clusteredLightIndex = LightLimitFix::lightList[lightOffset + i];
 			LightLimitFix::Light light = LightLimitFix::lights[clusteredLightIndex];
-			// (47i) Skip Engine Water Point-Light Highlights: the engine's shadow-casting lights too (their own passes add nothing then).
-			const bool skipShadowLights = !(LightLimitFix::StrictFlags & LightLimitFix::kStrictFlagSkipWaterSpecular);
-			if (LightLimitFix::IsLightIgnored(light) || (skipShadowLights && (light.lightFlags & LightLimitFix::LightFlags::Shadow))) {
+			// (47i) Skip Engine Water Point-Light Highlights ((47o) shader side permanent): the engine's shadow-casting lights too.
+			if (LightLimitFix::IsLightIgnored(light)) {
 				continue;
 			}
 
@@ -1165,32 +1158,6 @@ PS_OUTPUT main(PS_INPUT input)
 			const float rtVisibility = 1.0;
 #					endif
 
-#					if defined(SSPLS)
-			float lightAngle = dot(normal.xyz, normalizedLightDirection.xyz);
-			uint ssplsSteps = round(SharedData::ssplsSettings.StepLimit * (1.0 - saturate(viewPosition.z / SharedData::ssplsSettings.MaxDistance)));
-			[branch] if (
-				!FrameBuffer::FrameParams.z &&
-				SharedData::ssplsSettings.Enable &&
-				!(SharedData::ssplsSettings.Enable & ScreenSpacePointLightShadows::SettingFlags::SkipOnWater) &&  // (47k) Skip SSPLS on Water
-				!(light.lightFlags & LightLimitFix::LightFlags::Simple) &&
-				lightAngle > 0.0
-#						if defined(RT_POINT_SHADOWS)
-				&& (!rtShadow || (light.rtShadow & (RTPointShadows::kKeepSSPLS | RTPointShadows::kSSPLSNonRT)))
-#						endif
-			)
-			{
-				float3 lightDirectionVS = FrameBuffer::WorldToView(light.positionWS[eyeIndex].xyz, true, eyeIndex) - viewPosition.xyz;
-				// (46y) Non-RT casters (the light's tag): traced occluders only within the contact length (see Lighting.hlsl).
-#						if defined(RT_POINT_SHADOWS)
-				const float ssplsRtContact = (rtShadow && (light.rtShadow & RTPointShadows::kSSPLSNonRT)) ? float((light.rtShadow >> 16) & 0xFFu) * 0.125 * (2.0 + 0.0015 * length(viewPosition.xyz)) : -1.0;
-#						else
-				const float ssplsRtContact = -1.0;
-#						endif
-				float SSPLSShadow = lerp(1.0, ScreenSpacePointLightShadows::GetShadow(LinearSampler, viewPosition, screenNoise, lightDirectionVS, ssplsSteps, light.radius, eyeIndex, light.lightFlags & LightLimitFix::LightFlags::Shadow, ssplsRtContact), SharedData::ssplsSettings.Strength);
-				// (46b) Beside a ray-traced shadow: the darker of both.
-				lightColor *= rtShadow ? min(SSPLSShadow / max(rtVisibility, 1e-4), 1.0) : SSPLSShadow;
-			}
-#					endif
 
 			specularLighting += lightColor * intensityMultiplier;
 		}

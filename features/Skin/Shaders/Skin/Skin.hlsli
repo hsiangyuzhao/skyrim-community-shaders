@@ -20,15 +20,14 @@ namespace Skin
 	cbuffer SkinPerGeometry : register(b7)
 	{
 		float4 skinPerGeometry;
-		// (44a) Wet Skin, per character: x = swim wetness with the hold and the dry-off timer (New
-		// model), y = deepest submersion since entering the water, z = 1 while the character is
-		// in the water, w unused.
+		// (44a) Wet Skin, per character: z = 1 while the character is in the water. (47o) x / y (the Simple model's swim clock and
+		// deepest submersion) are 0 and not read; the layout stays.
 		float4 wetSkinPerGeometry;
 		// (44a) Wet Skin settings (WetSkin.cpp, WetSkin::GPUParams).
 		float4 wetSkinParams[6];
-		// (44c) Character Wetness, per character / per geometry: x = seconds since leaving the
-		// water (0 while in it), y = item class prior from the worn item's keywords (0 unknown,
-		// 1 cloth, 2 leather, 3 metal, 4 fur), z = 1 while in the water, w unused.
+		// (44c) Character Wetness, per character / per geometry: y = item class prior from the worn item's keywords (0 unknown,
+		// 1 cloth, 2 leather, 3 metal, 4 fur), z = 1 while in the water. (47o) x (the Simple model's time out of the water) is not
+		// read; w unused.
 		float4 wetCharPerGeometry;
 		// (44c) Character Wetness: hair and gear settings (WetSkin::GPUParams::c, layout there).
 		float4 wetCharParams[12];
@@ -103,20 +102,12 @@ namespace Skin
 		return s.x;
 	}
 
-	// (44a) Wet Skin model: New (1) or Original (0). (47f) Physical (2) is a New model too.
-	bool WetSkinNewModel()
-	{
-		return wetSkinParams[0].x > 0.5;
-	}
-
 	// (47f) Character Wetness "Physical": the CPU keeps each character's sweat, rain and swim water and hands over its
-	// look in the same parameters (WetSkin::PhysicalLook, Skin::BSLightingShader_SetupGeometry):
-	//   wetSkinParams[0].w = the rain level itself (not a weight), wetSkinParams[0].y = manual water (0 for oil),
-	//   wetSkinPerGeometry.w = droplet driver, wetCharPerGeometry.w = rivulet driver, wetCharParams[0].xy = runoff /
-	//   evaporation time, wetCharParams[11].z = the character's strongest source (droplet gate), [11].w = oil.
+	// look in the same parameters (WetSkin::PhysicalLook, Skin::BSLightingShader_SetupGeometry); wetCharParams[11].w = oil.
+	// (47o) The Simple model (wetSkinParams[0].x 1) is gone: x is 0 (Legacy) or 2 (Physical), so "not Legacy" is Physical.
 	bool WetPhysical()
 	{
-		return wetSkinParams[0].x > 1.5;
+		return wetSkinParams[0].x > 0.5;
 	}
 
 	/// (47f) Physical, Manual Look "Oil": the oil on the skin, 0..1 (0 in every other model).
@@ -131,43 +122,22 @@ namespace Skin
 		return lerp(w.x + 0.3 * w.y, 0.6, w.w);
 	}
 
-	/// The skin film's response to its wetness: W^1.3 (Simple). (47i) Physical: W is the film water / 80 um, response W^0.7
-	/// (a thin film already shows a sheen).
+	/// The skin film's response to its wetness. (47i) Physical: W is the film water / 80 um, response W^0.7 (a thin film
+	/// already shows a sheen).
 	float WetFilmResponse(float a_wetness)
 	{
-		return pow(saturate(a_wetness), WetPhysical() ? 0.7 : 1.3);
+		return pow(saturate(a_wetness), 0.7);
 	}
 
-	/// The 44a droplet fade by cell size (footprint: droplet cells per render pixel). (47i) Not used by Physical, which fades
-	/// all of a character's beads at once by their drawn size (WetPhysBeadFade).
-	float WetDropVisibility(float footprint)
-	{
-		return smoothstep(1.0, 2.5, 0.3 / footprint);
-	}
-
-	// (47c) "Wetness: Skip Invisible Work" (wetCharParams[11].x): leave out work whose result is
-	// multiplied by 0 (faded noise octaves, sub-pixel rivulets, rain detail under a roof, dry hair's
-	// clumps). The picture stays the same.
-	bool WetSkipInvisible()
-	{
-		return wetCharParams[11].x > 0.5;
-	}
-
-	// (47c) "Wetness: Faster Noise & Distance LOD" (wetCharParams[11].y): the cheaper patch noise and
-	// no droplets / rivulets on characters far away.
-	bool WetFastNoiseLOD()
-	{
-		return wetCharParams[11].y > 0.5;
-	}
+	// (47o) "Wetness: Skip Invisible Work" (47c) is permanent: work whose result is multiplied by 0 (faded noise octaves,
+	// sub-pixel rivulets, dry hair's clumps) is left out. "Faster Noise & Distance LOD" (47c) is permanent too.
 
 	/// (47c) Distance LOD for droplets and rivulets: 1 up close, fading to 0 while one pixel grows
 	/// from 0.8 to 1.2 game units (about 1.1 to 1.7 cm) on the character. pixelWorld: the world
 	/// size of a pixel at this distance (view-ray derivatives, not foreshortened). Around 13 m and
-	/// farther at 1440p; a third-person player (up to about 8.5 m) never reaches it. Off: 1.
+	/// farther at 1440p; a third-person player (up to about 8.5 m) never reaches it.
 	float WetDetailLOD(float pixelWorld)
 	{
-		[branch] if (!WetFastNoiseLOD())
-			return 1.0;
 		return 1.0 - smoothstep(0.8, 1.2, pixelWorld);
 	}
 
@@ -176,18 +146,11 @@ namespace Skin
 	static const float kPhysHold = 120.0;     // what skin holds after the runoff
 	static const float kPhysFilmFull = 80.0;  // film water at full sheen
 
-	// (47j) Switches in wetPhysParams[3].w (WetSkin::Phys::kFlag*); all 0 = 47i.
-	static const uint kPhysFlagWaterLine = 1u;
-	static const uint kPhysFlagFadeIn = 2u;
-	static const uint kPhysFlagShrink = 4u;
-	// (47k) Bead Coalescence Cap (per-pixel presence at most wetPhysParams[3].z, no halo at the bead edge) / Less Grid-like Bead
-	// Placement (a bead is kPhysLessGridRadius of its cell; 47j 0.42). WetSkin::Phys::kFlag*.
-	static const uint kPhysFlagBeadCap = 8u;
-	static const uint kPhysFlagLessGrid = 16u;
-	static const float kPhysLessGridRadius = 0.36;
-	// (47l) Sweat and Drying v2 (WetSkin::Phys::kFlagDryLaw): a swim zone's held water follows the drying law's curve.
-	static const uint kPhysFlagDryLaw = 32u;
-	// (47l) Water Line per Limb (WetSkin::Phys::kFlagLimbs): the stored lines per limb in wetPhysLimbs (WetPhysBandBody).
+	// (47o) The 47j-47l A/B switches (Water Line Like Legacy, Beads Fade In, Beads Shrink, Bead Coalescence Cap, Less Grid-like
+	// Bead Placement, Sweat and Drying v2) are permanent; their flag bits 1-32 of wetPhysParams[3].w are no longer read.
+	static const float kPhysLessGridRadius = 0.36;  // (47k) a bead is this share of its cell (47j: 0.42)
+	// (47l) Water Line per Limb (WetSkin::Phys::kFlagLimbs): the stored lines per limb in wetPhysLimbs (WetPhysBandBody); set per
+	// character (body-mapped ones), so still a flag.
 	static const uint kPhysFlagLimbs = 64u;
 	bool WetPhysFlag(uint a_flag)
 	{
@@ -208,37 +171,25 @@ namespace Skin
 		return lerp(kPhysDryCurve[i], kPhysDryCurve[i + 1], u - float(i));
 	}
 
-	/// The swim height profile at h units above the feet: x drying progress, y share of the above-capacity water still on,
-	/// z = 1 below the current water surface (the old 2.5-unit soft line).
+	/// The swim profile at h units above the feet: x drying progress, y share of the above-capacity water still on, z = 1 below
+	/// the current water surface (the old 2.5-unit soft line).
 	/// (47j) Water Line Like Legacy: below the water line (wetPhysParams[0].w, units above the feet, 0 = none; the Legacy 2.5-unit
 	/// soft line) at most two evenly drying zones: wetPhysBands[0] up to the line, wetPhysBands[1] up to wetPhysBands[0].z (the part
-	/// that left the water last); under the current surface soaked as before.
-	/// (47k) hBody: the body-fixed height (CharBodyHeight) for the stored line / zones / bands; hWorld: the world height for the
-	/// current water surface (the same value when Water Line Follows the Body is off).
+	/// that left the water last); under the current surface soaked as before. (47o) Always (the 47i height bands are gone).
+	/// (47k) hBody: the body-fixed height (CharBodyHeight) for the stored line / zones; hWorld: the world height for the current
+	/// water surface.
 	float3 WetPhysBand(float h, float hWorld)
 	{
 		float3 o = float3(4.0, 0.0, 0.0);
 		const float bandH = wetPhysParams[0].w;
-		[branch] if (WetPhysFlag(kPhysFlagWaterLine))
+		[branch] if (bandH > 0.0)
 		{
-			[branch] if (bandH > 0.0)
-			{
-				o.xy = lerp(float2(4.0, 0.0), wetPhysBands[0].xy, 1.0 - smoothstep(bandH - 2.5, bandH + 2.5, h));
-				const float mid = wetPhysBands[0].z;
-				o.xy = lerp(o.xy, wetPhysBands[1].xy, mid > 0.0 ? 1.0 - smoothstep(mid - 2.5, mid + 2.5, h) : 0.0);
-			}
-			const float depth = wetPhysParams[3].y;
-			o.z = depth > 0.0 ? 1.0 - smoothstep(depth - 2.5, depth + 2.5, hWorld) : 0.0;
+			o.xy = lerp(float2(4.0, 0.0), wetPhysBands[0].xy, 1.0 - smoothstep(bandH - 2.5, bandH + 2.5, h));
+			const float mid = wetPhysBands[0].z;
+			o.xy = lerp(o.xy, wetPhysBands[1].xy, mid > 0.0 ? 1.0 - smoothstep(mid - 2.5, mid + 2.5, h) : 0.0);
 		}
-		else if (bandH > 0.0)
-		{
-			const float t = clamp(h / bandH - 0.5, 0.0, 7.0);
-			const uint i = min(uint(t), 6u);
-			const float f = smoothstep(0.35, 0.65, t - float(i));
-			o.xy = lerp(wetPhysBands[i].xy, wetPhysBands[i + 1].xy, f);
-			const float depth = wetPhysParams[3].y;
-			o.z = depth > 0.0 ? 1.0 - smoothstep(depth - 2.5, depth + 2.5, hWorld) : 0.0;
-		}
+		const float depth = wetPhysParams[3].y;
+		o.z = depth > 0.0 ? 1.0 - smoothstep(depth - 2.5, depth + 2.5, hWorld) : 0.0;
 		return o;
 	}
 
@@ -288,7 +239,7 @@ namespace Skin
 		const float x = saturate(band.y);
 		const float excess = x > 0.0 ? pow(x, invM) : 0.0;
 		trail = x > 0.0 ? pow(x, 0.25 * invM) : 0.0;
-		const float held = WetPhysFlag(kPhysFlagDryLaw) ? WetPhysDryCurve(band.x * invM) : saturate(1.0 - band.x * invM);  // (47l)
+		const float held = WetPhysDryCurve(band.x * invM);  // (47l) Sweat and Drying v2 ((47o) permanent)
 		const float v = lerp(kPhysHold * held + (kPhysSoak - kPhysHold) * excess, kPhysSoak, band.z);
 		const float w = saturate(wetPhysParams[1].w);
 		trail = w > 0.0 ? max(trail, band.z) : 0.0;
@@ -307,13 +258,7 @@ namespace Skin
 		return lerp(0.6, 1.3, saturate(nz * 0.5 + 0.5)) + 0.15 * smoothstep(95.0, 115.0, h);
 	}
 
-	/// The beading share of swim water a_v (um): a closed film above 160 um makes no beads.
-	float WetPhysSwimBeadShare(float a_v)
-	{
-		return saturate(wetPhysParams[1].z) * (1.0 - smoothstep(120.0, 160.0, a_v));
-	}
-
-	// ---- (47j) Beads Fade In From the Film / Beads Shrink and Fade Out ------------------------------------
+	// ---- (47j) Beads Fade In From the Film / Beads Shrink and Fade Out ((47o) permanent) -----------------
 	static const float kPhysBreakHi = 200.0;  // the swim film starts to break up below this (um)
 	static const float kPhysBreakLo = 120.0;  // and is all beads (x Beading) by this
 	static const float kPhysBeadFloor = 0.6;  // a bead shrinks to this share of its drawn size before it fades
@@ -331,12 +276,10 @@ namespace Skin
 		return smoothstep(t0, t0 + 0.45, s);
 	}
 
-	/// The beading share of swim water a_v with the break-up (Fade In on) or the 47i gate (off). a_n: patch noise 0..1.
+	/// The beading share of swim water a_v with the break-up. a_n: patch noise 0..1.
 	float WetPhysSwimBeadShareEx(float a_v, float a_n)
 	{
-		[branch] if (WetPhysFlag(kPhysFlagFadeIn))
-			return saturate(wetPhysParams[1].z) * WetPhysBreakup(a_v, a_n);
-		return WetPhysSwimBeadShare(a_v);
+		return saturate(wetPhysParams[1].z) * WetPhysBreakup(a_v, a_n);
 	}
 
 	/// A bead's drawn size share and opacity at its life L (0 gone .. 1 full): it grows from kPhysBeadFloor to full over
@@ -390,17 +333,16 @@ namespace Skin
 		return smoothstep(1.0, 2.5, dPx) * lod;
 	}
 
-	/// Droplet cells per uv unit for the drawn bead radius (a bead is 0.42 cell in radius; (47k) Less Grid-like: 0.36).
+	/// Droplet cells per uv unit for the drawn bead radius (a bead is kPhysLessGridRadius cell in radius).
 	float WetPhysCellsPerUV(float cmPerUV)
 	{
-		return (WetPhysFlag(kPhysFlagLessGrid) ? kPhysLessGridRadius : 0.42) * cmPerUV / max(wetPhysParams[2].x, 0.01);
+		return kPhysLessGridRadius * cmPerUV / max(wetPhysParams[2].x, 0.01);
 	}
 
-	/// (47k) Bead Coalescence Cap: the pixel's bead presence at most wetPhysParams[3].z (c_cap / the grid's coverage, <= 0.75);
-	/// off: unchanged.
+	/// (47k) Bead Coalescence Cap: the pixel's bead presence at most wetPhysParams[3].z (c_cap / the grid's coverage, <= 0.75).
 	float WetPhysPresenceCap(float a_presence)
 	{
-		return WetPhysFlag(kPhysFlagBeadCap) ? min(a_presence, max(wetPhysParams[3].z, 0.0)) : a_presence;
+		return min(a_presence, max(wetPhysParams[3].z, 0.0));
 	}
 
 	/// (44c) Twomey wet albedo, d = 0..2: d <= 1 moves toward one soaking step A / (1.77 - 0.77 A),
@@ -415,48 +357,18 @@ namespace Skin
 		return a1;
 	}
 
-	/// (44c) Swimming wetness of one material class with its own drying multiplier (skin = 1,
-	/// hair, cloth, leather, metal, fur from Character Wetness): full in the water, held for
-	/// Hold x mult after leaving it, then a smooth dry-off over Dry x mult. progress: 0..1 how far
-	/// the dry-off is.
-	float CharSwimClass(float dryMult, out float progress)
-	{
-		progress = 0.0;
-		if (wetCharPerGeometry.z > 0.5)
-			return 1.0;
-		// (47i) Not used by Physical (its swim water is the height profile, WetPhysSwimWater).
-		const float hold = max(wetCharParams[0].x, 0.0) * dryMult;
-		const float dry = max(wetCharParams[0].y * dryMult, 1.0);
-		const float t = saturate((wetCharPerGeometry.x - hold) / dry);
-		progress = t;
-		return 1.0 - t * t * (3.0 - 2.0 * t);
-	}
-
-	/// (44c) CharDryWetness for hair and gear: their own swimming wetness (CharSwimClass), the
-	/// water line raised / lowered by levelOffset (cloth wicking, receding while drying), and
-	/// their share of the sweat.
-	float CharDryWetnessClass(float worldZ, float sweat, float swimClass, float levelOffset, float sweatShare, out float wSwim, out float wManual, out float wSweat)
-	{
-		const float waterLevel = skinPerGeometry.z + wetSkinPerGeometry.y + levelOffset;
-		const float swim = wetSkinPerGeometry.y > 0.0 ? swimClass * (1.0 - smoothstep(waterLevel - 2.5, waterLevel + 2.5, worldZ)) : 0.0;
-		wSwim = saturate(swim * wetSkinParams[0].z);
-		wManual = saturate(wetSkinParams[0].y);
-		wSweat = saturate(sweat * wetSkinParams[1].x * sweatShare);
-		return 1.0 - (1.0 - wSwim) * (1.0 - wManual) * (1.0 - wSweat);
-	}
-
 	// ---- (44c) Gear: soft material classes ------------------------------------------------------
 	//
 	// wetCharParams (WetSkin::GPUParams::c):
-	//   [0] x hold (s), y dry-off (s), z hair dry-time multiplier, w hair sweat share
+	//   [0] x / y unused ((47o) the Simple model's hold and dry-off), z hair dry-time multiplier, w hair sweat share
 	//   [1] x wet hair on, y hair darkening, z highlight sharpness, w highlight strength
 	//   [2] x secondary highlight loss, y scatter loss, z clumping, w clump count
 	//   [3] x clump streakiness, y gap darkening, z debug class tint, w unused
-	//   [4] x gear mode (0 off, 1 New, 2 42c), y overall sheen, z patch contrast, w cloth wicking
+	//   [4] x gear mode (0 off, 1 on; (47o) the 42c gear model is gone), y overall sheen, z patch contrast, w cloth wicking
 	//   [5] x gear sweat share, y item keyword trust (0 = pixels only), z leather droplets, w leather rivulets
-	//   [6] x metal droplets, y metal rivulets, z unused, w unused
+	//   [6] x metal droplets, y metal rivulets, z rivulets on the face, w between-trail dulling
 	//   [7..10] cloth, leather, metal, fur: x darkening, y sheen, z roughness floor, w dry-time multiplier
-	//   [11] unused
+	//   [11] w oil ((47o) x / y, the 47c performance switches, are permanent and not read)
 
 	/// Class weights: x cloth, y leather, z metal (x + y + z = 1), w fur / other (blends the result
 	/// toward the fur parameters). m0: metal evidence (TruePBR metallic, env mask); g0: gloss;
@@ -494,20 +406,6 @@ namespace Skin
 		return lerp(w.x * 0.55 + w.y * 0.70 + w.z * 0.75, 0.50, w.w);
 	}
 
-	/// (44b) Wet Skin New model: one character's wetness without the rain, the same for skin, hair
-	/// and gear: swimming (in the water, then held, then drying off; below the deepest water line
-	/// only), the manual slider and sweat, each weighted, combined as independent layers. Rain is
-	/// added by the caller, where the sky occlusion is known: only the rain is sky-occluded.
-	/// sweat: Advanced Skin's sweat for this pixel (Skin::GetWetness().x).
-	float CharDryWetness(float worldZ, float sweat, out float wSwim, out float wManual, out float wSweat)
-	{
-		const float waterLevel = skinPerGeometry.z + wetSkinPerGeometry.y;
-		const float swim = wetSkinPerGeometry.x * (1.0 - smoothstep(waterLevel - 2.5, waterLevel + 2.5, worldZ));
-		wSwim = saturate(swim * wetSkinParams[0].z);
-		wManual = saturate(wetSkinParams[0].y);
-		wSweat = saturate(sweat * wetSkinParams[1].x);
-		return 1.0 - (1.0 - wSwim) * (1.0 - wManual) * (1.0 - wSweat);
-	}
 #endif
 #if defined(SKIN)
 	Texture2D<float4> TexSkinDetailNormal : register(t72);
@@ -843,10 +741,9 @@ namespace Skin
 	// derivatives are defined.
 	float FBMFootprint(float2 uv, float uv_pixel_footprint, float base_scale, int octaves, float lacunarity, float persistence, float z_offset_multiplier)
 	{
-		// (47c) Skip Invisible Work: an octave faded out completely (octave_filter == 0) adds
+		// (47c) Skip Invisible Work ((47o) permanent): an octave faded out completely (octave_filter == 0) adds
 		// lerp(0.5, n, 0) = 0.5 exactly, so its noise is not evaluated. With Lacunarity < 1 the
 		// first octave is the finest, so the skipped ones are not at the end of the loop.
-		const bool skipFaded = WetSkipInvisible();
 		float total = 0.0;
 		float frequency = base_scale;
 		float amplitude = 1.0;
@@ -861,7 +758,7 @@ namespace Skin
 			// persistence still control the same frequency/amplitude progression.
 			const float octave_filter = 1.0f - smoothstep(0.25f, 0.5f, pixel_footprint);
 			float octave_value = 0.5f;
-			[branch] if (!skipFaded || octave_filter > 0.0f)
+			[branch] if (octave_filter > 0.0f)
 			{
 				const float octave_noise = (Random::perlinNoise(float3(octave_uv, (float)i * z_offset_multiplier)) + 1.0f) * 0.5f;
 				octave_value = lerp(0.5f, octave_noise, octave_filter);
@@ -880,8 +777,8 @@ namespace Skin
 
 	// ---- (47c) Faster Noise: a 2D gradient noise on a cheap integer hash -------------------------
 	//
-	// Replaces the 5-octave 3D murmur3 Perlin of the wet patches (New model, skin and gear) when
-	// "Wetness: Faster Noise & Distance LOD" is on. Same uv (mesh uv: stays put on a moving
+	// Replaces the 5-octave 3D murmur3 Perlin of the wet patches (Physical, skin and gear); (47o) always (the Legacy model keeps
+	// FBMFootprint through PerlinNoise). Same uv (mesh uv: stays put on a moving
 	// character), same Scale / Lacunarity / Persistence / footprint fade; each octave has its own
 	// seed (the old one had its own z slice). Per-octave gain: the old octave's spread (std of the
 	// 0..1 value, 0.124-0.134, measured over 400k samples) over this noise's (0.086), so the patch
@@ -929,7 +826,6 @@ namespace Skin
 	float FBMFootprintFast(float2 uv, float uv_pixel_footprint, float base_scale, float lacunarity, float persistence)
 	{
 		static const float kOctaveGain[5] = { 1.427, 1.514, 1.465, 1.431, 1.544 };
-		const bool skipFaded = WetSkipInvisible();
 		float total = 0.0;
 		float frequency = base_scale;
 		float amplitude = 1.0;
@@ -939,7 +835,7 @@ namespace Skin
 			const float pixel_footprint = uv_pixel_footprint * abs(frequency);
 			const float octave_filter = 1.0f - smoothstep(0.25f, 0.5f, pixel_footprint);
 			float octave_value = 0.5f;
-			[branch] if (!skipFaded || octave_filter > 0.0f)
+			[branch] if (octave_filter > 0.0f)
 			{
 				const float octave_noise = saturate(0.5f + 0.5f * kOctaveGain[i] * WetGradientNoise2(uv * frequency, (uint)i));
 				octave_value = lerp(0.5f, octave_noise, octave_filter);
@@ -1003,15 +899,15 @@ namespace Skin
 		return pow(sweat_intensity, 0.1f);
 	}
 
-	// ---- (44a) Wet Skin "New" model ------------------------------------------------------------
+	// ---- (44a) Wet Skin "New" model, (47o) the Physical model's look ------------------------------
 	//
 	// wetSkinParams (WetSkin::GPUParams):
-	//   [0] x model (1 = New), y manual wetness, z swim weight, w rain weight
+	//   [0] x model (0 Legacy, 2 Physical), y manual wetness, z swim weight, w unused ((47o) the Simple model's rain weight)
 	//   [1] x sweat weight, y film roughness when slightly wet, z film roughness at full wetness, w full-wetness strength
-	//   [2] x patch softness, y patch contrast, z droplet amount, w droplet density
-	//   [3] x droplet size, y size randomness, z face droplets, w droplet rim
+	//   [2] x patch softness, y patch contrast, z / w unused ((47o) the Simple model's droplet amount / density)
+	//   [3] x unused ((47o) Simple droplet size), y size randomness, z face droplets, w droplet rim
 	//   [4] x droplet trails, y streak amount, z streak length, w streak width
-	//   [5] x streak contrast, y darkening, z droplet normal strength, w rain droplets
+	//   [5] x streak contrast, y darkening, z droplet normal strength, w unused ((47o) Simple rain droplets)
 
 	float WetHash12(float2 p)
 	{
@@ -1050,11 +946,7 @@ namespace Skin
 	float WetPatchNoise(float2 uv, float uvFootprint, float scale, float lacunarity, float persistence)
 	{
 		// (47c) Faster Noise: the 2D gradient FBM (same parameters, matched statistics).
-		float fbm;
-		[branch] if (WetFastNoiseLOD())
-			fbm = FBMFootprintFast(uv, uvFootprint, scale, lacunarity, persistence);
-		else
-			fbm = FBMFootprint(uv, uvFootprint, scale, 5, lacunarity, persistence, 7.375f);
+		const float fbm = FBMFootprintFast(uv, uvFootprint, scale, lacunarity, persistence);
 		return saturate((fbm - 0.5) * 3.0 + 0.5);
 	}
 
@@ -1070,11 +962,7 @@ namespace Skin
 		if (contrast <= 0.0 || wetness >= 1.0)
 			return wetness;
 		// (47c) Faster Noise: the 2D gradient FBM (same parameters, matched statistics).
-		float fbm;
-		[branch] if (WetFastNoiseLOD())
-			fbm = FBMFootprintFast(uv, uvFootprint, scale, lacunarity, persistence);
-		else
-			fbm = FBMFootprint(uv, uvFootprint, scale, 5, lacunarity, persistence, 7.375f);
+		const float fbm = FBMFootprintFast(uv, uvFootprint, scale, lacunarity, persistence);
 		const float noise = saturate((fbm - 0.5) * 3.0 + 0.5);
 		const float threshold = lerp(1.0 + softness, -softness, wetness);
 		const float patches = smoothstep(threshold - softness, threshold + softness, noise);
@@ -1118,9 +1006,9 @@ namespace Skin
 		const float2 across = float2(-gravityUV.y, gravityUV.x);
 		const float presenceDrawn = shrink > 0.0 ? presence * kPhysBeadInflate : presence;
 		const float invRamp = 1.0 / max(kPhysBeadRamp * presenceDrawn, 1e-4);
-		// (47k) Physical only (the flags are 0 in the other models): a smaller bead per cell, no halo slope past the bead's edge.
-		const float cellRadius = WetPhysFlag(kPhysFlagLessGrid) ? kPhysLessGridRadius : 0.42;
-		const bool slopeClamp = WetPhysFlag(kPhysFlagBeadCap);
+		// (47k) A smaller bead per cell (Less Grid-like Bead Placement), no halo slope past the bead's edge (Bead Coalescence Cap);
+		// (47o) both permanent.
+		const float cellRadius = kPhysLessGridRadius;
 
 		[branch] if (presence > 0.0)
 		{
@@ -1150,7 +1038,7 @@ namespace Skin
 					const float m = (1.0 - smoothstep(1.0 - aa, 1.0 + aa, r)) * life.y;
 					if (m > best) {
 						best = m;
-						o.dropSlope = slopeClamp ? d / max(length(d), radius) : d / radius;
+						o.dropSlope = d / max(length(d), radius);
 						o.dropRim = saturate(1.0 - abs(r - 0.85) / max(0.2, aa));
 					}
 					// A short trail below the bead, along gravity, tapering away.
@@ -1215,7 +1103,7 @@ namespace Skin
 			const float lineFade = smoothstep(0.5, 1.2, linePixels);
 			// (47c) Skip Invisible Work: narrower than half a pixel (lineFade == 0) or past the
 			// distance LOD, the product below is exactly 0 (the fields are finite): not evaluated.
-			[branch] if (!WetSkipInvisible() || (lineFade > 0.0 && lod > 0.0))
+			[branch] if (lineFade > 0.0 && lod > 0.0)
 			{
 				// (44e) Contrast (RivuletContrast2): higher = more of each trail runs unbroken, so the trails
 				// read more clearly against the skin. 44b-44d raised the segment threshold with Contrast

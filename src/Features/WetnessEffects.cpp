@@ -32,16 +32,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	RippleStrength,
 	RippleRadius,
 	RippleBreadth,
-	RippleLifetime,
-	EnableWetFilm,
-	WetFilmRoughness,
-	WetFilmStrength,
-	EnableWetDarkening,
-	PorositySkin,
-	PorosityCloth,
-	PorosityMetal,
-	PorosityOther,
-	EnableRainSkinFilm)
+	RippleLifetime)
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	WetnessEffects::DebugSettings,
@@ -354,55 +345,9 @@ void WetnessEffects::DrawSettings()
 	ImGui::Spacing();
 	ImGui::Spacing();
 
-	// (42c) Character wetness: skin, hair and everything an actor wears or carries.
-	if (ImGui::TreeNodeEx("Characters", ImGuiTreeNodeFlags_DefaultOpen)) {
-		// (44c) Character Wetness New model with the New gear model: skin, hair and gear are all on
-		// that page and these 42c options do nothing; Original turns them off.
-		const auto& charWet = globals::features::wetSkin;
-		const bool charWetActive = charWet.loaded && globals::features::skin.loaded && globals::features::skin.settings.EnableSkin;
-		const bool charWetOwnsAll = charWetActive && !charWet.IsOriginal() && charWet.settings.GearEnabled && charWet.settings.GearModel == 0;
-		if (charWetOwnsAll || (charWetActive && charWet.IsOriginal())) {
-			ImGui::TextDisabled("Characters (skin, hair, gear): see the Character Wetness page (Characters).");
-			if (charWet.IsOriginal())
-				ImGui::TextColored({ 1.0f, 0.75f, 0.3f, 1.0f }, "Character Wetness Model is Legacy (pre-42c): the 42c character options are off.");
-			ImGui::TreePop();
-		} else {
-			if (charWetActive && !charWet.IsOriginal())
-				ImGui::TextDisabled("Used by gear with Character Wetness > Gear Model 42c. Skin and hair: Character Wetness page.");
-			ImGui::Checkbox("Wet Film Highlight", (bool*)&settings.EnableWetFilm);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				Util::DrawMultiLineTooltip({ "A thin layer of water on top of skin, hair and gear: a soft, clearly visible sheen in sunlight.",
-					"Off: the old wet highlight, which gets smaller and sharper the wetter a character is and is nearly invisible in sun.",
-					"Direct light only; reflections, SSR/SSGI inputs and the G-buffer are not changed." });
-			}
-			ImGui::BeginDisabled(!settings.EnableWetFilm);
-			ImGui::SliderFloat("Film Roughness", &settings.WetFilmRoughness, 0.2f, 0.4f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("Lower = smaller, sharper highlight (can sparkle under DLSS). Higher = broader, softer sheen.");
-			ImGui::SliderFloat("Film Strength", &settings.WetFilmStrength, 0.0f, 3.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("1.0 = physically based water. Raise only if you want an exaggerated wet look.");
-			ImGui::EndDisabled();
-
-			ImGui::Checkbox("Wet Darkening", (bool*)&settings.EnableWetDarkening);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				Util::DrawMultiLineTooltip({ "Wet materials get darker and a little more saturated. Applied before lighting, so sun, ambient, SSGI and skin SSS all see it.",
-					"Face and body darken together (no neck seam).",
-					"Off: the old darkening (skin and face never darkened)." });
-			}
-			ImGui::BeginDisabled(!settings.EnableWetDarkening);
-			ImGui::SliderFloat("Porosity: Cloth / Leather", &settings.PorosityCloth, 0.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-			ImGui::SliderFloat("Porosity: Metal", &settings.PorosityMetal, 0.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-			ImGui::SliderFloat("Porosity: Other (hair, fur)", &settings.PorosityOther, 0.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("How much each material darkens when soaked. 1.0 = a fully absorbent material (about a third darker); 0 = no change.");
-			ImGui::EndDisabled();
-
-			// (44a) Skin wetness (rain on skin, darkening of skin, the film) is on the Character Wetness page.
-			ImGui::TextDisabled("Skin (rain on skin, skin darkening, sheen, droplets): Character Wetness page (Characters).");
-			ImGui::TreePop();
-		}
-	}
+	// (42c) Character wetness. (47o) The 42c "Characters" options (Wet Film Highlight, Film Roughness / Strength, Wet Darkening,
+	// the three Porosities) are fixed at their defaults (GetCommonBufferData): skin, hair and gear are on the Character Wetness page.
+	ImGui::TextDisabled("Characters (skin, hair, gear): see the Character Wetness page (Characters).");
 
 	ImGui::Spacing();
 	ImGui::Spacing();
@@ -420,21 +365,7 @@ void WetnessEffects::DrawSettings()
 		ImGui::Checkbox("Enable Ripples", (bool*)&settings.EnableRipples);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("Enables circular ripples on puddles, and to a less extent other wet surfaces");
-		// (46y)
-		ImGui::Checkbox("Raindrops: Fast Path", &RaindropFastPath);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): the same splashes and ripples for less GPU time. Splashes are computed only where they can still");
-			ImGui::Text("  make the surface wetter (in steady rain most surfaces are already wetter than a splash), ripples only on");
-			ImGui::Text("  near-flat ground where they have strength, and only the neighbouring raindrop cells a drop could reach.");
-			ImGui::Text("Off: every pixel facing up computes all of it (46x).");
-		}
-		ImGui::BeginDisabled(!RaindropFastPath);
-		ImGui::Checkbox("Raindrops: Skip Sub-Pixel Drops", &RaindropSubPixelSkip);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default, with Fast Path): far away, where one raindrop cell is smaller than a pixel, the drops fade out and");
-			ImGui::Text("  are not computed (there they are only shimmering noise). Off: drops at every distance.");
-		}
-		ImGui::EndDisabled();
+		// (46y) Raindrops: Fast Path and Skip Sub-Pixel Drops are permanent (47o).
 
 		ImGui::BeginDisabled(splashesOfStormsLoaded);
 		std::string checkboxLabel = splashesOfStormsLoaded ?
@@ -904,26 +835,27 @@ WetnessEffects::PerFrame WetnessEffects::GetCommonBufferData() const
 	data.settings.RaindropGridSize = 1.0f / settings.RaindropGridSize;
 	data.settings.RaindropInterval = 1.0f / settings.RaindropInterval;
 	data.settings.RippleLifetime = settings.RaindropInterval / settings.RippleLifetime;
-	// (46y) Raindrops: Fast Path bits (WetnessEffects.hlsli kRaindropFastPath / kRaindropSubPixelSkip); bit 0 stays the switch.
-	data.settings.EnableVanillaRipples = (settings.EnableVanillaRipples ? 1u : 0u) | (RaindropFastPath ? 2u : 0u) |
-	                                     ((RaindropFastPath && RaindropSubPixelSkip) ? 4u : 0u);
+	// (46y) Raindrops: Fast Path and Skip Sub-Pixel Drops are permanent (47o): the shader no longer reads bits 1 / 2; bit 0 stays the
+	// vanilla-ripples switch (no shader reads it).
+	data.settings.EnableVanillaRipples = settings.EnableVanillaRipples ? 1u : 0u;
 
-	// (42c) Keep hand-edited JSON inside the ranges the shader assumes (the 0.05 floor is
-	// the same one the always-on numeric fix uses).
-	data.settings.WetFilmRoughness = std::clamp(settings.WetFilmRoughness, 0.2f, 1.0f);  // (44a) anti-mirror floor
-	data.settings.WetFilmStrength = std::clamp(settings.WetFilmStrength, 0.0f, 3.0f);
-	// (44a) Skin darkening comes from Wet Skin; its Original model turns the 42c character
-	// switches off for every character (gear included), as before 42c.
+	// (42c) (47o) The "Characters" options are fixed at their defaults (the film's roughness at its 0.2 anti-mirror floor). The fields
+	// stay in the GPU struct (FeatureData layout). (44a) Skin darkening comes from Wet Skin; its Original model turns the 42c
+	// character switches off for every character (gear included), as before 42c. EnableRainSkinFilm is not read (0).
+	data.settings.EnableWetFilm = 1;
+	data.settings.WetFilmRoughness = 0.2f;
+	data.settings.WetFilmStrength = 1.0f;
+	data.settings.EnableWetDarkening = 1;
 	const auto& wetSkin = globals::features::wetSkin;
 	data.settings.PorositySkin = std::clamp(wetSkin.settings.Darkening, 0.0f, 2.0f);
 	if (wetSkin.IsOriginal()) {
 		data.settings.EnableWetFilm = 0;
 		data.settings.EnableWetDarkening = 0;
-		data.settings.EnableRainSkinFilm = 0;
 	}
-	data.settings.PorosityCloth = std::clamp(settings.PorosityCloth, 0.0f, 2.0f);
-	data.settings.PorosityMetal = std::clamp(settings.PorosityMetal, 0.0f, 2.0f);
-	data.settings.PorosityOther = std::clamp(settings.PorosityOther, 0.0f, 2.0f);
+	data.settings.EnableRainSkinFilm = 0;
+	data.settings.PorosityCloth = 1.0f;
+	data.settings.PorosityMetal = 0.0f;
+	data.settings.PorosityOther = 0.8f;
 
 	return data;
 }
@@ -952,13 +884,6 @@ void WetnessEffects::LoadSettings(json& o_json)
 	if (o_json.contains("DebugSettings")) {
 		debugSettings = o_json["DebugSettings"].get<DebugSettings>();
 	}
-	// (46y)
-	const auto readBool = [&o_json](const char* a_key, bool a_default) {
-		const auto it = o_json.find(a_key);
-		return (it != o_json.end() && it->is_boolean()) ? it->get<bool>() : a_default;
-	};
-	RaindropFastPath = readBool("RaindropFastPath", true);
-	RaindropSubPixelSkip = readBool("RaindropSubPixelSkip", true);
 }
 
 void WetnessEffects::SaveSettings(json& o_json)
@@ -966,8 +891,6 @@ void WetnessEffects::SaveSettings(json& o_json)
 	o_json = settings;
 
 	o_json["DebugSettings"] = debugSettings;
-	o_json["RaindropFastPath"] = RaindropFastPath;          // (46y)
-	o_json["RaindropSubPixelSkip"] = RaindropSubPixelSkip;  // (46y)
 }
 
 

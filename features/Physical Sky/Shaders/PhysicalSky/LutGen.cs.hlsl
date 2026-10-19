@@ -114,12 +114,9 @@ void rayMarch(
 #	if LUTGEN == 1
 	// (batch 37b) Upstream c14664115: the higher-order scattering this LUT approximates is
 	// isotropic. With the peaked aerosol phase, 16 directions decide whether a sample happens to
-	// land near the sun.
-	[branch] if (SharedData::physSkyExtData.Flags & SharedData::PhysSkyExtFlags::MultiScatterFix)
-	{
-		phaseAerosolSun = 0.25 * RCP_PI;
-		phaseRayleighSun = 0.25 * RCP_PI;
-	}
+	// land near the sun. (47o) Always (the Legacy 36f path is gone).
+	phaseAerosolSun = 0.25 * RCP_PI;
+	phaseRayleighSun = 0.25 * RCP_PI;
 #	endif
 
 #	if LUTGEN != 1
@@ -338,8 +335,8 @@ float3 NightSkyBase(float3 rayDir)
 
 	float3 lumTotal = 0;
 	float3 fMs = 0;
-	// (batch 37b) Upstream c14664115: the azimuth covered only [0, pi), half the sphere.
-	const float azimuthRange = (SharedData::physSkyExtData.Flags & SharedData::PhysSkyExtFlags::MultiScatterFix) ? 2.0 * Math::PI : Math::PI;
+	// (batch 37b) Upstream c14664115: the azimuth covered only [0, pi), half the sphere. (47o) Always the full circle.
+	const float azimuthRange = 2.0 * Math::PI;
 	for (uint i = 0; i < sqrtSamples; ++i)
 		for (uint j = 0; j < sqrtSamples; ++j) {
 			const float theta = (i + 0.5) * azimuthRange * rcpSqrtSamples;

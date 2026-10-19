@@ -1362,7 +1362,7 @@ namespace RayTracingPointLights
 		std::uint32_t scan = 0;
 		// (46y) Non-RT casters mode: SSPLS for the occluders the trace does not see, its contact length in bits 16-23.
 		const std::uint32_t contactBits = a_config.ssplsNonRT ? static_cast<std::uint32_t>(std::lround(std::clamp(std::isfinite(a_config.ssplsContact) ? a_config.ssplsContact : 0.0f, 0.0f, 31.875f) * 8.0f)) : 0u;
-		const std::uint32_t tagFlags = (a_config.ssplsNonRT ? (kTagSSPLSNonRT | (contactBits << kTagContactShift)) : (a_config.keepSSPLS ? kTagKeepSSPLS : 0u)) |
+		const std::uint32_t tagFlags = (a_config.ssplsNonRT ? (kTagSSPLSNonRT | (contactBits << kTagContactShift)) : 0u) |
 		                               (a_config.split ? kTagSplit : 0u) | (a_config.waterBed ? kTagWaterBed : 0u);
 		std::uint32_t clearanceBits;
 		for (const std::uint32_t g : order) {

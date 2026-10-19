@@ -23,7 +23,7 @@ namespace RTPointShadows
 
 	static const uint kSourceMask = 0x7Fu;
 	static const uint kNative = 1u << 8;     // an engine shadow-map light: RT replaces its shadow map
-	static const uint kKeepSSPLS = 1u << 9;  // Screen Space Point Light Shadows stay on as contact shadows (min with RT)
+	// 1u << 9: (47o) reserved (was kKeepSSPLS, "Keep Screen-Space Contact Shadows", removed)
 	static const uint kSplit = 1u << 10;     // debug A/B: RT on the left half of the screen only
 	// (46y) Screen-Space Shadows for Non-RT Casters: SSPLS beside RT, an occluder that is a traced caster (Sources.w bit 7 at its
 	// pixel, TracePointLightsCS) counts only within the contact length; bits 16-23 = that length in eighths of the trace's start offset.

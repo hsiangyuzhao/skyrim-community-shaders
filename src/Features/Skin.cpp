@@ -31,15 +31,12 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	SkinDetailTiling,
 	BodyTilingMultiplier,
 	WetFadeTime,
-	StartSweat,
-	FullSweat,
 	Translucency,
 	sssWidth,
 	UseSSS,
 	FuzzStrength,
 	FuzzRoughness,
-	FuzzF0,
-	UseDynamicWetness);
+	FuzzF0);
 
 void Skin::DrawSettings()
 {
@@ -662,33 +659,10 @@ float4 Skin::GetWetness(RE::BSGeometry* geometry, float4& o_wetSkin, float4& o_w
 		state.snowGPU = float4(-1.0f, 0.0f, 0.0f, 0.0f);
 	}
 
-	// (44a) Wet Skin New model: in the water = 1; out of it, held for HoldTime, then drying off over
-	// DryTime (smooth). The deepest submersion is kept until the character is dry, so a character
-	// who climbed out stays wet up to where the water reached.
-	{
-		const auto& wet = globals::features::wetSkin.settings;
-		const float hold = std::max(wet.HoldTime, 0.0f);
-		const float dry = std::max(wet.DryTime, 1.0f);
-		// (44c) Everything (hair, the slowest gear class) is dry after this.
-		const float allDry = (hold + dry) * globals::features::wetSkin.MaxDryMultiplier();
-		float swim = 0.0f;
-		if (inWater) {
-			state.timeOut = 0.0f;
-			state.maxDepth = std::max(state.maxDepth, depth);
-			swim = 1.0f;
-		} else {
-			state.timeOut = std::min(state.timeOut + dt, 1e6f);
-			const float t = std::clamp((state.timeOut - hold) / dry, 0.0f, 1.0f);
-			swim = 1.0f - t * t * (3.0f - 2.0f * t);
-			// (44c) The water line is kept until the slowest class (hair, cloth ...) is dry too. (47f) Physical: below.
-			if (state.timeOut >= allDry && !globals::features::wetSkin.IsPhysical())
-				state.maxDepth = 0.0f;
-		}
-		state.wetSkin = float4(swim, state.maxDepth, inWater ? 1.0f : 0.0f, 0.0f);
-		// (44c) Hair and gear dry at their own pace: the shader gets the time since leaving the water
-		// (held at "all dry" afterwards, so the constant buffer stops changing).
-		state.wetChar = float4(inWater ? 0.0f : std::min(state.timeOut, allDry + 1.0f), 0.0f, inWater ? 1.0f : 0.0f, 0.0f);
-	}
+	// (47o) The Simple model's swim clock (hold, then dry-off, the deepest submersion) is gone: Physical keeps its own water below,
+	// Legacy uses the WetFadeTime fade. Only "in the water" is handed over (wetSkinPerGeometry.z / wetCharPerGeometry.z).
+	state.wetSkin = float4(0.0f, 0.0f, inWater ? 1.0f : 0.0f, 0.0f);
+	state.wetChar = float4(1e6f, 0.0f, inWater ? 1.0f : 0.0f, 0.0f);
 
 	// Sweat and the Original model's swim wetness (Advanced Skin's WetFadeTime fade). (47i) The sweat thresholds and Dynamic
 	// Wetness live on the Character Wetness page now (same meaning, every model).
@@ -772,15 +746,11 @@ float4 Skin::GetWetness(RE::BSGeometry* geometry, float4& o_wetSkin, float4& o_w
 		}
 		in.cold = cold;
 		// (47l) Water Line per Limb: how far up each limb is under the water, from its bones (a humanoid with usable limb chains; else
-		// the one line by the world height). (47m) Always on with Water Line Like Legacy.
-		if (wetSkin.settings.PhysWaterLine)
-			in.limbs = UpdateBodyLimbs(actor, state, water, in);
+		// the one line by the world height). (47m) Always on with Water Line Like Legacy ((47o) permanent).
+		in.limbs = UpdateBodyLimbs(actor, state, water, in);
 		wetSkin.UpdatePhysical(state.phys, in);
 		state.look = wetSkin.GetPhysicalLook(state.phys);
-		state.maxDepth = 0.0f;  // (47i) the swim water is in the height bands
 		state.skin.x = state.look.sweatLevel;
-		state.wetSkin = float4(0.0f, 0.0f, inWater ? 1.0f : 0.0f, 0.0f);
-		state.wetChar = float4(1e6f, 0.0f, inWater ? 1.0f : 0.0f, 0.0f);
 	} else {
 		state.phys.valid = false;  // a later switch to Physical starts afresh
 	}
@@ -1034,9 +1004,8 @@ void Skin::GetBodyFrame(RE::BSGeometry* a_geometry, RE::Actor* a_actor, ActorWet
 	auto& body = a_state.body;
 	// (47l) Water Line per Limb: a character without usable limb chains keeps the world height everywhere (never mixed); the
 	// body / world decision of a geometry is sticky (BodyGeometry::failCount), and no root offset (the lines are in body units).
-	const auto& wetSettings = globals::features::wetSkin.settings;
-	const bool limbs = wetSettings.PhysWaterLine;  // (47m) Water Line per Limb is permanent (needs Water Line Like Legacy)
-	if (limbs && !body.limbs.valid)
+	// (47m) Water Line per Limb is permanent ((47o) with Water Line Like Legacy): only characters with usable limb chains.
+	if (!body.limbs.valid)
 		return;
 
 	// Per geometry: its central bone, its bind height and skin-to-bone scale, the shoulder (rebuilt for another skin instance).
@@ -1099,10 +1068,7 @@ void Skin::GetBodyFrame(RE::BSGeometry* a_geometry, RE::Actor* a_actor, ActorWet
 		const float actual = boneZ - body.feetZ;
 		ok = s > 0.05f && s < 20.0f && std::fabs(predicted - actual) < 0.5f * body.height + 20.0f;
 	}
-	if (!limbs) {
-		if (!ok)
-			return;
-	} else if (ok) {
+	if (ok) {
 		geo.failCount = 0;
 		geo.lastScale = s;
 	} else {
@@ -1116,12 +1082,9 @@ void Skin::GetBodyFrame(RE::BSGeometry* a_geometry, RE::Actor* a_actor, ActorWet
 	}
 	const bool own = geo.shoulderKnown;
 	const bool shoulderKnown = own || body.shoulderKnown;
-	o_body = float4(s, limbs ? 0.0f : body.rootOffset, shoulderKnown ? (own ? geo.shoulderX : body.shoulderX) : 0.0f, shoulderKnown ? (own ? geo.shoulderZ : body.shoulderZ) : 0.0f);
-	o_body2 = float4(body.height, 0.0f, 0.0f, 0.0f);
-	if (limbs) {
-		const auto& l = body.limbs;
-		o_body2 = float4(body.height, l.crotchZ, l.legSign, l.armSign);
-	}
+	o_body = float4(s, 0.0f, shoulderKnown ? (own ? geo.shoulderX : body.shoulderX) : 0.0f, shoulderKnown ? (own ? geo.shoulderZ : body.shoulderZ) : 0.0f);
+	const auto& l = body.limbs;
+	o_body2 = float4(body.height, l.crotchZ, l.legSign, l.armSign);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1310,8 +1273,6 @@ bool Skin::RefreshBodyActor(RE::Actor* a_actor, ActorWetState& a_state, uint32_t
 	RE::NiAVObject* root = a_actor ? a_actor->Get3D(false) : nullptr;
 	if (!root)
 		return false;
-	const auto& wetSettings = globals::features::wetSkin.settings;
-	const bool limbsWanted = wetSettings.PhysWaterLine;  // (47m) Follows the Body and per Limb are permanent
 	bool lookedUp = false;
 	if (body.root != root || body.lookupFrame == UINT32_MAX || a_frame - body.lookupFrame > 300u) {
 		static const RE::BSFixedString kRoot("NPC Root [Root]");
@@ -1346,12 +1307,10 @@ bool Skin::RefreshBodyActor(RE::Actor* a_actor, ActorWetState& a_state, uint32_t
 		body.rootOffset = ReadNodeWorldZ(body.npcRoot.get(), rootZ) ? std::clamp(rootZ - body.feetZ, -64.0f, 64.0f) : 0.0f;
 		body.pelvisScale = ReadNodeWorldScale(body.pelvis.get(), body.pelvisScale) ? body.pelvisScale : 0.0f;
 	}
-	// (47l) The limb chains: at the lookup (or once the switch is turned on).
-	if (limbsWanted && (lookedUp || !body.limbsLooked)) {
+	// (47l) The limb chains: at the lookup ((47m) Follows the Body and per Limb are permanent).
+	if (lookedUp || !body.limbsLooked) {
 		body.limbsLooked = true;
 		LookupBodyLimbs(a_actor, root, body, body.limbs);
-	} else if (!limbsWanted) {
-		body.limbsLooked = false;
 	}
 	return true;
 }
@@ -1721,16 +1680,16 @@ void Skin::BSLightingShader_SetupGeometry(RE::BSRenderPass* a_pass)
 		// (44a) Wet Skin settings ride along (they change rarely; the buffer is only rewritten
 		// when something in it changed).
 		const auto& wetSkin = globals::features::wetSkin;
-		// (47c) Skip Invisible Work: the settings are turned into GPU values once per frame (a change
-		// in the menu shows from the next frame on); off: on every draw, as before.
+		// (47c) Skip Invisible Work ((47o) permanent): the settings are turned into GPU values once per frame (a change in the menu
+		// shows from the next frame on).
 		const uint32_t paramsFrame = globals::state->frameCount;
-		if (!wetSkin.settings.SkipInvisibleWork || wetParamsCacheFrame != paramsFrame) {
+		if (wetParamsCacheFrame != paramsFrame) {
 			const auto params = wetSkin.GetGPUParams();
 			for (int i = 0; i < 6; ++i)
 				wetSkinParamsCache[i] = params.p[i];
 			for (int i = 0; i < 12; ++i)
 				wetCharParamsCache[i] = params.c[i];
-			wetParamsCacheFrame = wetSkin.settings.SkipInvisibleWork ? paramsFrame : UINT32_MAX;
+			wetParamsCacheFrame = paramsFrame;
 		}
 		for (int i = 0; i < 6; ++i)
 			perGeometryData.wetSkinParams[i] = wetSkinParamsCache[i];
@@ -1766,7 +1725,7 @@ void Skin::BSLightingShader_SetupGeometry(RE::BSRenderPass* a_pass)
 			}
 		}
 		// (44f) Item class prior from the keywords of the worn item this geometry belongs to.
-		if (lastWetState && !wetSkin.IsOriginal() && wetSkin.settings.GearEnabled && wetSkin.settings.GearModel == 0 && wetSkin.settings.GearKeywords) {
+		if (lastWetState && !wetSkin.IsOriginal() && wetSkin.settings.GearEnabled && wetSkin.settings.GearKeywords) {
 			auto userData = geometry->GetUserData();
 			if (auto actor = userData ? userData->As<RE::Character>() : nullptr)
 				perGeometryData.wetCharPerGeometry.y = static_cast<float>(GetItemClassPrior(actor, *lastWetState, geometry, globals::state->frameCount));
@@ -1928,7 +1887,7 @@ void Skin::OnDrawStatesApplied(ID3D11DeviceContext* a_context)
 		// (the last frame covers one whose draws all come after the water); nobody in water = no
 		// draw is ever swapped (GetWaterDepthParams), so the full-screen copy was unused.
 		const bool someoneInWater = actorInWaterFrame != UINT32_MAX && frame - actorInWaterFrame <= 1;
-		if (preWaterDepthFrame != frame && endDeferredFrame == frame && (someoneInWater || !globals::features::wetSkin.settings.SkipInvisibleWork)) {
+		if (preWaterDepthFrame != frame && endDeferredFrame == frame && someoneInWater) {
 			ID3D11DepthStencilView* dsv = nullptr;
 			a_context->OMGetRenderTargets(0, nullptr, &dsv);
 			CopyPreWaterDepth(a_context, dsv);

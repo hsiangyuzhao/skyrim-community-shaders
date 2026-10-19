@@ -4,8 +4,6 @@
 #include "Common/FrameBuffer.hlsli"
 #include "Common/SharedData.hlsli"
 
-#define MAX_SAMPLES 4
-
 namespace ScreenSpacePointLightShadows
 {
 	/// (46y) Screen-Space Shadows for Non-RT Casters: is the visible surface at this screen UV a ray-traced caster? The point-light
@@ -21,102 +19,16 @@ namespace ScreenSpacePointLightShadows
 #endif
 	}
 
-	/// (46y) a_rtContact < 0: every occluder counts (as before). Else an occluder sample that is a ray-traced caster counts only
-	/// within a_rtContact view units of the start (the ray tracer handles it farther along the ray).
-	bool IgnoreOccluder(float a_rtContact, float a_travelled, float2 a_uv, uint a_eyeIndex)
-	{
-		bool ignore = false;
-		[branch] if (a_rtContact >= 0.0 && a_travelled > a_rtContact)
-			ignore = IsRtCaster(a_uv, a_eyeIndex);
-		return ignore;
-	}
-
-	float Raymarch(SamplerState s, float3 viewPosition, float3 lightDirectionVS, uint steps, float step, float2 stepScale, float compareToleranceScale, float radius, float2x2 rotationMatrix, uint a_eyeIndex = 0, float a_rtContact = -1.0)
-	{
-		float opacity = 1.0;
-		radius *= SharedData::ssplsSettings.SoftShadowScale * 0.0001;
-		const float3 startPosition = viewPosition;
-		const float3 normalizedLightDirection = normalize(lightDirectionVS);
-
-		float totalCompareTolerance = abs(lightDirectionVS.z - viewPosition.z) * step * compareToleranceScale;
-
-		[loop] for (uint i = 0; i < steps; i++)
-		{
-			// Step the ray
-			const float stepScaleMult = steps == 1 ? 1.0 : (stepScale.x + i * (stepScale.y - stepScale.x) / (steps - 1));
-			viewPosition += lightDirectionVS * step * stepScaleMult;
-			float compareTolerance = totalCompareTolerance * stepScaleMult;
-			float2 rayUV = FrameBuffer::ViewToUV(viewPosition, true, a_eyeIndex);
-
-			// Ensure the UV coordinates are inside the screen
-			if (!(rayUV.x >= 0.0 && rayUV.x <= 1.0 && rayUV.y >= 0.0 && rayUV.y <= 1.0))
-				break;
-
-			// Compute the difference between the ray's and the camera's depth
-			float rayDepth = SharedData::GetScreenDepth(rayUV, a_eyeIndex);
-			if (rayDepth < 16.5 || rayDepth > SharedData::ssplsSettings.MaxDistance)
-				break;
-
-			float depthDelta = viewPosition.z - rayDepth;
-			const float distanceScale = 1 - rayDepth / SharedData::ssplsSettings.MaxDistance;
-			if (rayDepth != startPosition.z) {
-				// (46y) Non-RT casters: a traced occluder past the contact length is the ray tracer's.
-				const float travelled = length(viewPosition - startPosition);
-				[branch] if (i == 0 || !SharedData::ssplsSettings.EnableSoftShadows)
-				{
-					bool hit = abs(depthDelta - compareTolerance) < compareTolerance;
-					if (hit && !IgnoreOccluder(a_rtContact, travelled, rayUV, a_eyeIndex)) {
-						return 0.0;
-					}
-				}
-				else
-				{
-					float distanceMult = abs(rayDepth - startPosition.z) / (abs(lightDirectionVS.z - rayDepth) + 0.00001) * distanceScale;
-					const uint sampleTimes = min(MAX_SAMPLES, (uint)(i >> 2) + 1);
-					float sampleOpacity = 1.0;
-					bool hit = (depthDelta > 0.5 * compareTolerance) && (depthDelta < compareTolerance * 1.5);
-					bool possibleHit = (depthDelta + compareTolerance > 0.0) && (depthDelta < compareTolerance * 3.0);
-					if (hit && !IgnoreOccluder(a_rtContact, travelled, rayUV, a_eyeIndex)) {
-						return 0.0;
-					}
-					if (possibleHit)
-						[loop] for (uint j = 0; j < sampleTimes; j++)
-						{
-							float2 sampleOffset = mul(Random::PoissonSampleOffsets16[(j * i) % 16], rotationMatrix);
-							float2 sampleUV = sampleOffset * distanceMult * radius + rayUV;
-							float sampleDepth = SharedData::GetScreenDepth(sampleUV, a_eyeIndex);
-
-							float sampleDepthDelta = viewPosition.z - sampleDepth;
-							bool hit = abs(sampleDepthDelta - compareTolerance) < compareTolerance;
-							if (hit && !IgnoreOccluder(a_rtContact, travelled, sampleUV, a_eyeIndex)) {
-								sampleOpacity -= 1.0 / sampleTimes;
-							}
-						}
-					opacity = min(opacity, sampleOpacity);
-				}
-				if (opacity <= 0.05) {
-					return opacity;
-				}
-			}
-		}
-
-		return opacity;
-	}
-
 	// (45 SSPLS) Switches packed into SSPLSSettings.Enable (the struct size is pinned by the
 	// FeatureData layout); C++ sends Enable = 0 when the feature is off, so `Enable != 0` still
 	// means "on" in Lighting.hlsl / Water.hlsl.
 	namespace SettingFlags
 	{
 		static const uint Enable = (1 << 0);
-		static const uint FixedMath = (1 << 1);
-		static const uint StableNoise = (1 << 2);
+		// (47o) Bits 1, 2 (Fixed Math, Stable Noise; 45o), 4 (Skip on Translucent Surfaces, 47h), 5 (Skip Weak Lights), 6 (Smarter
+		// Steps) and 7 (Skip SSPLS on Water; 47k) are permanent and no longer read; the C++ still sets them (reserved).
 		static const uint CoverageView = (1 << 3);  // (46y) Ray Tracing debug view SSPLS Coverage, drawn by Lighting.hlsl
-		static const uint SkipTranslucent = (1 << 4);  // (47h) not in forward (non-DEFERRED) Lighting draws: they read the depth behind them
-		static const uint SkipWeakLights = (1 << 5);   // (47k) no march for a light far weaker than the pixel's strongest
-		static const uint SmarterSteps = (1 << 6);     // (47k) GetShadowFixed: start past the receiver, >= 2 px steps, contact rays 2-3 steps
-		static const uint SkipOnWater = (1 << 7);      // (47k) Water.hlsl: no screen-space light shadows
-		static const uint MaxLightsShift = 8;          // (47k) bits 8-11: Max Shadowed Lights per Pixel (0 = unlimited)
+		static const uint MaxLightsShift = 8;       // (47k) bits 8-11: Max Shadowed Lights per Pixel (0 = unlimited)
 	}
 
 	/// (47k) Max Shadowed Lights per Pixel (1..7; 0 = unlimited, 47j).
@@ -160,8 +72,8 @@ namespace ScreenSpacePointLightShadows
 
 	/// (47k) The share of SSPLS strength a light gets from the light budget: 0 = not marched (lit unshadowed by SSPLS), 1 = full.
 	/// a_k: the budget (0 = unlimited), a_top / a_next: the budget's last score and the first one past it, a_strongest: the pixel's
-	/// strongest; a_skipWeak: Skip Weak Lights.
-	float BudgetWeight(float a_score, uint a_k, float a_last, float a_next, float a_strongest, bool a_skipWeak)
+	/// strongest. (47o) Skip Weak Lights is permanent.
+	float BudgetWeight(float a_score, uint a_k, float a_last, float a_next, float a_strongest)
 	{
 		float w = 1.0;
 		[branch] if (a_k > 0u)
@@ -169,41 +81,8 @@ namespace ScreenSpacePointLightShadows
 			// In the top K; the ones close to the first light out fade with it (no seam when the set changes).
 			w = a_score >= a_last * 0.999 && a_score > 0.0 ? (a_next > 0.0 ? smoothstep(1.0, 1.5, a_score / a_next) : 1.0) : 0.0;
 		}
-		[branch] if (a_skipWeak)
-			w *= smoothstep(0.035, 0.07, a_score / max(a_strongest, 1e-8)) * smoothstep(0.001, 0.002, a_score);
+		w *= smoothstep(0.035, 0.07, a_score / max(a_strongest, 1e-8)) * smoothstep(0.001, 0.002, a_score);  // Skip Weak Lights
 		return w;
-	}
-
-	/// Legacy (pre-45) ray march setup. noiseOffset / noiseRotation are both the caller's noise when
-	/// Stable Noise is off, which keeps this path identical to the old one.
-	float GetShadowLegacy(SamplerState s, float3 viewPosition, float noiseOffset, float noiseRotation, float offsetAmplitude, float3 lightDirectionVS, uint steps, float radius, uint a_eyeIndex, bool isShadowCaster, float a_rtContact)
-	{
-		const float rayLength = SharedData::ssplsSettings.RayLength;
-		if (rayLength <= 0.0)
-			return 1.0;
-		lightDirectionVS *= rayLength;
-
-		// Offset with interleaved gradient noise
-		const float offset = (noiseOffset - 0.5) * offsetAmplitude;
-		float2 rotation;
-		sincos(Math::TAU * noiseRotation, rotation.y, rotation.x);
-		float2x2 rotationMatrix = float2x2(rotation.x, rotation.y, -rotation.y, rotation.x);
-
-		const float step = 1.0 / steps;
-
-		viewPosition += lightDirectionVS * offset * step;
-
-#if defined(SKIN) || defined(HAIR) || defined(EYE)
-		const float2 stepScale = float2(0.5, 1.5);
-		const float shadowCasterToleranceScale = SharedData::ssplsSettings.CompareToleranceScale;
-#else
-		const float2 stepScale = float2(0.75, 1.25);
-		const float shadowCasterToleranceScale = 0.4;
-#endif
-
-		const float compareToleranceScale = isShadowCaster ? shadowCasterToleranceScale : SharedData::ssplsSettings.CompareToleranceScale;
-
-		return Raymarch(s, viewPosition, lightDirectionVS, steps, step, stepScale, compareToleranceScale, radius, rotationMatrix, a_eyeIndex, a_rtContact);
 	}
 
 	/// (45 SSPLS) How much one depth comparison says "blocked": 0 in front of the scene surface,
@@ -250,11 +129,10 @@ namespace ScreenSpacePointLightShadows
 		const float3 start = viewPosition + (lightDir * 1.5 + toCamera) * footprint;
 		const float2 receiverUV = FrameBuffer::ViewToUV(viewPosition, true, a_eyeIndex);
 
-		// (47k) Smarter Steps: the part of the ray still on the receiver's own 2 pixels is skipped (its samples were skipped anyway),
-		// the steps are at least 2 px apart on screen, the contact rays of shadow-map lights take 2-3 steps. Off: 47j.
+		// (47k) Smarter Steps ((47o) permanent): the part of the ray still on the receiver's own 2 pixels is skipped (its samples were
+		// skipped anyway), the steps are at least 2 px apart on screen, the contact rays of shadow-map lights take 2-3 steps.
 		float tStart = 0.0;
 		uint stepCount = steps;
-		[branch] if (SharedData::ssplsSettings.Enable & SettingFlags::SmarterSteps)
 		{
 			const float3 rayEnd = start + lightDir * rayLength;
 			[branch] if (rayEnd.z > 1.0)
@@ -365,23 +243,10 @@ namespace ScreenSpacePointLightShadows
 		if (steps == 0)
 			return 1.0;
 
-		const uint flags = SharedData::ssplsSettings.Enable;
-
-		float noiseOffset = noise2D;
-		float noiseRotation = noise2D;
-		float offsetAmplitude = 1.0;
-		[branch] if (flags & SettingFlags::StableNoise)
-		{
-			const float2 stable = GetStableNoise(viewPosition, a_eyeIndex);
-			noiseOffset = stable.x;
-			noiseRotation = stable.y;
-			offsetAmplitude = 0.5;
-		}
-
-		[branch] if (flags & SettingFlags::FixedMath)
-			return GetShadowFixed(viewPosition, noiseOffset, noiseRotation, offsetAmplitude, lightDirectionVS, steps, radius, a_eyeIndex, isShadowCaster, a_rtContact);
-
-		return GetShadowLegacy(s, viewPosition, noiseOffset, noiseRotation, offsetAmplitude, lightDirectionVS, steps, radius, a_eyeIndex, isShadowCaster, a_rtContact);
+		// (45o) Fixed Math and Stable Noise are always on; (47o) the legacy (pre-45) march is gone. s / noise2D: unused (the
+		// callers' signature is kept).
+		const float2 stable = GetStableNoise(viewPosition, a_eyeIndex);
+		return GetShadowFixed(viewPosition, stable.x, stable.y, 0.5, lightDirectionVS, steps, radius, a_eyeIndex, isShadowCaster, a_rtContact);
 	}
 }
 #endif  // SSPLS_COMMON

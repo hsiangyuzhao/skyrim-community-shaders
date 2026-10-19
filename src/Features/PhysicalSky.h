@@ -468,8 +468,8 @@ struct PhysicalSky final : public Feature
 	void UpdateCloudData(float a_exposure, float a_sunElevation);
 
 	/// (47f) Mirrors SharedData::HorizonFixData (HLSL), appended after WeatherFogData at the very end of FeatureData.
-	/// (47m) Horizon Fix is removed: anchorOffset, altitude and flags are always 0 (padding until the Lighting package
-	/// drops the shader side); only fogSkyLight is live. The layout must not change (SharedData).
+	/// (47m) Horizon Fix is removed; (47o) its shader side too: anchorOffset, altitude and flags are padding (0, not read); only
+	/// fogSkyLight is live (WeatherFog.hlsli). The layout must not change (SharedData).
 	struct HorizonFixCbData
 	{
 		float anchorOffset = 0.f;  // (47m) always 0 (was: camera height over the weather fog layer's base)
@@ -487,12 +487,7 @@ struct PhysicalSky final : public Feature
 	/// (47f) Sky.hlsl's cloud vertex shader still declares VS b11 (HorizonFixVS, the removed Horizon Fix's cloud dome warp).
 	/// (47m) Every cloud draw keeps getting a buffer of zeros there (exactly what it got with Horizon Fix off), so the
 	/// shader never reads someone else's b11; the previous b11 is put back after the draw. Goes with the Lighting package.
-	static constexpr UINT kHorizonWarpSlot = 11;
-	std::unique_ptr<ConstantBuffer> horizonWarpCB;
-	ID3D11Buffer* horizonWarpPrevious = nullptr;  // VS b11 before a cloud draw (AddRef'd), put back after it
-	bool horizonWarpBound = false;
-	void BindHorizonWarp(const RE::BSRenderPass* a_pass);
-	void UnbindHorizonWarp();
+	// (47o) The Horizon Fix cloud warp's VS b11 binding is gone (Sky.hlsl no longer declares it).
 
 	/// (batch 37c) "Sun Look" presets.
 	enum SunLook : int

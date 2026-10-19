@@ -4,15 +4,12 @@
 //
 // One R32_UINT texel per TrailTexelSize x TrailTexelSize patch of ground, addressed
 // toroidally: physical = (window texel + Wrap) & (MapSize - 1), so scrolling the window never
-// moves data, it only clears the strip that comes into view.
-//   hi 16 bits: print code (batch 39c). 0 = untouched; 1..32767 = a pushed-up rim, height =
-//               code / 32767; 32768..65535 = a dent, depth = (code - 32768) / 32767.
-//   lo 16 bits: the foot's height modulo 1024 units (UNORM)
-// The code sits in the high half so InterlockedMax keeps the deepest dent (any dent beats any
-// rim) together with the height of the foot that made it.
+// moves data, it only clears the strip that comes into view. (44e) Each texel holds a time-stamped
+// print (TrailTime.hlsli: code, stamp time, foot height); the refill is computed from its age.
 //
-// Three entry points, chosen by define: CLEAR (a window-relative rectangle), DECAY (whole map,
-// refill), STAMP (one thread group per print).
+// Three entry points, chosen by define: CLEAR (a window-relative rectangle), SWEEP (clears fully
+// refilled texels, a band of rows per frame), STAMP (one thread group per print). (47o) The 44d
+// DECAY pass and the untimed STAMP encoding are gone.
 
 cbuffer SnowTrailCB : register(b0)
 {
@@ -20,7 +17,7 @@ cbuffer SnowTrailCB : register(b0)
 	int2 RectSize;   // CLEAR: rectangle size in texels
 	int2 Wrap;       // window texel -> physical texel offset
 	uint MapSize;    // texels per side, power of two
-	uint DecayStep;  // DECAY: code units (of 32767) to remove
+	uint DecayStep;  // (47o) unused (was DECAY's code units to remove)
 	uint StampCount; // STAMP: number of valid stamps
 	uint ShapeCount; // STAMP: slices in StampShapes (0 = none loaded)
 	uint NowTick;    // (44e) TIMESTAMP / SWEEP: the current trail clock tick (wraps at 1024)
@@ -61,25 +58,6 @@ RWTexture2D<uint> TrailMap : register(u0);
 	TrailMap[p] = 0;
 }
 
-#elif defined(DECAY)
-
-[numthreads(8, 8, 1)] void main(uint3 id
-								: SV_DispatchThreadID) {
-	if (any(id.xy >= MapSize))
-		return;
-	uint v = TrailMap[id.xy];
-	uint code = v >> 16;
-	if (code >= 32768) {
-		// Dent: fill back in; a filled dent is untouched snow, not a rim.
-		uint d = code - 32768;
-		d = d > DecayStep ? d - DecayStep : 0;
-		code = d ? 32768 + d : 0;
-	} else {
-		code = code > DecayStep ? code - DecayStep : 0;
-	}
-	TrailMap[id.xy] = code ? ((code << 16) | (v & 0xFFFF)) : 0;
-}
-
 #elif defined(SWEEP)
 
 #	include "DynamicSnow/TrailTime.hlsli"
@@ -98,15 +76,7 @@ RWTexture2D<uint> TrailMap : register(u0);
 
 #elif defined(STAMP)
 
-#	if defined(TIMESTAMP)
-#		include "DynamicSnow/TrailTime.hlsli"
-#	endif
-
-uint EncodeHeight(float h)
-{
-	// h < 0: dent of depth -h; h > 0: rim of height h.
-	return h < 0.0 ? 32768 + uint(saturate(-h) * 32767.0 + 0.5) : uint(saturate(h) * 32767.0 + 0.5);
-}
+#	include "DynamicSnow/TrailTime.hlsli"
 
 [numthreads(8, 8, 1)] void main(uint3 gid
 								: SV_GroupID, uint3 gtid
@@ -169,7 +139,6 @@ uint EncodeHeight(float h)
 			height *= st.Strength;
 			if (abs(height) < 1.0 / 32767.0)
 				continue;
-#if defined(TIMESTAMP)
 			// (44e) Code, stamp time and foot height in one texel; the deeper / higher print *as it
 			// is now* (refill applied) wins, so a fresh shallow print beats an old, mostly refilled one.
 			uint v = TrailTime::Pack(height, NowTick, st.Z16 >> 6);
@@ -185,11 +154,6 @@ uint EncodeHeight(float h)
 					break;
 				prev = orig;
 			}
-#else
-			uint v = (EncodeHeight(height) << 16) | (st.Z16 & 0xFFFF);
-			uint2 p = uint2(int2(x, y) + Wrap) & (MapSize - 1);
-			InterlockedMax(TrailMap[p], v);
-#endif
 		}
 	}
 }
