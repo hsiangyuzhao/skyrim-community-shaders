@@ -377,6 +377,7 @@ namespace RayTracingRT
 				context->Dispatch((side + 7) / 8, (side + 7) / 8, 1);
 			}
 			entry.ready = true;
+			entry.readySerial = waitSerial_;  // (47s) the D3D12 queue sees it behind the next ready wait
 			entry.view11.Reset();
 			++made;
 		}
@@ -401,13 +402,14 @@ namespace RayTracingRT
 	{
 		if (a_blas >= blas_.size() || blas_[a_blas].uvOffset == UINT32_MAX)
 			return kInvalidAlphaInfo;
-		return CreateAlphaInfoAt(blas_[a_blas].uvOffset, blas_[a_blas].triangles, a_texture, a_material);
+		const std::uint32_t slot = CreateAlphaInfoAt(blas_[a_blas].uvOffset, blas_[a_blas].triangles, a_texture, a_material);
+		if (slot != kInvalidAlphaInfo && slot < slotBase_.size())
+			slotBase_[slot] = SlotBase{ VariantKind::Static, a_blas, a_texture };  // (47s)
+		return slot;
 	}
 
-	std::uint32_t Backend::CreateAlphaInfoAt(std::uint32_t a_uvOffset, std::uint32_t a_triangles, AlphaTexture a_texture, const AlphaMaterial& a_material)
+	std::uint32_t Backend::AllocateAlphaInfoSlot(const AlphaInfoGpu& a_info)
 	{
-		if (!AlphaAvailable() || a_uvOffset == UINT32_MAX || a_triangles == 0 || a_texture >= alphaTextures_.size() || !alphaTextures_[a_texture].live)
-			return kInvalidAlphaInfo;
 		std::uint32_t slot;
 		if (!freeAlphaInfos_.empty()) {
 			slot = freeAlphaInfos_.back();
@@ -415,10 +417,27 @@ namespace RayTracingRT
 		} else if (alphaInfos_.size() < kAlphaMaxInfos) {
 			slot = static_cast<std::uint32_t>(alphaInfos_.size());
 			alphaInfos_.emplace_back();
+			alphaInfoUsed_.push_back(0);
+			slotVariant_.push_back(UINT32_MAX);
+			slotBase_.emplace_back();
 		} else {
 			++alphaStats_.infosFull;
 			return kInvalidAlphaInfo;
 		}
+		alphaInfos_[slot] = a_info;
+		alphaInfoUsed_[slot] = 1;
+		slotVariant_[slot] = UINT32_MAX;
+		slotBase_[slot] = SlotBase{};
+		++alphaInfoLive_;
+		++alphaInfoVersion_;
+		alphaStats_.infos = alphaInfoLive_;
+		return slot;
+	}
+
+	std::uint32_t Backend::CreateAlphaInfoAt(std::uint32_t a_uvOffset, std::uint32_t a_triangles, AlphaTexture a_texture, const AlphaMaterial& a_material)
+	{
+		if (!AlphaAvailable() || a_uvOffset == UINT32_MAX || a_triangles == 0 || a_texture >= alphaTextures_.size() || !alphaTextures_[a_texture].live)
+			return kInvalidAlphaInfo;
 		auto finite = [](float a_value, float a_fallback) { return std::isfinite(a_value) ? a_value : a_fallback; };
 		AlphaInfoGpu info{};
 		info.uvBase = a_uvOffset;
@@ -433,19 +452,22 @@ namespace RayTracingRT
 		info.uvTransform[1] = finite(a_material.uvTransform[1], 0.0f);
 		info.uvTransform[2] = finite(a_material.uvTransform[2], 1.0f);
 		info.uvTransform[3] = finite(a_material.uvTransform[3], 1.0f);
-		alphaInfos_[slot] = info;
-		++alphaInfoLive_;
-		++alphaInfoVersion_;
-		alphaStats_.infos = alphaInfoLive_;
-		return slot;
+		return AllocateAlphaInfoSlot(info);
 	}
 
 	void Backend::ReleaseAlphaInfo(std::uint32_t a_info)
 	{
-		if (a_info >= alphaInfos_.size() || alphaInfos_[a_info].triangles == 0)
+		if (a_info >= alphaInfos_.size() || !alphaInfoUsed_[a_info])
 			return;
+		// (47s) Its classified variant loses this user.
+		if (const std::uint32_t variant = slotVariant_[a_info]; variant != UINT32_MAX) {
+			slotVariant_[a_info] = UINT32_MAX;
+			ReleaseVariantRef(variant);
+		}
+		slotBase_[a_info] = SlotBase{};
 		// Each command context traces with its own copy of the table: the slot can be reused at once.
 		alphaInfos_[a_info] = {};
+		alphaInfoUsed_[a_info] = 0;
 		freeAlphaInfos_.push_back(a_info);
 		alphaInfoLive_ -= std::min<std::uint32_t>(alphaInfoLive_, 1);
 		++alphaInfoVersion_;
@@ -515,9 +537,25 @@ namespace RayTracingRT
 		retiredAlphaLayers_.clear();
 		alphaCopyQueue_.clear();
 		alphaInfos_.clear();
+		alphaInfoUsed_.clear();
+		slotVariant_.clear();
+		slotBase_.clear();
 		freeAlphaInfos_.clear();
 		++alphaInfoVersion_;
 		alphaStats_.uvBytes = alphaStats_.uvBytesUsed = alphaStats_.layerBytes = 0;
+		// (47s) Alpha Classify: no record left, so no variant either; its bake buffers go too (behind the fence).
+		bakeQueue_.clear();
+		variantUploads_.clear();
+		if (bakeReadback_ && bakeMapped_)
+			bakeReadback_->Unmap(0, nullptr);
+		bakeMapped_ = nullptr;
+		if (bakeReadback_)
+			Retire(bakeReadback_, 0, nullptr);
+		if (bakeOut_)
+			Retire(bakeOut_, 0, nullptr);
+		bakeReadback_.Reset();
+		bakeOut_.Reset();
+		classifyStats_.bakeBufferBytes = 0;
 		logger::info("[RayTracing] Alpha-tested casters: buffers released");
 	}
 }

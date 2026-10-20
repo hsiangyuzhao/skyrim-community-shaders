@@ -263,6 +263,11 @@ public:
 		// FoliageLearnAnyFrame "Keep Leaves Moving: Learn on Any Frame": a plant's leaf rate is learned from every advance the game
 		// makes (any frame time), and a plant that never learned uses the rate shared by the others once they agree. Off = 47q.
 		bool FoliageLearnAnyFrame = true;
+		// (47s) AlphaClassify "Alpha Classify (leaves and cut-outs)": every triangle of an alpha-tested caster (leaves, cut-outs, swaying
+		// plants, hair) is sorted once against its cut-out on the GPU: fully solid ones become opaque geometry (no texture test per ray),
+		// fully see-through ones are left out, only the rest is tested per ray as before. Sun, point lights and RTAO. Exact for every
+		// alpha-tested ray. Off = 47r exactly.
+		bool AlphaClassify = true;
 	};
 	/// (46f) RTAO modes (Settings::AOMode); with RTAO off the AO is SSGI's, exactly as before.
 	enum class AOModeKind : int

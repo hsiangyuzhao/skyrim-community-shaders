@@ -194,6 +194,11 @@ namespace Util::FrameTrace
 		// (47r) Keep Leaves Moving: leaf timers frozen this frame without any rate (left as they were), catch-ups at the shared rate
 		// (-1 = sway off).
 		int windFrozenUnlearned = -1, windSharedCatchups = -1;
+		// (47s) Alpha Classify (-1 = off): triangles of the meshes in use sorted solid / left out / tested per ray, instances traced
+		// classified this frame, meshes waiting for their sort, triangles sorted this frame and the last sort's GPU ms, its video memory (MB).
+		int64_t acOpaque = -1, acDropped = -1, acMixed = -1;
+		int acInstances = -1, acWaiting = -1, acBakeTriangles = -1;
+		float acBakeGpuMs = -1.0f, acVramMb = -1.0f;
 	};
 	void OnRayTracingDetail(const RayTracingDetail& a_detail);
 

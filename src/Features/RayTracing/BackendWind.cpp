@@ -215,7 +215,7 @@ namespace RayTracingRT
 			--source.refs;
 	}
 
-	BlasHandle Backend::CreateWindBlas(std::uint32_t a_source, float a_amplitude)
+	BlasHandle Backend::CreateWindBlas(std::uint32_t a_source, float a_amplitude, std::uint32_t a_alphaInfo)
 	{
 		if (!WindAvailable() || a_source >= windSources_.size() || !windSources_[a_source].live || !std::isfinite(a_amplitude) ||
 			std::abs(a_amplitude) > 10000.0f) {
@@ -230,6 +230,7 @@ namespace RayTracingRT
 		mesh.triangles = source.triangles;
 		mesh.opaque = source.opaque;
 		mesh.meanAmplitude = a_amplitude;
+		mesh.alphaSlot = source.opaque ? UINT32_MAX : a_alphaInfo;  // (47s)
 		mesh.outputBytes = WindAlign(static_cast<std::uint64_t>(source.vertices) * kWindOutputStride, 256);
 		{
 			const D3D12_RAYTRACING_GEOMETRY_DESC geometryDesc = WindGeometryDesc(mesh.opaque, mesh.vertices, mesh.triangles);
@@ -315,7 +316,10 @@ namespace RayTracingRT
 		windStats_.vertices -= std::min<std::uint64_t>(windStats_.vertices, mesh.vertices);
 		windStats_.triangles -= std::min<std::uint64_t>(windStats_.triangles, mesh.triangles);
 		const std::uint32_t source = mesh.source;
+		const std::uint32_t layout = mesh.layout;
 		mesh = {};
+		if (layout != UINT32_MAX)
+			ReleaseVariantRef(layout);  // (47s) its classified layout's user
 		freeWinds_.push_back(a_index);
 		windLive_ -= std::min<std::uint32_t>(windLive_, 1);
 		windStats_.meshes = windLive_;
@@ -430,6 +434,9 @@ namespace RayTracingRT
 			auto& source = windSources_[entry.index];
 			uploadPool_.Free(entry.upload, RetireValue());  // read by this submission only
 			source.uploaded = true;
+			// (47s) An alpha-tested source keeps its indices: Alpha Classify's index lists of its swaying copies.
+			if (!source.opaque && bakePipeline_)
+				source.indicesCpu = std::move(source.geometry->indices);
 			source.geometry.reset();
 		}
 	}
@@ -461,18 +468,78 @@ namespace RayTracingRT
 		std::uint64_t scratchTotal = 0;
 		std::uint32_t pending = 0;
 		bool anyBuilt = false;
+		// (47s) Alpha Classify: the sizes of a mesh's BLAS in a layout (unclassified, or a classified variant's two geometries).
+		auto layoutSizes = [&](const WindMesh& a_mesh, std::uint32_t a_layout, std::uint64_t& o_blas, std::uint64_t& o_build, std::uint64_t& o_update) {
+			D3D12_RAYTRACING_GEOMETRY_DESC descs[2]{};
+			const UINT count = WindGeometryDescs(a_mesh, a_layout, descs);
+			if (count == 0)
+				return false;
+			D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs{};
+			inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+			inputs.Flags = kWindBuildFlags;
+			inputs.NumDescs = count;
+			inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+			inputs.pGeometryDescs = descs;
+			D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info{};
+			device_->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &info);
+			if (info.ResultDataMaxSizeInBytes == 0 || info.ScratchDataSizeInBytes == 0)
+				return false;
+			o_blas = WindAlign(info.ResultDataMaxSizeInBytes, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
+			o_build = WindAlign(info.ScratchDataSizeInBytes, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
+			o_update = WindAlign(std::max<std::uint64_t>(info.UpdateScratchDataSizeInBytes, 256), D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
+			return true;
+		};
+		// The mesh is (re)built in a_layout: its BLAS range is grown when that layout needs more, the scratch sizes are the layout's, and
+		// the variant gets its reference. False: not this frame (the pool's next block) or never (no triangles left).
+		auto takeLayout = [&](WindMesh& a_mesh, std::uint32_t a_layout) {
+			std::uint64_t blasBytes = 0, buildScratch = 0, updateScratch = 0;
+			if (!layoutSizes(a_mesh, a_layout, blasBytes, buildScratch, updateScratch))
+				return false;
+			if (a_mesh.allocated && blasBytes > a_mesh.blasBytes) {
+				ArenaAlloc fresh;
+				if (!asPool_.Allocate(blasBytes, fresh)) {
+					++stats_.pools.allocFailsLastFrame;
+					return false;
+				}
+				asPool_.Free(a_mesh.blas, RetireValue());  // a TLAS in flight may still name it
+				windStats_.bytes += blasBytes - a_mesh.blasBytes;
+				a_mesh.blas = fresh;
+				a_mesh.blasBytes = blasBytes;
+			} else if (!a_mesh.allocated && blasBytes > a_mesh.blasBytes) {
+				windStats_.bytes += blasBytes - a_mesh.blasBytes;
+				a_mesh.blasBytes = blasBytes;
+			}
+			a_mesh.buildScratch = buildScratch;
+			a_mesh.updateScratch = updateScratch;
+			if (a_layout != a_mesh.layout) {
+				const std::uint32_t old = a_mesh.layout;
+				if (a_layout != UINT32_MAX)
+					AddVariantRef(a_layout);
+				a_mesh.layout = a_layout;
+				if (old != UINT32_MAX)
+					ReleaseVariantRef(old);
+			}
+			return true;
+		};
 		for (std::uint32_t i = 0; i < winds_.size(); ++i) {
 			auto& mesh = winds_[i];
 			if (!mesh.live)
 				continue;
+			mesh.inBuild = false;
 			const bool sourceReady = mesh.source < windSources_.size() && windSources_[mesh.source].live && windSources_[mesh.source].uploaded;
 			if (!sourceReady) {
 				++pending;
 				continue;
 			}
+			// (47s) The layout it should have now (a variant in use and its index list over this source uploaded; else unclassified).
+			const std::uint32_t want = mesh.opaque ? UINT32_MAX : WantedWindLayout(mesh);
 			if (!mesh.built) {
 				if (builds.size() >= a_maxBuilds) {
 					++windStats_.deferredLastFrame;
+					++pending;
+					continue;
+				}
+				if (want != mesh.layout && !takeLayout(mesh, want) && mesh.layout != UINT32_MAX && !takeLayout(mesh, UINT32_MAX)) {
 					++pending;
 					continue;
 				}
@@ -496,10 +563,18 @@ namespace RayTracingRT
 					mesh.blas = blas;
 					mesh.allocated = true;
 				}
+				mesh.inBuild = true;
 				builds.push_back(Op{ i, scratchTotal });
 				scratchTotal += WindAlign(mesh.buildScratch, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
 			} else {
 				anyBuilt = true;
+				// (47s) Built in another layout (classified now, or Alpha Classify switched off): rebuilt at once in the new one (a first
+				// build's work, inside the per-frame cap); until then it keeps tracing in its old layout with that layout's record.
+				if (want != mesh.layout && builds.size() < a_maxBuilds && takeLayout(mesh, want)) {
+					mesh.inBuild = true;
+					builds.push_back(Op{ i, scratchTotal });
+					scratchTotal += WindAlign(mesh.buildScratch, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
+				}
 			}
 		}
 		if (refitsWanted) {
@@ -512,7 +587,8 @@ namespace RayTracingRT
 			}
 			for (std::uint32_t i = 0; i < winds_.size(); ++i) {
 				const auto& mesh = winds_[i];
-				if (!mesh.live || !mesh.built || !mesh.hasPose || (mesh.posed && SamePose(mesh.pose, mesh.posedPose)))
+				// (47s) inBuild: (re)built this frame (its refit is in the list above).
+				if (!mesh.live || !mesh.built || mesh.inBuild || !mesh.hasPose || (mesh.posed && SamePose(mesh.pose, mesh.posedPose)))
 					continue;
 				refits.push_back(Op{ i, scratchTotal });
 				scratchTotal += WindAlign(mesh.updateScratch, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
@@ -564,16 +640,16 @@ namespace RayTracingRT
 			return blocks;
 		};
 		auto record = [&](WindMesh& a_mesh, std::uint64_t a_scratchOffset, bool a_update) {
-			const auto& source = windSources_[a_mesh.source];
-			D3D12_RAYTRACING_GEOMETRY_DESC geometryDesc = WindGeometryDesc(a_mesh.opaque, a_mesh.vertices, a_mesh.triangles);
-			geometryDesc.Triangles.VertexBuffer.StartAddress = skinOutputPool_.Address(a_mesh.output);
-			geometryDesc.Triangles.IndexBuffer = skinStaticPool_.Address(source.index);
+			// (47s) In its layout: one geometry (unclassified), or a classified variant's mixed (non-opaque) and opaque ones (its index
+			// list over this source); a refit uses the descriptions of the build.
+			D3D12_RAYTRACING_GEOMETRY_DESC geometryDescs[2]{};
+			const UINT descCount = WindGeometryDescs(a_mesh, a_mesh.layout, geometryDescs);
 			D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC buildDesc{};
 			buildDesc.Inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
 			buildDesc.Inputs.Flags = kWindBuildFlags;
-			buildDesc.Inputs.NumDescs = 1;
+			buildDesc.Inputs.NumDescs = descCount;
 			buildDesc.Inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
-			buildDesc.Inputs.pGeometryDescs = &geometryDesc;
+			buildDesc.Inputs.pGeometryDescs = geometryDescs;
 			buildDesc.DestAccelerationStructureData = asPool_.Address(a_mesh.blas);
 			buildDesc.ScratchAccelerationStructureData = scratch + a_scratchOffset;
 			if (a_update) {

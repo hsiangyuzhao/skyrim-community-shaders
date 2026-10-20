@@ -48,9 +48,16 @@ namespace RayTracingRT
 		/// half2 texcoord as stored by the engine, y = its vertex alpha as float bits). Non-empty =
 		/// the BLAS geometry is non-opaque and its triangles are tested against their cut-out.
 		std::vector<std::uint32_t> alphaUV;
+		/// (47s) Alpha Classify: a classified BLAS. alphaUV is already packed (PackAlphaCorners layout, 4 uints per triangle) and holds only
+		/// the first opaqueFrom triangles (the mixed ones: geometry 0, non-opaque); the triangles from opaqueFrom on are fully opaque
+		/// (geometry 1, OPAQUE). UINT32_MAX = not classified (one geometry, as before).
+		std::uint32_t opaqueFrom = UINT32_MAX;
 		[[nodiscard]] std::uint32_t Triangles() const { return static_cast<std::uint32_t>(indices.size() / 3); }
 		[[nodiscard]] std::uint32_t Vertices() const { return static_cast<std::uint32_t>(positions.size() / 3); }
 		[[nodiscard]] bool Opaque() const { return alphaUV.empty(); }
+		[[nodiscard]] bool Classified() const { return opaqueFrom != UINT32_MAX; }
+		/// Triangles with a record (texcoords): all of an unclassified alpha BLAS, the mixed ones of a classified one.
+		[[nodiscard]] std::uint32_t AlphaTriangles() const { return Classified() ? std::min(opaqueFrom, Triangles()) : Triangles(); }
 	};
 
 	using BlasHandle = std::uint32_t;
@@ -86,6 +93,35 @@ namespace RayTracingRT
 		std::uint64_t uvBytes = 0;           // texcoord buffer (allocated on first use)
 		std::uint64_t layerBytes = 0;        // 256x256 copy layers (allocated on first use)
 		std::uint64_t infoBytes = 0;         // per-context upload copies of the records
+	};
+
+	/// (47s) Alpha Classify (OMM-lite): per mesh and material, every triangle of an alpha-tested BLAS sorted against its cut-out by a GPU
+	/// bake (AlphaClassifyCS): fully opaque -> an OPAQUE geometry of the same BLAS, fully transparent -> left out, mixed -> the non-opaque
+	/// geometry the trace's candidate loop tests as before. Counts over the variants in use unless noted.
+	struct AlphaClassifyStats
+	{
+		std::uint32_t variants = 0;            // live (mesh x material, or one character part)
+		std::uint32_t pending = 0;             // waiting for their bake (texture copy, mesh build, per-frame budget)
+		std::uint32_t baking = 0;              // bake in flight
+		std::uint32_t building = 0;            // classified, their BLAS / buffers not ready yet
+		std::uint32_t ready = 0;               // in use
+		std::uint32_t noGain = 0;              // every triangle mixed (or not classifiable): the original BLAS stays
+		std::uint64_t opaqueTriangles = 0;     // over the ready variants
+		std::uint64_t droppedTriangles = 0;
+		std::uint64_t mixedTriangles = 0;
+		std::uint32_t instancesLastFrame = 0;  // TLAS instances traced classified last frame (static + sway + character parts)
+		std::uint32_t windLastFrame = 0;       // ... of them swaying plants
+		std::uint32_t skinLastFrame = 0;       // ... of them character parts
+		bool forcedNonOpaqueLastFrame = false;  // a pass culling cut-outs ran: the classified instances were forced non-opaque
+		std::uint32_t bakesLastFrame = 0;      // bake jobs recorded last frame and their triangles
+		std::uint32_t bakeTrianglesLastFrame = 0;
+		std::uint64_t bakesTotal = 0;
+		std::uint64_t bakeTrianglesTotal = 0;
+		float lastBakeGpuMs = -1.0f;           // GPU ms of the last submission that baked (-1 = none yet)
+		std::uint64_t rejected = 0;            // bakes whose output came back incomplete (baked again)
+		std::uint64_t bytes = 0;               // VRAM: classified BLASes, mixed records, classified index buffers
+		std::uint64_t bakeBufferBytes = 0;     // VRAM: the bake output (default heap); the read-back copy is system memory
+		std::uint64_t cpuBytes = 0;            // system memory: the alpha meshes kept for classification
 	};
 
 	// (45i) Skinned characters: a shape's vertices in the mesh's own space with their bone indices
@@ -707,6 +743,13 @@ namespace RayTracingRT
 		[[nodiscard]] const AlphaStats& GetAlphaStats() const { return alphaStats_; }
 		/// Format of the copy layers for AlphaMaskCS (R8_UNORM, or R8G8B8A8_UNORM where R8 is not shareable).
 		[[nodiscard]] bool AlphaCopiesRgba() const { return alphaLayerFormat_ == DXGI_FORMAT_R8G8B8A8_UNORM; }
+		/// (47s) Alpha Classify (Settings::AlphaClassify), set every frame before PrepareFrame / ExecuteFrame. Off: no bake, no classified
+		/// BLAS in the TLAS (the classified data goes; swaying plants and character parts are rebuilt unclassified over the next frames).
+		void SetAlphaClassify(bool a_on);
+		[[nodiscard]] bool AlphaClassifyOn() const { return classifyOn_; }
+		/// The bake shader exists (the driver accepted it).
+		[[nodiscard]] bool AlphaClassifyAvailable() const { return bakePipeline_ != nullptr; }
+		[[nodiscard]] const AlphaClassifyStats& GetAlphaClassifyStats() const { return classifyStats_; }
 
 		// (45i) Skinned characters. Created on first use only (never with the switch off).
 		/// The skinning shader and the character variants of the trace pipeline exist.
@@ -751,7 +794,8 @@ namespace RayTracingRT
 		/// (47n) One instance's wind BLAS over a source (its own posed vertices and BLAS): a BlasHandle in the Queued state, built at the
 		/// mean pose of a_amplitude over the next frames, then refit whenever its pose (SetWindPose) changes. ReleaseBlas releases it
 		/// like any BLAS. kInvalidBlas when refused (counted).
-		BlasHandle CreateWindBlas(std::uint32_t a_source, float a_amplitude);
+		/// (47s) a_alphaInfo: the shape's alpha record (alpha-tested meshes), for Alpha Classify.
+		BlasHandle CreateWindBlas(std::uint32_t a_source, float a_amplitude, std::uint32_t a_alphaInfo = kInvalidAlphaInfo);
 		/// (47n) This frame's pose of a wind BLAS: the vertex shader's TreeParams.y (wind magnitude), .z (amplitude), .w (leaf frequency)
 		/// and WindTimers.x, as the engine's BSLightingShader::SetupGeometry computes them for that instance.
 		void SetWindPose(BlasHandle a_handle, float a_magnitude, float a_amplitude, float a_frequency, float a_timer);
@@ -873,6 +917,17 @@ namespace RayTracingRT
 			ComPtr<ID3D12Resource> resource12;
 		};
 
+		/// (47s) One Alpha Classify bake recorded into a prep list: the variant (and its serial: slots are reused), where its classes go in the
+		/// context's output region, its triangle count.
+		struct BakeJob
+		{
+			std::uint32_t variant = UINT32_MAX;
+			std::uint64_t serial = 0;      // the variant's bake generation (slot reuse and restarted bakes)
+			std::uint32_t outOffset = 0;
+			std::uint32_t first = 0;       // the part of the mesh: triangles [first, first + triangles)
+			std::uint32_t triangles = 0;
+		};
+
 		struct CommandContext
 		{
 			ComPtr<ID3D12CommandAllocator> allocator;
@@ -915,6 +970,10 @@ namespace RayTracingRT
 			ComPtr<ID3D12GraphicsCommandList4> pointList;
 			bool splitTrace = false;
 			Util::FrameTrace::RtPrepWork work{};  // (46p) what this submission's prep recorded (read with its timestamps)
+			// (47s) Alpha Classify: bake jobs recorded into this context's prep list (bakeRecorded) and, once that list was executed, waiting for
+			// its fence (bakeJobs: read back in CollectBakes). bakeTimed: the bake timestamps were written.
+			std::vector<BakeJob> bakeRecorded, bakeJobs;
+			bool bakeTimed = false;
 		};
 		/// (46f) A context may be reused once its submission (and its RTAO list, behind the second fence) completed.
 		static bool ContextFree(const CommandContext& a_context, std::uint64_t a_completed, std::uint64_t a_aoCompleted)
@@ -946,6 +1005,11 @@ namespace RayTracingRT
 			std::uint32_t uvCount = 0;
 			// (47l) A wind BLAS: its WindMesh (winds_); never in the build queue, never compacted (Ready once first built).
 			std::uint32_t wind = UINT32_MAX;
+			// (47s) Alpha Classify: an (unclassified) alpha BLAS keeps its geometry once built (positions, indices, packed records): the
+			// source of its classified variants; and the variants made from it (they lose their base when it goes).
+			std::unique_ptr<ChunkGeometry> source;
+			std::uint64_t sourceBytes = 0;
+			std::vector<std::uint32_t> variants;
 		};
 
 		// (47l) Foliage sway (BackendWind.cpp).
@@ -968,6 +1032,7 @@ namespace RayTracingRT
 			bool opaque = true;
 			std::uint32_t refs = 0;
 			float boundsMin[3]{}, boundsMax[3]{};    // rest positions (the instances' self-check box grows by their sway)
+			std::vector<std::uint32_t> indicesCpu;   // (47s) alpha-tested sources: their indices (Alpha Classify's index lists)
 			[[nodiscard]] std::uint64_t Bytes() const { return restBytes + indexBytes; }
 		};
 		// (47n) A wind instance: its posed vertices and BLAS over a source, its pose this frame and the pose it was last refit to.
@@ -988,6 +1053,11 @@ namespace RayTracingRT
 			float pose[4]{};             // magnitude, amplitude, frequency, timer
 			bool posed = false;          // refit to a pose at least once
 			float posedPose[4]{};        // the pose of the last refit (refit again only when it changes)
+			// (47s) Alpha Classify: the shape's alpha record, the classified variant its BLAS is built with (UINT32_MAX = unclassified; holds
+			// a reference) and its index list (the variant's WindIndex), being (re)built in this RecordWind.
+			std::uint32_t alphaSlot = UINT32_MAX;
+			std::uint32_t layout = UINT32_MAX;
+			bool inBuild = false;
 			[[nodiscard]] std::uint64_t Bytes() const { return outputBytes + blasBytes; }
 		};
 		std::vector<WindSource> windSources_;
@@ -1050,6 +1120,7 @@ namespace RayTracingRT
 			std::uint32_t sourceMips = 1;             // (47q) its mip count (AlphaInfoGpu::textureLevels)
 			bool live = false;
 			bool ready = false;
+			std::uint64_t readySerial = 0;            // (47s) waitSerial_ when its copy was recorded: bakeable once a later wait was queued
 		};
 
 		struct DeferredFree
@@ -1067,6 +1138,142 @@ namespace RayTracingRT
 		void CollectAlphaRetired(std::uint64_t a_completed);
 		bool EnsureAlphaInfoBuffer(CommandContext& a_context);
 		void UpdateAlphaTextureStats();
+		/// (47s) A record slot (CreateAlphaInfoAt / a variant's record): the next free one, kInvalidAlphaInfo when full.
+		std::uint32_t AllocateAlphaInfoSlot(const AlphaInfoGpu& a_info);
+
+		// (47s) Alpha Classify (BackendClassify.cpp).
+		static constexpr std::uint32_t kBakeCapacity = 131072;            // classes per context and frame
+		// Bake budget per frame in estimated texel tests (BakeCost; the 47s harness: 260-400 M per GPU ms on an RTX 4070 Ti Super, the
+		// lower figure without the early stop of mixed triangles): about 0.25 ms while playing, 16x behind loading / black screens. A mesh
+		// is baked in parts over several frames when it is larger; at least one triangle a frame.
+		static constexpr std::uint64_t kBakeCostPerFrame = 64ull << 20;
+		static constexpr std::uint64_t kBakeCostTransitionScale = 16;
+		static constexpr std::uint32_t kBakeJobsPerFrame = 64;
+		static constexpr std::uint32_t kBakeScanPerFrame = 256;           // queued variants looked at per frame
+		static constexpr std::uint32_t kBakeMips = 3;                     // copy mips the trace may sample (lod 0-2)
+		static constexpr std::uint32_t kBakeConstants = 12;               // AlphaClassifyCS BakeConstants
+		static constexpr std::uint32_t kBakeMarker = 0xC1A50000u;         // AlphaClassifyCS kMarker
+		static constexpr std::uint32_t kAlphaInfoClassified = 1u;         // AlphaInfoGpu::flags of a variant's record
+		enum class VariantKind : std::uint8_t
+		{
+			Static,  // an alpha BLAS of the scene (and the swaying copies of its mesh)
+			Skin     // a character's alpha-tested part
+		};
+		enum class VariantState : std::uint8_t
+		{
+			Pending,   // waiting for its bake
+			Baking,    // bake in flight
+			Building,  // classified; its BLAS (static) / buffers (character part) not ready yet
+			Ready,     // in use
+			NoGain,    // every triangle mixed, or not classifiable: the original stays
+			Dead       // its base went before it was classified
+		};
+		struct VariantKey
+		{
+			std::array<std::uint32_t, 10> words{};
+			bool operator==(const VariantKey&) const = default;
+		};
+		struct VariantKeyHash
+		{
+			std::size_t operator()(const VariantKey& a_key) const noexcept
+			{
+				std::uint64_t h = 1469598103934665603ull;
+				for (const auto w : a_key.words)
+					h = (h ^ w) * 1099511628211ull;
+				return static_cast<std::size_t>(h);
+			}
+		};
+		/// The classified index list of one variant over one wind source (the swaying copies of the variant's mesh).
+		struct WindIndex
+		{
+			std::uint32_t source = UINT32_MAX;
+			ArenaAlloc range;  // skinStaticPool_
+			bool uploaded = false;
+			bool failed = false;  // the source's indices do not match the variant's mesh: never used
+		};
+		struct AlphaVariant
+		{
+			bool live = false;
+			std::uint64_t serial = 0;
+			VariantKind kind = VariantKind::Static;
+			std::uint32_t base = UINT32_MAX;  // BLAS handle (Static) or skin handle
+			AlphaTexture texture = kInvalidAlphaTexture;
+			AlphaInfoGpu info{};               // the shapes' record (uvBase / triangles: the base's)
+			VariantKey key{};
+			std::uint32_t refs = 0;            // record slots mapped to it + swaying copies / character parts built with its layout
+			VariantState state = VariantState::Pending;
+			bool queued = false;               // in bakeQueue_
+			// The bake in parts: the classes so far (one per base triangle), the first triangle not yet recorded, those come back.
+			std::vector<std::uint32_t> classes;
+			std::uint32_t nextBake = 0, received = 0;
+			std::uint32_t mixed = 0, opaque = 0, dropped = 0;
+			std::vector<std::uint32_t> order;  // base triangle of each classified triangle: the mixed ones, then the opaque ones
+			BlasHandle blas = kInvalidBlas;    // Static: the classified BLAS
+			std::uint32_t record = kInvalidAlphaInfo;  // the classified record (uvBase = its mixed triangles' texcoords)
+			// Skin: the classified index list and the mixed triangles' texcoords, uploaded by RecordVariantUploads.
+			ArenaAlloc skinIndex;
+			std::uint32_t uvOffset = UINT32_MAX, uvCount = 0;
+			bool uploaded = false;
+			std::vector<WindIndex> wind;
+			std::uint64_t bytes = 0;           // counted in classifyStats_.bytes
+			bool counted = false;              // its triangles are in classifyStats_ (ready)
+		};
+		struct SlotBase
+		{
+			VariantKind kind = VariantKind::Static;
+			std::uint32_t handle = UINT32_MAX;  // UINT32_MAX: not a shape's record (a variant's own, or unknown)
+			AlphaTexture texture = kInvalidAlphaTexture;
+		};
+		/// The variant of a record slot (made on first use while on); UINT32_MAX = none (not alpha, off, or not classifiable).
+		std::uint32_t VariantForSlot(std::uint32_t a_slot);
+		/// The variant is in use: its BLAS (static) or buffers (character part) and its record are ready.
+		[[nodiscard]] bool VariantReady(std::uint32_t a_variant);
+		void AddVariantRef(std::uint32_t a_variant);
+		void ReleaseVariantRef(std::uint32_t a_variant);
+		void FreeVariant(std::uint32_t a_variant);
+		/// Its base goes (ReleaseBlas / ReleaseSkinShape): a variant not classified yet never will be.
+		void OrphanVariants(std::vector<std::uint32_t>& a_variants);
+		void SetVariantState(AlphaVariant& a_variant, VariantState a_state);
+		/// Classes read back (one per base triangle): the layout, then the classified BLAS (static) / the upload (character part).
+		void FinishBake(std::uint32_t a_variant, const std::uint32_t* a_classes, std::uint32_t a_triangles);
+		/// The bake starts over (a part was lost or came back incomplete): a new generation, from triangle 0.
+		void RequeueBake(std::uint32_t a_variant);
+		bool CreateBakePipeline();
+		bool EnsureBakeBuffers();
+		/// Prep list: this frame's bakes (budgeted) into the context's output region, its read-back copy, two timestamps.
+		void RecordAlphaBakes(ID3D12GraphicsCommandList4* a_list, CommandContext& a_context, std::size_t a_index);
+		/// The prep list holding them was executed / dropped.
+		void CommitBakes(CommandContext& a_context);
+		void DropBakes(CommandContext& a_context);
+		/// A completed context: its bakes' classes and GPU time.
+		void CollectBakes(std::size_t a_index);
+		/// Prep list, before the character / wind builds: character-part index lists and records, wind index lists.
+		void RecordVariantUploads(ID3D12GraphicsCommandList4* a_list);
+		/// The variant (ready) a wind mesh should be built with now, UINT32_MAX = unclassified; requests its index list.
+		std::uint32_t WantedWindLayout(WindMesh& a_mesh);
+		[[nodiscard]] const WindIndex* FindWindIndex(std::uint32_t a_variant, std::uint32_t a_source) const;
+		/// Geometry descriptions of a wind mesh in a layout (1 or 2); 0 = none (empty).
+		UINT WindGeometryDescs(const WindMesh& a_mesh, std::uint32_t a_layout, D3D12_RAYTRACING_GEOMETRY_DESC (&o_descs)[2]) const;
+		/// classifyStats_' counts of the variants by state.
+		void UpdateClassifyStats();
+		std::vector<AlphaVariant> variants_;
+		std::vector<std::uint32_t> freeVariants_;
+		std::unordered_map<VariantKey, std::uint32_t, VariantKeyHash> variantIndex_;
+		std::vector<std::uint32_t> slotVariant_;  // per record slot
+		std::vector<SlotBase> slotBase_;          // per record slot
+		std::deque<std::uint32_t> bakeQueue_;
+		std::vector<std::pair<std::uint32_t, std::uint32_t>> variantUploads_;  // (variant, wind entry or UINT32_MAX = its character-part upload)
+		std::uint64_t variantSerial_ = 0;
+		std::uint64_t waitSerial_ = 0;  // D3D12 queue waits on the D3D11 ready value queued so far
+		bool classifyOn_ = false;
+		bool variantMustSubmit_ = false;  // uploads recorded (marked done): the prep list must run
+		AlphaClassifyStats classifyStats_{};
+		ComPtr<ID3D12RootSignature> bakeRootSignature_;
+		ComPtr<ID3D12PipelineState> bakePipeline_;
+		ComPtr<ID3D12Resource> bakeOut_;       // default heap, UAV: kContexts regions of kBakeCapacity uints
+		ComPtr<ID3D12Resource> bakeReadback_;  // read-back heap, the same layout, persistently mapped
+		const std::uint32_t* bakeMapped_ = nullptr;
+		bool bakeBuffersFailed_ = false;
 
 		// (45i) Skinned characters.
 		static constexpr std::uint32_t kSkinMaxVertices = 65536;          // per shape (16-bit indices in the game's data)
@@ -1100,6 +1307,11 @@ namespace RayTracingRT
 			bool grouped = false;
 			bool skinned = false;
 			std::uint64_t serial = 0;
+			// (47s) Alpha Classify (alpha-tested parts): its record, the variant its BLAS is built with (UINT32_MAX = unclassified; holds a
+			// reference), and its indices / packed records kept for the bake's index list and mixed record.
+			std::uint32_t alphaSlot = UINT32_MAX;
+			std::uint32_t layout = UINT32_MAX;
+			std::vector<std::uint32_t> indicesCpu, uvCpu;
 			[[nodiscard]] std::uint64_t Bytes() const { return restBytes + indexBytes + outputBytes + blasBytes; }
 		};
 
@@ -1128,6 +1340,10 @@ namespace RayTracingRT
 		};
 		static constexpr float kSkinGroupSlack = 1.25f;  // a merged BLAS is allocated this much above its need
 
+		/// (47s) The variant (ready) a character part should be built with now, UINT32_MAX = unclassified.
+		std::uint32_t WantedSkinLayout(const SkinShape& a_shape);
+		/// (47s) Geometry descriptions of a character part in a layout (1 or 2); 0 = none (empty).
+		UINT SkinGeometryDescs(const SkinShape& a_shape, std::uint32_t a_layout, D3D12_RAYTRACING_GEOMETRY_DESC (&o_descs)[2]) const;
 		bool CreateSkinPipelines();
 		void SetSkinFault(std::string a_reason);
 		/// (46m) Gives a merged BLAS's memory back (behind the fence) and forgets it.
@@ -1351,6 +1567,7 @@ namespace RayTracingRT
 		std::uint32_t nextAlphaLayer_ = 0;  // never used so far
 		std::vector<DeferredFree> retiredAlphaLayers_, retiredAlphaUv_;
 		std::vector<AlphaInfoGpu> alphaInfos_;
+		std::vector<std::uint8_t> alphaInfoUsed_;  // (47s) per slot (a variant's record may list 0 triangles)
 		std::vector<std::uint32_t> freeAlphaInfos_;
 		std::uint32_t alphaInfoLive_ = 0;
 		std::uint64_t alphaInfoVersion_ = 1;

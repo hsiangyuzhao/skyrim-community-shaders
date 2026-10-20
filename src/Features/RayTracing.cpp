@@ -1378,6 +1378,7 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.SSSTileMask = read("SSSTileMask", defaults.SSSTileMask);
 		settings.PointProbeShareAll = read("PointProbeShareAll", defaults.PointProbeShareAll);
 		settings.FoliageLearnAnyFrame = read("FoliageLearnAnyFrame", defaults.FoliageLearnAnyFrame);
+		settings.AlphaClassify = read("AlphaClassify", defaults.AlphaClassify);  // (47s)
 		const float sunSize = read("SunSize", -1.0f);
 		if (sunSize >= 0.0f) {
 			settings.SunSize = sunSize;
@@ -1494,6 +1495,7 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["SSSTileMask"] = settings.SSSTileMask;
 	o_json["PointProbeShareAll"] = settings.PointProbeShareAll;
 	o_json["FoliageLearnAnyFrame"] = settings.FoliageLearnAnyFrame;
+	o_json["AlphaClassify"] = settings.AlphaClassify;  // (47s)
 	o_json["AOSmoothNormals"] = settings.AOSmoothNormals;  // (47j)
 	o_json["AOTemporalV2"] = settings.AOTemporalV2;  // (47l)
 	o_json["FoliageSway"] = settings.FoliageSway;  // (47l)
@@ -2202,6 +2204,7 @@ void RayTracing::RunEarlyPrep()
 		input.buildCpuMs = blackScreen ? kBlackBuildCpuMs : 0.0f;
 		input.skinUploadCpuMs = blackScreen ? kBlackSkinUploadCpuMs : 0.0f;
 		FillWind(input);  // (47l)
+		backend.SetAlphaClassify(settings.AlphaClassify);  // (47s)
 		earlyThisFrame = backend.PrepareFrame(input);
 		if (!earlyThisFrame && backend.HasFailed())
 			Disable(Status::Failed, backend.LastError());
@@ -2761,6 +2764,18 @@ void RayTracing::PublishCpuSplit()
 			detail.windCatchups = static_cast<int>(sw.catchups);  // (47q)
 			detail.windFrozenUnlearned = static_cast<int>(sw.frozenUnlearned);  // (47r)
 			detail.windSharedCatchups = static_cast<int>(sw.catchupsShared);
+		}
+		// (47s) Alpha Classify (-1 = off / unavailable).
+		if (settings.AlphaClassify && backend.AlphaClassifyAvailable()) {
+			const auto& cs = backend.GetAlphaClassifyStats();
+			detail.acOpaque = static_cast<std::int64_t>(cs.opaqueTriangles);
+			detail.acDropped = static_cast<std::int64_t>(cs.droppedTriangles);
+			detail.acMixed = static_cast<std::int64_t>(cs.mixedTriangles);
+			detail.acInstances = static_cast<int>(cs.instancesLastFrame);
+			detail.acWaiting = static_cast<int>(cs.pending + cs.baking + cs.building);
+			detail.acBakeTriangles = static_cast<int>(cs.bakeTrianglesLastFrame);
+			detail.acBakeGpuMs = cs.lastBakeGpuMs;
+			detail.acVramMb = static_cast<float>(static_cast<double>(cs.bytes + cs.bakeBufferBytes) / (1024.0 * 1024.0));
 		}
 		// (47q) The NPC rule and tiny face parts (characters traced), static chunks (a statistic, refreshed every 120 frames).
 		if (settings.Characters && backend.SkinAvailable()) {
@@ -3343,6 +3358,7 @@ void RayTracing::RunFrame()
 	// depth copy above, GPU-side). The D3D11 queue waits for the trace in FinishFrame.
 	const std::int64_t executeStart = Qpc();
 	cpuLast.d3d11 = static_cast<float>(static_cast<double>(executeStart - d3d11Start) * QpcMs());
+	backend.SetAlphaClassify(settings.AlphaClassify);  // (47s)
 	const bool traced = backend.ExecuteFrame(input);
 	const std::int64_t executeEnd = Qpc();
 	cpuLast.execute = static_cast<float>(static_cast<double>(executeEnd - executeStart) * QpcMs());
@@ -3602,6 +3618,7 @@ void RayTracing::RunNoSunFrame(ID3D11ShaderResourceView* a_depth, ID3D11ShaderRe
 	RememberAONormalFrame(a_width, a_height);
 	const std::int64_t executeStart = Qpc();
 	cpuLast.d3d11 = static_cast<float>(static_cast<double>(executeStart - d3d11Start) * QpcMs());
+	backend.SetAlphaClassify(settings.AlphaClassify);  // (47s)
 	const bool traced = backend.ExecuteFrame(input);
 	cpuLast.execute = static_cast<float>(static_cast<double>(Qpc() - executeStart) * QpcMs());
 	if (!traced && backend.HasFailed()) {
@@ -5602,6 +5619,7 @@ void RayTracing::RunInteriorFrame()
 	RememberAONormalFrame(width, height);  // (47j)
 	const std::int64_t executeStart = Qpc();
 	cpuLast.d3d11 = static_cast<float>(static_cast<double>(executeStart - d3d11Start) * QpcMs());
+	backend.SetAlphaClassify(settings.AlphaClassify);  // (47s)
 	const bool traced = backend.ExecuteFrame(input);
 	cpuLast.execute = static_cast<float>(static_cast<double>(Qpc() - executeStart) * QpcMs());
 	if (!traced && backend.HasFailed()) {
@@ -6191,6 +6209,28 @@ void RayTracing::DrawObjectRows()
 		ImGui::EndDisabled();
 		ImGui::Unindent();
 	}
+	// (47s) Alpha Classify (OMM-lite).
+	ImGui::Checkbox("Alpha Classify (leaves, cut-outs, hair)", &settings.AlphaClassify);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("On (default): every triangle of a ray-traced leaf, cut-out, swaying plant or hair card is sorted once against its cut-out");
+		ImGui::Text("  on the graphics card: fully solid triangles are traced as plain solid geometry (no texture test per ray), fully");
+		ImGui::Text("  see-through ones are left out, only the rest is tested per ray as before. Same shadows, less work for the sun, the");
+		ImGui::Text("  point lights and RT ambient occlusion. Takes a few frames after a load (each mesh is sorted once).");
+		ImGui::Text("Off: exactly as 47r (every cut-out triangle tested per ray). F7: rt_ac_* columns.");
+	}
+	if (settings.AlphaClassify) {
+		const auto& cs = backend.GetAlphaClassifyStats();
+		if (!backend.AlphaClassifyAvailable()) {
+			ImGui::TextDisabled("Not available: the sort shader was rejected by the driver (see the log).");
+		} else {
+			const double all = static_cast<double>(cs.opaqueTriangles + cs.droppedTriangles + cs.mixedTriangles);
+			auto share = [&](std::uint64_t a_count) { return all > 0.0 ? 100.0 * static_cast<double>(a_count) / all : 0.0; };
+			ImGui::TextDisabled("Sorted meshes: %u in use, %u no gain, %u waiting; triangles %.0f%% solid, %.0f%% left out, %.0f%% tested", cs.ready, cs.noGain,
+				cs.pending + cs.baking + cs.building, share(cs.opaqueTriangles), share(cs.droppedTriangles), share(cs.mixedTriangles));
+			ImGui::TextDisabled("%u instances classified last frame; %.1f MB video memory; last sort %.2f ms", cs.instancesLastFrame,
+				static_cast<double>(cs.bytes + cs.bakeBufferBytes) / (1024.0 * 1024.0), std::max(cs.lastBakeGpuMs, 0.0f));
+		}
+	}
 	ImGui::TreePop();
 }
 
@@ -6762,7 +6802,8 @@ void RayTracing::DrawDiagnostics()
 	const auto& alphaBytes = backend.GetAlphaStats();
 	const std::uint64_t vram = rt.blasBytes + rt.scratchBytes + rt.tlasBytes + rt.uploadBytes + rt.sharedTextureBytes + d3d11Bytes +
 	                           alphaBytes.uvBytes + alphaBytes.layerBytes + alphaBytes.infoBytes +
-	                           backend.GetSkinStats().bytes + backend.GetSkinStats().scratchBytes + backend.GetSkinStats().boneBytes;
+	                           backend.GetSkinStats().bytes + backend.GetSkinStats().scratchBytes + backend.GetSkinStats().boneBytes +
+	                           backend.GetAlphaClassifyStats().bakeBufferBytes;  // (47s)
 
 	// Summary for players: where the settings are, what is on, what it costs.
 	ImGui::TextWrapped("The settings are on the Sun Shadows, Point Light Shadows and Ambient Occlusion pages (below this one in the list).");
@@ -7121,6 +7162,9 @@ std::string RayTracing::DescribeForProfile() const
 	text += std::format(", sway in RT shadows {}{}", settings.FoliageSway ? "on" : "off",
 		settings.FoliageSway && !scene.SwayActive() ? " (not in effect: Foliage is shadow map or the wind shader is unavailable)" : "");
 	text += std::format(", point shadows on water {}", pointWaterOn ? "on" : "off (resources failed)");
+	// (47s)
+	text += std::format(", alpha classify {}{}", settings.AlphaClassify ? "on" : "off",
+		settings.AlphaClassify && !backend.AlphaClassifyAvailable() ? " (not available: the sort shader was rejected)" : "");
 	return text;
 }
 
@@ -7202,6 +7246,15 @@ nlohmann::json RayTracing::DescribeJson() const
 			{ "tiny_face_skipped", ch.skipTinyFace } };
 		j["sun_size_deg"] = settings.SunSize;
 		j["foliage_keep_moving"] = settings.FoliageKeepMoving;
+		// (47s) Alpha Classify.
+		const auto& cs = backend.GetAlphaClassifyStats();
+		j["alpha_classify"] = { { "enabled", settings.AlphaClassify }, { "available", backend.AlphaClassifyAvailable() }, { "meshes", cs.variants },
+			{ "in_use", cs.ready }, { "no_gain", cs.noGain }, { "waiting_bake", cs.pending }, { "baking", cs.baking }, { "building", cs.building },
+			{ "opaque_triangles", cs.opaqueTriangles }, { "dropped_triangles", cs.droppedTriangles }, { "mixed_triangles", cs.mixedTriangles },
+			{ "instances_last_frame", cs.instancesLastFrame }, { "wind_instances_last_frame", cs.windLastFrame }, { "character_parts_last_frame", cs.skinLastFrame },
+			{ "forced_non_opaque_last_frame", cs.forcedNonOpaqueLastFrame }, { "bakes_total", cs.bakesTotal }, { "bake_triangles_total", cs.bakeTrianglesTotal },
+			{ "last_bake_gpu_ms", cs.lastBakeGpuMs }, { "rejected_bakes", cs.rejected }, { "vram_mb", static_cast<double>(cs.bytes) / (1024.0 * 1024.0) },
+			{ "bake_buffer_mb", static_cast<double>(cs.bakeBufferBytes) / (1024.0 * 1024.0) }, { "cpu_mb", static_cast<double>(cs.cpuBytes) / (1024.0 * 1024.0) } };
 	}
 	// (46b)
 	{

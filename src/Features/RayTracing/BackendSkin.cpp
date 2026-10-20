@@ -218,7 +218,16 @@ namespace RayTracingRT
 		skinStats_.bytes -= std::min(skinStats_.bytes, shape.Bytes());
 		skinStats_.vertices -= std::min<std::uint64_t>(skinStats_.vertices, shape.vertices);
 		skinStats_.triangles -= std::min<std::uint64_t>(skinStats_.triangles, shape.triangles);
+		const std::uint32_t layout = shape.layout;
 		shape = {};
+		// (47s) Alpha Classify: its variant loses its base (and, built with it, this user).
+		std::vector<std::uint32_t> orphans;
+		for (std::uint32_t v = 0; v < variants_.size(); ++v)
+			if (variants_[v].live && variants_[v].kind == VariantKind::Skin && variants_[v].base == a_shape)
+				orphans.push_back(v);
+		OrphanVariants(orphans);
+		if (layout != UINT32_MAX)
+			ReleaseVariantRef(layout);
 		freeSkins_.push_back(a_shape);
 		skinLive_ -= std::min<std::uint32_t>(skinLive_, 1);
 		skinStats_.shapes = skinLive_;
@@ -233,7 +242,12 @@ namespace RayTracingRT
 	{
 		if (a_shape >= skins_.size() || !skins_[a_shape].live || skins_[a_shape].uvOffset == UINT32_MAX)
 			return kInvalidAlphaInfo;
-		return CreateAlphaInfoAt(skins_[a_shape].uvOffset, skins_[a_shape].triangles, a_texture, a_material);
+		const std::uint32_t slot = CreateAlphaInfoAt(skins_[a_shape].uvOffset, skins_[a_shape].triangles, a_texture, a_material);
+		if (slot != kInvalidAlphaInfo && slot < slotBase_.size()) {
+			slotBase_[slot] = SlotBase{ VariantKind::Skin, a_shape, a_texture };  // (47s)
+			skins_[a_shape].alphaSlot = slot;
+		}
+		return slot;
 	}
 
 	void Backend::ReleaseSkinResources()
@@ -385,6 +399,11 @@ namespace RayTracingRT
 			auto& shape = skins_[entry.handle];
 			uploadPool_.Free(entry.upload, RetireValue());  // read by this submission only
 			shape.uploaded = true;
+			// (47s) An alpha-tested part keeps its indices and packed records: Alpha Classify's index list and mixed record.
+			if (!shape.geometry->Opaque() && bakePipeline_) {
+				shape.indicesCpu = std::move(shape.geometry->indices);
+				shape.uvCpu = std::move(shape.geometry->alphaUV);
+			}
 			shape.geometry.reset();
 			++skinUploadsTotal_;
 		}
@@ -481,6 +500,47 @@ namespace RayTracingRT
 		groupSkins.reserve(draws.size());
 		std::uint32_t builds = 0, rebuilds = 0;
 		std::uint64_t scratchTotal = 0;
+		// (47s) Alpha Classify: the part is (re)built in a_layout: its BLAS range grown when that layout needs more (the old one behind the
+		// fence), the scratch sizes the layout's, the variant referenced. False: not now (the pool's next block) or never.
+		auto takeSkinLayout = [&](SkinShape& a_shape, std::uint32_t a_layout) {
+			D3D12_RAYTRACING_GEOMETRY_DESC descs[2]{};
+			const UINT count = SkinGeometryDescs(a_shape, a_layout, descs);
+			if (count == 0)
+				return false;
+			D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs{};
+			inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+			inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+			inputs.NumDescs = count;
+			inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+			inputs.pGeometryDescs = descs;
+			D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info{};
+			device_->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &info);
+			if (info.ResultDataMaxSizeInBytes == 0 || info.ScratchDataSizeInBytes == 0)
+				return false;
+			const std::uint64_t need = AlignUp(info.ResultDataMaxSizeInBytes, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
+			if (need > a_shape.blasBytes) {
+				ArenaAlloc fresh;
+				if (!asPool_.Allocate(need, fresh)) {
+					++stats_.pools.allocFailsLastFrame;
+					return false;
+				}
+				asPool_.Free(a_shape.blas, RetireValue());  // a TLAS in flight may still name it
+				skinStats_.bytes += need - a_shape.blasBytes;
+				a_shape.blas = fresh;
+				a_shape.blasBytes = need;
+			}
+			a_shape.buildScratch = AlignUp(info.ScratchDataSizeInBytes, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
+			a_shape.updateScratch = AlignUp(std::max<std::uint64_t>(info.UpdateScratchDataSizeInBytes, 256), D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
+			if (a_layout != a_shape.layout) {
+				const std::uint32_t old = a_shape.layout;
+				if (a_layout != UINT32_MAX)
+					AddVariantRef(a_layout);
+				a_shape.layout = a_layout;
+				if (old != UINT32_MAX)
+					ReleaseVariantRef(old);
+			}
+			return true;
+		};
 		for (std::size_t d = 0; d < draws.size(); ++d) {
 			const auto& draw = draws[d];
 			if (draw.reuse)
@@ -507,11 +567,22 @@ namespace RayTracingRT
 				continue;
 			}
 			bool build = !shape.built;
+			// (47s) Alpha Classify: the layout this part should have now (its variant in use, else unclassified); a part built in
+			// another one is rebuilt (a first build's work, inside the cap), else it keeps tracing its old layout with that record.
+			const std::uint32_t want = shape.uvOffset != UINT32_MAX ? WantedSkinLayout(shape) : UINT32_MAX;
 			if (build) {
 				if (builds >= kSkinBuildsPerFrame) {
 					++skinStats_.notReadyLastFrame;
 					continue;
 				}
+				++builds;
+				if (want != shape.layout && !takeSkinLayout(shape, want) && shape.layout != UINT32_MAX && !takeSkinLayout(shape, UINT32_MAX)) {
+					--builds;
+					++skinStats_.notReadyLastFrame;
+					continue;
+				}
+			} else if (want != shape.layout && builds < kSkinBuildsPerFrame && takeSkinLayout(shape, want)) {
+				build = true;
 				++builds;
 			} else if (shape.refits >= kSkinRebuildFrames && rebuilds < kSkinRebuildsPerFrame) {
 				build = true;
@@ -798,22 +869,15 @@ namespace RayTracingRT
 		const D3D12_GPU_VIRTUAL_ADDRESS scratch = skinScratch_ ? skinScratch_->GetGPUVirtualAddress() : 0;
 		for (const auto& op : ops) {
 			auto& shape = skins_[draws[op.draw].shape];
-			D3D12_RAYTRACING_GEOMETRY_DESC geometryDesc{};
-			geometryDesc.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
-			geometryDesc.Flags = shape.uvOffset == UINT32_MAX ? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE : D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
-			geometryDesc.Triangles.VertexBuffer.StartAddress = skinOutputPool_.Address(shape.output);
-			geometryDesc.Triangles.VertexBuffer.StrideInBytes = kSkinOutputStride;
-			geometryDesc.Triangles.VertexCount = shape.vertices;
-			geometryDesc.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
-			geometryDesc.Triangles.IndexBuffer = skinStaticPool_.Address(shape.index);
-			geometryDesc.Triangles.IndexCount = shape.triangles * 3;
-			geometryDesc.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
+			// (47s) In its layout: one geometry (unclassified), or a classified variant's mixed and opaque ones (refits use the build's).
+			D3D12_RAYTRACING_GEOMETRY_DESC geometryDescs[2]{};
+			const UINT descCount = SkinGeometryDescs(shape, shape.layout, geometryDescs);
 			D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC buildDesc{};
 			buildDesc.Inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
 			buildDesc.Inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
-			buildDesc.Inputs.NumDescs = 1;
+			buildDesc.Inputs.NumDescs = descCount;
 			buildDesc.Inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
-			buildDesc.Inputs.pGeometryDescs = &geometryDesc;
+			buildDesc.Inputs.pGeometryDescs = geometryDescs;
 			buildDesc.DestAccelerationStructureData = asPool_.Address(shape.blas);
 			buildDesc.ScratchAccelerationStructureData = scratch + op.scratchOffset;
 			if (!op.build) {

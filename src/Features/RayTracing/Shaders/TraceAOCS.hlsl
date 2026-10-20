@@ -126,9 +126,11 @@ float2 UnpackTexcoord(uint packed)
 	return f16tof32(uint2(packed & 0xFFFFu, packed >> 16));
 }
 
-bool AlphaBlocks(uint instanceID, uint primitive, float2 bary, float footprint)
+// (47s) Alpha Classify: geometry 0 = the mixed triangles of a classified BLAS (the record lists only those); any later geometry is its
+// fully opaque triangles and blocks (TraceShadowsCS AlphaBlocks). An unclassified BLAS has geometry 0 only.
+bool AlphaBlocks(uint instanceID, uint geometry, uint primitive, float2 bary, float footprint)
 {
-	if (instanceID == 0u)
+	if (instanceID == 0u || geometry != 0u)
 		return true;
 	const AlphaInfo info = AlphaInfos[instanceID - 1u];
 	if (primitive >= info.Triangles)
@@ -202,7 +204,7 @@ float Visibility(float3 origin, float3 dir, float tMin, float tMax, uint mask, f
 			} else {
 				q.CommitNonOpaqueTriangleHit();
 			}
-		} else if (AlphaBlocks(q.CandidateInstanceID(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(), footprint)) {
+		} else if (AlphaBlocks(q.CandidateInstanceID(), q.CandidateGeometryIndex(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(), footprint)) {
 			q.CommitNonOpaqueTriangleHit();
 		} else {
 			budget -= 1u;
@@ -252,7 +254,7 @@ bool ClosestBlocker(float3 origin, float3 dir, float tMin, float tMax, uint mask
 		if (budget == 0u) {
 			complete = false;
 			q.Abort();
-		} else if (AlphaBlocks(q.CandidateInstanceID(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(), footprint)) {
+		} else if (AlphaBlocks(q.CandidateInstanceID(), q.CandidateGeometryIndex(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(), footprint)) {
 			q.CommitNonOpaqueTriangleHit();
 		} else {
 			budget -= 1u;
@@ -389,7 +391,7 @@ float CharacterVisibilitySelf(float3 origin, float3 dir, float tStart, float tMa
 				q.CommitNonOpaqueTriangleHit();
 			}
 			q.Abort();
-		} else if (AlphaBlocks(id, q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(), footprint)) {
+		} else if (AlphaBlocks(id, q.CandidateGeometryIndex(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(), footprint)) {
 			q.CommitNonOpaqueTriangleHit();
 			q.Abort();
 		} else {
@@ -456,7 +458,7 @@ bool CharacterClosestSelf(float3 origin, float3 dir, float tStart, float tMax, f
 		if (budget == 0u) {
 			complete = false;
 			q.Abort();
-		} else if (AlphaBlocks(id, q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(), footprint)) {
+		} else if (AlphaBlocks(id, q.CandidateGeometryIndex(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(), footprint)) {
 			q.CommitNonOpaqueTriangleHit();
 		} else {
 			budget -= 1u;

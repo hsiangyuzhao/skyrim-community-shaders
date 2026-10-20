@@ -269,6 +269,23 @@ add_custom_command(
     COMMENT "Compiling Ray Tracing DXIL (WindFoliageCS, cs_6_5)"
     VERBATIM
 )
+# (47s) Alpha Classify (OMM-lite): the GPU bake that sorts alpha-tested triangles into opaque / transparent / mixed.
+set(CS_RT_CLASSIFY_SHADER_SOURCE
+    "${CMAKE_SOURCE_DIR}/src/Features/RayTracing/Shaders/AlphaClassifyCS.hlsl"
+)
+set(CS_RT_CLASSIFY_SHADER_HEADER
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/RayTracing/AlphaClassifyCS.dxil.h"
+)
+add_custom_command(
+    OUTPUT "${CS_RT_CLASSIFY_SHADER_HEADER}"
+    COMMAND
+        "${CS_SDK_DXC}" -nologo -T cs_6_5 -E main -O3 -WX -Qstrip_reflect -Fh
+        "${CS_RT_CLASSIFY_SHADER_HEADER}" -Vn g_AlphaClassifyCS
+        "${CS_RT_CLASSIFY_SHADER_SOURCE}"
+    DEPENDS "${CS_RT_CLASSIFY_SHADER_SOURCE}"
+    COMMENT "Compiling Ray Tracing DXIL (AlphaClassifyCS, cs_6_5)"
+    VERBATIM
+)
 # (46b) Point-light shadows: traced right after the sun, same list and TLAS.
 set(CS_RT_POINT_SHADER_SOURCE
     "${CMAKE_SOURCE_DIR}/src/Features/RayTracing/Shaders/TracePointLightsCS.hlsl"
@@ -342,6 +359,7 @@ target_sources(
         "${CS_RT_CHAR_ALPHA_SHADER_HEADER}"
         "${CS_RT_SKIN_SHADER_HEADER}"
         "${CS_RT_WIND_SHADER_HEADER}"
+        "${CS_RT_CLASSIFY_SHADER_HEADER}"
 )
 target_include_directories(
     "${PROJECT_NAME}"

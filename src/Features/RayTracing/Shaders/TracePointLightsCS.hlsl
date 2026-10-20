@@ -137,9 +137,11 @@ float2 UnpackTexcoord(uint packed)
 	return f16tof32(uint2(packed & 0xFFFFu, packed >> 16));
 }
 
-bool AlphaBlocks(uint instanceID, uint primitive, float2 bary, float footprint)
+// (47s) Alpha Classify: geometry 0 = the mixed triangles of a classified BLAS (the record lists only those); any later geometry is its
+// fully opaque triangles and blocks (TraceShadowsCS AlphaBlocks). An unclassified BLAS has geometry 0 only.
+bool AlphaBlocks(uint instanceID, uint geometry, uint primitive, float2 bary, float footprint)
 {
-	if (instanceID == 0u)
+	if (instanceID == 0u || geometry != 0u)
 		return true;
 	const AlphaInfo info = AlphaInfos[instanceID - 1u];
 	if (primitive >= info.Triangles)
@@ -247,7 +249,7 @@ bool Blocked(float3 origin, float3 dir, float tMax, uint mask, float tMin, float
 	while (q.Proceed()) {
 		if (q.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE)
 			continue;
-		if (budget == 0u || AlphaBlocks(q.CandidateInstanceID(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(), footprint))
+		if (budget == 0u || AlphaBlocks(q.CandidateInstanceID(), q.CandidateGeometryIndex(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(), footprint))
 			q.CommitNonOpaqueTriangleHit();
 		else
 			budget -= 1u;
@@ -288,7 +290,7 @@ bool BlockedExcept(float3 origin, float3 dir, float tMax, uint mask, float tMin,
 		bool blocks = id == 0u;
 #if defined(RT_ALPHA)
 		if (!blocks) {
-			if (budget == 0u || AlphaBlocks(id, q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(), footprint))
+			if (budget == 0u || AlphaBlocks(id, q.CandidateGeometryIndex(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(), footprint))
 				blocks = true;
 			else
 				budget -= 1u;

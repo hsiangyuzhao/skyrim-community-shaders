@@ -1060,6 +1060,11 @@ namespace Util::FrameTrace
 				out << "# (47r) rt_wind_frozen_unlearned = leaf timers the game froze on this long frame that had no rate to advance them (no own rate,\n";
 				out << "#   no shared one); rt_wind_shared = of rt_wind_catchup, those advanced at the rate the other plants share (Learn on Any Frame).\n";
 				out << "#   pacer_repeat_fed = 1: the learned frame-start sleep was fed the largest of the last 4 waits (Pacer: Learn Repeating Waits).\n";
+				out << "# (47s) rt_ac_* = Alpha Classify (-1 = off): rt_ac_opaque_tris / rt_ac_dropped_tris / rt_ac_mixed_tris = triangles of the sorted\n";
+				out << "#   alpha-tested meshes in use traced as solid geometry / left out / still tested per ray; rt_ac_instances = TLAS instances\n";
+				out << "#   traced classified this frame; rt_ac_waiting = meshes waiting for their sort or their classified BLAS; rt_ac_bake_tris =\n";
+				out << "#   triangles sorted this frame; rt_ac_bake_gpu_ms = GPU ms of the last sort (not in rt_prep_gpu_ms); rt_ac_vram_mb = video\n";
+				out << "#   memory of the classified BLASes, records, index lists and the sort buffer.\n";
 				out << "#   rt_pw_* = the work of the RT D3D12 prep submission whose GPU time is rt_prep_gpu_ms on the same row (1 = valid; early =\n";
 				out << "#   recorded at the frame start): static BLAS builds (of which alpha-tested, triangles, MB before compaction), compactions (MB\n";
 				out << "#   written), new character shapes uploaded, own-BLAS character builds / refits, merged character BLAS builds (triangles) /\n";
@@ -1164,7 +1169,8 @@ namespace Util::FrameTrace
 					   "rt_wind_in_radius,rt_wind_sources,rt_wind_builds,rt_wind_refit_verts,rt_wind_radius,"  // (47n)
 					   "gpu_spike_ms,jobs,"  // (47p)
 					   "rt_npc_body_only,rt_npc_refit_skipped,rt_skip_tiny_face,rt_wind_catchup,rt_chunk_cells,rt_chunks_per_cell,rt_chunk_overlap,"  // (47q)
-					   "rt_wind_frozen_unlearned,rt_wind_shared,pacer_repeat_fed\n";  // (47r) the last ones
+					   "rt_wind_frozen_unlearned,rt_wind_shared,pacer_repeat_fed,"  // (47r)
+					   "rt_ac_opaque_tris,rt_ac_dropped_tris,rt_ac_mixed_tris,rt_ac_instances,rt_ac_waiting,rt_ac_bake_tris,rt_ac_bake_gpu_ms,rt_ac_vram_mb\n";  // (47s) the last ones
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
 					std::string s = std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{},{}", t.scene,
@@ -1357,6 +1363,10 @@ namespace Util::FrameTrace
 					// (47r) Keep Leaves Moving (frozen without a rate, at the shared rate) and the pacer's repeating-wait feed, after rt_chunk_overlap.
 					extra.pop_back();
 					extra += std::format(",{},{},{}\n", r.rt.windFrozenUnlearned, r.rt.windSharedCatchups, r.pacer.repeatFed);
+					// (47s) Alpha Classify, after pacer_repeat_fed (the old last column).
+					extra.pop_back();
+					extra += std::format(",{},{},{},{},{},{},{:.3f},{:.1f}\n", r.rt.acOpaque, r.rt.acDropped, r.rt.acMixed, r.rt.acInstances, r.rt.acWaiting,
+						r.rt.acBakeTriangles, r.rt.acBakeGpuMs, r.rt.acVramMb);
 					if (it == a_reflex.end()) {
 						out << (r.reflexFrame == UINT32_MAX ? std::string("-1") : std::to_string(r.reflexFrame)) << ",-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" << engineColumns(r) << extra;
 						continue;
