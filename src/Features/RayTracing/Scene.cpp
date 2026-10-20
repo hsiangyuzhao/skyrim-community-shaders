@@ -358,7 +358,7 @@ namespace RayTracingScene
 			const std::uint32_t base = chunk.Vertices();
 			const auto* positions = a_cell.stagePositions.data() + static_cast<std::size_t>(shape.firstVertex) * 3;
 			chunk.positions.insert(chunk.positions.end(), positions, positions + static_cast<std::size_t>(shape.vertices) * 3);
-			chunk.indices.reserve(chunk.indices.size() + shape.indices);
+			// No per-shape reserve (an exact reserve per shape would copy the whole chunk again for every shape): geometric growth.
 			for (std::uint32_t k = 0; k < shape.indices; ++k)
 				chunk.indices.push_back(base + a_cell.stageIndices[shape.firstIndex + k]);
 			a_cell.currentGeometries[side].push_back(shape.geometry);
