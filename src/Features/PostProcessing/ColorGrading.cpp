@@ -45,7 +45,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     outputColorSpace,
 	colorSpaceTransform,
 	invColorSpaceTransform,
-	tonemapHDR
+	tonemapHDR,
+	lutHalfTexelFix
 )
 
 template <int num = 3>
@@ -92,6 +93,18 @@ bool exposureSlider(float* val)
 	return retval;
 }
 
+// (47r) Reinhard / Reinhard Extended: "Per Channel" (params[0].z, 0 = on luminance as before).
+static void perChannelCheckbox(float* a_value)
+{
+	bool perChannel = *a_value > 0.5f;
+	if (ImGui::Checkbox("Per Channel", &perChannel))
+		*a_value = perChannel ? 1.0f : 0.0f;
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("Off (default, as before): the curve works on brightness; hue and saturation are kept.");
+		ImGui::Text("On: R, G and B each follow the curve; bright colours turn toward white (a film-like look).");
+	}
+}
+
 // Profjack Design
 struct TonemapperInfo
 {
@@ -113,7 +126,9 @@ struct TonemapperInfo
         static std::vector<TonemapperInfo> tonemappers = {
 			{ "Reinhard"sv, "Reinhard"sv,
 				"Mapping proposed in \"Photographic Tone Reproduction for Digital Images\" by Reinhard et al. 2002."sv,
-				[](CTP& params) { exposureSlider(&params[0].x); },
+				[](CTP& params) {
+					exposureSlider(&params[0].x);
+					perChannelCheckbox(&params[0].z); },
 				{ f4{ 1.f, 0.f, 0.f, 0.f } } },
 
 			{ "Reinhard Extended"sv, "ReinhardExt"sv,
@@ -121,7 +136,8 @@ struct TonemapperInfo
 				"An additional user parameter specifies the smallest luminance that is mapped to 1, which allows high luminances to burn out."sv,
 				[](CTP& params) {
 					exposureSlider(&params[0].x);
-					ImGui::SliderFloat("White Point", &params[0].y, 0.f, 10.f, "%.2f"); },
+					ImGui::SliderFloat("White Point", &params[0].y, 0.f, 10.f, "%.2f");
+					perChannelCheckbox(&params[0].z); },
 				{ f4{ 1.f, 2.f, 0.f, 0.f } } },
 
 			{ "Hejl Burgess-Dawson Filmic"sv, "HejlBurgessDawsonFilmic"sv,
@@ -235,8 +251,64 @@ struct TonemapperInfo
 					ImGui::SliderFloat("Clip Point", &params[0].y, 1.f, 100.f, "%.2f", ImGuiSliderFlags_Logarithmic);
 					if (auto _tt = Util::HoverTooltipWrapper())
 						ImGui::Text("Scene brightness that reaches the peak. Higher = softer shoulder.");
+					// (47r) What the curve compresses (upstream renodx neutwo.hlsl modes).
+					const char* modes[] = { "Luminance", "Brightest Channel", "Each Channel" };
+					int mode = std::clamp(static_cast<int>(params[0].z + 0.5f), 0, 2);
+					if (ImGui::Combo("Compress", &mode, modes, IM_ARRAYSIZE(modes)))
+						params[0].z = static_cast<float>(mode);
+					if (auto _tt = Util::HoverTooltipWrapper()) {
+						ImGui::Text("Luminance (default, as before): hue and saturation kept exactly; very saturated bright colours may need scaling down.");
+						ImGui::Text("Brightest Channel: the strongest of R, G, B follows the curve; hue kept, saturated colours a little darker.");
+						ImGui::Text("Each Channel: R, G and B each follow the curve; very bright colours turn toward white (a film-like look).");
+					}
 				},
-				{ f4{ 1.f, 100.f, 0.f, 0.f } } }
+				{ f4{ 1.f, 100.f, 0.f, 0.f } } },
+
+			// (47r) RenoDX tone mappers (MIT, Carlos Lopez), ported from upstream under upstream's names. They work in BT.709 (the processing
+			// space is converted back first) and have a Native HDR form. Mid grey stays at 0.18 (neutral): about 1 stop darker than a curve
+			// that lifts mid grey (Lottes at 0.18 -> 0.36): compare them at about +1 EV of Exposure.
+			{ "ACES"sv, "ACESTonemap"sv,
+				"The full ACES 1.x output transform (RenoDX): reference gamut compression, the RRT and the ODT for the display range. "
+				"Film-like contrast and highlight roll-off; colours stay inside the display gamut. Its HDR form makes the ODT for the peak."sv,
+				[](CTP& params) {
+					exposureSlider(&params[0].x);
+					ImGui::SliderFloat("Min Luminance", &params[0].y, 0.0001f, 1.f, "%.4f nits", ImGuiSliderFlags_Logarithmic);
+					if (auto _tt = Util::HoverTooltipWrapper())
+						ImGui::Text("The darkest level the curve aims at (nits). Higher = lifted blacks.");
+				},
+				{ f4{ 1.f, 0.0001f, 0.f, 0.f } } },
+
+			{ "Frostbite"sv, "FrostbiteTonemap"sv,
+				"Frostbite's display mapping (RenoDX, after the EA SEED talk): desaturates very bright colours a little in ICtCp, then rolls "
+				"highlights off toward the peak, keeping the hue; some saturation is given back afterwards."sv,
+				[](CTP& params) {
+					exposureSlider(&params[0].x);
+					ImGui::SliderFloat("Rolloff Start", &params[0].y, 0.f, 1.f, "%.2f");
+					if (auto _tt = Util::HoverTooltipWrapper())
+						ImGui::Text("Brightness (in paper whites) where highlights start to bend toward the peak. Lower = softer, earlier roll-off.");
+					ImGui::SliderFloat("Saturation Boost", &params[0].z, 0.f, 1.f, "%.2f");
+					ImGui::SliderFloat("Hue Correction", &params[0].w, 0.f, 1.f, "%.2f");
+					if (auto _tt = Util::HoverTooltipWrapper())
+						ImGui::Text("1 = highlights keep their hue exactly; 0 = each channel rolls off on its own (bright colours shift toward white / yellow).");
+				},
+				{ f4{ 1.f, 0.25f, 0.3f, 0.6f } } },
+
+			{ "Hermite Spline"sv, "HermiteSplineTonemap"sv,
+				"BT.2408-style roll-off (RenoDX): the picture passes through unchanged up to a knee, then a smooth spline bends highlights to the "
+				"peak. Brightness only, so hue and saturation are kept. The softest shoulder of these, with the most highlight detail."sv,
+				[](CTP& params) {
+					exposureSlider(&params[0].x);
+					ImGui::SliderFloat("White Clip", &params[0].y, 1.f, 500.f, "%.1f", ImGuiSliderFlags_Logarithmic);
+					if (auto _tt = Util::HoverTooltipWrapper())
+						ImGui::Text("Scene brightness that reaches the peak. Higher = softer shoulder.");
+				},
+				{ f4{ 1.f, 100.f, 0.f, 0.f } } },
+
+			{ "PsychoV"sv, "PsychoVTonemap"sv,
+				"PsychoV 17 by Carlos Lopez (RenoDX): models how the eye's cones respond to light, then restores the hue and keeps colours "
+				"inside the display gamut. Natural-looking saturation in bright light. Its HDR form raises the peak."sv,
+				[](CTP& params) { exposureSlider(&params[0].x); },
+				{ f4{ 1.f, 0.f, 0.f, 0.f } } }
 		};
 
 		static std::once_flag flag;
@@ -426,7 +498,8 @@ void ColorGrading::DrawSettings()
                 ImGui::TextUnformatted("How this tone mapper behaves with HDR output on (saved for each tone mapper).");
                 ImGui::TextUnformatted("Extend: the picture is exactly the SDR one up to the roll-off start; only brighter highlights go above white, up to the peak.");
                 ImGui::TextUnformatted("Native: the tone mapper's own HDR form (Lottes: the curve re-solved for the peak, mid-grey kept;");
-                ImGui::TextUnformatted("GT7: its HDR curve matched to its SDR mid-tones; Neutwo: its peak raised). Only Lottes, GT7 and Neutwo have one.");
+                ImGui::TextUnformatted("GT7: its HDR curve matched to its SDR mid-tones; Neutwo / Hermite Spline / PsychoV / Frostbite: their peak raised;");
+                ImGui::TextUnformatted("Uchimura: its shoulder extended to the peak; ACES: the ODT made for the peak). Only those have one.");
             }
             const bool kneeUsed = hdr.mode == 0 || !native || isGT7;
             if (kneeUsed) {
@@ -440,13 +513,19 @@ void ColorGrading::DrawSettings()
                     }
                 }
             }
-            if (native && hdr.mode == 1 && isGT7) {
+            const bool isACES = tmName == "ACES";  // (47r)
+            if (native && hdr.mode == 1 && (isGT7 || isACES)) {
                 bool reference = hdr.option == 1;
                 if (ImGui::Checkbox("Upstream Reference Brightness", &reference))
                     hdr.option = reference ? 1u : 0u;
                 if (auto _tt = Util::HoverTooltipWrapper()) {
-                    ImGui::TextUnformatted("Off: GT7's HDR curve with the same mid-tones as GT7 in SDR.");
-                    ImGui::TextUnformatted("On: GT7's HDR curve as upstream uses it: everything about 2.5x (1.3 stops) brighter than SDR.");
+                    if (isACES) {
+                        ImGui::TextUnformatted("Off: ACES in HDR keeps the mid-tones of ACES in SDR (mid grey at 0.10 of paper white).");
+                        ImGui::TextUnformatted("On: as upstream: mid grey at 0.18 of paper white, about 0.85 stop brighter than SDR.");
+                    } else {
+                        ImGui::TextUnformatted("Off: GT7's HDR curve with the same mid-tones as GT7 in SDR.");
+                        ImGui::TextUnformatted("On: GT7's HDR curve as upstream uses it: everything about 2.5x (1.3 stops) brighter than SDR.");
+                    }
                 }
             }
             settings.tonemapHDR[tmName] = hdr;
@@ -465,6 +544,15 @@ void ColorGrading::DrawSettings()
         ImGui::Text("Saturation, Brightness and Contrast.");
     ImGui::SliderFloat("Fade Blend", &settings.gameFadeBlend, 0.f, 1.f, "%.3f");
     ImGui::SliderFloat("Tint Blend", &settings.gameTintBlend, 0.f, 1.f, "%.3f");
+    // (47r) Upstream 350c6fe82 as a switch (it changes the look).
+    ImGui::SeparatorText("Lookup Table");
+    ImGui::Checkbox("LUT Half-Texel Fix", &settings.lutHalfTexelFix);
+    if (auto _tt = Util::HoverTooltipWrapper()) {
+        ImGui::TextUnformatted("The grading is baked into a 64x64x64 lookup table. Until now it was baked half a step off from where it is read,");
+        ImGui::TextUnformatted("which made the whole picture slightly brighter (about +0.1 stop at mid grey, +0.2 at the brightest).");
+        ImGui::TextUnformatted("On: baked and read at the same points (upstream's fix): the picture gets that much darker, the curve exactly as set.");
+        ImGui::TextUnformatted("Off (default): as before, so your current look does not change.");
+    }
     ImGui::SeparatorText("Color Space Transform");
     ImGui::Checkbox("Enable Color Space Transform", &settings.enableColorSpaceTransform);
     if (settings.enableColorSpaceTransform) {
@@ -564,14 +652,19 @@ ColorGrading::TonemapHDR ColorGrading::GetTonemapHDR(std::string_view a_name) co
 	if (auto it = settings.tonemapHDR.find(std::string(a_name)); it != settings.tonemapHDR.end())
 		return it->second;
 	TonemapHDR defaults{};
-	if (a_name == "Neutwo")
-		defaults.mode = 1;  // made for HDR: its Native form is the point of it
+	if (a_name == "Neutwo" || UsesRenoDX(a_name))
+		defaults.mode = 1;  // made for HDR: its Native form is the point of it ((47r) the RenoDX ones too; Uchimura stays Extend)
 	return defaults;
 }
 
 bool ColorGrading::HasNativeHDR(std::string_view a_name)
 {
-	return a_name == "Lottes Filmic/AMD Curve" || a_name == "GT7" || a_name == "Neutwo";
+	return a_name == "Lottes Filmic/AMD Curve" || a_name == "GT7" || a_name == "Neutwo" || a_name == "Uchimura/Grand Turismo Curve" || UsesRenoDX(a_name);  // (47r)
+}
+
+bool ColorGrading::UsesRenoDX(std::string_view a_name)
+{
+	return a_name == "ACES" || a_name == "Frostbite" || a_name == "Hermite Spline" || a_name == "PsychoV";
 }
 
 void ColorGrading::SaveSettings(json& o_json)
@@ -730,6 +823,11 @@ void ColorGrading::CompileComputeShaders()
 		};
 	// (44e) COD Bloom fused into the apply.
 	shaderInfos.push_back({ &colorgradingFusedCS, "colorgrading.cs.hlsl", { { "TONEMAP_FUNC", tonemappers[tonemapperType].func_name.data() }, { "BLOOM_FUSED", "" } }, "CSColorGrading" });
+	// (47r) The RenoDX tone mappers: their library and the display-space rule, in every variant (only theirs).
+	const bool renodx = UsesRenoDX(tonemappers[tonemapperType].name);
+	if (renodx)
+		for (auto& info : shaderInfos)
+			info.defines.insert(info.defines.end(), { { "TONEMAP_RENODX", "" }, { "TONEMAP_DISPLAY_SPACE", "" } });
 
 	// (batch 43) The HDR variants only exist in a native-HDR session, so an SDR session compiles exactly
 	// what it did before.
@@ -737,6 +835,8 @@ void ColorGrading::CompileComputeShaders()
 		std::vector<std::pair<const char*, const char*>> hdrDefines = { { "TONEMAP_FUNC", tonemappers[tonemapperType].func_name.data() }, { "HDR_OUTPUT", "" } };
 		if (tonemappers[tonemapperType].name == "GT7"sv)
 			hdrDefines.push_back({ "TONEMAP_GT7", "" });  // (44a) GT7's Native form lives in ColorGrading()
+		if (renodx)
+			hdrDefines.insert(hdrDefines.end(), { { "TONEMAP_RENODX", "" }, { "TONEMAP_DISPLAY_SPACE", "" } });  // (47r)
 		shaderInfos.push_back({ &colorgradingHdrCS, "colorgrading.cs.hlsl", hdrDefines, "CSColorGrading" });
 		shaderInfos.push_back({ &lutgenHdrCS, "colorgrading.cs.hlsl", hdrDefines, "CSLUTGen" });
 		auto fusedDefines = hdrDefines;
@@ -868,7 +968,7 @@ void ColorGrading::Draw(TextureInfo& inout_tex)
 		const auto hdr = GetTonemapHDR(tonemapperName);
 		const bool native = hdr.mode == 1 && HasNativeHDR(tonemapperName);
 		colorCBData.hdrParams = float4{ native ? 2.0f : 1.0f, levels.peakRel, std::clamp(hdr.knee, 0.3f, 0.9f), levels.displayGamma ? 1.0f : 0.0f };
-		colorCBData.hdrParams2 = float4{ (native && hdr.option == 1) ? 1.0f : 0.0f, 1.0f, 0.0f, 0.0f };
+		colorCBData.hdrParams2 = float4{ (native && hdr.option == 1) ? 1.0f : 0.0f, 1.0f, levels.paperWhiteNits, 0.0f };  // (47r) z: paper white
 		// processing -> BT.2020 = (709 -> 2020) x (processing -> sRGB): greys exactly as in SDR.
 		const int process = settings.enableColorSpaceTransform ? settings.processColorSpace : -1;
 		if (process != cachedOutputProcessSpace) {
@@ -888,6 +988,7 @@ void ColorGrading::Draw(TextureInfo& inout_tex)
 		for (int r = 0; r < 3; ++r)
 			colorCBData.hdrOutputTransform[r] = cachedOutputTransform[r];
 	}
+	colorCBData.hdrParams2.w = settings.lutHalfTexelFix ? 1.0f : 0.0f;  // (47r) LUT Half-Texel Fix (SDR and HDR)
 	colorCB->Update(colorCBData);
 
 	ID3D11Buffer* cb = colorCB->CB();
@@ -1091,9 +1192,11 @@ void ColorGrading::DrawCurvePreview()
 		return;
 	}
 	// Input of texel i: the LUT's log shaper (CSLUTGen), 14 stops around 0.18.
-	auto inputOf = [](int i) {
+	// (47r) With the LUT Half-Texel Fix texel i is baked at i / 63 (else (i + 0.5) / 63).
+	const float texelOffset = settings.lutHalfTexelFix ? 0.0f : 0.5f;
+	auto inputOf = [texelOffset](int i) {
 		const auto logToLinear = [](float v) { return std::exp2((v - 444.0f / 1023.0f) * 14.0f) * 0.18f; };
-		return logToLinear((static_cast<float>(i) + 0.5f) / static_cast<float>(LUTDim - 1)) - logToLinear(0.0f);
+		return logToLinear((static_cast<float>(i) + texelOffset) / static_cast<float>(LUTDim - 1)) - logToLinear(0.0f);
 	};
 	const float yMax = std::max(curvePeakRel, 1.0f) * 1.05f;
 	const float xMin = std::log2(std::max(inputOf(1), 1e-4f));

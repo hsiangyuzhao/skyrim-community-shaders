@@ -54,6 +54,7 @@ struct ColorGrading : public PostProcessFeature
     {
         bool useToDInterior = false;
         bool skipLDR = false;
+        bool lutHalfTexelFix = false;  // (47r) upstream 350c6fe82: the LUT baked and sampled at the same coordinates (default off: slightly darker)
         std::array<ColorProfile, 8> profiles = {};
         std::string currentTonemapper = "GT7";
         std::array<float4, 2> tonemapParams = { float4{ 1.f, 2.f, 0.f, 0.f }, float4{ 0.f, 0.f, 0.f, 0.f } };
@@ -186,6 +187,8 @@ struct ColorGrading : public PostProcessFeature
     TonemapHDR GetTonemapHDR(std::string_view a_name) const;
     /// (44a) The tone mapper has a Native HDR form (Lottes, GT7, Neutwo).
     static bool HasNativeHDR(std::string_view a_name);
+    /// (47r) The RenoDX tone mappers (ACES, Frostbite, Hermite Spline, PsychoV): TONEMAP_RENODX + TONEMAP_DISPLAY_SPACE.
+    static bool UsesRenoDX(std::string_view a_name);
     /// (44a) True when the last bake was the HDR variant writing BT.2020 (DLSS 5 tone match reads it).
     bool LUTIsBT2020() const { return lutValid && bakedColorCBData.hdrParams2.y > 0.5f; }
 

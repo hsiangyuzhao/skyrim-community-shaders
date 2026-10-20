@@ -4,6 +4,11 @@
 #include "PostProcessing/common.hlsli"
 #include "PostProcessing/aces.hlsli"
 #include "PostProcessing/ColourTransforms/GT7ToneMapping.hlsli"
+#if defined(TONEMAP_RENODX)
+// (47r) RenoDX (Carlos Lopez, MIT: Include/RenoDX.MIT.LICENSE), as upstream vendors it: ACES (RRT + ODT), Frostbite, Hermite
+// Spline, PsychoV. Only in the variants of those tone mappers (TONEMAP_RENODX), so the others compile as before.
+#	include "PostProcessing/ColorGrading/Include/RenoDXToneMapping.hlsli"
+#endif
 
 #define LUT_SIZE 64
 
@@ -75,8 +80,9 @@ cbuffer ColorCB : register(b1) {
 	// 2 = the tone mapper's Native HDR form; y: peak / paper white; z: roll-off start (knee);
 	// w: 1 when the chain's output is display gamma (Linear Lighting's gamma correction off).
 	float4 hdrParams;
-	// (44a) x: Native option (GT7: upstream reference brightness); y: 1 = output BT.2020 (HDR
-	// working colour space; hdrOutputTransform replaces the inverse transform); z, w: unused.
+	// (44a) x: Native option (GT7 / (47r) ACES: upstream reference brightness); y: 1 = output BT.2020 (HDR
+	// working colour space; hdrOutputTransform replaces the inverse transform); (47r) z: paper white (nits, HDR
+	// only); w: 1 = the LUT half-texel fix (upstream 350c6fe82).
 	float4 hdrParams2;
 	float4 hdrOutputTransform[3];  // (44a) processing space -> BT.2020, (709 -> 2020) x (processing -> 709)
 };
@@ -310,20 +316,37 @@ float3 LinearToLog(float3 linearColor)
 float3 Reinhard(float3 val)
 {
 	val *= tonemapParams[0].x;
-	float luma = Color::RGBToLuminance(val);
-	float lumaOut = luma / (1 + luma);
-	val = val / (luma + 1e-10) * lumaOut;
-	val = saturate(val);
+	// (47r) tonemapParams[0].z = 1: per channel (each of R, G, B on its own: brights desaturate toward white). 0: on luminance (as before).
+	[branch] if (tonemapParams[0].z > 0.5)
+	{
+		val = saturate(max(val, 0.0) / (1.0 + max(val, 0.0)));
+	}
+	else
+	{
+		float luma = Color::RGBToLuminance(val);
+		float lumaOut = luma / (1 + luma);
+		val = val / (luma + 1e-10) * lumaOut;
+		val = saturate(val);
+	}
 	return val;
 }
 
 float3 ReinhardExt(float3 val)
 {
 	val *= tonemapParams[0].x;
-	float luma = Color::RGBToLuminance(val);
-	float lumaOut = luma * (1 + luma / (tonemapParams[0].y * tonemapParams[0].y)) / (1 + luma);
-	val = val / (luma + 1e-10) * lumaOut;
-	val = saturate(val);
+	// (47r) tonemapParams[0].z = 1: per channel (see Reinhard).
+	[branch] if (tonemapParams[0].z > 0.5)
+	{
+		const float3 v = max(val, 0.0);
+		val = saturate(v * (1.0 + v / (tonemapParams[0].y * tonemapParams[0].y)) / (1.0 + v));
+	}
+	else
+	{
+		float luma = Color::RGBToLuminance(val);
+		float lumaOut = luma * (1 + luma / (tonemapParams[0].y * tonemapParams[0].y)) / (1 + luma);
+		val = val / (luma + 1e-10) * lumaOut;
+		val = saturate(val);
+	}
 	return val;
 }
 
@@ -459,7 +482,7 @@ float3 DayFilmic(float3 val)
 
 float3 UchimuraFilmic(float3 val)
 {
-	const float P = tonemapParams[0].y;
+	float P = tonemapParams[0].y;
 	const float a = tonemapParams[0].z;
 	const float m = tonemapParams[0].w;
 	const float l = tonemapParams[1].x;
@@ -467,6 +490,12 @@ float3 UchimuraFilmic(float3 val)
 	const float b = tonemapParams[1].z;
 
 	val *= tonemapParams[0].x;
+#if defined(HDR_OUTPUT)
+	// (47r) Native HDR form (upstream 1399e15a1): the maximum brightness P scaled by peak / paper white; the toe and the linear
+	// section are unchanged, only the shoulder reaches further; clamped to the new P.
+	[branch] if (HDRNative())
+		P *= hdrParams.y;
+#endif
 
 	float l0 = ((P - m) * l) / a,
 		  S0 = m + l0,
@@ -484,7 +513,11 @@ float3 UchimuraFilmic(float3 val)
 
 	val = T * w0 + L * w1 + S * w2;
 
+#if defined(HDR_OUTPUT)
+	val = HDRNative() ? clamp(val, 0.0, P) : saturate(val);
+#else
 	val = saturate(val);
+#endif
 	return val;
 }
 
@@ -699,13 +732,116 @@ float3 NeutwoTonemap(float3 val)
 		peak = hdrParams.y;
 #endif
 	const float clip = max(tonemapParams[0].y, peak);
-	const float y = Color::RGBToLuminance(val);
-	val *= y > 0.0 ? NeutwoCurve(y, peak, clip) / y : 1.0;
+	// (47r) tonemapParams[0].z: what the curve compresses (upstream renodx neutwo.hlsl): 0 luminance (as before), 1 the brightest channel
+	// (hue kept, saturated colours a little darker), 2 each channel on its own (brights desaturate toward white).
+	[branch] if (tonemapParams[0].z > 1.5)
+	{
+		val = float3(NeutwoCurve(val.r, peak, clip), NeutwoCurve(val.g, peak, clip), NeutwoCurve(val.b, peak, clip));
+	}
+	else if (tonemapParams[0].z > 0.5)
+	{
+		const float mc = max(max(val.r, val.g), val.b);
+		val *= mc > 0.0 ? NeutwoCurve(mc, peak, clip) / mc : 1.0;
+	}
+	else
+	{
+		const float y = Color::RGBToLuminance(val);
+		val *= y > 0.0 ? NeutwoCurve(y, peak, clip) / y : 1.0;
+	}
 	// Saturated colours can put a channel above the peak at the same luminance: scale the whole
 	// colour down (keeps the hue) rather than clipping a channel.
 	const float m = max(max(val.r, val.g), val.b);
 	return m > peak ? val * (peak / m) : val;
 }
+
+////////////////////////////////////////////////////////////////////////
+// (47r) The RenoDX tone mappers (upstream 69a585349, ff332789a, 61ffef904, 61e60e341), TONEMAP_RENODX + TONEMAP_DISPLAY_SPACE.
+// They take scene-linear BT.709: the processing space (ACEScg here, for example) goes back to BT.709 first, else the colour would be
+// converted twice. Output: BT.709 (SDR, and HDR Extend) or BT.2020 with 1.0 = paper white (HDR Native); ColorGrading() then skips the
+// processing -> output transform for them (TONEMAP_DISPLAY_SPACE).
+#if defined(TONEMAP_RENODX)
+float3 ProcessToBT709(float3 c)
+{
+	if (enableColorSpaceTransform)
+		c = mul(float3x3(invColorSpaceTransform[0].xyz, invColorSpaceTransform[1].xyz, invColorSpaceTransform[2].xyz), c);
+	return c;
+}
+
+// ACES 1.x (RenoDX): reference gamut compression, RRT, then the ODT (SSTS) for the display range. Params: x exposure, y minimum
+// luminance (nits). HDR Native: by default mid grey as in SDR (0.10); "upstream reference brightness" (hdrParams2.x) uses upstream's
+// 0.18 (about 0.85 stop brighter).
+float3 ACESTonemap(float3 color)
+{
+	const float3 c = max(0.0, ProcessToBT709(color) * tonemapParams[0].x);
+	const float minNits = max(tonemapParams[0].y, 0.0001);
+#	if defined(HDR_OUTPUT)
+	float3 result;
+	[branch] if (HDRNative())
+	{
+		const float paper = max(hdrParams2.z, 1.0);
+		const float midGray = hdrParams2.x > 0.5 ? ColorGradingRenoDX::ACES_DEFAULT_MID_GRAY_VALUE : ColorGradingRenoDX::ACES_MID_GRAY;
+		result = ColorGradingRenoDX::ACESBT2020(mul(kHDR709To2020, c), minNits, hdrParams.y * paper, paper, midGray);
+	}
+	else
+		result = ColorGradingRenoDX::ACESSDRBT709(c, minNits);
+	return result;
+#	else
+	return ColorGradingRenoDX::ACESSDRBT709(c, minNits);
+#	endif
+}
+
+// Frostbite (RenoDX): ICtCp desaturation by brightness, an exponential roll-off from Rolloff Start toward the peak (max channel and per
+// channel, blended by Hue Correction), some saturation given back. Params: x exposure, y rolloff start, z saturation boost, w hue correction.
+float3 FrostbiteTonemap(float3 color)
+{
+	const float3 c = max(0.0, ProcessToBT709(color) * tonemapParams[0].x);
+	float3 result = 0.0;
+	[branch] if (max(c.r, max(c.g, c.b)) > 0.0)
+	{
+#	if defined(HDR_OUTPUT)
+		[branch] if (HDRNative())
+			result = ColorGradingRenoDX::FrostbiteBT2020(mul(kHDR709To2020, c), hdrParams.y, min(tonemapParams[0].y, hdrParams.y), tonemapParams[0].z, tonemapParams[0].w);
+		else
+#	endif
+			result = renodx::tonemap::frostbite::BT709(c, 1.0, min(tonemapParams[0].y, 1.0), tonemapParams[0].z, tonemapParams[0].w);
+	}
+	return result;
+}
+
+// Hermite Spline (RenoDX, BT.2408 style): luminance only; below the knee unchanged, above it a cubic spline (in log luminance) to the
+// peak. Params: x exposure, y white clip (scene brightness that reaches the peak).
+float3 HermiteSplineTonemap(float3 color)
+{
+	const float3 c = max(0.0, ProcessToBT709(color) * tonemapParams[0].x);
+#	if defined(HDR_OUTPUT)
+	float3 result;
+	[branch] if (HDRNative())
+		result = ColorGradingRenoDX::HermiteSplineBT2020(mul(kHDR709To2020, c), hdrParams.y, max(tonemapParams[0].y, hdrParams.y));
+	else
+		result = renodx::tonemap::HermiteSplineLuminanceRolloff(c, 1.0, max(tonemapParams[0].y, 1.0));
+	return result;
+#	else
+	return renodx::tonemap::HermiteSplineLuminanceRolloff(c, 1.0, max(tonemapParams[0].y, 1.0));
+#	endif
+}
+
+// PsychoV 17 (RenoDX): a cone-response (LMS Naka-Rushton) model with hue restore and gamut compression. Params: x exposure. Its HDR
+// form returns BT.709 values compressed into BT.2020: converted to BT.2020 here.
+float3 PsychoVTonemap(float3 color)
+{
+	const float3 c = ProcessToBT709(color) * tonemapParams[0].x;
+#	if defined(HDR_OUTPUT)
+	float3 result;
+	[branch] if (HDRNative())
+		result = mul(kHDR709To2020, renodx::tonemap::psycho::HDR(c, hdrParams.y));
+	else
+		result = renodx::tonemap::psycho::SDR(c);
+	return result;
+#	else
+	return renodx::tonemap::psycho::SDR(c);
+#	endif
+}
+#endif
 
 ////////////////////////////////////////////////////////////////////////
 // (batch 43) Native HDR output: highlight extension.
@@ -1026,7 +1162,15 @@ float3 ColorGrading(float3 color)
 	// Then the post-curve adjustments (see HDRPostCurve) and the out-of-range correction.
 	[branch] if (HDROutputBT2020()) {
 		const float3x3 hdrOutputMat = float3x3(hdrOutputTransform[0].xyz, hdrOutputTransform[1].xyz, hdrOutputTransform[2].xyz);
+#	if defined(TONEMAP_DISPLAY_SPACE)
+		// (47r) The display-space tone mappers output BT.2020 (Native) or BT.709 (Extend) themselves.
+		if (enableTonemap)
+			color = HDRNative() ? color : mul(kHDR709To2020, color);
+		else
+			color = mul(hdrOutputMat, color);
+#	else
 		color = mul(hdrOutputMat, color);
+#	endif
 		if (!skipLDR)
 			color = HDRPostCurve(color);
 		color = CorrectOutOfRangeColor(color, kHDRLuma2020);
@@ -1034,7 +1178,12 @@ float3 ColorGrading(float3 color)
 #endif
 
 	// Inverse color space transform
+#if defined(TONEMAP_DISPLAY_SPACE)
+	// (47r) Not after a display-space tone mapper (its output is BT.709 already).
+    if (enableColorSpaceTransform && !enableTonemap) {
+#else
     if (enableColorSpaceTransform) {
+#endif
 		const float3x3 invColorSpaceTransformMat = float3x3(invColorSpaceTransform[0].xyz, invColorSpaceTransform[1].xyz, invColorSpaceTransform[2].xyz);
         color = mul(invColorSpaceTransformMat, color);
     }
@@ -1057,16 +1206,31 @@ float3 ColorGrading(float3 color)
 	return color;
 }
 
+// (47r) "LUT Half-Texel Fix" (hdrParams2.w, upstream 350c6fe82; default off: it changes the look). Off (as before): texel i is baked at
+// the log coordinate (i + 0.5) / 63 but sampled at the raw coordinate, so the lookup reads the input u x 64 / 63 (slightly brighter: about
+// +0.1 stop at mid grey, +0.2 at the top). On: texel i baked at i / 63 and sampled at u x 63 / 64 + 0.5 / 64 (exact at the texel centres).
+float3 LUTCoordinate(float3 u)
+{
+	return hdrParams2.w > 0.5 ? u * ((LUT_SIZE - 1.0) / LUT_SIZE) + (0.5 / LUT_SIZE) : u;
+}
+
+float3 LUTBakeCoordinate(uint3 id)
+{
+	return hdrParams2.w > 0.5 ? float3(id) / float3((LUT_SIZE - 1).xxx) : float3(id + 0.5) / float3((LUT_SIZE - 1).xxx);
+}
+
 #if defined(HDR_OUTPUT)
 float4 ApplyLUT(float3 color)
 {
 	color = LinearToLog(color + LogToLinear(0));
+	color = LUTCoordinate(color);
 	return TexLUT.SampleLevel(LinearSampler, color, 0);
 }
 #else
 float3 ApplyLUT(float3 color)
 {
 	color = LinearToLog(color + LogToLinear(0));
+	color = LUTCoordinate(color);
 	color = TexLUT.SampleLevel(LinearSampler, color, 0).xyz;
 	return color;
 }
@@ -1158,7 +1322,7 @@ groupshared float gHdrKnee[4];
 	hdrKnee.slope = gHdrKnee[2];
 	hdrKnee.valid = gHdrKnee[3];
 
-	float3 uvw = float3(DTid + 0.5) / float3((LUT_SIZE - 1).xxx);
+	float3 uvw = LUTBakeCoordinate(DTid);
 	float4 neutralColor = float4(uvw, 1);
 	float3 linearColor = LogToLinear(neutralColor.xyz) - LogToLinear(0);
 	float hdrScale = 1.0;
@@ -1170,7 +1334,7 @@ groupshared float gHdrKnee[4];
 }
 #else
 [numthreads(8, 8, 8)] void CSLUTGen(uint3 DTid : SV_DispatchThreadID) {
-	float3 uvw = float3(DTid + 0.5) / float3((LUT_SIZE - 1).xxx);
+	float3 uvw = LUTBakeCoordinate(DTid);
 	float4 neutralColor = float4(uvw, 1);
 	float3 linearColor = LogToLinear(neutralColor.xyz) - LogToLinear(0);
 	linearColor = ColorGrading(linearColor);
