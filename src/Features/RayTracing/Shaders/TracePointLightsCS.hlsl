@@ -78,10 +78,13 @@ static const uint kFlagCharacters = 1u;   // characters are in the TLAS: the cha
 static const uint kFlagFirstPerson = 2u;  // no character ray for pixels near the camera
 static const uint kFlagCharCull = 4u;     // the character ray only where the segment passes a character's bounds
 static const uint kFlagSticky = 8u;          // (46g) last frame's sources of the pixel rank x kStickyBonus and pass at half the share cut
-static const uint kFlagBeamCullFront = 16u;  // (46g) window beam rays cull triangles facing the ray start (the room shell from inside)
-                                             // ((47n) the cull-back flag 32 is gone: Window Beam Culling is fixed at this one)
+// (46g) Window beam rays cull triangles facing the ray start (the room shell from inside). (47q) Always (Window Beam Culling has been fixed
+// at "Faces Toward the Room" since 47m): the flag (16) and the cull-back flag (32, gone in 47n) are no more.
+static const uint kBeamCull = RAY_FLAG_CULL_FRONT_FACING_TRIANGLES;
 static const uint kFlagRtSurface = 64u;      // (46y) probe whether the visible surface is a traced caster (PLIdx.w bit 7)
 static const uint kFlagWater = 128u;         // (47i) trace the pixel's sources from last frame's water surface too (PLWaterVis)
+static const uint kFlagSunProbe = 256u;      // (47q) with kFlagRtSurface: the sun pass's probe (SunVisibility.w) where it made one (RT_ALPHA only)
+static const uint kSunOutProbed = 64u, kSunOutRtSurfaceRaw = 128u;  // TraceShadowsCS kOutProbed / kOutRtSurfaceRaw
 static const float kStickyBonus = 1.5;
 static const uint kChurnWord = 1u;           // (46g) RayCounter words: [1] pixels whose source set changed
 static const uint kWaterRayWord = 2u;        // (47j) RayCounter word [2]: the rays traced from the water surface (also in [0])
@@ -118,12 +121,13 @@ struct AlphaInfo
 	uint Flags;
 	float Threshold;
 	float AlphaScale;
-	float2 Pad;
+	float TextureSize;    // (47q) the bindless texture's larger side and mip count (instead of GetDimensions; unused for copy layers)
+	float TextureLevels;
 	float4 UvTransform;
 };
 
 StructuredBuffer<AlphaInfo> AlphaInfos : register(t4);
-StructuredBuffer<uint2> AlphaUVs : register(t5);
+StructuredBuffer<uint2> AlphaUVs : register(t5);  // (47q) per triangle: (uv0, uv1), (uv2, vertex alpha 0 | 1 << 8 | 2 << 16, 8 bits each)
 Texture2DArray<float> AlphaLayers : register(t6);
 Texture2D<float4> AlphaTextures[kAlphaTextureSlots] : register(t0, space1);
 SamplerState AlphaSampler : register(s0);
@@ -140,13 +144,13 @@ bool AlphaBlocks(uint instanceID, uint primitive, float2 bary, float footprint)
 	const AlphaInfo info = AlphaInfos[instanceID - 1u];
 	if (primitive >= info.Triangles)
 		return true;
-	const uint base = info.UvBase + primitive * 3u;
+	const uint base = info.UvBase + primitive * 2u;
 	const uint2 c0 = AlphaUVs[base];
 	const uint2 c1 = AlphaUVs[base + 1u];
-	const uint2 c2 = AlphaUVs[base + 2u];
 	const float w0 = 1.0 - bary.x - bary.y;
-	float2 uv = UnpackTexcoord(c0.x) * w0 + UnpackTexcoord(c1.x) * bary.x + UnpackTexcoord(c2.x) * bary.y;
-	const float vertexAlpha = asfloat(c0.y) * w0 + asfloat(c1.y) * bary.x + asfloat(c2.y) * bary.y;
+	float2 uv = UnpackTexcoord(c0.x) * w0 + UnpackTexcoord(c0.y) * bary.x + UnpackTexcoord(c1.x) * bary.y;
+	const float3 cornerAlpha = float3(uint3(c1.y, c1.y >> 8u, c1.y >> 16u) & 0xFFu) / 255.0;
+	const float vertexAlpha = cornerAlpha.x * w0 + cornerAlpha.y * bary.x + cornerAlpha.z * bary.y;
 	uv = uv * info.UvTransform.zw + info.UvTransform.xy;
 	if (!all(isfinite(uv)))
 		return true;
@@ -158,11 +162,9 @@ bool AlphaBlocks(uint instanceID, uint primitive, float2 bary, float footprint)
 	}
 	else
 	{
-		uint width, height, levels;
-		AlphaTextures[NonUniformResourceIndex(info.Texture)].GetDimensions(0u, width, height, levels);
-		const float size = float(max(width, height));
+		const float size = info.TextureSize;
 		// Never below 256 texels across (coarser mips average a window's lattice away).
-		const float maxLod = clamp(log2(size / 256.0), 0.0, max(float(levels) - 1.0, 0.0));
+		const float maxLod = clamp(log2(size / 256.0), 0.0, max(info.TextureLevels - 1.0, 0.0));
 		const float lod = clamp(log2(size * footprintUV) + 0.5, 0.0, maxLod);
 		alpha = AlphaTextures[NonUniformResourceIndex(info.Texture)].SampleLevel(AlphaSampler, uv, lod).a;
 	}
@@ -343,7 +345,6 @@ float4 TraceFromWater(int2 p, uint4 idx, float waterDist, uint flags, float n0, 
 	const float3 N = float3(0.0, 0.0, 1.0);
 	const float3 origin = W + N * (C.Bias.x + C.Bias.y * waterDist);
 	const bool characters = (flags & kFlagCharacters) && !((flags & kFlagFirstPerson) && waterDist < kFirstPersonNear);
-	const uint beamCull = (flags & kFlagBeamCullFront) ? RAY_FLAG_CULL_FRONT_FACING_TRIANGLES : RAY_FLAG_NONE;
 	const float footprint = waterDist * 2.0 * C.RenderSize.w;
 	[unroll] for (uint k = 0u; k < 4u; ++k)
 	{
@@ -378,7 +379,7 @@ float4 TraceFromWater(int2 p, uint4 idx, float waterDist, uint flags, float n0, 
 		if (tMax <= 1.0)
 			continue;
 		float tHit;
-		bool blocked = Blocked(origin, dir, tMax, kSceneMask, 0.0, footprint, beamLike ? beamCull : RAY_FLAG_NONE, tHit);
+		bool blocked = Blocked(origin, dir, tMax, kSceneMask, 0.0, footprint, beamLike ? kBeamCull : RAY_FLAG_NONE, tHit);
 		rays += 1u;
 		if (!blocked && characters) {
 			const bool ownLight = (src.Info.x & kSourceNoPlayer) != 0u;
@@ -477,9 +478,18 @@ groupshared uint gsMask[2];
 		N = -N;
 	// (46y) Is this surface a traced caster (an occluder for other pixels' Screen Space Point Light Shadows)?
 	bool rtSurface = false;
+	bool probeShared = false;
 	[branch] if (flags & kFlagRtSurface)
 	{
+#if defined(RT_ALPHA)
+		// (47q, kFlagSunProbe) The sun pass probed this pixel the same way (same depth, rect, depth normal, opaque-forced probe against
+		// every instance): its result. Only in this variant (the other one culls the cut-outs in its probe).
+		const uint sunFlags = (flags & kFlagSunProbe) ? uint(SunVisibility[p].w * 255.0 + 0.5) : 0u;
+		probeShared = (sunFlags & kSunOutProbed) != 0u;
+		rtSurface = probeShared ? (sunFlags & kSunOutRtSurfaceRaw) != 0u : SurfaceProbe(P, V, N, dist);
+#else
 		rtSurface = SurfaceProbe(P, V, N, dist);
+#endif
 	}
 
 	// Top K by contribution.
@@ -554,10 +564,9 @@ groupshared uint gsMask[2];
 		threshold = max(threshold, sunTerm * C.Extra.z);
 		stickyThreshold = max(stickyThreshold, sunTerm * C.Extra.z);
 	}
-	const uint beamCull = (flags & kFlagBeamCullFront) ? RAY_FLAG_CULL_FRONT_FACING_TRIANGLES : RAY_FLAG_NONE;
 	const bool beamSample = ((p.x & 3) | (p.y & 3)) == 0;  // (46g) 1 of 16 pixels feeds the beam counters
 	float4 vis = 1.0;
-	uint rays = (flags & kFlagRtSurface) ? 1u : 0u;  // (46y) the surface probe above
+	uint rays = ((flags & kFlagRtSurface) && !probeShared) ? 1u : 0u;  // (46y) the surface probe above
 	uint4 idx = 0u;
 	[unroll] for (uint k = 0u; k < 4u; ++k)
 	{
@@ -597,7 +606,7 @@ groupshared uint gsMask[2];
 			continue;  // the surface is inside the clearance: lit
 		float tHit;
 		const float footprint = dist * 2.0 * C.RenderSize.w;  // about a pixel's size there (alpha mip choice)
-		bool blocked = Blocked(origin, dir, tMax, kSceneMask, 0.0, footprint, beamLike ? beamCull : RAY_FLAG_NONE, tHit);
+		bool blocked = Blocked(origin, dir, tMax, kSceneMask, 0.0, footprint, beamLike ? kBeamCull : RAY_FLAG_NONE, tHit);
 		rays += 1u;
 		if (!blocked && characters) {
 			// (46d) The player's own light: the player's body (torch, arm, torso) is not tested, only the other actors.

@@ -62,6 +62,10 @@ namespace RayTracingRT
 	inline constexpr AlphaTexture kInvalidAlphaTexture = UINT32_MAX;
 	inline constexpr std::uint32_t kInvalidAlphaInfo = UINT32_MAX;
 
+	/// (47q) Captured alpha corners (ChunkGeometry::alphaUV layout, 6 uints per triangle) to the traced record (4 uints per triangle:
+	/// uv0, uv1, uv2, the three vertex alphas in 8 bits each). False = the size does not match a_triangles.
+	bool PackAlphaCorners(std::vector<std::uint32_t>& a_corners, std::uint32_t a_triangles);
+
 	struct AlphaMaterial
 	{
 		float threshold = 0.5f;   // pass when alpha >= threshold (0-1)
@@ -554,6 +558,15 @@ namespace RayTracingRT
 		void ReleaseBlas(BlasHandle a_handle);
 		void ReleaseAllBlas();
 		[[nodiscard]] bool IsBlasBuilt(BlasHandle a_handle) const;
+		/// (47q) The local box of a BLAS's vertices (as the self-check uses it); false = unknown handle or empty.
+		bool GetBlasBounds(BlasHandle a_handle, float o_min[3], float o_max[3]) const
+		{
+			if (a_handle >= blas_.size() || blas_[a_handle].boundsMin[0] > blas_[a_handle].boundsMax[0])
+				return false;
+			std::copy_n(blas_[a_handle].boundsMin, 3, o_min);
+			std::copy_n(blas_[a_handle].boundsMax, 3, o_max);
+			return true;
+		}
 
 		/// Records and submits this frame's D3D12 work between two GPU-side fence waits.
 		/// Returns false when nothing was traced (busy ring or a failure; see LastError()).
@@ -1010,7 +1023,7 @@ namespace RayTracingRT
 		static constexpr std::uint32_t kAlphaLayerSize = 256;
 		static constexpr std::uint32_t kAlphaLayerMips = 5;              // 256 .. 16
 		static constexpr std::uint32_t kAlphaMaxInfos = 65536;
-		static constexpr std::uint64_t kAlphaUvBytes = 64ull << 20;      // about 2.8 M alpha-tested triangles
+		static constexpr std::uint64_t kAlphaUvBytes = 64ull << 20;      // about 4.2 M alpha-tested triangles ((47q) 16 bytes each)
 		static constexpr std::uint32_t kAlphaFallbackBit = 0x80000000u;  // record texture = copy layer (TraceShadowsCS)
 
 		struct AlphaInfoGpu
@@ -1021,7 +1034,8 @@ namespace RayTracingRT
 			std::uint32_t flags;
 			float threshold;
 			float alphaScale;
-			float pad[2];
+			float textureSize;    // (47q) the bindless texture's larger side and mip count (the trace reads them instead of GetDimensions)
+			float textureLevels;
 			float uvTransform[4];
 		};
 		static_assert(sizeof(AlphaInfoGpu) == 48);
@@ -1033,6 +1047,7 @@ namespace RayTracingRT
 			std::uint32_t users = 0;
 			std::uint32_t gpuIndex = UINT32_MAX;
 			std::uint32_t sourceSize = 0;             // larger side of the game texture (copy mip choice)
+			std::uint32_t sourceMips = 1;             // (47q) its mip count (AlphaInfoGpu::textureLevels)
 			bool live = false;
 			bool ready = false;
 		};

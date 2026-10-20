@@ -32,7 +32,6 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	RtContactScale,
 	CustomBaseRays,
 	CustomExtraRays,
-	CustomSunCone,
 	CustomFalloffStart,
 	CustomFalloffEnd,
 	CustomFarQuality,
@@ -71,13 +70,12 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 
 namespace
 {
-	// Quality tiers (rays, sun cone, small filter, distance fall-off, denoiser size).
+	// Quality tiers (rays, distance fall-off, denoiser size). (47q) The sun's cone is a look slider of its own (Settings::SunSize), the
+	// small Combine filter follows it; the fall-off of Very Low - High is closer; NPCs beyond npcFull: body only, refit every other frame.
 	struct QualityTier
 	{
 		const char* name;
 		std::uint32_t baseRays, extraRays;
-		float coneDegrees;  // half angle; the sun disc is about 0.27
-		std::uint32_t smallFilterRadius;
 		std::uint32_t tracePattern, farPattern;  // 0 full, 1 checkerboard, 2 half (one pixel of each 2x2)
 		float falloffStart, falloffEnd;          // units (70 per metre); end <= start: none
 		bool npcReduced;
@@ -85,23 +83,28 @@ namespace
 		std::uint32_t denoiseTaps;
 		bool denoiseHalf;
 		float farDenoiseScale;
+		float npcFull;  // (47q) units; 0 = no limit
 		const char* tooltip;
 	};
 
 	constexpr QualityTier kTiers[5] = {
-		{ "Very Low", 1, 0, 0.27f, 1, 1, 2, 1024.0f, 4096.0f, true, 8.0f, 3, true, 0.5f,
-			"Half the pixels traced each frame (checkerboard), a quarter beyond 60 m; no extra rays; other characters at reduced quality; "
-			"half-resolution denoiser. Cheapest." },
-		{ "Low", 1, 0, 0.27f, 1, 0, 1, 2048.0f, 6144.0f, true, 12.0f, 4, true, 0.5f,
-			"1 ray per pixel, checkerboard beyond 90 m; no extra rays; other characters at reduced quality; half-resolution denoiser." },
-		{ "Medium", 1, 1, 0.27f, 1, 0, 0, 4096.0f, 12288.0f, true, 16.0f, 4, true, 0.75f,
-			"1 ray per pixel (+1 at shadow edges, fading out between 60 and 175 m), the real sun disc; other characters at "
-			"reduced quality; half-resolution denoiser." },
-		{ "High", 1, 3, 0.5f, 2, 0, 0, 6144.0f, 16384.0f, false, 16.0f, 6, false, 1.0f,
-			"1 ray per pixel (+3 at shadow edges, fading out between 90 and 230 m), slightly softer edges; full-resolution denoiser." },
-		{ "Ultra", 2, 4, 0.5f, 2, 0, 0, 0.0f, 0.0f, false, 16.0f, 6, false, 1.0f,
-			"2 rays per pixel (+4 at shadow edges, no fall-off), slightly softer edges; full-resolution denoiser. Cleanest." },
+		{ "Very Low", 1, 0, 1, 2, 560.0f, 2100.0f, true, 8.0f, 3, true, 0.5f, 700.0f,
+			"Half the pixels traced each frame (checkerboard), a quarter beyond 30 m; no extra rays; other characters at reduced quality, beyond "
+			"10 m their body only; half-resolution denoiser. Cheapest." },
+		{ "Low", 1, 0, 0, 1, 1050.0f, 3150.0f, true, 12.0f, 4, true, 0.5f, 1400.0f,
+			"1 ray per pixel, checkerboard beyond 45 m; no extra rays; other characters at reduced quality, beyond 20 m their body only; "
+			"half-resolution denoiser." },
+		{ "Medium", 1, 1, 0, 0, 2100.0f, 6300.0f, true, 16.0f, 4, true, 0.75f, 2450.0f,
+			"1 ray per pixel (+1 at shadow edges, fading out between 30 and 90 m); other characters at reduced quality, beyond 35 m their "
+			"body only; half-resolution denoiser." },
+		{ "High", 1, 3, 0, 0, 4200.0f, 10500.0f, false, 16.0f, 6, false, 1.0f, 3150.0f,
+			"1 ray per pixel (+3 at shadow edges, fading out between 60 and 150 m); other characters beyond 45 m their body only; "
+			"full-resolution denoiser." },
+		{ "Ultra", 2, 4, 0, 0, 0.0f, 0.0f, false, 16.0f, 6, false, 1.0f, 0.0f,
+			"2 rays per pixel (+4 at shadow edges, no fall-off); every character with all its parts, every frame; full-resolution denoiser. "
+			"Cleanest." },
 	};
+	constexpr float kSunSizeMin = 0.1f, kSunSizeMax = 2.0f, kSunSizeDefault = 0.27f;
 	constexpr const char* kQualityNames[6] = { "Very Low", "Low", "Medium", "High", "Ultra", "Custom" };
 	constexpr const char* kPatternNames[3] = { "Full", "Checkerboard", "Half" };
 	// (47n) The sun's dropdown: Off first (SunShadows false), then the tiers and Custom (QualityLevel 0 - 5).
@@ -114,27 +117,37 @@ namespace
 		int k, kInterior, maxSources;
 		float distance;
 		bool alphaOutdoors;
+		bool player, effects;  // (47q)
 		const char* tooltip;
 	};
+	// (47q) Low 1/1/16/20 m, Medium 1/2/24/35 m, High 2/3/48/50 m (plants block), Ultra as 47n. The player's own lights are ray traced from
+	// Medium up, spell / effect lights in High and Ultra.
 	constexpr PointTier kPointTiers[4] = {
-		{ 1, 1, 16, 2048.0f, false, "1 light per pixel (indoors too), at most 16 lights, up to about 29 m; plants and cut-outs do not block point lights outdoors." },
-		{ 1, 2, 32, 3000.0f, true, "1 light per pixel (2 indoors), at most 32 lights, up to about 43 m." },
-		{ 2, 4, 64, 4000.0f, true, "2 lights per pixel (4 indoors), at most 64 lights, up to about 57 m (the 46b-47m defaults)." },
-		{ 4, 4, 64, 6000.0f, true, "4 lights per pixel (indoors too), at most 64 lights, up to about 86 m." },
+		{ 1, 1, 16, 1400.0f, false, false, false,
+			"1 light per pixel (indoors too), at most 16 lights, up to about 20 m; plants and cut-outs do not block point lights outdoors; "
+			"your own lights and spell / effect lights keep their old shadows." },
+		{ 1, 2, 24, 2450.0f, false, true, false,
+			"1 light per pixel (2 indoors), at most 24 lights, up to about 35 m; plants and cut-outs do not block point lights outdoors; "
+			"spell / effect lights keep their old shadows." },
+		{ 2, 3, 48, 3500.0f, true, true, true, "2 lights per pixel (3 indoors), at most 48 lights, up to about 50 m; plants and cut-outs block point lights." },
+		{ 4, 4, 64, 6000.0f, true, true, true, "4 lights per pixel (indoors too), at most 64 lights, up to about 86 m." },
 	};
 	struct AOTier
 	{
 		int detailRays;
 		float distance;
-		bool halfResFar, fullResFilter, temporalV2, smoothNormals;
+		int broadRate;  // (47q) 0 every pixel, 1 half, 2 one in four
+		bool fullResFilter, temporalV2, smoothNormals;
 		const char* tooltip;
 	};
 	constexpr AOTier kAOTiers[4] = {
-		{ 1, 3000.0f, true, false, false, false, "1 detail ray, up to about 43 m, the broad AO on half the pixels; the 47k history, facet normals. Cheapest." },
-		{ 1, 5000.0f, true, false, true, true, "1 detail ray, up to about 71 m, the broad AO on half the pixels; Temporal v2 and Smooth Normals." },
-		{ 2, 8192.0f, false, false, true, true, "2 detail rays, up to about 117 m, the broad AO on every pixel; Temporal v2 and Smooth Normals." },
-		{ 3, 8192.0f, false, true, true, true, "3 detail rays, up to about 117 m, every pixel, the broad AO filtered at full resolution. Cleanest." },
+		{ 1, 2100.0f, 2, false, false, false,
+			"1 detail ray, up to about 30 m, the broad AO on one pixel in four (rotating); the 47k history, facet normals. Cheapest." },
+		{ 1, 4200.0f, 1, false, true, true, "1 detail ray, up to about 60 m, the broad AO on half the pixels; Temporal v2 and Smooth Normals." },
+		{ 1, 7000.0f, 1, false, true, true, "1 detail ray, up to about 100 m, the broad AO on half the pixels; Temporal v2 and Smooth Normals." },
+		{ 3, 8192.0f, 0, true, true, true, "3 detail rays, up to about 117 m, every pixel, the broad AO filtered at full resolution. Cleanest." },
 	};
+	constexpr const char* kBroadRateNames[3] = { "Every pixel", "Half (checkerboard)", "One in four (rotating)" };
 
 	constexpr float kCaptureBudgetMs = 1.0f;      // CPU per frame for capturing new cells (45j: 1.5 -> 1.0, resumable per shape)
 	constexpr std::uint32_t kBuildBudget = 131072;  // triangles of BLAS builds per frame (about one chunk)
@@ -241,16 +254,18 @@ namespace
 	};
 
 	// (46b) Point-light shadows.
-	int ValidPointK(int a_value) { return a_value >= 4 ? 4 : (a_value >= 2 ? 2 : 1); }
+	int ValidPointK(int a_value) { return std::clamp(a_value, 1, 4); }  // (47q) 3 too (High indoors); the trace takes 1 - 4 slots
 	constexpr float kPointMinShare = 0.02f;          // a light under 2 % of the pixel's point light is not traced
 	constexpr float kPointMinContribution = 1e-3f;   // nor one that hardly lights it at all
 	constexpr float kPointHistoryWeight = 0.25f;     // this frame's weight in the denoiser's history blend
 	constexpr float kPointMaxFilterRadius = 12.0f;   // px
 	constexpr float kPointSunShare = 0.05f;          // at a sunlit pixel a point light under 5 % of the sun's light there is not traced
 	constexpr std::uint32_t kPointFlagCharacters = 1u, kPointFlagFirstPerson = 2u, kPointFlagCharCull = 4u;  // TracePointLightsCS
-	constexpr std::uint32_t kPointFlagSticky = 8u, kPointFlagBeamCullFront = 16u;  // (46g) TracePointLightsCS (32 = cull back: gone since 47n)
+	constexpr std::uint32_t kPointFlagSticky = 8u;  // (46g) TracePointLightsCS ((47q) 16 = cull front: always, 32 = cull back: gone since 47n)
 	constexpr std::uint32_t kPointFlagRtSurface = 64u;  // (46y) TracePointLightsCS: mark traced-caster surfaces for SSPLS
 	constexpr std::uint32_t kPointFlagWater = 128u;     // (47i) TracePointLightsCS: trace the sources from last frame's water too
+	constexpr std::uint32_t kPointFlagSunProbe = 256u;  // (47q) TracePointLightsCS: reuse the sun pass's surface probe (its alpha variant)
+	constexpr std::uint32_t kFlagProbeShare = 8192u;    // (47q) TraceShadowsCS: write the probe as the point pass makes it (Output.w 64 / 128)
 	constexpr std::uint32_t kPointDenoiseHistory = 1u, kPointDenoiseDebug = 2u;                             // PointDenoiseCS
 	constexpr float kBeamRayMargin = 64.0f;  // (46c) a window beam's ray goes this far past the interior's box
 	// (46f) RTAO.
@@ -271,6 +286,7 @@ namespace
 	constexpr std::uint32_t kAOTraceSmoothNormals = 512u;  // (47j) TraceAOCS: RTAO: Smooth Normals (AONormalPrepCS)
 	constexpr std::uint32_t kAOTraceSmoothNormals2 = 1024u;  // (47k) TraceAOCS: RTAO: Smooth Normals v2 (offset along Ns, projection; always since 47n)
 	constexpr std::uint32_t kAOTraceDynamicFlag = 2048u;     // (47n) TraceAOCS: mark pixels whose rays hit characters / moving objects (.b + 0.6)
+	constexpr std::uint32_t kAOTraceQuarterFar = 4096u;      // (47q) TraceAOCS: the broad ray on one pixel of each 2x2, rotating
 	constexpr std::uint32_t kAOFlagNormalDebug = 128u;       // (47k) RTAOCompositeCS: t5 holds this frame's Smooth Normals debug view
 	// (47l) RTAO: Temporal v2. (TraceAOCS 2048 = the removed Blue-Noise Rays: never set since 47m.)
 	constexpr std::uint32_t kAOFlagTemporalV2 = 256u;        // RTAOCommon.hlsli: Temporal v2 (RTAOTemporalCS RTAO_TEMPORAL_V2, the filters' world sigma)
@@ -1066,7 +1082,9 @@ void RayTracing::FillWind(RayTracingRT::FrameInput& a_input)
 	(void)a_input;
 	if (!scene.SwayActive() || !globals::state || !backend.IsReady())
 		return;
-	scene.UpdateWindPoses(backend, globals::state->frameCount);
+	// (47q) Keep Leaves Moving on Long Frames: this frame's game time step (0 while the game is paused: nothing advanced).
+	const bool paused = globals::game::ui && globals::game::ui->GameIsPaused();
+	scene.UpdateWindPoses(backend, globals::state->frameCount, settings.FoliageKeepMoving, paused ? 0.0f : RE::GetSecondsSinceLastFrame());
 }
 
 RayTracingScene::SceneConfig RayTracing::SceneConfigFromSettings() const
@@ -1114,6 +1132,7 @@ void RayTracing::UpdateCharacters()
 	// (46m) Read lanes, scan cache and merged BLASes are always on (47m).
 	characters.Configure(settings.PhysicsParts, settings.Hair, backend.SkinAlphaAvailable(), settings.FirstPersonPlayer, PerfOptions::settings.RtDropTinyParts);
 	characters.SetBonesTolerant(PerfOptions::settings.RtBonesTolerant);  // (47p)
+	characters.SetBodyOnlyDistance(NpcFullDistance());                   // (47q) the NPC rule
 }
 
 
@@ -1125,11 +1144,13 @@ RayTracing::QualityParams RayTracing::ResolveQuality() const
 {
 	QualityParams q;
 	const int level = std::clamp(settings.QualityLevel, 0, static_cast<int>(Quality::Count) - 1);
+	// (47q) The cone is the look slider (all tiers and Custom); the small Combine filter (denoiser Off) follows it, as Custom's did.
+	q.coneDegrees = std::isfinite(settings.SunSize) ? std::clamp(settings.SunSize, kSunSizeMin, kSunSizeMax) : kSunSizeDefault;
+	q.smallFilterRadius = q.coneDegrees > 0.4f ? 2u : 1u;
 	if (level == static_cast<int>(Quality::Custom)) {
 		q.baseRays = static_cast<std::uint32_t>(std::clamp(settings.CustomBaseRays, 1, 4));
 		q.extraRays = static_cast<std::uint32_t>(std::clamp(settings.CustomExtraRays, 0, 8));
-		q.coneDegrees = settings.CustomSunCone;
-		q.smallFilterRadius = settings.CustomSunCone > 0.4f ? 2u : 1u;
+		q.npcFullDistance = std::isfinite(settings.CustomNpcFullDistance) ? std::clamp(settings.CustomNpcFullDistance, 0.0f, 8192.0f) : 0.0f;
 		q.tracePattern = static_cast<std::uint32_t>(std::clamp(settings.CustomTraceResolution, 0, 2));
 		q.farPattern = static_cast<std::uint32_t>(std::clamp(settings.CustomFarQuality, 0, 2));
 		q.falloffStart = settings.CustomFalloffStart;
@@ -1145,8 +1166,7 @@ RayTracing::QualityParams RayTracing::ResolveQuality() const
 		const auto& t = kTiers[level];
 		q.baseRays = t.baseRays;
 		q.extraRays = t.extraRays;
-		q.coneDegrees = t.coneDegrees;
-		q.smallFilterRadius = t.smallFilterRadius;
+		q.npcFullDistance = t.npcFull;
 		q.tracePattern = t.tracePattern;
 		q.farPattern = t.farPattern;
 		q.falloffStart = t.falloffStart;
@@ -1165,7 +1185,7 @@ void RayTracing::CopyTierToCustom(int a_tier)
 	const auto& t = kTiers[std::clamp(a_tier, 0, 4)];
 	settings.CustomBaseRays = static_cast<int>(t.baseRays);
 	settings.CustomExtraRays = static_cast<int>(t.extraRays);
-	settings.CustomSunCone = t.coneDegrees;
+	settings.CustomNpcFullDistance = t.npcFull;  // (47q)
 	settings.CustomTraceResolution = static_cast<int>(t.tracePattern);
 	settings.CustomFarQuality = static_cast<int>(t.farPattern);
 	settings.CustomFalloffStart = t.falloffStart;
@@ -1189,6 +1209,8 @@ RayTracing::PointTierParams RayTracing::ResolvePointTier() const
 		p.maxSources = std::clamp(settings.PointLightsMaxSources, 8, static_cast<int>(RayTracingPointLights::kMaxSources));
 		p.distance = std::clamp(settings.PointLightsDistance, 512.0f, 8192.0f);
 		p.alphaOutdoors = settings.PointLightsAlphaOutdoors;
+		p.player = settings.PointLightsPlayer;
+		p.effects = settings.PointLightsEffects;
 	} else {
 		const auto& t = kPointTiers[tier];
 		p.k = t.k;
@@ -1196,8 +1218,22 @@ RayTracing::PointTierParams RayTracing::ResolvePointTier() const
 		p.maxSources = std::min(t.maxSources, static_cast<int>(RayTracingPointLights::kMaxSources));
 		p.distance = t.distance;
 		p.alphaOutdoors = t.alphaOutdoors;
+		p.player = t.player;
+		p.effects = t.effects;
 	}
 	return p;
+}
+
+float RayTracing::NpcFullDistance() const
+{
+	// (47q) The sun's tier decides; with the sun Off the point lights' tier (Low .. Ultra = the sun's Low .. Ultra), then RTAO's. Their
+	// Custom: no limit.
+	if (settings.SunShadows)
+		return ResolveQuality().npcFullDistance;
+	const int tier = settings.PointLights ? settings.PointQuality : (settings.AO ? settings.AOQuality : kTierCustom);
+	if (tier < 0 || tier >= kTierCustom)
+		return 0.0f;
+	return kTiers[tier + 1].npcFull;
 }
 
 RayTracing::AOTierParams RayTracing::ResolveAOTier() const
@@ -1207,7 +1243,7 @@ RayTracing::AOTierParams RayTracing::ResolveAOTier() const
 	if (tier == kTierCustom) {
 		p.detailRays = std::clamp(settings.AODetailRays, 1, kAODetailRaysMax);
 		p.distance = std::clamp(settings.AODistance, 1000.0f, 8192.0f);
-		p.halfResFar = settings.AOHalfResFar;
+		p.broadRate = std::clamp(settings.AOBroadRate, 0, 2);
 		p.fullResFilter = settings.AOFullResFilter;
 		p.temporalV2 = settings.AOTemporalV2;
 		p.smoothNormals = settings.AOSmoothNormals;
@@ -1215,7 +1251,7 @@ RayTracing::AOTierParams RayTracing::ResolveAOTier() const
 		const auto& t = kAOTiers[tier];
 		p.detailRays = t.detailRays;
 		p.distance = t.distance;
-		p.halfResFar = t.halfResFar;
+		p.broadRate = t.broadRate;
 		p.fullResFilter = t.fullResFilter;
 		p.temporalV2 = t.temporalV2;
 		p.smoothNormals = t.smoothNormals;
@@ -1231,6 +1267,8 @@ void RayTracing::CopyPointTierToCustom(int a_tier)
 	settings.PointLightsMaxSources = t.maxSources;
 	settings.PointLightsDistance = t.distance;
 	settings.PointLightsAlphaOutdoors = t.alphaOutdoors;
+	settings.PointLightsPlayer = t.player;  // (47q)
+	settings.PointLightsEffects = t.effects;
 }
 
 void RayTracing::CopyAOTierToCustom(int a_tier)
@@ -1238,7 +1276,7 @@ void RayTracing::CopyAOTierToCustom(int a_tier)
 	const auto& t = kAOTiers[std::clamp(a_tier, 0, kTierCustom - 1)];
 	settings.AODetailRays = t.detailRays;
 	settings.AODistance = t.distance;
-	settings.AOHalfResFar = t.halfResFar;
+	settings.AOBroadRate = t.broadRate;
 	settings.AOFullResFilter = t.fullResFilter;
 	settings.AOTemporalV2 = t.temporalV2;
 	settings.AOSmoothNormals = t.smoothNormals;
@@ -1314,7 +1352,8 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.AOAlphaBudget = read("AOAlphaBudget", defaults.AOAlphaBudget);
 		// (46y)
 		settings.PointLightsSSPLSContact = read("PointLightsSSPLSContact", defaults.PointLightsSSPLSContact);
-		settings.AOHalfResFar = read("AOHalfResFar", defaults.AOHalfResFar);
+		// (47q) AOBroadRate; saved before 47q: from AOHalfResFar (half or every pixel).
+		settings.AOBroadRate = read("AOBroadRate", read("AOHalfResFar", false) ? 1 : 0);
 		// (47h) (47o) Sun Shadow: Depth Check for Translucent Surfaces, Point Light Shadows on Water and (46y) Screen-Space Shadows for
 		// Non-RT Casters are permanent (their keys are ignored and dropped on the next save); Keep Screen-Space Contact Shadows is gone.
 		settings.AOSmoothNormals = read("AOSmoothNormals", defaults.AOSmoothNormals);  // (47j)
@@ -1325,6 +1364,21 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.AODynamicFlag = read("AODynamicFlag", defaults.AODynamicFlag);
 		settings.PointQuality = read("PointQuality", -1);
 		settings.AOQuality = read("AOQuality", -1);
+		// (47q) The sun's size left the tiers. Saved before 47q (no key): the cone the tier in effect had -- High / Ultra 0.5, Very Low -
+		// Medium 0.27, Custom its CustomSunCone -- so the picture stays as it was.
+		settings.CustomNpcFullDistance = read("CustomNpcFullDistance", defaults.CustomNpcFullDistance);
+		settings.FoliageKeepMoving = read("FoliageKeepMoving", defaults.FoliageKeepMoving);
+		const float sunSize = read("SunSize", -1.0f);
+		if (sunSize >= 0.0f) {
+			settings.SunSize = sunSize;
+		} else {
+			const int level = std::clamp(read("QualityLevel", static_cast<int>(Quality::Medium)), 0, static_cast<int>(Quality::Count) - 1);
+			if (level == static_cast<int>(Quality::Custom))
+				settings.SunSize = read("CustomSunCone", kSunSizeDefault);
+			else
+				settings.SunSize = level >= static_cast<int>(Quality::High) ? 0.5f : kSunSizeDefault;
+			logger::info("[RayTracing] Shadow Edge Softness (sun size, 47q): {:.2f} degrees (the sun quality's cone until 47p)", settings.SunSize);
+		}
 	}
 	// (47m) Skip the Game's Shadow Maps for RT-Shadowed Lights: on once for settings saved before 47m (its new default).
 	if (loadedVersion < 7) {
@@ -1339,7 +1393,9 @@ void RayTracing::LoadSettings(json& o_json)
 	settings.QualityLevel = std::clamp(settings.QualityLevel, 0, static_cast<int>(Quality::Count) - 1);
 	settings.CustomBaseRays = std::clamp(settings.CustomBaseRays, 1, 4);
 	settings.CustomExtraRays = std::clamp(settings.CustomExtraRays, 0, 8);
-	settings.CustomSunCone = std::isfinite(settings.CustomSunCone) ? std::clamp(settings.CustomSunCone, 0.1f, 2.0f) : 0.27f;
+	settings.SunSize = std::isfinite(settings.SunSize) ? std::clamp(settings.SunSize, kSunSizeMin, kSunSizeMax) : kSunSizeDefault;  // (47q)
+	settings.CustomNpcFullDistance = std::isfinite(settings.CustomNpcFullDistance) ? std::clamp(settings.CustomNpcFullDistance, 0.0f, 8192.0f) : 3150.0f;
+	settings.AOBroadRate = std::clamp(settings.AOBroadRate, 0, 2);
 	settings.CustomFalloffStart = std::isfinite(settings.CustomFalloffStart) ? std::clamp(settings.CustomFalloffStart, 0.0f, 32768.0f) : 4096.0f;
 	settings.CustomFalloffEnd = std::isfinite(settings.CustomFalloffEnd) ? std::clamp(settings.CustomFalloffEnd, 0.0f, 65536.0f) : 12288.0f;
 	settings.CustomFarQuality = std::clamp(settings.CustomFarQuality, 0, 2);
@@ -1395,7 +1451,7 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.AOQuality = kTierCustom;
 		for (int t = 0; t < kTierCustom; ++t) {
 			const auto& tier = kAOTiers[t];
-			if (settings.AODetailRays == tier.detailRays && std::abs(settings.AODistance - tier.distance) < 0.5f && settings.AOHalfResFar == tier.halfResFar &&
+			if (settings.AODetailRays == tier.detailRays && std::abs(settings.AODistance - tier.distance) < 0.5f && settings.AOBroadRate == tier.broadRate &&
 				settings.AOFullResFilter == tier.fullResFilter && settings.AOTemporalV2 == tier.temporalV2 && settings.AOSmoothNormals == tier.smoothNormals) {
 				settings.AOQuality = t;
 				break;
@@ -1419,7 +1475,10 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["AOFullResFilter"] = settings.AOFullResFilter;
 	o_json["AOAlphaBudget"] = settings.AOAlphaBudget;
 	o_json["PointLightsSSPLSContact"] = settings.PointLightsSSPLSContact;
-	o_json["AOHalfResFar"] = settings.AOHalfResFar;
+	o_json["AOBroadRate"] = settings.AOBroadRate;  // (47q) replaces AOHalfResFar
+	o_json["SunSize"] = settings.SunSize;          // (47q)
+	o_json["CustomNpcFullDistance"] = settings.CustomNpcFullDistance;
+	o_json["FoliageKeepMoving"] = settings.FoliageKeepMoving;
 	o_json["AOSmoothNormals"] = settings.AOSmoothNormals;  // (47j)
 	o_json["AOTemporalV2"] = settings.AOTemporalV2;  // (47l)
 	o_json["FoliageSway"] = settings.FoliageSway;  // (47l)
@@ -2670,6 +2729,23 @@ void RayTracing::PublishCpuSplit()
 			detail.windBuilds = activeThisFrame || earlyThisFrame ? ws.buildsLastFrame : 0;
 			detail.windRefitVertices = activeThisFrame || earlyThisFrame ? static_cast<std::int64_t>(ws.refitVerticesLastFrame) : 0;
 			detail.windRadius = sw.radius;
+			detail.windCatchups = static_cast<int>(sw.catchups);  // (47q)
+		}
+		// (47q) The NPC rule and tiny face parts (characters traced), static chunks (a statistic, refreshed every 120 frames).
+		if (settings.Characters && backend.SkinAvailable()) {
+			const auto& ch = characters.GetStats();
+			detail.npcBodyOnly = static_cast<int>(ch.bodyOnlyActors);
+			detail.npcRefitSkipped = static_cast<int>(ch.refitsSkipped);
+			detail.skipTinyFace = PerfOptions::settings.RtDropTinyParts ? static_cast<std::int64_t>(ch.skipTinyFace) : -1;
+		}
+		if (globals::state->frameCount - chunkStatsFrame >= 120u || chunkStatsFrame == UINT32_MAX) {
+			chunkStatsFrame = globals::state->frameCount;
+			scene.ChunkOverlapStats(backend, chunkStatsCells, chunkStatsPerCell, chunkStatsOverlap);
+		}
+		if (chunkStatsCells > 0) {
+			detail.chunkCells = static_cast<int>(chunkStatsCells);
+			detail.chunksPerCell = chunkStatsPerCell;
+			detail.chunkOverlap = chunkStatsOverlap;
 		}
 		detail.plCpuMs = PointLightsOn() ? pointCpuMs : -1.0f;
 		// (46c)
@@ -3084,6 +3160,18 @@ void RayTracing::RunFrame()
 		}
 		pointCpuMs = static_cast<float>(static_cast<double>(Qpc() - pointStart) * QpcMs());
 	}
+	// (47q) The point pass reuses the sun's surface probe (both mark the traced-caster surfaces; same depth, rect and probe ray): the sun
+	// writes the probe as the point pass makes it where it probed, the point pass (its cut-out variant) takes it there, traces it elsewhere.
+	if (input.pointLights && (traceFlags & kFlagRtSurface) && pointInput.alpha) {
+		std::uint32_t pointFlags;
+		std::memcpy(&pointFlags, &pointInput.constants.params[2], sizeof(pointFlags));
+		if (pointFlags & kPointFlagRtSurface) {
+			pointFlags |= kPointFlagSunProbe;
+			traceFlags |= kFlagProbeShare;
+			std::memcpy(&pointInput.constants.params[2], &pointFlags, sizeof(pointFlags));
+			std::memcpy(&input.constants.params[2], &traceFlags, sizeof(float));
+		}
+	}
 	// (46f) RTAO: its own list right behind the trace, its own fence (the D3D11 queue waits for it in DrawAmbientOcclusion).
 	{
 		const std::int64_t aoStart = Qpc();
@@ -3329,12 +3417,22 @@ void RayTracing::RunFrame()
 			const auto& sk = backend.GetSkinStats();
 			logger::info("[RayTracing] Characters: {} actors ({} in range), {} of {} shapes traced ({} skinned, {} rigid, {} physics, {} alpha-tested), "
 						 "{} in the TLAS, {:.2f} M vertices skinned, {} refits / {} builds / {} reused last frame, {:.0f} MB; left to the shadow map: physics off {}, "
-						 "alpha off {}, alpha failed {}, shader {}, type {}, no CPU data {}, bad data {}, placement {}, budget/size {}; bone indices palette {}, global {}",
+						 "alpha off {}, alpha failed {}, shader {}, type {}, no CPU data {}, bad data {}, placement {}, budget/size {}, tiny face parts {}; bone "
+						 "indices palette {}, global {}; (47q) NPCs body only {} (all parts within {}), of them not refit this frame {}",
 				ch.actors, ch.inRange, ch.registered, ch.shapes, ch.skinnedShapes, ch.rigidShapes, ch.physicsShapes, ch.alphaShapes, sk.drawsLastFrame,
 				static_cast<double>(sk.verticesLastFrame) / 1e6, sk.refitsLastFrame, sk.buildsLastFrame, sk.reusedLastFrame,
 				static_cast<double>(sk.bytes + sk.scratchBytes + sk.boneBytes) / (1024.0 * 1024.0), ch.skipPhysicsOff, ch.skipAlphaOff, ch.skipAlphaFailed,
-				ch.skipShader, ch.skipGeometryType, ch.skipNoCpuData, ch.skipBadData, ch.skipPlacement, ch.skipBackend, ch.paletteMode, ch.globalMode);
+				ch.skipShader, ch.skipGeometryType, ch.skipNoCpuData, ch.skipBadData, ch.skipPlacement, ch.skipBackend, ch.skipTinyFace, ch.paletteMode,
+				ch.globalMode, ch.bodyOnlyActors, NpcFullDistance() > 0.0f ? std::format("{:.0f} units", NpcFullDistance()) : std::string("no limit"),
+				ch.refitsSkipped);
 		}
+		// (47q) Static chunks (a statistic: no re-chunking).
+		std::uint32_t cells = 0;
+		float perCell = 0.0f, overlap = 0.0f;
+		scene.ChunkOverlapStats(backend, cells, perCell, overlap);
+		logger::info("[RayTracing] Static chunks (47q statistic): {} exterior cells, {:.2f} chunk BLASes per cell, pairwise box overlap {:.3f} "
+					 "(intersection / summed volume; 0 = disjoint)",
+			cells, perCell, overlap);
 	}
 }
 
@@ -4180,8 +4278,10 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	config.interior = a_interior;
 	config.beams = settings.PointLightsWindowBeams;
 	// (46d) The player's lights (never shadowed by the player's own body) and ownerless spell / effect lights.
-	config.player = settings.PointLightsPlayer;
-	config.effects = settings.PointLightsEffects;
+	// (47q) Tier knobs: the player's lights from Medium up, spell / effect lights in High and Ultra (Custom: the two keys). NPC-carried
+	// lights are always traced.
+	config.player = tier.player;
+	config.effects = tier.effects;
 	// (46s)
 	config.meshless = static_cast<std::uint32_t>(std::clamp(settings.PointLightsMeshless, 0, 2));
 	// (46x) Direct fills' emitter. (47m) Native shadow lights, stable selection, steady flickering lights, merge hysteresis, direct
@@ -4242,7 +4342,7 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	// (46y) Screen-Space Shadows for Non-RT Casters: the trace marks the pixels whose surface is a traced caster (PLIdx.w bit 7).
 	if (globals::features::screenSpacePointLightShadows.loaded && globals::features::screenSpacePointLightShadows.settings.Enable)
 		flags |= kPointFlagRtSurface;
-	flags |= kPointFlagBeamCullFront;  // (46n) Window Beam Culling: fixed (47m) at "Faces Toward the Room"
+	// (46n) Window Beam Culling: fixed (47m) at "Faces Toward the Room" ((47q) no flag: the shader always culls so).
 	// (47i) Point Light Shadows on Water: the water distance of last frame (its prep ran after last frame's water draws) is traced
 	// from; with no prep last frame (no water drawn) the distance is cleared, so the Water shader never matches a stale one.
 	std::memcpy(waterInvViewProj, a_input.constants.invViewProj, sizeof(waterInvViewProj));
@@ -4658,8 +4758,10 @@ bool RayTracing::PrepareAO(RayTracingRT::FrameInput& a_input, const float a_trac
 	// (46y) Single Long Ray (always, 47n) / Half-Resolution Broad Term (a tier knob: the far part on a checkerboard; the filter's far
 	// weight .b = 0 elsewhere).
 	flags |= kAOTraceDetail | kAOTraceSingleRay;
-	if (tier.halfResFar)
+	if (tier.broadRate == 1)
 		flags |= kAOTraceHalfFar;
+	else if (tier.broadRate == 2)
+		flags |= kAOTraceQuarterFar;  // (47q) one pixel of each 2x2, rotating over 4 frames
 	flags |= shape.alphaBudget == 1 ? kAOTraceAlphaHalf : (shape.alphaBudget == 2 ? kAOTraceAlphaOpen : 0u);
 	// (47h) The trace output fell back to RGBA8: dither its weight. Character Self-Occlusion Fix (always, 47n; only with characters in
 	// the TLAS).
@@ -5681,6 +5783,13 @@ void RayTracing::DrawSunPage()
 			}
 			if (!typedUavLoadR8)
 				ImGui::TextDisabled("This GPU cannot rewrite Screen Space Shadows; they are kept as with Ray Tracing off.");
+			// (47q) A look slider of its own, outside the tiers and Custom.
+			ImGui::SliderFloat("Shadow Edge Softness (sun size)", &settings.SunSize, kSunSizeMin, kSunSizeMax, "%.2f deg", ImGuiSliderFlags_AlwaysClamp);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("How big the sun looks to the shadows (degrees, half angle). 0.27 (default) = the real sun: sharp contact edges that");
+				ImGui::Text("  widen with the distance to the caster. Larger = softer, wider shadow edges everywhere (until 47p High and Ultra used 0.5).");
+				ImGui::Text("  Not part of the quality tiers: picking a tier keeps it.");
+			}
 		} else {
 			ImGui::TextDisabled("Sun shadows: the game's own. Objects in Ray Tracing (main page) still decide what blocks point lights and RT AO.");
 		}
@@ -5691,7 +5800,6 @@ void RayTracing::DrawSunPage()
 			const QualityParams q = ResolveQuality();
 			const bool custom = settings.QualityLevel == static_cast<int>(Quality::Custom);
 			// The values in effect, in the Custom keys' form.
-			float cone = q.coneDegrees;
 			int baseRays = static_cast<int>(q.baseRays), extraRays = static_cast<int>(q.extraRays);
 			int traceRes = static_cast<int>(q.tracePattern), farQuality = static_cast<int>(q.farPattern);
 			float falloffStart = q.falloffStart, falloffEnd = q.falloffEnd, farScale = q.farDenoiseScale;
@@ -5701,10 +5809,8 @@ void RayTracing::DrawSunPage()
 			bool half = q.denoiseHalf;
 			int history = static_cast<int>(q.history);
 			float clampSigma = q.clampSigma;
+			float npcFull = q.npcFullDistance;
 			bool changed = false;
-			changed |= ImGui::SliderFloat("Sun Softness", &cone, 0.1f, 2.0f, "%.2f deg");
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("How big the sun looks to the shadows: 0.27 = the real sun (sharp edges), larger = softer, wider shadow edges.");
 			changed |= ImGui::SliderInt("Rays per Pixel", &baseRays, 1, 4);
 			changed |= ImGui::SliderInt("Extra Rays at Shadow Edges", &extraRays, 0, 8);
 			if (auto _tt = Util::HoverTooltipWrapper())
@@ -5726,6 +5832,14 @@ void RayTracing::DrawSunPage()
 			changed |= ImGui::Combo("Other Characters", &npc, npcModes, 2);
 			if (auto _tt = Util::HoverTooltipWrapper())
 				ImGui::Text("The player always gets full quality. Reduced: other characters get no extra edge rays.");
+			changed |= ImGui::SliderFloat("Other Characters: All Parts Within", &npcFull, 0.0f, 8192.0f, npcFull > 0.0f ? "%.0f units" : "no limit");
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Other characters farther than this from the camera are traced with their body and armour only (one merged shape):");
+				ImGui::Text("  capes / skirts with physics, hair and cut-out parts keep the game's shadow-map shadow, and the body is re-posed every");
+				ImGui::Text("  other frame (characters take turns). Closer ones and the player: every part, every frame. 0 = no limit (Ultra).");
+				ImGui::Text("  Very Low 700 (10 m), Low 1400 (20 m), Medium 2450 (35 m), High 3150 (45 m). Characters are traced up to 40 m at most.");
+				ImGui::Text("  With Sun Shadows Off the point-light quality decides (then RT AO's): Low 20 m, Medium 35 m, High 45 m, Ultra / Custom none.");
+			}
 			changed |= ImGui::SliderFloat("Denoiser Radius", &radius, 2.0f, 32.0f, "%.0f px");
 			changed |= ImGui::SliderInt("Denoiser Taps per Side", &taps, 1, 8);
 			changed |= ImGui::Checkbox("Denoiser at Half Resolution", &half);
@@ -5740,8 +5854,8 @@ void RayTracing::DrawSunPage()
 					settings.QualityLevel = static_cast<int>(Quality::Custom);
 				}
 				const QualityParams seeded = ResolveQuality();
-				if (cone != seeded.coneDegrees)
-					settings.CustomSunCone = std::clamp(cone, 0.1f, 2.0f);
+				if (npcFull != seeded.npcFullDistance)
+					settings.CustomNpcFullDistance = std::clamp(npcFull, 0.0f, 8192.0f);
 				if (baseRays != static_cast<int>(seeded.baseRays))
 					settings.CustomBaseRays = std::clamp(baseRays, 1, 4);
 				if (extraRays != static_cast<int>(seeded.extraRays))
@@ -5833,6 +5947,18 @@ void RayTracing::DrawObjectRows()
 			ImGui::Text("  Costs GPU time (F7: rt_wind_* columns, rt_prep_gpu_ms). Off: they are traced at rest.");
 			ImGui::Text("  No effect while Foliage is Shadow map.");
 		}
+		ImGui::Indent();
+		ImGui::BeginDisabled(!settings.FoliageSway);
+		ImGui::Checkbox("Keep Leaves Moving on Long Frames", &settings.FoliageKeepMoving);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("The game itself stops its leaf animation on every frame that takes 35 ms or more (below about 29 real frames per");
+			ImGui::Text("  second, common with frame generation): leaves on screen and their shadows stand still for those frames, then move on.");
+			ImGui::Text("On (default): for the swaying plants in reach, those frames advance the leaves as the game would have (each plant at");
+			ImGui::Text("  its own pace), before anything is drawn: the leaves, their shadow maps and the ray-traced shadow keep moving.");
+			ImGui::Text("Off: exactly as the game (F7: rt_wind_catchup = plants advanced this frame).");
+		}
+		ImGui::EndDisabled();
+		ImGui::Unindent();
 		ImGui::EndDisabled();
 		if (scene.SwayActive()) {
 			const auto& ws = scene.GetWindStats();
@@ -5922,15 +6048,30 @@ void RayTracing::DrawPointLightPage()
 		}
 
 		ImGui::SeparatorText("Which Lights");
-		ImGui::Checkbox("Player Lights Cast RT Shadows", &settings.PointLightsPlayer);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): the torch in your hand, Quick Light's light and light spells on you cast ray-traced shadows.");
-			ImGui::Text("  Off: they keep the old shadows.");
-		}
-		ImGui::Checkbox("Spell / Effect Lights Cast RT Shadows", &settings.PointLightsEffects);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): lights of spells and effects that belong to nobody (Magelight on a wall, fire bolts in flight)");
-			ImGui::Text("  cast ray-traced shadows. Off: they keep the old shadows.");
+		{
+			// (47q) Tier knobs (the values in effect; an edit switches to Custom, seeded from the tier shown). Torches carried by other
+			// characters are always ray traced.
+			const PointTierParams cur = ResolvePointTier();
+			bool player = cur.player, effects = cur.effects;
+			bool changed = ImGui::Checkbox("Player Lights Cast RT Shadows", &player);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("The torch in your hand, Quick Light's light and light spells on you cast ray-traced shadows (Medium and above).");
+				ImGui::Text("  Off (Low): they keep the old shadows.");
+			}
+			changed |= ImGui::Checkbox("Spell / Effect Lights Cast RT Shadows", &effects);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Lights of spells and effects that belong to nobody (Magelight on a wall, fire bolts in flight) cast ray-traced");
+				ImGui::Text("  shadows (High and Ultra). Off (Low, Medium): they keep the old shadows.");
+				ImGui::Text("Torches carried by other characters always cast ray-traced shadows.");
+			}
+			if (changed) {
+				if (settings.PointQuality != kTierCustom) {
+					CopyPointTierToCustom(settings.PointQuality);
+					settings.PointQuality = kTierCustom;
+				}
+				settings.PointLightsPlayer = player;
+				settings.PointLightsEffects = effects;
+			}
 		}
 		{
 			const char* kMeshless[3] = { "Own", "Snap", "Skip" };
@@ -5958,12 +6099,11 @@ void RayTracing::DrawPointLightPage()
 				// (47n) The tier's values in effect; an edit switches to Custom, seeded from the tier shown, then the edited value.
 				const PointTierParams cur = ResolvePointTier();
 				PointTierParams v = cur;
-				static constexpr int kKs[3] = { 1, 2, 4 };
-				const char* kNames[3] = { "1", "2", "4" };
+				const char* kNames[4] = { "1", "2", "3", "4" };
 				bool changed = false;
-				int index = v.k >= 4 ? 2 : (v.k >= 2 ? 1 : 0);
-				if (ImGui::Combo("Lights per Pixel", &index, kNames, 3)) {
-					v.k = kKs[std::clamp(index, 0, 2)];
+				int index = std::clamp(v.k, 1, 4) - 1;
+				if (ImGui::Combo("Lights per Pixel", &index, kNames, 4)) {
+					v.k = std::clamp(index, 0, 3) + 1;
 					changed = true;
 				}
 				if (auto _tt = Util::HoverTooltipWrapper()) {
@@ -5971,23 +6111,23 @@ void RayTracing::DrawPointLightPage()
 					ImGui::Text("  Weaker lights at that pixel keep their old shadows. More = slower.");
 				}
 				ImGui::BeginDisabled(!settings.PointLightsInteriors);
-				int indexInterior = v.kInterior >= 4 ? 2 : (v.kInterior >= 2 ? 1 : 0);
-				if (ImGui::Combo("Lights per Pixel Indoors", &indexInterior, kNames, 3)) {
-					v.kInterior = kKs[std::clamp(indexInterior, 0, 2)];
+				int indexInterior = std::clamp(v.kInterior, 1, 4) - 1;
+				if (ImGui::Combo("Lights per Pixel Indoors", &indexInterior, kNames, 4)) {
+					v.kInterior = std::clamp(indexInterior, 0, 3) + 1;
 					changed = true;
 				}
 				if (auto _tt = Util::HoverTooltipWrapper())
-					ImGui::Text("Indoors many lights overlap; 4 (High) catches nearly all of the light. 2 or 1 = cheaper.");
+					ImGui::Text("Indoors many lights overlap; 3 (High) or 4 (Ultra) catch nearly all of the light. 2 or 1 = cheaper.");
 				ImGui::EndDisabled();
 				changed |= ImGui::SliderInt("Max Lights", &v.maxSources, 8, static_cast<int>(RayTracingPointLights::kMaxSources));
 				if (auto _tt = Util::HoverTooltipWrapper())
 					ImGui::Text("Shadow-casting lights per frame at most (the ones that matter most on screen). Lights within 64 units count as one.");
 				changed |= ImGui::SliderFloat("Max Distance", &v.distance, 512.0f, 8192.0f, "%.0f units");
 				if (auto _tt = Util::HoverTooltipWrapper())
-					ImGui::Text("Lights farther from the camera keep their old shadows. 70 units = 1 m. High: 4000 (about 57 m).");
+					ImGui::Text("Lights farther from the camera keep their old shadows. 70 units = 1 m. High: 3500 (about 50 m).");
 				changed |= ImGui::Checkbox("Plants and Cut-Outs Block Point Lights Outdoors", &v.alphaOutdoors);
 				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::Text("On (Medium and above): at night leaves, bushes and cut-out shapes (fences, nets) cast shadows from torches and campfires,");
+					ImGui::Text("On (High and Ultra): at night leaves, bushes and cut-out shapes (fences, nets) cast shadows from torches and campfires,");
 					ImGui::Text("  for the kinds traced with their cut-out (Foliage / Cut-outs under Objects in Ray Tracing). A little slower.");
 					ImGui::Text("Off: outdoors only solid shapes block point lights.");
 				}
@@ -6230,7 +6370,7 @@ void RayTracing::DrawAOPage()
 				bool changed = false;
 				changed |= ImGui::SliderInt("Detail Rays", &v.detailRays, 1, kAODetailRaysMax);
 				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::Text("Short rays per pixel for the fine detail (the long ray's first part is one of them). Low / Medium 1, High 2, Ultra 3.");
+					ImGui::Text("Short rays per pixel for the fine detail (the long ray's first part is one of them). Low - High 1, Ultra 3.");
 					ImGui::Text("  More = smoother creases, costs more GPU time (about +20 %% of the RTAO rays' time per ray).");
 				}
 				changed |= ImGui::SliderFloat("Max Distance", &v.distance, 1000.0f, 8192.0f, "%.0f units");
@@ -6238,11 +6378,12 @@ void RayTracing::DrawAOPage()
 					ImGui::Text("Outdoors: RTAO fades back to Screen Space GI's AO over the last quarter of this distance (70 units = 1 m).");
 					ImGui::Text("  Shorter = cheaper. Indoors there is no fade: the whole interior is traced.");
 				}
-				changed |= ImGui::Checkbox("Half-Resolution Broad Term", &v.halfResFar);
+				changed |= ImGui::Combo("Broad Ray Rate", &v.broadRate, kBroadRateNames, 3);
 				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::Text("On (Low, Medium): the broad (far) part is traced on every other pixel (a checkerboard that swaps every frame); the");
-					ImGui::Text("  blur fills the rest from neighbours on the same surface. The fine detail stays full resolution. Cheaper; the broad");
-					ImGui::Text("  AO may be a little noisier on thin objects. Off: every pixel.");
+					ImGui::Text("Where the broad (long) ray is traced each frame; the fine detail stays on every pixel.");
+					ImGui::Text("  Every pixel (Ultra). Half (Medium, High): a checkerboard that swaps every frame. One in four (Low): one pixel of each");
+					ImGui::Text("  2 x 2 block, a different one each frame. The blur fills the rest from neighbours on the same surface and the history");
+					ImGui::Text("  averages the frames: cheaper, the broad AO a little noisier on thin objects and a little slower to follow motion.");
 				}
 				changed |= ImGui::Checkbox("Full-Resolution Filter", &v.fullResFilter);
 				if (auto _tt = Util::HoverTooltipWrapper()) {
@@ -6273,8 +6414,8 @@ void RayTracing::DrawAOPage()
 						settings.AODetailRays = std::clamp(v.detailRays, 1, kAODetailRaysMax);
 					if (v.distance != cur.distance)
 						settings.AODistance = std::clamp(v.distance, 1000.0f, 8192.0f);
-					if (v.halfResFar != cur.halfResFar)
-						settings.AOHalfResFar = v.halfResFar;
+					if (v.broadRate != cur.broadRate)
+						settings.AOBroadRate = std::clamp(v.broadRate, 0, 2);
 					if (v.fullResFilter != cur.fullResFilter)
 						settings.AOFullResFilter = v.fullResFilter;
 					if (v.temporalV2 != cur.temporalV2)
@@ -6717,8 +6858,8 @@ std::string RayTracing::DescribeForProfile() const
 		pt.kInterior, settings.PointLightsWindowBeams ? "on" : "off", settings.PointLightsSkipShadowMaps ? "on" : "off",
 		interiorOffReason.empty() ? "" : ", switched off: " + interiorOffReason);
 	// (46d)
-	text += std::format(", player lights {}, spell / effect lights {}, plants block point lights outdoors {}", settings.PointLightsPlayer ? "on" : "off",
-		settings.PointLightsEffects ? "on" : "off", pt.alphaOutdoors ? "on" : "off");
+	text += std::format(", player lights {}, spell / effect lights {}, plants block point lights outdoors {}", pt.player ? "on" : "off",
+		pt.effects ? "on" : "off", pt.alphaOutdoors ? "on" : "off");
 	// (46o)
 	text += std::format(", window beam softness {:.2f} deg", settings.PointLightsBeamSoftness);
 	// (46f)
@@ -6735,8 +6876,10 @@ std::string RayTracing::DescribeForProfile() const
 		settings.AODetailStrength, settings.AODetailLength, at.detailRays, at.fullResFilter ? "on" : "off", kAOBudget[std::clamp(settings.AOAlphaBudget, 0, 2)],
 		aoExtrasFault.empty() ? "" : ", detail / full-res filter switched off: " + aoExtrasFault);
 	// (46y)
-	text += std::format(", RTAO half-resolution broad term {}, point lights: screen-space shadows for non-RT casters on (contact {:.1f})", at.halfResFar ? "on" : "off",
+	text += std::format(", RTAO broad ray rate {}, point lights: screen-space shadows for non-RT casters on (contact {:.1f})", kBroadRateNames[std::clamp(at.broadRate, 0, 2)],
 		settings.PointLightsSSPLSContact);
+	// (47q)
+	text += std::format(", NPCs all parts within {}", NpcFullDistance() > 0.0f ? std::format("{:.0f}", NpcFullDistance()) : std::string("no limit"));
 	// (47l) (47n)
 	text += std::format(", RTAO smooth normals {}{}, temporal v2 {}{}, tight history near moving things {}, SSGI contact AO ghost fix {}", at.smoothNormals ? "on" : "off",
 		aoSmoothFault.empty() ? "" : " (switched off: " + aoSmoothFault + ")", at.temporalV2 ? "on" : "off", aoV2Fault.empty() ? "" : " (switched off: " + aoV2Fault + ")",
@@ -6828,6 +6971,18 @@ nlohmann::json RayTracing::DescribeJson() const
 		{ "instances", cpuWorst.instances }, { "missed", cpuWorst.missed }, { "execute", cpuWorst.execute }, { "d3d11", cpuWorst.d3d11 },
 		{ "end_frame", cpuWorst.endFrame } };
 	j["tlas_instances"] = stats.instancesLastFrame;
+	{
+		// (47q) Static chunks per cell / overlap (a statistic), the NPC rule, the sun size.
+		std::uint32_t cells = 0;
+		float perCell = 0.0f, overlap = 0.0f;
+		scene.ChunkOverlapStats(backend, cells, perCell, overlap);
+		j["static_chunks"] = { { "cells", cells }, { "per_cell", perCell }, { "pairwise_overlap", overlap } };
+		const auto& ch = characters.GetStats();
+		j["npc_rule"] = { { "all_parts_within", NpcFullDistance() }, { "body_only", ch.bodyOnlyActors }, { "refits_skipped", ch.refitsSkipped },
+			{ "tiny_face_skipped", ch.skipTinyFace } };
+		j["sun_size_deg"] = settings.SunSize;
+		j["foliage_keep_moving"] = settings.FoliageKeepMoving;
+	}
 	// (46b)
 	{
 		const auto& ps = pointSelector.GetStats();
@@ -6839,7 +6994,7 @@ nlohmann::json RayTracing::DescribeJson() const
 			{ "candidates", ps.candidates }, { "merged", ps.merged }, { "capped", ps.capped }, { "native_lights", ps.native }, { "gpu_ms", stats.lastPointGpuMs },
 			{ "rays_per_frame", stats.pointRaysPerFrame }, { "water_rays_per_frame", stats.pointWaterRaysPerFrame },  // (47j)
 			 { "denoise_gpu_ms", Util::GpuPassTimers::GetSingleton()->SmoothedMs(Util::GpuBucket::RayTracingPointDenoise) },
-			{ "cpu_ms", pointCpuMs }, { "off_reason", pointOffReason }, { "player", settings.PointLightsPlayer }, { "effects", settings.PointLightsEffects },
+			{ "cpu_ms", pointCpuMs }, { "off_reason", pointOffReason }, { "player", pt.player }, { "effects", pt.effects },
 			{ "alpha_outdoors", pt.alphaOutdoors }, { "player_sources", ps.player }, { "effect_sources", ps.effects },
 			{ "alpha_last_frame", backend.PointAlphaLastFrame() } };
 		// (46c)

@@ -2672,14 +2672,83 @@ namespace RayTracingScene
 		windStats_.instances = static_cast<std::uint32_t>(windInstances_.size());
 	}
 
-	void Scene::UpdateWindPoses(RayTracingRT::Backend& a_backend, std::uint32_t a_frame)
+	void Scene::ChunkOverlapStats(const RayTracingRT::Backend& a_backend, std::uint32_t& o_cells, float& o_chunksPerCell, float& o_overlap) const
 	{
-		if (windInstances_.empty())
+		// (47q) A statistic for a later re-chunking decision (analysis-rt-ada-efficiency #5): nothing is changed.
+		o_cells = 0;
+		o_chunksPerCell = 0.0f;
+		o_overlap = 0.0f;
+		std::uint64_t chunks = 0;
+		double summed = 0.0, intersections = 0.0;
+		struct Box
+		{
+			float lo[3], hi[3];
+		};
+		std::vector<Box> boxes;
+		for (const auto& cell : cells_) {
+			if (cell->interior || cell->blas.empty())
+				continue;
+			++o_cells;
+			boxes.clear();
+			for (const auto handle : cell->blas) {
+				Box b;
+				if (!a_backend.GetBlasBounds(handle, b.lo, b.hi))
+					continue;
+				boxes.push_back(b);
+			}
+			chunks += boxes.size();
+			auto volume = [](const float a_lo[3], const float a_hi[3]) {
+				double v = 1.0;
+				for (int a = 0; a < 3; ++a)
+					v *= std::max(0.0, static_cast<double>(a_hi[a]) - static_cast<double>(a_lo[a]));
+				return v;
+			};
+			for (std::size_t i = 0; i < boxes.size(); ++i) {
+				summed += volume(boxes[i].lo, boxes[i].hi);
+				for (std::size_t k = i + 1; k < boxes.size(); ++k) {
+					float lo[3], hi[3];
+					for (int a = 0; a < 3; ++a) {
+						lo[a] = std::max(boxes[i].lo[a], boxes[k].lo[a]);
+						hi[a] = std::min(boxes[i].hi[a], boxes[k].hi[a]);
+					}
+					intersections += volume(lo, hi);
+				}
+			}
+		}
+		if (o_cells > 0)
+			o_chunksPerCell = static_cast<float>(static_cast<double>(chunks) / static_cast<double>(o_cells));
+		if (summed > 0.0)
+			o_overlap = static_cast<float>(intersections / summed);
+	}
+
+	void Scene::UpdateWindPoses(RayTracingRT::Backend& a_backend, std::uint32_t a_frame, bool a_keepMoving, float a_dt)
+	{
+		if (windInstances_.empty()) {
+			windClocks_.clear();
 			return;
+		}
 		if (a_frame != windPoseStatsFrame_) {
 			windPoseStatsFrame_ = a_frame;
 			windStats_.poses = windStats_.poseFaults = 0;
+			windStats_.catchups = windStats_.frozenUnlearned = 0;
+			// Nodes not visited for a while (their plants left the radius) are forgotten.
+			if (windClocks_.size() > windInstances_.size() * 2 + 256) {
+				for (auto it = windClocks_.begin(); it != windClocks_.end();) {
+					if (a_frame - it->second.frame > 600u)
+						it = windClocks_.erase(it);
+					else
+						++it;
+				}
+			}
 		}
+		// (47q) Keep Leaves Moving on Long Frames. The game advances a leaf node's timer before the frame's Early Prep, except on a frame of
+		// 35 ms or more (then it stays as it was: leaves, their shadow maps and the RT shadow freeze). Per node (once per frame): an advance
+		// since our last visit is the game's own (our writes are in `last`): its rate per second of game time is learned there (frames
+		// under kFreezeDt only); a timer still at `last` on a frame of at least kFreezeDt is advanced by rate x dt here, before the draws.
+		constexpr float kFreezeDt = 0.0345f;
+		constexpr float kLearnMinDt = 0.001f;
+		const bool longFrame = a_keepMoving && a_dt >= kFreezeDt && a_dt < 1.0f;
+		const bool learnFrame = a_dt >= kLearnMinDt && a_dt < kFreezeDt;
 		const auto globals = RayTracingWind::FrameGlobals(a_frame);
 		for (auto& [handle, instance] : windInstances_) {
 			if (instance.poseFrame == a_frame)
@@ -2689,6 +2758,34 @@ namespace RayTracingScene
 			RE::NiNode* node = RayTracingWind::LeafNodeOf(instance.geometry.get());
 			if (node != instance.node.get())
 				instance.node.reset(node);
+			float timer;
+			if (node && RayTracingWind::ReadTimer(node, timer)) {
+				auto& clock = windClocks_[node];
+				if (clock.frame != a_frame) {
+					const bool consecutive = clock.frame != UINT32_MAX && clock.frame + 1 == a_frame;
+					if (consecutive && timer != clock.last) {
+						const float rate = (timer - clock.last) / std::max(a_dt, kLearnMinDt);
+						const bool plausible = std::isfinite(rate) && rate > 0.0f && rate < 1000.0f &&
+						                       (clock.learned < 3 || (rate > clock.rate * 0.5f && rate < clock.rate * 2.0f));
+						if (learnFrame && plausible) {
+							clock.rate = clock.learned == 0 ? rate : clock.rate * 0.8f + rate * 0.2f;
+							clock.learned = std::min(clock.learned + 1, 1000u);
+						}
+					} else if (consecutive && longFrame) {
+						if (clock.learned > 0 && clock.rate > 0.0f) {
+							const float advanced = timer + clock.rate * a_dt;
+							if (RayTracingWind::WriteTimer(node, advanced)) {
+								timer = advanced;
+								++windStats_.catchups;
+							}
+						} else {
+							++windStats_.frozenUnlearned;
+						}
+					}
+					clock.last = timer;
+					clock.frame = a_frame;
+				}
+			}
 			RayTracingWind::Pose pose;
 			if (!RayTracingWind::Evaluate(node, globals, pose)) {
 				++windStats_.poseFaults;

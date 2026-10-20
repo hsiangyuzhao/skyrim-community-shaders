@@ -165,6 +165,8 @@ namespace Util
 		float SmoothedMs(GpuBucket a_bucket) const;
 		/// (45k) The bucket's last collected sample (ms, a few frames old); -1 without a recent one. For the F7 trace.
 		float LastSampleMs(GpuBucket a_bucket) const;
+		/// (47q) As LastSampleMs, but -1 unless the bucket's pass ran this frame or the one before (a pass switched off reads -1 at once).
+		float LastSampleMsIfRan(GpuBucket a_bucket) const;
 
 		/**
 		 * @brief Releases every query and clears all smoothing/pending state.

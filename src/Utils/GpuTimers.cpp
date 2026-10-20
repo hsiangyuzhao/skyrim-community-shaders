@@ -482,6 +482,17 @@ namespace Util
 		return bucket.lastSampleMs;
 	}
 
+	float GpuPassTimers::LastSampleMsIfRan(GpuBucket a_bucket) const
+	{
+		const int index = static_cast<int>(a_bucket);
+		if (index < 0 || index >= static_cast<int>(GpuBucket::Count))
+			return -1.0f;
+		const auto& bucket = buckets[index];
+		if (!bucket.everActive || !bucket.hasSample || frameIndex - bucket.lastActiveFrame > 1)
+			return -1.0f;
+		return bucket.lastSampleMs;
+	}
+
 	float GpuPassTimers::SmoothedMs(GpuBucket a_bucket) const
 	{
 		const int index = static_cast<int>(a_bucket);

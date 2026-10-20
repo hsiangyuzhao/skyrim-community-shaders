@@ -57,6 +57,8 @@ namespace RayTracingCharacters
 	inline constexpr std::uint32_t kRescanFrames = 8;
 	inline constexpr std::uint32_t kEquipScanFrames = 30;
 	inline constexpr std::uint32_t kReadLanes = 4;  // (46m) per-actor reads: this thread + 3 workers
+	// (47q) The NPC rule: an NPC turns body-only beyond the distance + this, back to all its parts within the distance - this.
+	inline constexpr float kBodyOnlyHysteresis = 105.0f;  // 1.5 m
 
 	struct Stats
 	{
@@ -86,6 +88,10 @@ namespace RayTracingCharacters
 		std::uint32_t skipBackend = 0;     // refused by the backend (VRAM budget, size)
 		std::uint32_t skipShapeCap = 0;    // past kMaxShapesPerActor
 		std::uint32_t skipTinyFace = 0;    // (47p) eyes, brows, mouth left out (they cast nothing visible)
+		// (47q) The NPC rule, this frame: NPCs traced with their merged body only, and of them those whose merged BLAS was not refit
+		// (their off frame: last frame's pose, moved with the actor).
+		std::uint32_t bodyOnlyActors = 0;
+		std::uint32_t refitsSkipped = 0;
 		std::uint32_t paletteMode = 0;     // shapes whose bone indices are partition-local (palette)
 		std::uint32_t globalMode = 0;      // ... global
 		std::uint32_t dynamicShapes = 0;   // BSDynamicTriShape positions taken at capture
@@ -125,6 +131,10 @@ namespace RayTracingCharacters
 		void Configure(bool a_physics, bool a_hair, bool a_alpha, bool a_firstPersonPlayer, bool a_dropTiny);
 		/// (47p) Bone matrices within float noise of the last skinned ones count as a still pose (no re-skinning).
 		void SetBonesTolerant(bool a_on) { bonesTolerant_ = a_on; }
+		/// (47q) The NPC rule: NPCs farther than this from the camera (with kBodyOnlyHysteresis) are traced with their merged opaque body /
+		/// armour only -- physics parts, hair and cut-out parts leave the TLAS and go back to the engine cascades -- and their merged BLAS
+		/// is refit every other frame (staggered by actor). The player and nearer NPCs: every part, every frame. 0 = no limit.
+		void SetBodyOnlyDistance(float a_distance) { bodyOnlyDistance_ = std::isfinite(a_distance) ? std::max(a_distance, 0.0f) : 0.0f; }
 		/// Drops everything on the next Update (loading screens, from any thread).
 		void RequestFlush() { flushRequested_.store(true); }
 		/// (46m) An actor equipped / unequipped something (any thread): its 3D is scanned in full for the next frames.
@@ -182,6 +192,8 @@ namespace RayTracingCharacters
 			std::vector<float> fresh;
 			bool freshOk = false;
 			bool grouped = false;  // (46m) in its actor's merged BLAS (opaque, Merge Character Parts when captured)
+			/// (47q) Part of a body-only NPC's trace: in the merged BLAS and neither a physics part nor hair.
+			[[nodiscard]] bool BodyPart() const { return grouped && !physics && !hair; }
 		};
 		struct Found
 		{
@@ -205,6 +217,7 @@ namespace RayTracingCharacters
 			std::uint32_t bonesRead = 0;
 			bool scanned = false;
 			bool readOk = false;  // this frame's reads completed (otherwise its shapes stay as they were)
+			bool bodyOnly = false;  // (47q) the NPC rule (with hysteresis)
 		};
 
 		void ReleaseShape(RayTracingRT::Backend& a_backend, Shape& a_shape);
@@ -229,6 +242,7 @@ namespace RayTracingCharacters
 		bool alpha_ = false;
 		bool dropTiny_ = false;  // (47p)
 		bool bonesTolerant_ = false;  // (47p) "Ray tracing: ignore bone noise"
+		float bodyOnlyDistance_ = 0.0f;  // (47q) 0 = no limit
 		std::uint32_t stillReused_ = 0;  // (45n)
 		std::uint64_t frame_ = 0;
 		std::uint32_t actorSerial_ = 0;

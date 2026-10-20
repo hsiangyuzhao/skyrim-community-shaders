@@ -442,7 +442,12 @@ namespace Util::FrameTrace
 		struct SpikeWatch
 		{
 			float usualMs = 0.0f;
-			int learned = 0;
+			// (47q) The usual GPU work = the median of the last 64 frames (spikes included: up to half of them can not move it). 47p learned
+			// an average only on frames without a spike: learned low (1.6 ms on the loading screen), every later frame was a "spike" and
+			// the average never moved again.
+			std::array<float, 64> recent{};
+			int recentCount = 0;
+			int recentHead = 0;
 			int64_t lastSpikeQpc = 0;
 			std::array<float, 4> intervals{};  // seconds between the last spikes, newest first
 			int intervalCount = 0;
@@ -859,8 +864,9 @@ namespace Util::FrameTrace
 			a_row.vfPassMs[3] = sample(vfFar, Util::GpuBucket::VolumetricFogFar);
 			a_row.vfPassMs[4] = sample(vf, Util::GpuBucket::VolumetricFogIntegrate);
 			a_row.vfPassMs[5] = sample(vf, Util::GpuBucket::VolumetricFogHistory);
-			a_row.waterPrepGpuMs = timers->LastSampleMs(Util::GpuBucket::RayTracingWaterPrep);  // (47j) -1 once quiet
-			a_row.aoNormalPrepGpuMs = timers->LastSampleMs(Util::GpuBucket::RayTracingAONormalPrep);  // (47l) -1 once quiet
+			// (47j, 47l) (47q) -1 unless the pass ran this frame or the last (47p: the last value stayed for 8 frames after RT was switched off).
+			a_row.waterPrepGpuMs = timers->LastSampleMsIfRan(Util::GpuBucket::RayTracingWaterPrep);
+			a_row.aoNormalPrepGpuMs = timers->LastSampleMsIfRan(Util::GpuBucket::RayTracingAONormalPrep);
 			if (vf) {
 				a_row.vfGrid[0] = ehf.currentGridSize.x;
 				a_row.vfGrid[1] = ehf.currentGridSize.y;
@@ -1046,6 +1052,11 @@ namespace Util::FrameTrace
 				out << "# (47p) gpu_spike_ms = GPU work of this frame over the usual (learned on frames without a spike), 0 = no spike (12 ms+ and 1.4x);\n";
 				out << "#   jobs = our periodic jobs that ran in this frame (| separated). A spike that lands in a different gpu_seg_* each time while no\n";
 				out << "#   job of ours ran is another GPU user taking the GPU (another queue or process), not our work.\n";
+				out << "#   (47q) The usual GPU work is the median of the last 64 frames (it re-learns after a change, never freezes low).\n";
+				out << "# (47q) rt_npc_body_only = NPCs traced with their body only (the NPC rule), rt_npc_refit_skipped = of them not refit this frame\n";
+				out << "#   (every other frame, staggered); rt_skip_tiny_face = tiny face parts left out (session); rt_wind_catchup = leaf timers the game\n";
+				out << "#   froze on this long frame (35 ms+) and Keep Leaves Moving advanced; rt_chunk_cells / rt_chunks_per_cell / rt_chunk_overlap =\n";
+				out << "#   captured exterior cells, static chunk BLASes per cell, their boxes' pairwise overlap (intersection / summed volume, 0 = disjoint).\n";
 				out << "#   rt_pw_* = the work of the RT D3D12 prep submission whose GPU time is rt_prep_gpu_ms on the same row (1 = valid; early =\n";
 				out << "#   recorded at the frame start): static BLAS builds (of which alpha-tested, triangles, MB before compaction), compactions (MB\n";
 				out << "#   written), new character shapes uploaded, own-BLAS character builds / refits, merged character BLAS builds (triangles) /\n";
@@ -1148,7 +1159,8 @@ namespace Util::FrameTrace
 					   "rtao_normal_prep_gpu_ms,"  // (47l)
 					   "pacer_learned_cap_ms,pacer_learned_cut_ms,"  // (47m)
 					   "rt_wind_in_radius,rt_wind_sources,rt_wind_builds,rt_wind_refit_verts,rt_wind_radius,"  // (47n)
-					   "gpu_spike_ms,jobs\n";  // (47p) the last ones
+					   "gpu_spike_ms,jobs,"  // (47p)
+					   "rt_npc_body_only,rt_npc_refit_skipped,rt_skip_tiny_face,rt_wind_catchup,rt_chunk_cells,rt_chunks_per_cell,rt_chunk_overlap\n";  // (47q) the last ones
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
 					std::string s = std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{},{}", t.scene,
@@ -1334,6 +1346,10 @@ namespace Util::FrameTrace
 					// (47p) GPU spike and our periodic jobs, after rt_wind_radius (the old last column).
 					extra.pop_back();
 					extra += std::format(",{:.3f},{}\n", r.gpuSpikeMs, JobNames(r.jobs));
+					// (47q) The NPC rule, tiny face parts, Keep Leaves Moving, static chunks, after jobs (the old last column).
+					extra.pop_back();
+					extra += std::format(",{},{},{},{},{},{:.2f},{:.3f}\n", r.rt.npcBodyOnly, r.rt.npcRefitSkipped, r.rt.skipTinyFace, r.rt.windCatchups, r.rt.chunkCells,
+						r.rt.chunksPerCell, r.rt.chunkOverlap);
 					if (it == a_reflex.end()) {
 						out << (r.reflexFrame == UINT32_MAX ? std::string("-1") : std::to_string(r.reflexFrame)) << ",-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" << engineColumns(r) << extra;
 						continue;
@@ -2283,16 +2299,21 @@ namespace Util::FrameTrace
 			auto& w = g_spike;
 			if (!(a_workMs > 0.0f) || a_workMs > 1000.0f)
 				return 0.0f;
-			if (w.learned < 30) {
-				w.usualMs = w.learned == 0 ? a_workMs : w.usualMs * 0.9f + a_workMs * 0.1f;
-				++w.learned;
+			w.recent[static_cast<size_t>(w.recentHead)] = a_workMs;
+			w.recentHead = (w.recentHead + 1) % static_cast<int>(w.recent.size());
+			w.recentCount = std::min(w.recentCount + 1, static_cast<int>(w.recent.size()));
+			if (w.recentCount < 30)
 				return 0.0f;
+			{
+				std::array<float, 64> sorted{};
+				std::copy_n(w.recent.begin(), w.recentCount, sorted.begin());
+				const auto mid = sorted.begin() + w.recentCount / 2;
+				std::nth_element(sorted.begin(), mid, sorted.begin() + w.recentCount);
+				w.usualMs = *mid;
 			}
 			const float excess = a_workMs - w.usualMs;
-			if (!(excess >= 12.0f && a_workMs >= 1.4f * w.usualMs)) {
-				w.usualMs = w.usualMs * 0.97f + a_workMs * 0.03f;
+			if (!(excess >= 12.0f && a_workMs >= 1.4f * w.usualMs))
 				return 0.0f;
-			}
 			const int64_t now = Now();
 			float sinceS = -1.0f;
 			if (w.lastSpikeQpc != 0 && g_frequency != 0)

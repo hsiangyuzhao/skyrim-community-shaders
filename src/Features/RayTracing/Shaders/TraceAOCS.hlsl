@@ -88,6 +88,7 @@ static const uint kFlagSmoothNormals = 512u;  // (47j) RTAO: Smooth Normals (see
 static const uint kFlagSmoothNormals2 = 1024u;  // (47k) RTAO: Smooth Normals v2 (with kFlagSmoothNormals): offsets along Ns, projection
 static const uint kFlagDynamic = 2048u;         // (47n) RTAO: Tight History Near Moving Things (see the top)
 static const uint kMovingKey = 0x800000u;       // (47n) Backend kMovingInstanceKey: a scene instance that moved since last frame
+static const uint kFlagQuarterFar = 4096u;      // (47q) two scales: the far part on one pixel of each 2x2, rotating every frame
 static const uint kMaxDetailRays = 4u;
 static const float kSelfProbe = 4.0;          // (47h) CharacterAt: the probe reaches this far to either side of the pixel (units)
 static const float kSelfGrazeOffset = 1.5;    // (47h) extra ray start offset at a character pixel for a ray along the surface (units)
@@ -109,12 +110,13 @@ struct AlphaInfo
 	uint Flags;
 	float Threshold;
 	float AlphaScale;
-	float2 Pad;
+	float TextureSize;    // (47q) the bindless texture's larger side and mip count (instead of GetDimensions; unused for copy layers)
+	float TextureLevels;
 	float4 UvTransform;
 };
 
 StructuredBuffer<AlphaInfo> AlphaInfos : register(t2);
-StructuredBuffer<uint2> AlphaUVs : register(t3);
+StructuredBuffer<uint2> AlphaUVs : register(t3);  // (47q) per triangle: (uv0, uv1), (uv2, vertex alpha 0 | 1 << 8 | 2 << 16, 8 bits each)
 Texture2DArray<float> AlphaLayers : register(t4);
 Texture2D<float4> AlphaTextures[kAlphaTextureSlots] : register(t0, space1);
 SamplerState AlphaSampler : register(s0);
@@ -131,13 +133,13 @@ bool AlphaBlocks(uint instanceID, uint primitive, float2 bary, float footprint)
 	const AlphaInfo info = AlphaInfos[instanceID - 1u];
 	if (primitive >= info.Triangles)
 		return true;
-	const uint base = info.UvBase + primitive * 3u;
+	const uint base = info.UvBase + primitive * 2u;
 	const uint2 c0 = AlphaUVs[base];
 	const uint2 c1 = AlphaUVs[base + 1u];
-	const uint2 c2 = AlphaUVs[base + 2u];
 	const float w0 = 1.0 - bary.x - bary.y;
-	float2 uv = UnpackTexcoord(c0.x) * w0 + UnpackTexcoord(c1.x) * bary.x + UnpackTexcoord(c2.x) * bary.y;
-	const float vertexAlpha = asfloat(c0.y) * w0 + asfloat(c1.y) * bary.x + asfloat(c2.y) * bary.y;
+	float2 uv = UnpackTexcoord(c0.x) * w0 + UnpackTexcoord(c0.y) * bary.x + UnpackTexcoord(c1.x) * bary.y;
+	const float3 cornerAlpha = float3(uint3(c1.y, c1.y >> 8u, c1.y >> 16u) & 0xFFu) / 255.0;
+	const float vertexAlpha = cornerAlpha.x * w0 + cornerAlpha.y * bary.x + cornerAlpha.z * bary.y;
 	uv = uv * info.UvTransform.zw + info.UvTransform.xy;
 	if (!all(isfinite(uv)))
 		return true;
@@ -149,10 +151,8 @@ bool AlphaBlocks(uint instanceID, uint primitive, float2 bary, float footprint)
 	}
 	else
 	{
-		uint width, height, levels;
-		AlphaTextures[NonUniformResourceIndex(info.Texture)].GetDimensions(0u, width, height, levels);
-		const float size = float(max(width, height));
-		const float maxLod = max(float(levels) - 1.0, 0.0);
+		const float size = info.TextureSize;
+		const float maxLod = max(info.TextureLevels - 1.0, 0.0);
 		const float lod = clamp(log2(size * footprintUV) + 0.5, 0.0, maxLod);
 		alpha = AlphaTextures[NonUniformResourceIndex(info.Texture)].SampleLevel(AlphaSampler, uv, lod).a;
 	}
@@ -519,9 +519,27 @@ float3 CosineDirection(float2 u, float3 T, float3 B, float3 N)
 	return normalize(T * (r * cs) + B * (r * sn) + N * sqrt(saturate(1.0 - u.x)));
 }
 
-[numthreads(8, 8, 1)] void main(uint3 dtid : SV_DispatchThreadID)
+// (47q) Thread groups of 16 x 8 (one wave of 32 covers 16 x 2 pixels: rays of neighbouring rows stay together) in a swizzled order:
+// the groups are walked in vertical strips kTileGroups groups wide (NVIDIA's ThreadGroupTilingX), so groups running at the same time
+// trace neighbouring screen areas (shared BVH nodes in the caches). Every pixel is still visited exactly once.
+static const uint2 kGroupSize = uint2(16u, 8u);
+static const uint kTileGroups = 8u;
+
+uint2 SwizzledGroup(uint2 a_group)
 {
-	const int2 p = int2(dtid.xy);
+	const uint2 grid = (uint2(C.RenderSize.xy) + kGroupSize - 1u) / kGroupSize;
+	const uint flat = a_group.y * grid.x + a_group.x;
+	const uint perStrip = kTileGroups * grid.y;
+	const uint strip = flat / perStrip;
+	const uint inStrip = flat - strip * perStrip;
+	const uint lastWidth = grid.x - (grid.x / kTileGroups) * kTileGroups;  // the last strip may be narrower
+	const uint width = (strip == grid.x / kTileGroups && lastWidth != 0u) ? lastWidth : kTileGroups;
+	return uint2(strip * kTileGroups + inStrip % width, inStrip / width);
+}
+
+[numthreads(16, 8, 1)] void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+	const int2 p = int2(SwizzledGroup(gid.xy) * kGroupSize + gtid.xy);
 	if (any(float2(p) >= C.RenderSize.xy))
 		return;
 	const uint flags = asuint(C.Params.y);
@@ -608,7 +626,12 @@ float3 CosineDirection(float2 u, float3 T, float3 B, float3 N)
 			const float shortLength = clamp(C.Extra.y, 1.0, rayLength);
 			// (46y, kFlagHalfFar) The far part on half the pixels (checkerboard, swapped every frame); the others write far weight 0
 			// (.b), which the filter's weighted mean already reads as "no far sample here" (as where the near part was blocked).
-			const bool farHere = !(flags & kFlagHalfFar) || (((uint(p.x) + uint(p.y) + frame) & 1u) == 0u);
+			// (47q, kFlagQuarterFar) One pixel of each 2x2 block (the down filter's block), a different one every frame (all four in 4
+			// frames, in a crossing order); the others write far weight 0 as above.
+			const uint quad = (uint(p.x) & 1u) | ((uint(p.y) & 1u) << 1);
+			static const uint kQuarterOrder[4] = { 0u, 3u, 1u, 2u };
+			const bool farHere = (flags & kFlagQuarterFar) ? quad == kQuarterOrder[frame & 3u] :
+			                                               (!(flags & kFlagHalfFar) || (((uint(p.x) + uint(p.y) + frame) & 1u) == 0u));
 			float near0 = 1.0;
 			float far = 1.0;
 			bool traced = false;

@@ -130,7 +130,7 @@ namespace RayTracingRT
 			if (!std::isfinite(vertex.position[0]) || !std::isfinite(vertex.position[1]) || !std::isfinite(vertex.position[2]))
 				return refuse();
 		}
-		if (!opaque && (geometry.alphaUV.size() != static_cast<std::size_t>(triangles) * 3 * 2 || !SkinAlphaAvailable()))
+		if (!opaque && (!SkinAlphaAvailable() || !PackAlphaCorners(a_geometry->alphaUV, triangles)))  // (47q) packed: 2 entries per triangle
 			return refuse();
 		// (46m) Merge Character Parts: an opaque shape traced inside its character's merged BLAS has none of its own.
 		const bool grouped = geometry.grouped && opaque;
@@ -174,7 +174,7 @@ namespace RayTracingRT
 			return kInvalidSkin;
 		}
 		if (!opaque) {
-			shape.uvCount = triangles * 3;
+			shape.uvCount = triangles * 2;  // (47q)
 			if (!AllocateAlphaUv(shape.uvCount, shape.uvOffset))
 				return refuse();
 		}

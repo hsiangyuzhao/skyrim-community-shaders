@@ -183,6 +183,14 @@ namespace Util::FrameTrace
 		// (47n) Per-plant sway: plants within the radius, wind sources, first builds, refit vertices this frame, the radius (-1 = off).
 		int64_t windInRadius = -1, windSources = -1, windBuilds = -1, windRefitVertices = -1;
 		float windRadius = -1.0f;
+		// (47q) The NPC rule: NPCs traced with their body only, of them those not refit this frame (-1 = characters not traced); tiny face
+		// parts left out (session total, -1 = off); Keep Leaves Moving: leaf timers advanced this frame (-1 = sway off); static chunks:
+		// captured exterior cells, chunk BLASes per cell, their pairwise overlap (intersection volume / summed volume; -1 = none).
+		int npcBodyOnly = -1, npcRefitSkipped = -1;
+		int64_t skipTinyFace = -1;
+		int windCatchups = -1;
+		int chunkCells = -1;
+		float chunksPerCell = -1.0f, chunkOverlap = -1.0f;
 	};
 	void OnRayTracingDetail(const RayTracingDetail& a_detail);
 

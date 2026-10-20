@@ -79,4 +79,10 @@ namespace RayTracingWind
 	/// so the ray tracer keeps their frozen BLASes.
 	[[nodiscard]] bool TreeAnimsEnabled();
 	[[nodiscard]] Stats GetStats();
+
+	/// (47q) The node's leaf timer (+0x164): read / written (SEH-guarded; false = refused). "Keep Leaves Moving on Long Frames": the
+	/// game does not advance its leaf timers on a frame of 35 ms or more (trace-20261020-164255: every frame with eng_dt < 35 ms
+	/// refit, none at 35.2 ms and up, the same frame's dt); the scene advances the frozen ones of its swaying plants itself.
+	bool ReadTimer(const RE::NiNode* a_node, float& o_timer);
+	bool WriteTimer(RE::NiNode* a_node, float a_timer);
 }

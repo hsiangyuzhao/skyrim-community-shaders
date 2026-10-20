@@ -3,7 +3,7 @@
 //
 // Textures: every cut-out texture gets a 256x256 alpha copy (5 mips) in a texture array shared from
 // D3D11, made by AlphaMaskCS on D3D11 before the frame's trace (the D3D12 queue waits for D3D11 on the GPU, so the trace sees it).
-// Texcoords: one buffer, a range per alpha BLAS (3 corners per triangle, uint2 each).
+// Texcoords: one buffer, a range per alpha BLAS ((47q) 2 uint2 per triangle: uv0, uv1 / uv2, the 3 vertex alphas; PackAlphaCorners).
 // Records: a CPU table; each command context keeps its own upload copy, rewritten when the table
 // changed, so a record can be reused at once without touching a submission in flight.
 // Descriptor slots, copy layers and texcoord ranges are reused only after the GPU passed the
@@ -22,6 +22,27 @@ namespace RayTracingRT
 	namespace
 	{
 		std::string Hr(HRESULT a_hr) { return std::format("0x{:08X}", static_cast<std::uint32_t>(a_hr)); }
+	}
+
+	bool PackAlphaCorners(std::vector<std::uint32_t>& a_corners, std::uint32_t a_triangles)
+	{
+		// (47q) Captured as 3 corners per triangle, (half2 texcoord, vertex alpha float bits) each; traced as 2 entries per triangle:
+		// (uv0, uv1), (uv2, alpha0 | alpha1 << 8 | alpha2 << 16). Every vertex alpha the captures write is byte / 255 or 1, exact in 8 bits.
+		if (a_triangles == 0 || a_corners.size() != static_cast<std::size_t>(a_triangles) * 6)
+			return false;
+		for (std::size_t t = 0; t < a_triangles; ++t) {
+			const std::uint32_t* in = a_corners.data() + t * 6;
+			std::uint32_t alphas = 0;
+			for (int c = 0; c < 3; ++c) {
+				const float a = std::bit_cast<float>(in[c * 2 + 1]);
+				const float clamped = std::isfinite(a) ? std::clamp(a, 0.0f, 1.0f) : 1.0f;
+				alphas |= static_cast<std::uint32_t>(std::lround(clamped * 255.0f)) << (8 * c);
+			}
+			const std::uint32_t packed[4] = { in[0], in[2], in[4], alphas };
+			std::copy_n(packed, 4, a_corners.data() + t * 4);  // t * 4 + 3 < t * 6 + 4 for t >= 0: never overwrites unread input
+		}
+		a_corners.resize(static_cast<std::size_t>(a_triangles) * 4);
+		return true;
 	}
 
 	void Backend::SetAlphaFault(std::string a_reason)
@@ -256,6 +277,7 @@ namespace RayTracingRT
 		AlphaTextureEntry entry;
 		entry.texture11 = a_texture;
 		entry.sourceSize = std::max(desc.Width, desc.Height);
+		entry.sourceMips = std::max(desc.MipLevels, 1u);  // (47q)
 
 		// A 256x256 alpha copy, made on D3D11 by RecordAlphaCopies.
 		if (!EnsureAlphaLayers())
@@ -405,6 +427,8 @@ namespace RayTracingRT
 		info.flags = 0;
 		info.threshold = std::clamp(finite(a_material.threshold, 0.5f), 0.0f, 1.0f);
 		info.alphaScale = std::clamp(finite(a_material.alphaScale, 1.0f), 0.0f, 4.0f);
+		info.textureSize = static_cast<float>(alphaTextures_[a_texture].sourceSize);  // (47q)
+		info.textureLevels = static_cast<float>(alphaTextures_[a_texture].sourceMips);
 		info.uvTransform[0] = finite(a_material.uvTransform[0], 0.0f);
 		info.uvTransform[1] = finite(a_material.uvTransform[1], 0.0f);
 		info.uvTransform[2] = finite(a_material.uvTransform[2], 1.0f);

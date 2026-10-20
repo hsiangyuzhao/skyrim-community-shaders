@@ -119,7 +119,7 @@ public:
 		// Quality "Custom": what the tiers set.
 		int CustomBaseRays = 1;
 		int CustomExtraRays = 1;
-		float CustomSunCone = 0.27f;        // degrees, half angle
+		// (47q) The sun's cone left the tiers / Custom: SunSize below (the CustomSunCone key is read once, for the migration).
 		float CustomFalloffStart = 4096.0f; // units
 		float CustomFalloffEnd = 12288.0f;
 		int CustomFarQuality = 0;           // beyond the fall-off end: 0 full, 1 checkerboard, 2 half
@@ -200,7 +200,9 @@ public:
 		// near / far result as the two segments; off = 46x). RTAO Half-Resolution Broad Term: the far part is traced on a checkerboard
 		// that alternates every frame (the filter fills the other half from the neighbours; off = 46x, default off).
 		float PointLightsSSPLSContact = 8.0f;
-		bool AOHalfResFar = false;  // the RTAO Custom tier's value ((47n) Single Long Ray always on: the AOSingleRay key is gone)
+		// (47q) AOBroadRate replaces AOHalfResFar (read once, for the migration): the RTAO Custom tier's broad (long) ray rate, 0 every
+		// pixel, 1 half (checkerboard swapped every frame), 2 one in four (each 2x2 block, rotating over 4 frames).
+		int AOBroadRate = 0;
 		// (47h) Outside the settings macro too. AOCharacterSelfFix "RTAO: Character Self-Occlusion Fix" (TraceAOCS kFlagSelfFix).
 		// SunDepthCheckTranslucent "Sun Shadow: Depth Check for Translucent Surfaces": a forward (blended) Lighting surface that is not
 		// the one in the depth buffer takes the cascades at its own position instead of the ray-traced screen mask (Lighting.hlsl).
@@ -232,6 +234,18 @@ public:
 		// animated leaves, bushes and branches are traced with the game's wind (a wind BLAS per mesh, posed and refit every frame).
 		// Off = 47k (frozen at their rest pose). No effect with Foliage = Shadow map.
 		bool FoliageSway = true;
+		// (47q) Outside the settings macro. SunSize "Shadow Edge Softness (sun size)": the sun's cone (degrees, half angle), a look slider
+		// outside the tiers and Custom (0.27 = the real sun). Saved before 47q (no key): the cone the tier in effect had (High / Ultra 0.5,
+		// the others 0.27, Custom its CustomSunCone), so nothing changes on screen.
+		float SunSize = 0.27f;
+		// (47q) The sun's Custom tier: NPCs beyond this distance (units, camera to actor) are traced with their merged body only (no physics
+		// parts, hair, cut-out parts; those keep the engine cascades) and refit every other frame. 0 = no limit (all parts, every frame).
+		float CustomNpcFullDistance = 3150.0f;
+		// (47q) Foliage sway: "Keep Leaves Moving on Long Frames". The game itself stops advancing the tree-leaf animation timers on any frame
+		// of 35 ms or more (under ~28.6 real fps, typical with frame generation): leaves on screen and their RT shadow freeze until the
+		// frames get shorter. On: for the swaying plants in reach, the frozen timers are advanced as the game would (each plant's own
+		// learned rate), before anything is drawn, so leaves, their shadow maps and the RT shadow keep moving. Off: as the game.
+		bool FoliageKeepMoving = true;
 	};
 	/// (46f) RTAO modes (Settings::AOMode); with RTAO off the AO is SSGI's, exactly as before.
 	enum class AOModeKind : int
@@ -387,6 +401,7 @@ private:
 		float farDenoiseScale = 1.0f;
 		float history = 12.0f;
 		float clampSigma = 1.5f;
+		float npcFullDistance = 0.0f;  // (47q) NPCs beyond it: body only, refit every other frame (0 = no limit)
 	};
 	QualityParams ResolveQuality() const;
 	void CopyTierToCustom(int a_tier);
@@ -396,17 +411,21 @@ private:
 		int k = 2, kInterior = 4, maxSources = 64;
 		float distance = 4000.0f;
 		bool alphaOutdoors = true;
+		bool player = true, effects = true;  // (47q) tier knobs (Custom: PointLightsPlayer / PointLightsEffects)
 	};
 	struct AOTierParams
 	{
 		int detailRays = 1;
 		float distance = 5000.0f;
-		bool halfResFar = true, fullResFilter = false, temporalV2 = true, smoothNormals = true;
+		int broadRate = 1;  // (47q) 0 every pixel, 1 half, 2 one in four
+		bool fullResFilter = false, temporalV2 = true, smoothNormals = true;
 	};
 	[[nodiscard]] PointTierParams ResolvePointTier() const;
 	[[nodiscard]] AOTierParams ResolveAOTier() const;
 	void CopyPointTierToCustom(int a_tier);
 	void CopyAOTierToCustom(int a_tier);
+	/// (47q) The NPC rule's distance: the sun tier's; with the sun Off the point-light tier's, then RTAO's (0 = no limit).
+	[[nodiscard]] float NpcFullDistance() const;
 	/// (47n) The sun's shadows are traced (Sun Shadows not "Off").
 	[[nodiscard]] bool SunOn() const { return settings.SunShadows; }
 	/// (47n) Ray Tracing has something to do: on, and at least one of sun / point lights / RTAO not "Off" (else: as switched off).
@@ -719,6 +738,10 @@ private:
 	bool windRequested = false;
 	std::string windOffReason;
 	void FillWind(RayTracingRT::FrameInput& a_input);
+	// (47q) Static chunks per cell / overlap (F7, F12): refreshed every 120 frames.
+	std::uint32_t chunkStatsFrame = UINT32_MAX;
+	std::uint32_t chunkStatsCells = 0;
+	float chunkStatsPerCell = 0.0f, chunkStatsOverlap = 0.0f;
 
 	// (46b) Point-light shadows.
 	struct alignas(16) PointDenoiseCB

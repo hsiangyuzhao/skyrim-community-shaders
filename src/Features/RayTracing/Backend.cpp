@@ -1097,7 +1097,7 @@ namespace RayTracingRT
 			alphaTable.ptr += static_cast<UINT64>(descriptorSize_) * (kAlphaDescriptorBase - 1);
 			list->SetComputeRootDescriptorTable(6, alphaTable);
 		}
-		list->Dispatch((a_input.renderWidth + 7) / 8, (a_input.renderHeight + 7) / 8, 1);
+		list->Dispatch((a_input.renderWidth + 15) / 16, (a_input.renderHeight + 7) / 8, 1);  // (47q) TraceAOCS 16 x 8, swizzled in the shader
 		if (timestampHeap_)
 			list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 1);
 		D3D12_RESOURCE_BARRIER post[3] = {
@@ -1806,11 +1806,11 @@ namespace RayTracingRT
 	{
 		if (!ready_ || !a_geometry || a_geometry->Triangles() == 0)
 			return kInvalidBlas;
-		// (45h) An alpha BLAS keeps its texcoords (3 corners per triangle) in the shared buffer.
+		// (45h) An alpha BLAS keeps its texcoords in the shared buffer ((47q) packed: 2 entries of 8 bytes per triangle).
 		std::uint32_t uvOffset = UINT32_MAX, uvCount = 0;
 		if (!a_geometry->Opaque()) {
-			uvCount = a_geometry->Triangles() * 3;
-			if (a_geometry->alphaUV.size() != static_cast<std::size_t>(uvCount) * 2 || !AlphaAvailable() || !AllocateAlphaUv(uvCount, uvOffset))
+			uvCount = a_geometry->Triangles() * 2;
+			if (!PackAlphaCorners(a_geometry->alphaUV, a_geometry->Triangles()) || !AlphaAvailable() || !AllocateAlphaUv(uvCount, uvOffset))
 				return kInvalidBlas;
 		}
 		const BlasHandle handle = AllocateHandle();
@@ -2255,9 +2255,50 @@ namespace RayTracingRT
 		}
 		const double extent = std::max({ a_instance.expectMax[0] - a_instance.expectMin[0], a_instance.expectMax[1] - a_instance.expectMin[1],
 			a_instance.expectMax[2] - a_instance.expectMin[2] });
-		const double margin = 64.0 + extent * 0.05;
+		double margin = 64.0 + extent * 0.05;
+		// (47q) A wind BLAS's box is its rest box grown by its sway's reach (1.1 x |amplitude|): the game's leaves sway that far out of the
+		// engine's rest bounds too.
+		if (a_blas.wind != UINT32_MAX && a_blas.wind < winds_.size() && winds_[a_blas.wind].live)
+			margin += 1.1 * std::abs(static_cast<double>(winds_[a_blas.wind].meanAmplitude));
 		if (!empty && worst <= margin)
 			return;
+		// (47q) The world box of a rotated local box is larger than the shape: a rotated tree (trunk or leaves, frozen or swaying) stuck
+		// out of the engine's box by up to ~40 % of its size (47p log: 150-435 units, every one far beyond the sway radius). Checked again
+		// in the BLAS's own space: the engine's box taken there (its 8 corners through the inverse transform) must hold the BLAS box. A
+		// misplaced instance fails both.
+		if (!empty) {
+			const double m[3][3] = { { a_desc.Transform[0][0], a_desc.Transform[0][1], a_desc.Transform[0][2] },
+				{ a_desc.Transform[1][0], a_desc.Transform[1][1], a_desc.Transform[1][2] }, { a_desc.Transform[2][0], a_desc.Transform[2][1], a_desc.Transform[2][2] } };
+			const double det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+			                   m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+			if (std::abs(det) > 1e-12 && std::isfinite(det)) {
+				const double inv[3][3] = {
+					{ (m[1][1] * m[2][2] - m[1][2] * m[2][1]) / det, (m[0][2] * m[2][1] - m[0][1] * m[2][2]) / det, (m[0][1] * m[1][2] - m[0][2] * m[1][1]) / det },
+					{ (m[1][2] * m[2][0] - m[1][0] * m[2][2]) / det, (m[0][0] * m[2][2] - m[0][2] * m[2][0]) / det, (m[0][2] * m[1][0] - m[0][0] * m[1][2]) / det },
+					{ (m[1][0] * m[2][1] - m[1][1] * m[2][0]) / det, (m[0][1] * m[2][0] - m[0][0] * m[2][1]) / det, (m[0][0] * m[1][1] - m[0][1] * m[1][0]) / det },
+				};
+				double localMin[3] = { DBL_MAX, DBL_MAX, DBL_MAX }, localMax[3] = { -DBL_MAX, -DBL_MAX, -DBL_MAX };
+				for (int corner = 0; corner < 8; ++corner) {
+					const double w[3] = { (corner & 1) ? a_instance.expectMax[0] : a_instance.expectMin[0], (corner & 2) ? a_instance.expectMax[1] : a_instance.expectMin[1],
+						(corner & 4) ? a_instance.expectMax[2] : a_instance.expectMin[2] };
+					const double d[3] = { w[0] - camera[0] - a_desc.Transform[0][3], w[1] - camera[1] - a_desc.Transform[1][3], w[2] - camera[2] - a_desc.Transform[2][3] };
+					for (int r = 0; r < 3; ++r) {
+						const double l = inv[r][0] * d[0] + inv[r][1] * d[1] + inv[r][2] * d[2];
+						localMin[r] = std::min(localMin[r], l);
+						localMax[r] = std::max(localMax[r], l);
+					}
+				}
+				const double scale = std::cbrt(std::abs(det));
+				const double localMargin = margin / std::max(scale, 1e-6);
+				double localWorst = 0.0;
+				for (int a = 0; a < 3; ++a) {
+					localWorst = std::max(localWorst, localMin[a] - static_cast<double>(a_blas.boundsMin[a]));
+					localWorst = std::max(localWorst, static_cast<double>(a_blas.boundsMax[a]) - localMax[a]);
+				}
+				if (localWorst <= localMargin)
+					return;
+			}
+		}
 		const auto category = std::min<std::uint32_t>(a_instance.category, kInstanceCategories - 1);
 		++check_.mismatched[category];
 		++check_.mismatchedTotal;

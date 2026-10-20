@@ -1237,6 +1237,22 @@ namespace RayTracingCharacters
 					if (actor->ref.get() == reference)
 						actor->scanUntil = frame_ + kEquipScanFrames;
 		}
+		// (47q) The NPC rule: body only beyond the distance (hysteresis both ways); the player never.
+		stats_.bodyOnlyActors = stats_.refitsSkipped = 0;
+		for (auto& actor : actors_) {
+			if (actor->player || !(bodyOnlyDistance_ > 0.0f)) {
+				actor->bodyOnly = false;
+				continue;
+			}
+			const float d = std::sqrt(eye.GetSquaredDistance(actor->ref->GetPosition()));
+			if (!std::isfinite(d))
+				continue;
+			if (!actor->bodyOnly && d > bodyOnlyDistance_ + kBodyOnlyHysteresis)
+				actor->bodyOnly = true;
+			else if (actor->bodyOnly && d < bodyOnlyDistance_ - kBodyOnlyHysteresis)
+				actor->bodyOnly = false;
+			stats_.bodyOnlyActors += actor->bodyOnly ? 1 : 0;
+		}
 		stats_.candidatesMs = msSince(start);
 
 		// 3a. (46m) The per-actor reads (shapes, bone matrices) on the read lanes, joined here: the engine's nodes are only
@@ -1329,11 +1345,22 @@ namespace RayTracingCharacters
 		const std::int64_t commitStart = Qpc();
 		stillReused_ = 0;
 		for (auto& actor : actors_) {
+			// (47q) A body-only NPC on its off frame (every other frame, staggered by its serial): its merged body keeps last frame's skinned
+			// pose (moved with the actor's root), no skinning, no refit. Explicit user exception (2026-10-20) for distant NPCs only.
+			const bool offFrame = actor->bodyOnly && ((frame_ + actor->serial) & 1u) != 0u;
+			bool skipped = false;
 			for (auto& shape : actor->shapes) {
 				shape->reuse = false;
 				if (!shape->freshOk)
 					continue;  // not read (captured this frame: read at capture; or a bad read: the last ones)
 				shape->freshOk = false;
+				if (offFrame && shape->BodyPart() && shape->drawable && !shape->matrices.empty() && shape->fresh.size() == shape->matrices.size() &&
+					a_backend.IsSkinShapeReady(shape->handle)) {
+					std::copy_n(actor->origin, 3, shape->origin);
+					shape->reuse = true;
+					skipped = skipped || std::memcmp(shape->fresh.data(), shape->matrices.data(), shape->fresh.size() * sizeof(float)) != 0;
+					continue;
+				}
 				// (45n) Still pose: bit-identical to the matrices of last frame's draw (drawable then, so
 				// skinned with them or itself reused from identical ones): last frame's skinned BLAS is
 				// exact. The matrices are relative to the origin, which still moves the instance.
@@ -1352,6 +1379,7 @@ namespace RayTracingCharacters
 					++stillReused_;
 				}
 			}
+			stats_.refitsSkipped += skipped ? 1 : 0;
 		}
 		stats_.commitMs = msSince(commitStart);
 
@@ -1374,7 +1402,10 @@ namespace RayTracingCharacters
 			const bool stale = !(position.GetSquaredDistance(translate) <= kStaleDistance * kStaleDistance) ||
 			                   (actor->player && firstPerson && !firstPersonPlayer_);
 			for (auto& shape : actor->shapes) {
-				if (stale) {
+				// (47q) A body-only NPC's physics parts, hair and cut-out parts: back to the engine cascades and out of the TLAS (as a stale
+				// skeleton's: still traced this frame if they had left the cascades, so no frame without their shadow).
+				const bool excluded = actor->bodyOnly && !shape->BodyPart();
+				if (stale || excluded) {
 					if (shape->registered) {
 						RayTracingCasterFilter::Remove(shape->geometry.get());
 						shape->registered = false;

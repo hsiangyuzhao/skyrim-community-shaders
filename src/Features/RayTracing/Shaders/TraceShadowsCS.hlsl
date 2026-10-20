@@ -56,6 +56,9 @@ static const uint kFlagRtSurface = 512u;       // Output.w bit kOutRtSurface: th
 static const uint kFlagBlockerEdges = 1024u;   // blocker distance from a closest hit only at shadow edges (first extra ray); elsewhere any-hit t
 static const uint kFlagCharCull = 2048u;       // the character ray only where the sun ray passes a character's bounding sphere
 static const uint kFlagFalloff = 4096u;        // fewer rays and a coarser pattern with distance (Extra.yzw)
+// (47q) The point-light pass reuses this pass's surface probe: Output.w kOutProbed / kOutRtSurfaceRaw = the probe as the point pass
+// would make it (the depth normal, before the stable-normal override; never dilated).
+static const uint kFlagProbeShare = 8192u;
 static const uint kPatternFull = 0u, kPatternChecker = 1u, kPatternHalf = 2u;
 static const uint kPatternNpcReduced = 16u;    // Extra.w bit: no adaptive extra character rays against other actors
 // Output.w (45j): bit flags as unorm8 (value / 255).
@@ -65,6 +68,8 @@ static const uint kOutRtSurface = 4u;          // (45k) the visible surface is a
 static const uint kOutExtraRays = 8u;          // (45k) adaptive extra rays were traced here
 static const uint kOutCharRay = 16u;            // (45l) the character ray was traced here (debug view Character Rays)
 static const uint kOutFilled = 32u;             // (45l) not traced this frame (pattern): filled from its neighbours
+static const uint kOutProbed = 64u;             // (47q) kFlagProbeShare: the surface probe ran here ...
+static const uint kOutRtSurfaceRaw = 128u;      // (47q) ... and found a traced caster (undilated, depth normal)
 static const float kBlockerRange = 4096.0;     // (45k) Output.z = sqrt(t / range), 0 = no blocker
 #if defined(RT_CHARACTERS)
 static const uint kFlagFirstPerson = 4u;             // (45i) player in first person: no character ray for near pixels
@@ -130,18 +135,20 @@ static const float kAlphaTextureWorld = 128.0;   // assumed world size of one te
 
 struct AlphaInfo
 {
-	uint UvBase;         // first corner of triangle 0 in AlphaUVs (3 per triangle)
+	uint UvBase;         // first entry of triangle 0 in AlphaUVs ((47q) 2 per triangle)
 	uint Triangles;
 	uint Texture;        // bindless slot, or kAlphaFallbackBit | layer of AlphaLayers
 	uint Flags;
 	float Threshold;     // keep when alpha >= threshold
 	float AlphaScale;    // material alpha
-	float2 Pad;
+	float TextureSize;   // (47q) the bindless texture's larger side and mip count (instead of GetDimensions; unused for copy layers)
+	float TextureLevels;
 	float4 UvTransform;  // xy offset, zw scale (the material's texcoord offset / scale)
 };
 
 StructuredBuffer<AlphaInfo> AlphaInfos : register(t2);
-StructuredBuffer<uint2> AlphaUVs : register(t3);   // x = half2 texcoord, y = vertex alpha (float bits)
+// (47q) Per triangle two entries: (uv0, uv1), (uv2, vertex alpha 0 | 1 << 8 | 2 << 16, 8 bits each); uv = half2 texcoord.
+StructuredBuffer<uint2> AlphaUVs : register(t3);
 Texture2DArray<float> AlphaLayers : register(t4);  // 256x256 alpha copies of textures D3D12 cannot open
 Texture2D<float4> AlphaTextures[kAlphaTextureSlots] : register(t0, space1);
 SamplerState AlphaSampler : register(s0);
@@ -160,13 +167,13 @@ bool AlphaBlocks(uint instanceID, uint primitive, float2 bary, float footprint)
 	const AlphaInfo info = AlphaInfos[instanceID - 1u];
 	if (primitive >= info.Triangles)
 		return true;
-	const uint base = info.UvBase + primitive * 3u;
+	const uint base = info.UvBase + primitive * 2u;
 	const uint2 c0 = AlphaUVs[base];
 	const uint2 c1 = AlphaUVs[base + 1u];
-	const uint2 c2 = AlphaUVs[base + 2u];
 	const float w0 = 1.0 - bary.x - bary.y;
-	float2 uv = UnpackTexcoord(c0.x) * w0 + UnpackTexcoord(c1.x) * bary.x + UnpackTexcoord(c2.x) * bary.y;
-	const float vertexAlpha = asfloat(c0.y) * w0 + asfloat(c1.y) * bary.x + asfloat(c2.y) * bary.y;
+	float2 uv = UnpackTexcoord(c0.x) * w0 + UnpackTexcoord(c0.y) * bary.x + UnpackTexcoord(c1.x) * bary.y;
+	const float3 cornerAlpha = float3(uint3(c1.y, c1.y >> 8u, c1.y >> 16u) & 0xFFu) / 255.0;
+	const float vertexAlpha = cornerAlpha.x * w0 + cornerAlpha.y * bary.x + cornerAlpha.z * bary.y;
 	uv = uv * info.UvTransform.zw + info.UvTransform.xy;
 	if (!all(isfinite(uv)))
 		return true;
@@ -185,10 +192,8 @@ bool AlphaBlocks(uint instanceID, uint primitive, float2 bary, float footprint)
 	}
 	else
 	{
-		uint width, height, levels;
-		AlphaTextures[NonUniformResourceIndex(info.Texture)].GetDimensions(0u, width, height, levels);
-		const float size = float(max(width, height));
-		const float maxLod = clamp(log2(size / minTexels), 0.0, max(float(levels) - 1.0, 0.0));
+		const float size = info.TextureSize;
+		const float maxLod = clamp(log2(size / minTexels), 0.0, max(info.TextureLevels - 1.0, 0.0));
 		lod = clamp(log2(size * footprintUV) + 0.5, 0.0, maxLod);
 		alpha = AlphaTextures[NonUniformResourceIndex(info.Texture)].SampleLevel(AlphaSampler, uv, lod).a;
 	}
@@ -459,6 +464,7 @@ groupshared float gsT[64];
 	float hitDelta = 0.5;
 	float dist = 0.0;
 	float3 N = float3(0, 0, 1);
+	float3 Nd = float3(0, 0, 1);  // (47q) the depth normal before the stable-normal override (the point pass's normal)
 	float3 V = float3(0, 0, 1);
 	bool rtSurface = false;
 	bool traced = false;
@@ -496,6 +502,7 @@ groupshared float gsT[64];
 		N = nLen > 1e-12 ? N / nLen : V;
 		if (dot(N, V) < 0.0)
 			N = -N;
+		Nd = N;
 		// (45j, kFlagStableNormal) A pixel whose neighbours on one axis BOTH jump in distance (a thin
 		// leaf, a blade, the silhouette of a branch) has no usable depth normal: the one picked flips
 		// with the jitter from frame to frame. The view direction is used there instead.
@@ -566,8 +573,16 @@ groupshared float gsT[64];
 
 		// (45k) Screen Space Shadows "non-RT casters only": is this surface a traced caster?
 		// (45l) Pixels not traced this frame take it from their neighbours (the dilation below).
-		if ((flags & kFlagRtSurface) && active)
+		if ((flags & kFlagRtSurface) && active) {
 			rtSurface = SurfaceProbe(P, V, N, dist);
+			// (47q, kFlagProbeShare) The probe as the point pass makes it (its normal is the depth normal): the same result unless the
+			// stable-normal override changed N here (depth edges), then probed again with Nd.
+			[branch] if (flags & kFlagProbeShare)
+			{
+				const bool raw = all(N == Nd) ? rtSurface : SurfaceProbe(P, V, Nd, dist);
+				outFlags |= kOutProbed | (raw ? kOutRtSurfaceRaw : 0u);
+			}
+		}
 
 		skipped = (flags & kFlagSkipShadowed) && dm < 0.0;
 		filled = !skipped && !active;

@@ -292,6 +292,10 @@ namespace RayTracingWind
 		const void* key = node ? static_cast<const void*>(node) : static_cast<const void*>(a_pass->geometry);
 		if (g_sampled.contains(key) || frame != g_globalsFrame || !g_globals.valid)
 			return;
+		// (47q) Only plants with this frame's Early Prep value (they have a wind BLAS): 47p sampled the first 32 tree draws after the
+		// load, before any plant had one, and logged "match 0 of 0".
+		if (!node || !g_early.contains(node) || g_early[node].frame != frame)
+			return;
 		float tree[4], timers[2];
 		if (!ReadConstants(tree, timers))
 			return;
@@ -337,5 +341,29 @@ namespace RayTracingWind
 	{
 		std::scoped_lock lock(g_mutex);
 		return g_stats;
+	}
+
+	bool ReadTimer(const RE::NiNode* a_node, float& o_timer)
+	{
+		if (!a_node || !Available())
+			return false;
+		__try {
+			o_timer = *reinterpret_cast<const float*>(reinterpret_cast<std::uintptr_t>(a_node) + kNodeTimer);
+			return std::isfinite(o_timer);
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
+	bool WriteTimer(RE::NiNode* a_node, float a_timer)
+	{
+		if (!a_node || !Available() || !std::isfinite(a_timer))
+			return false;
+		__try {
+			*reinterpret_cast<float*>(reinterpret_cast<std::uintptr_t>(a_node) + kNodeTimer) = a_timer;
+			return true;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
 	}
 }

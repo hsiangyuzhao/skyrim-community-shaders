@@ -126,6 +126,10 @@ namespace RayTracingScene
 		std::uint32_t released = 0;     // released this frame (left the radius)
 		std::uint32_t poses = 0;        // poses set this frame (Early Prep / the trace frame)
 		std::uint32_t poseFaults = 0;   // ... refused (node unreadable: the last pose kept)
+		// (47q) Keep Leaves Moving on Long Frames: leaf nodes this frame whose timer the game left frozen (a long frame) and that were advanced
+		// here (each at its learned rate), and those frozen without a learned rate yet (left as they were).
+		std::uint32_t catchups = 0;
+		std::uint32_t frozenUnlearned = 0;
 		float radius = 0.0f;            // this frame's sway radius (units)
 	};
 
@@ -391,6 +395,11 @@ namespace RayTracingScene
 			}
 		}
 
+		/// (47q) Statistic only (no re-chunking): the captured cells (exterior), their chunk BLASes per cell on average, and how much the
+		/// chunks of a cell overlap: the summed volume of every pair's box intersection over the summed box volumes (0 = disjoint; the
+		/// boxes are the BLASes' local vertex boxes, all in their cell's frame).
+		void ChunkOverlapStats(const RayTracingRT::Backend& a_backend, std::uint32_t& o_cells, float& o_chunksPerCell, float& o_overlap) const;
+
 		/// (46c) Interiors: whether the player's interior cell may be captured (Ray Tracing's point lights indoors).
 		/// Off: Update drops an interior capture (and never starts one), as before 46c.
 		void SetInteriorEnabled(bool a_enabled) { interiorEnabled_ = a_enabled; }
@@ -430,7 +439,9 @@ namespace RayTracingScene
 		[[nodiscard]] const WindSceneStats& GetWindStats() const { return windStats_; }
 		/// (47n) This frame's pose of every wind BLAS (each plant's own wind, RayTracingWind::Evaluate), once per frame per BLAS:
 		/// Early Prep (before the frame's prep list), and again before the trace frame for BLASes made since. Render thread.
-		void UpdateWindPoses(RayTracingRT::Backend& a_backend, std::uint32_t a_frame);
+		/// (47q) a_keepMoving: "Keep Leaves Moving on Long Frames" (a_dt = this frame's game time step, seconds): leaf timers the game
+		/// left frozen on a long frame are advanced at their learned rate before the poses are read (the frame's draws see it too).
+		void UpdateWindPoses(RayTracingRT::Backend& a_backend, std::uint32_t a_frame, bool a_keepMoving = false, float a_dt = 0.0f);
 
 	private:
 		// (45e) Objects: one BLAS per distinct engine mesh (in the shape's own space), one TLAS
@@ -626,6 +637,16 @@ namespace RayTracingScene
 		WindSceneStats windStats_{};
 		std::uint32_t windNewSourcesThisFrame_ = 0, windNewInstancesThisFrame_ = 0;
 		std::uint32_t windPoseStatsFrame_ = UINT32_MAX;
+		// (47q) Keep Leaves Moving on Long Frames: per leaf node the timer after this frame (ours if we advanced it), the game's advance per
+		// second of game time learned on the frames it did advance it, and the frame of the last visit (one visit per node per frame).
+		struct WindClock
+		{
+			float last = 0.0f;
+			float rate = 0.0f;
+			std::uint32_t frame = UINT32_MAX;
+			std::uint32_t learned = 0;
+		};
+		ankerl::unordered_dense::map<const RE::NiNode*, WindClock> windClocks_;
 		std::uint32_t windPauseUntil_ = 0;  // (47n) the wind VRAM budget was hit: no new wind BLAS before this frame
 		static constexpr std::uint32_t kWindBudgetPauseFrames = 120;
 		bool windWasOn_ = false;          // the last UpdateWind ran with sway on (off: every shape's wind state is reset once)
