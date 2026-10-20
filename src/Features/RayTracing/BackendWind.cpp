@@ -481,7 +481,7 @@ namespace RayTracingRT
 			inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
 			inputs.pGeometryDescs = descs;
 			D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info{};
-			device_->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &info);
+			PrebuildBlas(inputs, WindOmm(a_mesh, a_layout), info);  // (47t) with the layout's OMM array
 			if (info.ResultDataMaxSizeInBytes == 0 || info.ScratchDataSizeInBytes == 0)
 				return false;
 			o_blas = WindAlign(info.ResultDataMaxSizeInBytes, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
@@ -656,7 +656,7 @@ namespace RayTracingRT
 				buildDesc.Inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
 				buildDesc.SourceAccelerationStructureData = buildDesc.DestAccelerationStructureData;  // in place
 			}
-			a_list->BuildRaytracingAccelerationStructure(&buildDesc, 0, nullptr);
+			RecordBlasBuild(a_list, buildDesc, 0, nullptr, WindOmm(a_mesh, a_mesh.layout));  // (47t) the layout's OMM array, refits too
 		};
 
 		// 1. First builds at the mean pose: posed vertices (UAV), then read by the builds (non-pixel shader resource).

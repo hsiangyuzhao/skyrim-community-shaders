@@ -268,6 +268,11 @@ public:
 		// fully see-through ones are left out, only the rest is tested per ray as before. Sun, point lights and RTAO. Exact for every
 		// alpha-tested ray. Off = 47r exactly.
 		bool AlphaClassify = true;
+		// (47t) OpacityMicromaps "Opacity Micromaps (RTX 40)": with Alpha Classify, each still-tested triangle is also cut into up to 256
+		// micro-triangles sorted the same way (NVAPI opacity micromaps, 4-state): the graphics card itself skips the see-through ones and
+		// stops at the solid ones; only the undecided ones come back to the texture test. Needs the driver's OMM support (in effect only
+		// then). Exact for every alpha-tested ray. Off = 47s exactly.
+		bool OpacityMicromaps = true;
 	};
 	/// (46f) RTAO modes (Settings::AOMode); with RTAO off the AO is SSGI's, exactly as before.
 	enum class AOModeKind : int

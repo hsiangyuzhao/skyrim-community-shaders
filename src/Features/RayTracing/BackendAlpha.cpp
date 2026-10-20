@@ -545,6 +545,7 @@ namespace RayTracingRT
 		alphaStats_.uvBytes = alphaStats_.uvBytesUsed = alphaStats_.layerBytes = 0;
 		// (47s) Alpha Classify: no record left, so no variant either; its bake buffers go too (behind the fence).
 		bakeQueue_.clear();
+		ommBuildQueue_.clear();  // (47t)
 		variantUploads_.clear();
 		if (bakeReadback_ && bakeMapped_)
 			bakeReadback_->Unmap(0, nullptr);

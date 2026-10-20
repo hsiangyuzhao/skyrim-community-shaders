@@ -1379,6 +1379,7 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.PointProbeShareAll = read("PointProbeShareAll", defaults.PointProbeShareAll);
 		settings.FoliageLearnAnyFrame = read("FoliageLearnAnyFrame", defaults.FoliageLearnAnyFrame);
 		settings.AlphaClassify = read("AlphaClassify", defaults.AlphaClassify);  // (47s)
+		settings.OpacityMicromaps = read("OpacityMicromaps", defaults.OpacityMicromaps);  // (47t)
 		const float sunSize = read("SunSize", -1.0f);
 		if (sunSize >= 0.0f) {
 			settings.SunSize = sunSize;
@@ -1496,6 +1497,7 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["PointProbeShareAll"] = settings.PointProbeShareAll;
 	o_json["FoliageLearnAnyFrame"] = settings.FoliageLearnAnyFrame;
 	o_json["AlphaClassify"] = settings.AlphaClassify;  // (47s)
+	o_json["OpacityMicromaps"] = settings.OpacityMicromaps;  // (47t)
 	o_json["AOSmoothNormals"] = settings.AOSmoothNormals;  // (47j)
 	o_json["AOTemporalV2"] = settings.AOTemporalV2;  // (47l)
 	o_json["FoliageSway"] = settings.FoliageSway;  // (47l)
@@ -2205,6 +2207,7 @@ void RayTracing::RunEarlyPrep()
 		input.skinUploadCpuMs = blackScreen ? kBlackSkinUploadCpuMs : 0.0f;
 		FillWind(input);  // (47l)
 		backend.SetAlphaClassify(settings.AlphaClassify);  // (47s)
+		backend.SetOpacityMicromaps(settings.OpacityMicromaps);  // (47t)
 		earlyThisFrame = backend.PrepareFrame(input);
 		if (!earlyThisFrame && backend.HasFailed())
 			Disable(Status::Failed, backend.LastError());
@@ -2776,6 +2779,14 @@ void RayTracing::PublishCpuSplit()
 			detail.acBakeTriangles = static_cast<int>(cs.bakeTrianglesLastFrame);
 			detail.acBakeGpuMs = cs.lastBakeGpuMs;
 			detail.acVramMb = static_cast<float>(static_cast<double>(cs.bytes + cs.bakeBufferBytes) / (1024.0 * 1024.0));
+			// (47t) Opacity Micromaps (-1 = off / not available).
+			if (backend.OpacityMicromapsOn()) {
+				detail.ommArrays = static_cast<int>(cs.ommArrays);
+				detail.ommMicro = static_cast<std::int64_t>(cs.ommMicroTriangles);
+				detail.ommKnownPct = cs.ommMicroTriangles > 0 ? static_cast<float>(100.0 * static_cast<double>(cs.ommKnownMicro) / static_cast<double>(cs.ommMicroTriangles)) : 0.0f;
+				detail.ommVramMb = static_cast<float>(static_cast<double>(cs.ommBytes + cs.ommInputBytes) / (1024.0 * 1024.0));
+				detail.ommBakeGpuMs = cs.lastOmmBakeGpuMs;
+			}
 		}
 		// (47q) The NPC rule and tiny face parts (characters traced), static chunks (a statistic, refreshed every 120 frames).
 		if (settings.Characters && backend.SkinAvailable()) {
@@ -3359,6 +3370,7 @@ void RayTracing::RunFrame()
 	const std::int64_t executeStart = Qpc();
 	cpuLast.d3d11 = static_cast<float>(static_cast<double>(executeStart - d3d11Start) * QpcMs());
 	backend.SetAlphaClassify(settings.AlphaClassify);  // (47s)
+	backend.SetOpacityMicromaps(settings.OpacityMicromaps);  // (47t)
 	const bool traced = backend.ExecuteFrame(input);
 	const std::int64_t executeEnd = Qpc();
 	cpuLast.execute = static_cast<float>(static_cast<double>(executeEnd - executeStart) * QpcMs());
@@ -3619,6 +3631,7 @@ void RayTracing::RunNoSunFrame(ID3D11ShaderResourceView* a_depth, ID3D11ShaderRe
 	const std::int64_t executeStart = Qpc();
 	cpuLast.d3d11 = static_cast<float>(static_cast<double>(executeStart - d3d11Start) * QpcMs());
 	backend.SetAlphaClassify(settings.AlphaClassify);  // (47s)
+	backend.SetOpacityMicromaps(settings.OpacityMicromaps);  // (47t)
 	const bool traced = backend.ExecuteFrame(input);
 	cpuLast.execute = static_cast<float>(static_cast<double>(Qpc() - executeStart) * QpcMs());
 	if (!traced && backend.HasFailed()) {
@@ -5620,6 +5633,7 @@ void RayTracing::RunInteriorFrame()
 	const std::int64_t executeStart = Qpc();
 	cpuLast.d3d11 = static_cast<float>(static_cast<double>(executeStart - d3d11Start) * QpcMs());
 	backend.SetAlphaClassify(settings.AlphaClassify);  // (47s)
+	backend.SetOpacityMicromaps(settings.OpacityMicromaps);  // (47t)
 	const bool traced = backend.ExecuteFrame(input);
 	cpuLast.execute = static_cast<float>(static_cast<double>(Qpc() - executeStart) * QpcMs());
 	if (!traced && backend.HasFailed()) {
@@ -6231,6 +6245,32 @@ void RayTracing::DrawObjectRows()
 				static_cast<double>(cs.bytes + cs.bakeBufferBytes) / (1024.0 * 1024.0), std::max(cs.lastBakeGpuMs, 0.0f));
 		}
 	}
+	// (47t) Opacity Micromaps (NVAPI, RTX 40), on top of Alpha Classify.
+	{
+		const bool available = backend.OpacityMicromapsAvailable();
+		ImGui::Indent();
+		ImGui::BeginDisabled(!settings.AlphaClassify || !available);
+		ImGui::Checkbox("Opacity Micromaps (RTX 40)", &settings.OpacityMicromaps);
+		ImGui::EndDisabled();
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default where the driver supports it): every triangle Alpha Classify still tests per ray is also cut into up to 256");
+			ImGui::Text("  small pieces, each sorted the same way. The graphics card itself then skips the see-through pieces and stops at the");
+			ImGui::Text("  solid ones; only the pieces along a leaf's edge come back to the texture test. Same shadows, less work in foliage.");
+			ImGui::Text("  Needs Alpha Classify and an RTX 40 (or newer) card with its driver's support. Sorting after a load takes longer.");
+			ImGui::Text("Off: exactly as 47s. F7: rt_omm_* columns.");
+		}
+		if (!available) {
+			ImGui::TextDisabled("Not available: the driver reports no Opacity Micromap support (see the log).");
+		} else if (settings.AlphaClassify && settings.OpacityMicromaps) {
+			const auto& cs = backend.GetAlphaClassifyStats();
+			const double known = cs.ommMicroTriangles > 0 ? 100.0 * static_cast<double>(cs.ommKnownMicro) / static_cast<double>(cs.ommMicroTriangles) : 0.0;
+			ImGui::TextDisabled("%u meshes with micromaps; %llu tested triangles cut, %.0f%% of their pieces decided by the card", cs.ommArrays,
+				static_cast<unsigned long long>(cs.ommTriangles), known);
+			ImGui::TextDisabled("%.1f MB video memory (+%.1f MB waiting); last sort with micromaps %.2f ms", static_cast<double>(cs.ommBytes) / (1024.0 * 1024.0),
+				static_cast<double>(cs.ommInputBytes) / (1024.0 * 1024.0), std::max(cs.lastOmmBakeGpuMs, 0.0f));
+		}
+		ImGui::Unindent();
+	}
 	ImGui::TreePop();
 }
 
@@ -6803,7 +6843,8 @@ void RayTracing::DrawDiagnostics()
 	const std::uint64_t vram = rt.blasBytes + rt.scratchBytes + rt.tlasBytes + rt.uploadBytes + rt.sharedTextureBytes + d3d11Bytes +
 	                           alphaBytes.uvBytes + alphaBytes.layerBytes + alphaBytes.infoBytes +
 	                           backend.GetSkinStats().bytes + backend.GetSkinStats().scratchBytes + backend.GetSkinStats().boneBytes +
-	                           backend.GetAlphaClassifyStats().bakeBufferBytes;  // (47s)
+	                           backend.GetAlphaClassifyStats().bakeBufferBytes +  // (47s)
+	                           backend.GetAlphaClassifyStats().ommBytes + backend.GetAlphaClassifyStats().ommInputBytes;  // (47t)
 
 	// Summary for players: where the settings are, what is on, what it costs.
 	ImGui::TextWrapped("The settings are on the Sun Shadows, Point Light Shadows and Ambient Occlusion pages (below this one in the list).");
@@ -7165,6 +7206,11 @@ std::string RayTracing::DescribeForProfile() const
 	// (47s)
 	text += std::format(", alpha classify {}{}", settings.AlphaClassify ? "on" : "off",
 		settings.AlphaClassify && !backend.AlphaClassifyAvailable() ? " (not available: the sort shader was rejected)" : "");
+	// (47t)
+	text += std::format(", opacity micromaps {}{}", settings.OpacityMicromaps ? "on" : "off",
+		settings.OpacityMicromaps && !backend.OpacityMicromapsOn() ?
+			(backend.OpacityMicromapsAvailable() ? " (not in effect: Alpha Classify off)" : " (not available: no driver support)") :
+			"");
 	return text;
 }
 
@@ -7255,6 +7301,12 @@ nlohmann::json RayTracing::DescribeJson() const
 			{ "forced_non_opaque_last_frame", cs.forcedNonOpaqueLastFrame }, { "bakes_total", cs.bakesTotal }, { "bake_triangles_total", cs.bakeTrianglesTotal },
 			{ "last_bake_gpu_ms", cs.lastBakeGpuMs }, { "rejected_bakes", cs.rejected }, { "vram_mb", static_cast<double>(cs.bytes) / (1024.0 * 1024.0) },
 			{ "bake_buffer_mb", static_cast<double>(cs.bakeBufferBytes) / (1024.0 * 1024.0) }, { "cpu_mb", static_cast<double>(cs.cpuBytes) / (1024.0 * 1024.0) } };
+		// (47t) Opacity Micromaps.
+		j["opacity_micromaps"] = { { "enabled", settings.OpacityMicromaps }, { "available", backend.OpacityMicromapsAvailable() },
+			{ "in_effect", backend.OpacityMicromapsOn() }, { "arrays", cs.ommArrays }, { "triangles", cs.ommTriangles }, { "micro_triangles", cs.ommMicroTriangles },
+			{ "known_micro_triangles", cs.ommKnownMicro }, { "vram_mb", static_cast<double>(cs.ommBytes) / (1024.0 * 1024.0) },
+			{ "waiting_input_mb", static_cast<double>(cs.ommInputBytes) / (1024.0 * 1024.0) }, { "builds_total", cs.ommBuildsTotal },
+			{ "gave_up", cs.ommFailed }, { "last_bake_gpu_ms", cs.lastOmmBakeGpuMs } };
 	}
 	// (46b)
 	{

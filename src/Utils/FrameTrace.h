@@ -199,6 +199,11 @@ namespace Util::FrameTrace
 		int64_t acOpaque = -1, acDropped = -1, acMixed = -1;
 		int acInstances = -1, acWaiting = -1, acBakeTriangles = -1;
 		float acBakeGpuMs = -1.0f, acVramMb = -1.0f;
+		// (47t) Opacity Micromaps (-1 = off / not available): meshes with an OMM array, micro-triangles in use and the share of them the
+		// hardware decides (%), their video memory (MB, + the bake output waiting for its array), GPU ms of the last bake with OMM data.
+		int ommArrays = -1;
+		int64_t ommMicro = -1;
+		float ommKnownPct = -1.0f, ommVramMb = -1.0f, ommBakeGpuMs = -1.0f;
 	};
 	void OnRayTracingDetail(const RayTracingDetail& a_detail);
 

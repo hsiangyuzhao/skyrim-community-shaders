@@ -39,6 +39,25 @@ namespace RayTracingRT
 {
 	using Microsoft::WRL::ComPtr;
 
+	/// (47t) Opacity Micromaps: how many OMMs of a subdivision level an OMM array / a geometry holds (the layout of
+	/// NVAPI_D3D12_RAYTRACING_OPACITY_MICROMAP_USAGE_COUNT; 4-state OC1 only).
+	struct OmmUsage
+	{
+		std::uint32_t count = 0;
+		std::uint32_t level = 0;
+		std::uint32_t format = 2;  // NVAPI_D3D12_RAYTRACING_OPACITY_MICROMAP_FORMAT_OC1_4_STATE
+	};
+	/// (47t) An OMM array attached to geometry 0 (the mixed triangles) of a classified BLAS: the array (dereferenced while tracing) and
+	/// one int32 per mixed triangle (its OMM, or the special index "fully unknown"). Built through NVAPI (BLAS-ex) when valid.
+	struct OmmLink
+	{
+		D3D12_GPU_VIRTUAL_ADDRESS array = 0;
+		D3D12_GPU_VIRTUAL_ADDRESS index = 0;
+		std::uint32_t usages = 0;
+		std::array<OmmUsage, 8> usage{};
+		[[nodiscard]] bool Valid() const { return array != 0 && index != 0 && usages > 0; }
+	};
+
 	/// Triangles of one BLAS, positions relative to the owner's origin (a cell corner).
 	struct ChunkGeometry
 	{
@@ -52,6 +71,8 @@ namespace RayTracingRT
 		/// the first opaqueFrom triangles (the mixed ones: geometry 0, non-opaque); the triangles from opaqueFrom on are fully opaque
 		/// (geometry 1, OPAQUE). UINT32_MAX = not classified (one geometry, as before).
 		std::uint32_t opaqueFrom = UINT32_MAX;
+		/// (47t) Opacity Micromaps on geometry 0 of a classified BLAS (the variant's; it outlives the BLAS).
+		OmmLink omm{};
 		[[nodiscard]] std::uint32_t Triangles() const { return static_cast<std::uint32_t>(indices.size() / 3); }
 		[[nodiscard]] std::uint32_t Vertices() const { return static_cast<std::uint32_t>(positions.size() / 3); }
 		[[nodiscard]] bool Opaque() const { return alphaUV.empty(); }
@@ -122,6 +143,17 @@ namespace RayTracingRT
 		std::uint64_t bytes = 0;               // VRAM: classified BLASes, mixed records, classified index buffers
 		std::uint64_t bakeBufferBytes = 0;     // VRAM: the bake output (default heap); the read-back copy is system memory
 		std::uint64_t cpuBytes = 0;            // system memory: the alpha meshes kept for classification
+		// (47t) Opacity Micromaps (NVAPI, RTX 40): over the ready variants unless noted.
+		std::uint32_t ommArrays = 0;           // variants with an OMM array
+		std::uint64_t ommTriangles = 0;        // mixed triangles with an OMM (the rest of the mixed ones: "fully unknown")
+		std::uint64_t ommMicroTriangles = 0;   // micro-triangles in those OMMs
+		std::uint64_t ommKnownMicro = 0;       // ... of them opaque or transparent (decided by the hardware, never tested per ray)
+		std::uint64_t ommBytes = 0;            // VRAM (live variants): OMM arrays + OMM index lists
+		std::uint64_t ommInputBytes = 0;       // VRAM (live variants): bake output waiting for its OMM array build
+		std::uint32_t ommBuildsLastFrame = 0;  // OMM arrays built last frame
+		std::uint64_t ommBuildsTotal = 0;
+		std::uint64_t ommFailed = 0;           // variants that went on without OMM (data / pool / driver refused)
+		float lastOmmBakeGpuMs = -1.0f;        // GPU ms of the last bake submission that made OMM data (-1 = none yet)
 	};
 
 	// (45i) Skinned characters: a shape's vertices in the mesh's own space with their bone indices
@@ -750,6 +782,12 @@ namespace RayTracingRT
 		/// The bake shader exists (the driver accepted it).
 		[[nodiscard]] bool AlphaClassifyAvailable() const { return bakePipeline_ != nullptr; }
 		[[nodiscard]] const AlphaClassifyStats& GetAlphaClassifyStats() const { return classifyStats_; }
+		/// (47t) Opacity Micromaps (Settings::OpacityMicromaps), set every frame with SetAlphaClassify. In effect only with Alpha Classify on
+		/// and the driver's OMM caps (NVAPI); off = 47s exactly (variants made from now on carry no OMM; those in use are replaced).
+		void SetOpacityMicromaps(bool a_on);
+		[[nodiscard]] bool OpacityMicromapsOn() const { return ommOn_; }
+		/// NVAPI reports Opacity Micromap support on this device (and its entry points were found).
+		[[nodiscard]] bool OpacityMicromapsAvailable() const { return ommCaps_ && bakePipeline_ != nullptr; }
 
 		// (45i) Skinned characters. Created on first use only (never with the switch off).
 		/// The skinning shader and the character variants of the trace pipeline exist.
@@ -974,6 +1012,7 @@ namespace RayTracingRT
 			// its fence (bakeJobs: read back in CollectBakes). bakeTimed: the bake timestamps were written.
 			std::vector<BakeJob> bakeRecorded, bakeJobs;
 			bool bakeTimed = false;
+			bool bakeOmm = false;  // (47t) some of those bakes made OMM data
 		};
 		/// (46f) A context may be reused once its submission (and its RTAO list, behind the second fence) completed.
 		static bool ContextFree(const CommandContext& a_context, std::uint64_t a_completed, std::uint64_t a_aoCompleted)
@@ -1151,7 +1190,15 @@ namespace RayTracingRT
 		static constexpr std::uint32_t kBakeJobsPerFrame = 64;
 		static constexpr std::uint32_t kBakeScanPerFrame = 256;           // queued variants looked at per frame
 		static constexpr std::uint32_t kBakeMips = 3;                     // copy mips the trace may sample (lod 0-2)
-		static constexpr std::uint32_t kBakeConstants = 12;               // AlphaClassifyCS BakeConstants
+		static constexpr std::uint32_t kBakeConstants = 14;               // AlphaClassifyCS BakeConstants ((47t) + OmmStride, OmmMaxLevel)
+		// (47t) Opacity Micromaps. Level 4 (256 micro-triangles): the 47t harness found levels 3 / 4 / 5 within 1 % of each other in the
+		// candidates left (the support squares of mip 2 are 4 texels of mip 0 wide) at 1 : 2 : 5 times the bake work. The micro-triangle
+		// bake runs a thread per micro-triangle (serial texel loops): its estimated texel tests count kOmmCostScale times (harness: about
+		// 80-100 M per GPU ms against 260-400 M for the class bake).
+		static constexpr std::uint32_t kOmmMaxLevel = 4;
+		static constexpr std::uint64_t kOmmCostScale = 4;
+		static constexpr std::uint32_t kOmmBuildsPerFrame = 16;           // OMM arrays built per prep list
+		static constexpr std::uint64_t kOmmBuildBytesPerFrame = 8ull << 20;  // ... and their input data
 		static constexpr std::uint32_t kBakeMarker = 0xC1A50000u;         // AlphaClassifyCS kMarker
 		static constexpr std::uint32_t kAlphaInfoClassified = 1u;         // AlphaInfoGpu::flags of a variant's record
 		enum class VariantKind : std::uint8_t
@@ -1170,7 +1217,7 @@ namespace RayTracingRT
 		};
 		struct VariantKey
 		{
-			std::array<std::uint32_t, 10> words{};
+			std::array<std::uint32_t, 11> words{};  // (47t) the last: made with Opacity Micromaps
 			bool operator==(const VariantKey&) const = default;
 		};
 		struct VariantKeyHash
@@ -1217,6 +1264,19 @@ namespace RayTracingRT
 			std::vector<WindIndex> wind;
 			std::uint64_t bytes = 0;           // counted in classifyStats_.bytes
 			bool counted = false;              // its triangles are in classifyStats_ (ready)
+			// (47t) Opacity Micromaps: made with them wanted (omm; cleared when they cannot be had: the variant goes on as 47s). The bake
+			// writes each mixed triangle's micro-triangle states at ommStride x base triangle into ommInput (skinOutputPool_); FinishBake
+			// makes the OMM descriptions and the per-mixed-triangle index list; RecordOmmBuilds builds the OMM array (asPool_), uploads the
+			// index list (skinStaticPool_), frees ommInput, and the variant goes on (classified BLAS / character upload) with ommLink.
+			bool omm = false;
+			bool ommQueued = false;            // in ommBuildQueue_
+			std::uint32_t ommMaxLevel = 0, ommStride = 0;
+			ArenaAlloc ommInput, ommArray, ommIndex;
+			std::vector<std::uint64_t> ommDescs;   // NVAPI_D3D12_RAYTRACING_OPACITY_MICROMAP_DESC (byteOffset | level << 32 | format << 48)
+			std::vector<std::int32_t> ommIndexCpu;  // per mixed triangle: its OMM, or the special index "fully unknown"
+			OmmLink ommLink{};
+			std::uint32_t ommCount = 0;
+			std::uint64_t ommMicro = 0, ommKnown = 0;
 		};
 		struct SlotBase
 		{
@@ -1256,6 +1316,45 @@ namespace RayTracingRT
 		UINT WindGeometryDescs(const WindMesh& a_mesh, std::uint32_t a_layout, D3D12_RAYTRACING_GEOMETRY_DESC (&o_descs)[2]) const;
 		/// classifyStats_' counts of the variants by state.
 		void UpdateClassifyStats();
+		/// (47t) The classified variant goes on after its classes (and its OMM array, if any): static -> its classified BLAS (build queue),
+		/// character part -> its upload (RecordVariantUploads). The 47s tail of FinishBake.
+		void ContinueClassified(std::uint32_t a_variant);
+		/// (47t) Opacity Micromaps: NVAPI entry points and the device's OMM caps (Initialize, before CreatePipeline).
+		void InitOpacityMicromaps();
+		/// (47t) NvAPI_D3D12_SetCreatePipelineStateOptions(ENABLE_OMM_SUPPORT) around the creation of the trace pipelines.
+		void SetOmmPipelineOption(bool a_on);
+		/// (47t) Prep list, before RecordVariantUploads: the queued variants' OMM arrays and index lists (marks variantMustSubmit_).
+		void RecordOmmBuilds(ID3D12GraphicsCommandList4* a_list);
+		/// (47t) The variant's OMM link when it has one (geometry 0 of its layout), else nullptr.
+		[[nodiscard]] const OmmLink* VariantOmm(std::uint32_t a_variant) const;
+		/// (47t) ... for a wind mesh / character part in a layout: only when that layout's classified index list is the one its geometry
+		/// descriptions use (WindGeometryDescs / SkinGeometryDescs), else nullptr.
+		[[nodiscard]] const OmmLink* WindOmm(const WindMesh& a_mesh, std::uint32_t a_layout) const;
+		[[nodiscard]] const OmmLink* SkinOmm(std::uint32_t a_layout) const;
+		/// (47t) A variant gives up its OMM (before its OMM array exists): it goes on as in 47s.
+		void DropVariantOmm(AlphaVariant& a_variant);
+		/// (47t) BLAS size query / build: the plain D3D12 call, or through NVAPI (BLAS-ex) with the OMM array on geometry 0.
+		void PrebuildBlas(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS& a_inputs, const OmmLink* a_omm,
+			D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO& o_info);
+		void RecordBlasBuild(ID3D12GraphicsCommandList4* a_list, const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC& a_desc, UINT a_postbuildCount,
+			const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* a_postbuild, const OmmLink* a_omm);
+		// (47t) NVAPI entry points (nvapi.h stays out of this header): GetRaytracingCaps, SetCreatePipelineStateOptions,
+		// GetRaytracingOpacityMicromapArrayPrebuildInfo, BuildRaytracingOpacityMicromapArray, GetRaytracingAccelerationStructurePrebuildInfoEx,
+		// BuildRaytracingAccelerationStructureEx.
+		struct NvOmmApi
+		{
+			void* getCaps = nullptr;
+			void* setPipelineOptions = nullptr;
+			void* ommPrebuild = nullptr;
+			void* buildOmm = nullptr;
+			void* asPrebuildEx = nullptr;
+			void* buildAsEx = nullptr;
+		};
+		NvOmmApi nvOmm_{};
+		bool ommCaps_ = false;   // the device supports OMMs (NVAPI caps) and every entry point was found
+		bool ommOn_ = false;     // in effect (switch on, caps, Alpha Classify on)
+		bool ommWanted_ = true;  // the switch
+		std::deque<std::uint32_t> ommBuildQueue_;
 		std::vector<AlphaVariant> variants_;
 		std::vector<std::uint32_t> freeVariants_;
 		std::unordered_map<VariantKey, std::uint32_t, VariantKeyHash> variantIndex_;

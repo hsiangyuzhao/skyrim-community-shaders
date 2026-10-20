@@ -1065,6 +1065,10 @@ namespace Util::FrameTrace
 				out << "#   traced classified this frame; rt_ac_waiting = meshes waiting for their sort or their classified BLAS; rt_ac_bake_tris =\n";
 				out << "#   triangles sorted this frame; rt_ac_bake_gpu_ms = GPU ms of the last sort (not in rt_prep_gpu_ms); rt_ac_vram_mb = video\n";
 				out << "#   memory of the classified BLASes, records, index lists and the sort buffer.\n";
+				out << "# (47t) rt_omm_* = Opacity Micromaps (-1 = off / not available): rt_omm_arrays = meshes in use with an OMM array; rt_omm_micro_tris =\n";
+				out << "#   their micro-triangles; rt_omm_known_pct = percent of them opaque / transparent (decided by the hardware, never tested per ray);\n";
+				out << "#   rt_omm_vram_mb = OMM arrays + index lists (+ bake output waiting for its array); rt_omm_bake_gpu_ms = GPU ms of the last sort\n";
+				out << "#   that made OMM data (it is in rt_ac_bake_gpu_ms too).\n";
 				out << "#   rt_pw_* = the work of the RT D3D12 prep submission whose GPU time is rt_prep_gpu_ms on the same row (1 = valid; early =\n";
 				out << "#   recorded at the frame start): static BLAS builds (of which alpha-tested, triangles, MB before compaction), compactions (MB\n";
 				out << "#   written), new character shapes uploaded, own-BLAS character builds / refits, merged character BLAS builds (triangles) /\n";
@@ -1170,7 +1174,8 @@ namespace Util::FrameTrace
 					   "gpu_spike_ms,jobs,"  // (47p)
 					   "rt_npc_body_only,rt_npc_refit_skipped,rt_skip_tiny_face,rt_wind_catchup,rt_chunk_cells,rt_chunks_per_cell,rt_chunk_overlap,"  // (47q)
 					   "rt_wind_frozen_unlearned,rt_wind_shared,pacer_repeat_fed,"  // (47r)
-					   "rt_ac_opaque_tris,rt_ac_dropped_tris,rt_ac_mixed_tris,rt_ac_instances,rt_ac_waiting,rt_ac_bake_tris,rt_ac_bake_gpu_ms,rt_ac_vram_mb\n";  // (47s) the last ones
+					   "rt_ac_opaque_tris,rt_ac_dropped_tris,rt_ac_mixed_tris,rt_ac_instances,rt_ac_waiting,rt_ac_bake_tris,rt_ac_bake_gpu_ms,rt_ac_vram_mb,"  // (47s)
+					   "rt_omm_arrays,rt_omm_micro_tris,rt_omm_known_pct,rt_omm_vram_mb,rt_omm_bake_gpu_ms\n";  // (47t) the last ones
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
 					std::string s = std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{},{}", t.scene,
@@ -1367,6 +1372,9 @@ namespace Util::FrameTrace
 					extra.pop_back();
 					extra += std::format(",{},{},{},{},{},{},{:.3f},{:.1f}\n", r.rt.acOpaque, r.rt.acDropped, r.rt.acMixed, r.rt.acInstances, r.rt.acWaiting,
 						r.rt.acBakeTriangles, r.rt.acBakeGpuMs, r.rt.acVramMb);
+					// (47t) Opacity Micromaps, after rt_ac_vram_mb (the old last column).
+					extra.pop_back();
+					extra += std::format(",{},{},{:.1f},{:.2f},{:.3f}\n", r.rt.ommArrays, r.rt.ommMicro, r.rt.ommKnownPct, r.rt.ommVramMb, r.rt.ommBakeGpuMs);
 					if (it == a_reflex.end()) {
 						out << (r.reflexFrame == UINT32_MAX ? std::string("-1") : std::to_string(r.reflexFrame)) << ",-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" << engineColumns(r) << extra;
 						continue;

@@ -514,7 +514,7 @@ namespace RayTracingRT
 			inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
 			inputs.pGeometryDescs = descs;
 			D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info{};
-			device_->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &info);
+			PrebuildBlas(inputs, SkinOmm(a_layout), info);  // (47t) with the layout's OMM array
 			if (info.ResultDataMaxSizeInBytes == 0 || info.ScratchDataSizeInBytes == 0)
 				return false;
 			const std::uint64_t need = AlignUp(info.ResultDataMaxSizeInBytes, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
@@ -884,7 +884,7 @@ namespace RayTracingRT
 				buildDesc.Inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
 				buildDesc.SourceAccelerationStructureData = buildDesc.DestAccelerationStructureData;  // in place
 			}
-			a_list->BuildRaytracingAccelerationStructure(&buildDesc, 0, nullptr);
+			RecordBlasBuild(a_list, buildDesc, 0, nullptr, SkinOmm(shape.layout));  // (47t) the layout's OMM array, refits too
 			if (op.build) {
 				shape.built = true;
 				shape.refits = 0;

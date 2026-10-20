@@ -280,7 +280,12 @@ namespace RayTracingRT
 		InitPools();  // (46g)
 
 		std::string pipelineReason;
-		if (!CreatePipeline(pipelineReason))
+		// (47t) Opacity Micromaps: NVAPI caps on this device; the trace pipelines are created with the NVAPI OMM option when supported.
+		InitOpacityMicromaps();
+		SetOmmPipelineOption(true);
+		const bool pipelineOk = CreatePipeline(pipelineReason);
+		SetOmmPipelineOption(false);
+		if (!pipelineOk)
 			return fail(pipelineReason);
 
 		ready_ = true;
@@ -1340,6 +1345,8 @@ namespace RayTracingRT
 		bakeQueue_.clear();
 		variantUploads_.clear();
 		variantMustSubmit_ = false;
+		ommBuildQueue_.clear();  // (47t)
+		ommOn_ = false;
 		waitSerial_ = 0;
 		classifyStats_ = {};
 		if (bakeReadback_ && bakeMapped_)
@@ -2120,7 +2127,7 @@ namespace RayTracingRT
 			inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
 			inputs.pGeometryDescs = geometryDescs;
 			D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info{};
-			device_->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &info);
+			PrebuildBlas(inputs, &geometry.omm, info);  // (47t) with the OMM array, if any
 			if (info.ResultDataMaxSizeInBytes == 0) {
 				// Degenerate input: drop it rather than retry forever.
 				buildQueue_.pop_front();
@@ -2239,7 +2246,7 @@ namespace RayTracingRT
 			buildDesc.DestAccelerationStructureData = asPool_.Address(entry.result);
 			buildDesc.ScratchAccelerationStructureData = scratch_->GetGPUVirtualAddress() + (parallel ? scratchOffset : 0);
 			scratchOffset += Align(entry.info.ScratchDataSizeInBytes, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
-			a_list->BuildRaytracingAccelerationStructure(&buildDesc, 1, &postbuild);
+			RecordBlasBuild(a_list, buildDesc, 1, &postbuild, &geometry.omm);  // (47t) through NVAPI with an OMM array
 
 			const std::uint64_t bytes = entry.result.size;
 			// (46p) This submission's prep work.
@@ -2513,6 +2520,7 @@ namespace RayTracingRT
 			const std::int64_t buildEnd = QpcNow();
 
 			variantMustSubmit_ = false;
+			RecordOmmBuilds(list);  // (47t) Opacity Micromaps: OMM arrays before the character / wind builds (and the classified BLASes queued now)
 			RecordVariantUploads(list);  // (47s) Alpha Classify: character-part / wind index lists before their builds
 			skinReady_.assign(skinDraws.size(), 0);
 			skinRecorded_ = false;
@@ -3083,6 +3091,7 @@ namespace RayTracingRT
 		skinRecorded_ = false;
 		skinGroupFrame_.clear();  // (46m)
 		variantMustSubmit_ = false;
+		RecordOmmBuilds(list);  // (47t) Opacity Micromaps: OMM arrays before the character / wind builds (and the classified BLASes queued now)
 		RecordVariantUploads(list);  // (47s) Alpha Classify: character-part / wind index lists before their builds
 		if (!skinDraws.empty() || !skinUploadQueue_.empty()) {
 			const std::uint64_t uploadsBefore = skinUploadsTotal_;
