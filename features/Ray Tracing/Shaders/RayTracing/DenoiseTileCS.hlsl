@@ -9,6 +9,29 @@
 
 #include "RayTracing/Common.hlsli"
 
+#if defined(SSS_CASTER_TILES)
+// (47r) "Screen Space Shadows: Tile Mask for RT Casters": per 8x8 tile of the visibility texture (its whole size: the contact-shadow pass
+// addresses it so) bit 0 = some pixel has kOutRtSurface (a traced caster), bit 1 = some pixel has not. bend_sss_gpu IsRtCaster answers
+// a tile of only one kind without reading the mask (exact: the same bit, read the same way).
+Texture2D<unorm float4> Visibility : register(t0);
+RWTexture2D<uint> CasterTiles : register(u0);
+groupshared uint gsKinds;
+
+[numthreads(8, 8, 1)] void main(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
+	if (gi == 0u)
+		gsKinds = 0u;
+	GroupMemoryBarrierWithGroupSync();
+	uint w, h;
+	Visibility.GetDimensions(w, h);
+	if (all(dtid.xy < uint2(w, h))) {
+		const bool caster = (uint(Visibility.Load(int3(dtid.xy, 0)).w * 255.0 + 0.5) & kOutRtSurface) != 0u;
+		InterlockedOr(gsKinds, caster ? 1u : 2u);
+	}
+	GroupMemoryBarrierWithGroupSync();
+	if (gi == 0u)
+		CasterTiles[gid.xy] = gsKinds;
+}
+#else
 Texture2D<unorm float4> Visibility : register(t0);  // r visibility, z blocker distance (sqrt(t / range))
 Texture2D<float> DepthMask : register(t1);          // signed depth, see PrepareCS
 RWTexture2D<float4> Tiles : register(u0);
@@ -79,3 +102,4 @@ groupshared float gsMax[64];
 		Tiles[gid.xy] = float4(c > 0.0 ? gsSum[0] / c : 0.0, c, gsMin[0], gsMax[0]);
 	}
 }
+#endif

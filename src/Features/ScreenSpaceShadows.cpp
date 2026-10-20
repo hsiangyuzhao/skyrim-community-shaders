@@ -154,7 +154,7 @@ ID3D11ComputeShader* ScreenSpaceShadows::GetComputeRaymarchRight()
 	return raymarchRightCS;
 }
 
-void ScreenSpaceShadows::DrawShadows(ID3D11ShaderResourceView* a_rtMask)
+void ScreenSpaceShadows::DrawShadows(ID3D11ShaderResourceView* a_rtMask, ID3D11ShaderResourceView* a_rtTiles)
 {
 	ZoneScoped;
 	auto state = globals::state;
@@ -197,8 +197,11 @@ void ScreenSpaceShadows::DrawShadows(ID3D11ShaderResourceView* a_rtMask)
 	if (a_rtMask && !globals::game::isVR) {
 		CompileRaymarchShaders();
 		maskShader = raymarchMaskCS;
-		if (maskShader)
+		if (maskShader) {
 			context->CSSetShaderResources(1, 1, &a_rtMask);
+			if (a_rtTiles)  // (47r) the per-tile summary of the mask (RtTileMask)
+				context->CSSetShaderResources(2, 1, &a_rtTiles);
+		}
 	}
 
 	// (45 SSS) With Edge Smoothing the ray march writes into rawShadowsTexture and the smoothing pass
@@ -230,6 +233,7 @@ void ScreenSpaceShadows::DrawShadows(ID3D11ShaderResourceView* a_rtMask)
 	common.InvDepthTextureSize[1] = 1.0f / (float)viewportSize[1];
 	common.settings = bendSettings;
 	common.settings.SampleCount = std::clamp(bendSettings.SampleCount, 1u, 4u);
+	common.settings.RtTileMask = (maskShader && a_rtTiles) ? 1u : 0u;  // (47r)
 	{
 		// (45 SSS) Linear depth, the sun in view space and the projection scale: Edge Smoothing and (45k) the RT_CASTER_MASK contact range.
 		const float4 cameraData = Util::GetCameraData();
@@ -335,8 +339,8 @@ void ScreenSpaceShadows::DrawShadows(ID3D11ShaderResourceView* a_rtMask)
 			globals::state->EndPerfEvent();
 	}
 
-	ID3D11ShaderResourceView* views[2]{ nullptr, nullptr };
-	context->CSSetShaderResources(0, 2, views);
+	ID3D11ShaderResourceView* views[3]{ nullptr, nullptr, nullptr };
+	context->CSSetShaderResources(0, 3, views);  // (47r) t2 too
 
 	context->CSSetShader(nullptr, nullptr, 0);
 
@@ -373,7 +377,7 @@ void ScreenSpaceShadows::Prepass()
 	context->PSSetShaderResources(45, 1, &view);
 }
 
-void ScreenSpaceShadows::DrawDeferred(ID3D11ShaderResourceView* a_rtMask, float a_contactScale, float a_biasConstant, float a_biasPerUnit)
+void ScreenSpaceShadows::DrawDeferred(ID3D11ShaderResourceView* a_rtMask, float a_contactScale, float a_biasConstant, float a_biasPerUnit, ID3D11ShaderResourceView* a_rtTiles)
 {
 	if (!deferredThisFrame)
 		return;
@@ -386,7 +390,7 @@ void ScreenSpaceShadows::DrawDeferred(ID3D11ShaderResourceView* a_rtMask, float 
 	bendSettings.RtBiasConstant = a_biasConstant;
 	bendSettings.RtBiasPerUnit = a_biasPerUnit;
 	Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::ScreenSpaceShadows);
-	DrawShadows(a_rtMask);
+	DrawShadows(a_rtMask, a_rtMask ? a_rtTiles : nullptr);
 	Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::ScreenSpaceShadows);
 	bendSettings.RtContactScale = 0.0f;
 	deferredThisFrame = false;

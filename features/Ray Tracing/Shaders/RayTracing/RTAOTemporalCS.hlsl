@@ -52,8 +52,15 @@ RWTexture2D<uint> GeometryOut : register(u3);
 Texture2D<float4> Raw : register(t9);                 // (47n) TraceAOCS' output: .b carries the moving-occluder flag (RawDynamic)
 RWTexture2D<unorm float4> HistoryDebug : register(u4); // (47n) the debug view (only bound while it is on)
 
+// (47r) RTAO_WIDE (RTAO: Filter Only Where Traced): 16x16 groups, the same per-pixel work with less of the tile loaded twice (the 6-pixel
+// apron is 28 x 28 for 256 pixels instead of 20 x 20 for 64).
+#	if defined(RTAO_WIDE)
+#		define GROUP_SIZE 16
+#	else
+#		define GROUP_SIZE 8
+#	endif
 static const int kTileRadius = 6;  // the history fix reaches 2 x 3 pixels
-static const int kTile = 8 + 2 * kTileRadius;
+static const int kTile = GROUP_SIZE + 2 * kTileRadius;
 static const int kTileCount = kTile * kTile;
 static const float kDepthTol = 0.02;      // relative, plus the slope and kDepthTolUnits
 static const float kDepthTolUnits = 6.0;  // a moving surface moves a few units a frame along the view (a running character)
@@ -120,14 +127,29 @@ float FixBlur(bool a_detail, int a_centre, float a_z, float a_slope, float3 a_n,
 	return sumW > 0.0 ? sum / sumW : (a_detail ? g_detail[a_centre] : g_large[a_centre]);
 }
 
-[numthreads(8, 8, 1)] void main(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
+[numthreads(GROUP_SIZE, GROUP_SIZE, 1)] void main(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
 	const int2 maxP = max(int2(Size.xy) - 1, int2(0, 0));
 	const bool detail = (Size.z & kFlagDetail) != 0u;
+	// (47r) RTAO: Filter Only Where Traced: a group farther than 1 tile from every traced tile is not composited (RT weight 0); it
+	// leaves "no history" (geometry 0, length 0) and open values for the next frame.
 	{
-		const int2 tileOrigin = int2(gid.xy) * 8 - kTileRadius;
-		const uint lane = gtid.y * 8 + gtid.x;
-		for (uint slot = lane; slot < (uint)kTileCount; slot += 64) {
+		const int2 t0 = int2(gid.xy) * (GROUP_SIZE / 8);
+		if (TilesFar(t0, t0 + (GROUP_SIZE / 8 - 1), 1u)) {
+			if (all(dtid.xy < Size.xy)) {
+				Output[dtid.xy] = 1.0;
+				if (detail)
+					OutputDetail[dtid.xy] = 1.0;
+				LengthOut[dtid.xy] = 0.0;
+				GeometryOut[dtid.xy] = 0u;
+			}
+			return;
+		}
+	}
+	{
+		const int2 tileOrigin = int2(gid.xy) * GROUP_SIZE - kTileRadius;
+		const uint lane = gtid.y * GROUP_SIZE + gtid.x;
+		for (uint slot = lane; slot < (uint)kTileCount; slot += GROUP_SIZE * GROUP_SIZE) {
 			const int2 q = clamp(tileOrigin + int2(slot % kTile, slot / kTile), int2(0, 0), maxP);
 			g_large[slot] = Current[q];
 			g_detail[slot] = detail ? CurrentDetail[q] : 1.0;
@@ -320,9 +342,14 @@ Texture2D<float4> Raw : register(t3);  // (47n) TraceAOCS' output: its moving-oc
 SamplerState LinearClamp : register(s0);
 RWTexture2D<unorm float> Output : register(u0);
 
-[numthreads(8, 8, 1)] void main(uint3 dtid : SV_DispatchThreadID) {
+[numthreads(8, 8, 1)] void main(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID) {
 	if (any(dtid.xy >= Size.xy))
 		return;
+	// (47r) RTAO: Filter Only Where Traced (see the v2 pass): open, nothing read.
+	if (TilesFar(int2(gid.xy), int2(gid.xy), 1u)) {
+		Output[dtid.xy] = 1.0;
+		return;
+	}
 	const int2 p = int2(dtid.xy);
 	const int2 maxP = int2(Size.xy) - 1;
 	const float current = Current[p];

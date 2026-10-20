@@ -2721,7 +2721,7 @@ namespace RayTracingScene
 			o_overlap = static_cast<float>(intersections / summed);
 	}
 
-	void Scene::UpdateWindPoses(RayTracingRT::Backend& a_backend, std::uint32_t a_frame, bool a_keepMoving, float a_dt)
+	void Scene::UpdateWindPoses(RayTracingRT::Backend& a_backend, std::uint32_t a_frame, bool a_keepMoving, float a_dt, bool a_learnAnyFrame)
 	{
 		if (windInstances_.empty()) {
 			windClocks_.clear();
@@ -2731,6 +2731,7 @@ namespace RayTracingScene
 			windPoseStatsFrame_ = a_frame;
 			windStats_.poses = windStats_.poseFaults = 0;
 			windStats_.catchups = windStats_.frozenUnlearned = 0;
+			windStats_.catchupsShared = 0;  // (47r)
 			// Nodes not visited for a while (their plants left the radius) are forgotten.
 			if (windClocks_.size() > windInstances_.size() * 2 + 256) {
 				for (auto it = windClocks_.begin(); it != windClocks_.end();) {
@@ -2748,7 +2749,14 @@ namespace RayTracingScene
 		constexpr float kFreezeDt = 0.0345f;
 		constexpr float kLearnMinDt = 0.001f;
 		const bool longFrame = a_keepMoving && a_dt >= kFreezeDt && a_dt < 1.0f;
-		const bool learnFrame = a_dt >= kLearnMinDt && a_dt < kFreezeDt;
+		// (47r) "Learn on Any Frame": every advance the game makes is learned (whatever the frame time: at a steady 35-37 ms the game
+		// advances only on the odd shorter frame, and 47q learned only below 34.5 ms, so those plants never learned). Off = 47q.
+		const bool learnFrame = a_learnAnyFrame ? (a_dt >= kLearnMinDt && a_dt < 1.0f) : (a_dt >= kLearnMinDt && a_dt < kFreezeDt);
+		// (47r) The shared rate (from last frame's learned plants) for plants without their own: 1 = k x the node's frequency, 2 one rate.
+		const int sharedMode = a_learnAnyFrame ? windSharedMode_ : 0;
+		const float sharedValue = windSharedValue_;
+		windStats_.sharedMode = sharedMode;
+		windStats_.sharedValue = sharedMode != 0 ? sharedValue : 0.0f;
 		const auto globals = RayTracingWind::FrameGlobals(a_frame);
 		for (auto& [handle, instance] : windInstances_) {
 			if (instance.poseFrame == a_frame)
@@ -2770,13 +2778,32 @@ namespace RayTracingScene
 						if (learnFrame && plausible) {
 							clock.rate = clock.learned == 0 ? rate : clock.rate * 0.8f + rate * 0.2f;
 							clock.learned = std::min(clock.learned + 1, 1000u);
+							if (a_learnAnyFrame) {
+								float frequency = 0.0f;
+								clock.frequency = RayTracingWind::ReadFrequency(node, frequency) ? frequency : 0.0f;
+							}
 						}
 					} else if (consecutive && longFrame) {
-						if (clock.learned > 0 && clock.rate > 0.0f) {
-							const float advanced = timer + clock.rate * a_dt;
+						float useRate = clock.learned > 0 && clock.rate > 0.0f ? clock.rate : 0.0f;
+						bool shared = false;
+						if (useRate <= 0.0f && sharedMode != 0) {
+							// (47r) No rate of its own yet: the one the other plants share (only while they agree; see the end).
+							float frequency = 0.0f;
+							if (sharedMode == 2)
+								useRate = sharedValue;
+							else if (RayTracingWind::ReadFrequency(node, frequency) && frequency > 0.0f)
+								useRate = sharedValue * frequency;
+							shared = useRate > 0.0f && std::isfinite(useRate) && useRate < 1000.0f;
+							if (!shared)
+								useRate = 0.0f;
+						}
+						if (useRate > 0.0f) {
+							const float advanced = timer + useRate * a_dt;
 							if (RayTracingWind::WriteTimer(node, advanced)) {
 								timer = advanced;
 								++windStats_.catchups;
+								if (shared)
+									++windStats_.catchupsShared;
 							}
 						} else {
 							++windStats_.frozenUnlearned;
@@ -2795,5 +2822,46 @@ namespace RayTracingScene
 			RayTracingWind::NoteEarly(node, pose, a_frame);
 			++windStats_.poses;
 		}
+		if (a_learnAnyFrame)
+			UpdateWindSharedRate();
+	}
+
+	void Scene::UpdateWindSharedRate()
+	{
+		// (47r) The shared rate for plants that never learned their own, from the plants that did (3 learns or more): k = rate / frequency
+		// when those agree within 10 % (interquartile range over the median), else one rate for all when the rates agree, else none (such
+		// plants stay frozen on long frames, as in 47q). At least 4 plants. Robust: medians and quartiles, not means.
+		windShareK_.clear();
+		windShareRate_.clear();
+		for (const auto& [node, clock] : windClocks_) {
+			if (clock.learned < 3 || !(clock.rate > 0.0f))
+				continue;
+			windShareRate_.push_back(clock.rate);
+			if (clock.frequency > 0.0f)
+				windShareK_.push_back(clock.rate / clock.frequency);
+		}
+		constexpr std::size_t kMinPlants = 4;
+		constexpr float kAgree = 0.1f;
+		auto spread = [](std::vector<float>& a_v, float& o_median) {
+			std::sort(a_v.begin(), a_v.end());
+			const std::size_t n = a_v.size();
+			o_median = a_v[n / 2];
+			const float q1 = a_v[n / 4], q3 = a_v[(3 * n) / 4];
+			return o_median > 0.0f ? (q3 - q1) / o_median : 1e30f;
+		};
+		int mode = 0;
+		float value = 0.0f;
+		float kMedian = 0.0f, rMedian = 0.0f;
+		const float kSpread = windShareK_.size() >= kMinPlants ? spread(windShareK_, kMedian) : 1e30f;
+		const float rSpread = windShareRate_.size() >= kMinPlants ? spread(windShareRate_, rMedian) : 1e30f;
+		if (kSpread <= kAgree && kSpread <= rSpread) {
+			mode = 1;
+			value = kMedian;
+		} else if (rSpread <= kAgree) {
+			mode = 2;
+			value = rMedian;
+		}
+		windSharedMode_ = mode;
+		windSharedValue_ = value;
 	}
 }

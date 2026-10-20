@@ -130,6 +130,11 @@ namespace RayTracingScene
 		// here (each at its learned rate), and those frozen without a learned rate yet (left as they were).
 		std::uint32_t catchups = 0;
 		std::uint32_t frozenUnlearned = 0;
+		// (47r) Learn on Any Frame: of the catch-ups, those at the rate shared by the other plants (the plant had none of its own); the
+		// shared model in effect (0 none, 1 rate = k x the node's frequency, 2 one rate for all) and its value.
+		std::uint32_t catchupsShared = 0;
+		int sharedMode = 0;
+		float sharedValue = 0.0f;
 		float radius = 0.0f;            // this frame's sway radius (units)
 	};
 
@@ -441,7 +446,7 @@ namespace RayTracingScene
 		/// Early Prep (before the frame's prep list), and again before the trace frame for BLASes made since. Render thread.
 		/// (47q) a_keepMoving: "Keep Leaves Moving on Long Frames" (a_dt = this frame's game time step, seconds): leaf timers the game
 		/// left frozen on a long frame are advanced at their learned rate before the poses are read (the frame's draws see it too).
-		void UpdateWindPoses(RayTracingRT::Backend& a_backend, std::uint32_t a_frame, bool a_keepMoving = false, float a_dt = 0.0f);
+		void UpdateWindPoses(RayTracingRT::Backend& a_backend, std::uint32_t a_frame, bool a_keepMoving = false, float a_dt = 0.0f, bool a_learnAnyFrame = false);
 
 	private:
 		// (45e) Objects: one BLAS per distinct engine mesh (in the shape's own space), one TLAS
@@ -625,6 +630,7 @@ namespace RayTracingScene
 		/// a_allowNew is false), those beyond it give theirs back; windReady. With sway off (or Foliage not ray traced) every wind BLAS
 		/// and source is released.
 		void UpdateWind(RayTracingRT::Backend& a_backend, std::int64_t a_deadline, bool a_allowNew);
+		void UpdateWindSharedRate();  // (47r) Keep Leaves Moving: Learn on Any Frame
 		void VisitWind(RayTracingRT::Backend& a_backend, ObjectShape& a_shape, std::int64_t a_deadline, bool a_allowNew, const double a_camera[3], float a_radius);
 		/// The shape's own wind BLAS (its mesh's wind source made when new); false = not possible now (windNone set when never).
 		bool AcquireWind(RayTracingRT::Backend& a_backend, ObjectShape& a_shape, bool a_allowNewSource);
@@ -645,8 +651,14 @@ namespace RayTracingScene
 			float rate = 0.0f;
 			std::uint32_t frame = UINT32_MAX;
 			std::uint32_t learned = 0;
+			float frequency = 0.0f;  // (47r) the node's frequency when its rate was last learned (the shared k = rate / frequency)
 		};
 		ankerl::unordered_dense::map<const RE::NiNode*, WindClock> windClocks_;
+		// (47r) Keep Leaves Moving: Learn on Any Frame. The shared rate for plants that never learned their own: from last frame's learned
+		// plants, either k = rate / frequency (when those agree) or one rate (when the rates agree); 0 = none.
+		int windSharedMode_ = 0;
+		float windSharedValue_ = 0.0f;
+		std::vector<float> windShareK_, windShareRate_;
 		std::uint32_t windPauseUntil_ = 0;  // (47n) the wind VRAM budget was hit: no new wind BLAS before this frame
 		static constexpr std::uint32_t kWindBudgetPauseFrames = 120;
 		bool windWasOn_ = false;          // the last UpdateWind ran with sway on (off: every shape's wind state is reset once)

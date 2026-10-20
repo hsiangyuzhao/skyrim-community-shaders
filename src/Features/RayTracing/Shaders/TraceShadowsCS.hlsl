@@ -59,6 +59,8 @@ static const uint kFlagFalloff = 4096u;        // fewer rays and a coarser patte
 // (47q) The point-light pass reuses this pass's surface probe: Output.w kOutProbed / kOutRtSurfaceRaw = the probe as the point pass
 // would make it (the depth normal, before the stable-normal override; never dilated).
 static const uint kFlagProbeShare = 8192u;
+// (47r) With kFlagProbeShare: the point pass is its non-alpha variant: kOutProbed only where the probe means the same there.
+static const uint kFlagProbeShareOpaque = 16384u;
 static const uint kPatternFull = 0u, kPatternChecker = 1u, kPatternHalf = 2u;
 static const uint kPatternNpcReduced = 16u;    // Extra.w bit: no adaptive extra character rays against other actors
 // Output.w (45j): bit flags as unorm8 (value / 255).
@@ -346,7 +348,7 @@ bool CharacterClosestHit(float3 origin, float3 direction, float tMax, out float 
 // (45k, kFlagRtSurface) Is the visible surface at P part of the ray-traced scene? A short segment
 // through P along the view ray, any hit (cut-outs taken as solid), every instance (characters too).
 // The tolerance is tight so that grass standing on traced ground is not taken for the ground.
-bool SurfaceProbe(float3 P, float3 V, float3 N, float dist)
+bool SurfaceProbe(float3 P, float3 V, float3 N, float dist, out bool o_opaque)
 {
 	const float cosTheta = max(abs(dot(N, V)), 0.25);
 	const float tolerance = min(clamp(1.5 + dist * 0.002, 1.5, 24.0) / cosTheta, 48.0);
@@ -358,7 +360,11 @@ bool SurfaceProbe(float3 P, float3 V, float3 N, float dist)
 	RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES | RAY_FLAG_FORCE_OPAQUE> q;
 	q.TraceRayInline(Scene, RAY_FLAG_NONE, 0xFF, ray);
 	q.Proceed();
-	return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
+	// (47r) Whether the hit found is on an instance without a cut-out record (ID 0: forced opaque in the TLAS) -- the point pass's
+	// non-alpha probe (it culls the non-opaque ones) would find a hit too then.
+	const bool hit = q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
+	o_opaque = hit && q.CommittedInstanceID() == 0u;
+	return hit;
 }
 
 // (45k) The direction of sun ray i of this pixel (a point on the sun disc).
@@ -574,13 +580,21 @@ groupshared float gsT[64];
 		// (45k) Screen Space Shadows "non-RT casters only": is this surface a traced caster?
 		// (45l) Pixels not traced this frame take it from their neighbours (the dilation below).
 		if ((flags & kFlagRtSurface) && active) {
-			rtSurface = SurfaceProbe(P, V, N, dist);
+			bool opaqueN;
+			rtSurface = SurfaceProbe(P, V, N, dist, opaqueN);
 			// (47q, kFlagProbeShare) The probe as the point pass makes it (its normal is the depth normal): the same result unless the
 			// stable-normal override changed N here (depth edges), then probed again with Nd.
 			[branch] if (flags & kFlagProbeShare)
 			{
-				const bool raw = all(N == Nd) ? rtSurface : SurfaceProbe(P, V, Nd, dist);
-				outFlags |= kOutProbed | (raw ? kOutRtSurfaceRaw : 0u);
+				bool rawOpaque = opaqueN;
+				bool raw = rtSurface;
+				[branch] if (any(N != Nd))
+					raw = SurfaceProbe(P, V, Nd, dist, rawOpaque);
+				// (47r, kFlagProbeShareOpaque) For the point pass's non-alpha variant (its probe culls the cut-out instances): shared only
+				// where it means the same there -- no hit, or a hit on a forced-opaque instance; a hit on a cut-out instance is left unshared
+				// (the point pass probes that pixel itself). Exact.
+				if (!(flags & kFlagProbeShareOpaque) || !raw || rawOpaque)
+					outFlags |= kOutProbed | (raw ? kOutRtSurfaceRaw : 0u);
 			}
 		}
 

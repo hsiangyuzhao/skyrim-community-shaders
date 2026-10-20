@@ -246,6 +246,23 @@ public:
 		// frames get shorter. On: for the swaying plants in reach, the frozen timers are advanced as the game would (each plant's own
 		// learned rate), before anything is drawn, so leaves, their shadow maps and the RT shadow keep moving. Off: as the game.
 		bool FoliageKeepMoving = true;
+		// (47r) Outside the settings macro. Each on by default; off = 47q exactly.
+		// AOPostTracedOnly "RTAO: Filter Only Where Traced": the RTAO filter / history passes skip the 8x8 tiles that are far from every
+		// traced pixel (sky, beyond the fade end, outside the traced area; a tile mask with the reach each pass needs), and the
+		// history pass works in 16x16 groups. The traced pixels get exactly the 47q values.
+		bool AOPostTracedOnly = true;
+		// SunCombineTiles "Sun: Fast Path for Uniform Tiles": Combine skips the per-pixel statistics where the denoiser's 5x5 tiles are
+		// all fully lit or all fully shadowed (Penumbra denoiser only). Exact.
+		bool SunCombineTiles = true;
+		// SSSTileMask "Screen Space Shadows: Tile Mask for RT Casters": the contact-shadow pass reads a per-tile summary of the traced-
+		// caster mask (all traced / none traced) and the per-pixel mask only in mixed tiles. Exact.
+		bool SSSTileMask = true;
+		// PointProbeShareAll "Point Lights: Reuse the Sun's Surface Probe Everywhere": the point pass's non-alpha variant (Low / Medium
+		// outdoors) reuses the sun's probe too where it means the same (no hit, or a hit on a forced-opaque instance). Exact.
+		bool PointProbeShareAll = true;
+		// FoliageLearnAnyFrame "Keep Leaves Moving: Learn on Any Frame": a plant's leaf rate is learned from every advance the game
+		// makes (any frame time), and a plant that never learned uses the rate shared by the others once they agree. Off = 47q.
+		bool FoliageLearnAnyFrame = true;
 	};
 	/// (46f) RTAO modes (Settings::AOMode); with RTAO off the AO is SSGI's, exactly as before.
 	enum class AOModeKind : int
@@ -1015,6 +1032,23 @@ private:
 	std::uint64_t aoV2Bytes = 0;
 	std::string aoV2Fault;
 	winrt::com_ptr<ID3D11ComputeShader> aoTemporalV2CS;
+	// (47r) RTAO: Filter Only Where Traced (Settings::AOPostTracedOnly). Per 8x8 tile of the render size: traced or not (RTAO_TILE_MARK),
+	// then the Chebyshev distance in tiles to the nearest traced tile (RTAO_TILE_DIST, separable, capped; R8_UINT, 255 = farther); each
+	// filter / history pass skips the groups farther than the reach it needs. Made on first use; failing that: 47q this session.
+	bool EnsureAOTiles();
+	void ReleaseAOTiles();
+	DenoiseTexture aoTileMark, aoTileH, aoTileDist;
+	std::uint32_t aoTilesWidth = 0, aoTilesHeight = 0;
+	std::uint64_t aoTilesBytes = 0;
+	std::string aoTilesFault;
+	winrt::com_ptr<ID3D11ComputeShader> aoTileMarkCS, aoTileDistHCS, aoTileDistVCS, aoTemporalV2WideCS;
+	// (47r) Screen Space Shadows: Tile Mask for RT Casters (Settings::SSSTileMask): per 8x8 tile of the visibility texture, which kinds of
+	// pixels it has (DenoiseTileCS SSS_CASTER_TILES; R8_UINT). Null = the per-pixel mask only (47q).
+	ID3D11ShaderResourceView* MakeSSSCasterTiles();
+	DenoiseTexture sssCasterTiles;
+	std::uint32_t sssCasterTilesWidth = 0, sssCasterTilesHeight = 0;
+	std::string sssCasterTilesFault;
+	winrt::com_ptr<ID3D11ComputeShader> sssCasterTilesCS;
 	struct AOPrevCamera
 	{
 		bool valid = false;

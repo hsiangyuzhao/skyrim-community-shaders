@@ -18,6 +18,10 @@
 //   RTAO_UP                    quarter (value, weight) t5 + Raw t0 -> full-resolution far / large visibility u0
 //   RTAO_FULL [RTAO_VERTICAL]  horizontal: Raw t0 -> full (value, weight) u0; vertical: t5 -> visibility u0: 21 taps
 //   RTAO_DETAIL                Raw .a t0 -> full-resolution detail visibility u0: 5x5
+//   (47r) RTAO_TILE_MARK       Raw .g t0 -> per 8x8 tile 0 traced / 255 not (R8_UINT u0)
+//   (47r) RTAO_TILE_DIST [RTAO_VERTICAL]  t6 -> the Chebyshev distance in tiles to a traced tile (u0), separable
+//   (47r) every pass above: with kFlagTileSkip (RTAO: Filter Only Where Traced) a group farther from every traced tile than the reach its
+//   readers need (kReach*) returns at once; t10 = the tile distances (RTAOCommon.hlsli TilesFar).
 // (47l) kFlagTemporalV2 (RTAO: Temporal v2): RTAO_BLUR / RTAO_FULL take their Gaussian sigma from a world size (Temporal.y units at the
 // pixel's distance, clamped), taps spread up to 4 pixels apart past the tile (read directly). Off: the fixed pixel sigma (47k).
 // Guides: t1 the depth after the prepass (the game's), t2 NORMALROUGHNESS (view-space normal, octahedral).
@@ -44,6 +48,17 @@ static const float kGradTolFull = 0.03;   // ... 1 pixel away
 static const float kWorldSigmaMinLo = 1.0, kWorldSigmaMaxLo = 16.0;
 static const float kWorldSigmaMinFull = 2.0, kWorldSigmaMaxFull = 24.0;
 static const int kWorldStrideMax = 4;
+
+// (47r) RTAO: Filter Only Where Traced (kFlagTileSkip): how far (in 8x8 tiles) from a traced tile each pass is still read. The history pass
+// runs within 1 tile (its 16x16 groups span 2: 2); a pass is needed 1 tile (6 / 4 / 3 pixels) beyond its reader, the blurs 7 tiles (28
+// quarter-resolution pixels) more, the full-resolution horizontal pass 5 (40 pixels) more; quarter-resolution groups span 2 tiles (+1).
+static const uint kReachUp = 3u, kReachDetail = 3u, kReachDown = 20u;
+#if defined(RTAO_VERTICAL)
+static const uint kReachBlur = 4u, kReachFull = 3u;
+#else
+static const uint kReachBlur = 12u, kReachFull = 8u;
+#endif
+static const int kTileDistReach = 20;  // RTAO_TILE_DIST: the largest reach above
 
 float LinearDepth(float a_depth)
 {
@@ -96,8 +111,11 @@ RWTexture2D<float2> LoOut : register(u0);
 RWTexture2D<float> LoDepthOut : register(u1);
 RWTexture2D<float4> LoNormalOut : register(u2);
 
-[numthreads(8, 8, 1)] void main(uint3 dtid : SV_DispatchThreadID)
+[numthreads(8, 8, 1)] void main(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID)
 {
+	// (47r) Down: read by the horizontal blur 28 quarter-resolution pixels (7 tiles) away.
+	if (TilesFar(int2(gid.xy) * 2, int2(gid.xy) * 2 + 1, kReachDown))
+		return;
 	const int2 hiSize = int2(Size.xy);
 	const int2 loSize = (hiSize + 1) >> 1;
 	if (any(int2(dtid.xy) >= loSize))
@@ -159,6 +177,9 @@ groupshared float3 g_normal[TILE_COUNT];
 [numthreads(8, 8, 1)] void main(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
 	const int2 loSize = (int2(Size.xy) + 1) >> 1;
+	// (47r) Blur: the vertical one is read by the upsample (1 tile), the horizontal one by the vertical blur 28 pixels (7 tiles) away.
+	if (TilesFar(int2(gid.xy) * 2, int2(gid.xy) * 2 + 1, kReachBlur))
+		return;
 	const int2 maxP = max(loSize - 1, int2(0, 0));
 	{
 		const int2 tileOrigin = int2(gid.xy) * 8 - BLUR_RADIUS * TAP_STEP;
@@ -224,8 +245,11 @@ groupshared float3 g_normal[TILE_COUNT];
 // ---------------------------------------------------------------------------------------------------------------------
 RWTexture2D<float> VisibilityOut : register(u0);
 
-[numthreads(8, 8, 1)] void main(uint3 dtid : SV_DispatchThreadID)
+[numthreads(8, 8, 1)] void main(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID)
 {
+	// (47r) Up: read by the history pass 6 pixels away (1 tile) of its own reach (1).
+	if (TilesFar(int2(gid.xy), int2(gid.xy), kReachUp))
+		return;
 	if (any(dtid.xy >= Size.xy))
 		return;
 	const int2 hiSize = int2(Size.xy);
@@ -283,6 +307,9 @@ groupshared float3 g_normal[TILE_COUNT];
 
 [numthreads(8, 8, 1)] void main(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
+	// (47r) Full: the vertical one is read by the history pass (1 tile), the horizontal one by the vertical one 40 pixels (5 tiles) away.
+	if (TilesFar(int2(gid.xy), int2(gid.xy), kReachFull))
+		return;
 	const int2 maxP = max(int2(Size.xy) - 1, int2(0, 0));
 	{
 		const int2 tileOrigin = int2(gid.xy) * 8 - FULL_RADIUS * TAP_STEP;
@@ -372,6 +399,9 @@ groupshared float3 g_normal[DTILE_COUNT];
 
 [numthreads(8, 8, 1)] void main(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
+	// (47r) Detail: read by the history pass 4 pixels away (1 tile) of its own reach (1).
+	if (TilesFar(int2(gid.xy), int2(gid.xy), kReachDetail))
+		return;
 	const int2 maxP = max(int2(Size.xy) - 1, int2(0, 0));
 	{
 		const int2 tileOrigin = int2(gid.xy) * 8 - DETAIL_RADIUS;
@@ -409,6 +439,53 @@ groupshared float3 g_normal[DTILE_COUNT];
 	VisibilityOut[dtid.xy] = saturate(sumW > 0.0 ? sum / sumW : g_value[c]);
 }
 
+#elif defined(RTAO_TILE_MARK)
+// ---------------------------------------------------------------------------------------------------------------------
+// (47r) One group per 8x8 tile: 0 where any pixel of it was traced (TraceAOCS .g, the RT weight, above 0), else 255.
+RWTexture2D<uint> TileOut : register(u0);
+groupshared uint g_traced;
+
+[numthreads(8, 8, 1)] void main(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
+{
+	if (gi == 0u)
+		g_traced = 0u;
+	GroupMemoryBarrierWithGroupSync();
+	if (all(dtid.xy < Size.xy) && Raw[dtid.xy].g > 0.0)
+		InterlockedOr(g_traced, 1u);
+	GroupMemoryBarrierWithGroupSync();
+	if (gi == 0u)
+		TileOut[gid.xy] = g_traced != 0u ? 0u : 255u;
+}
+
+#elif defined(RTAO_TILE_DIST)
+// ---------------------------------------------------------------------------------------------------------------------
+// (47r) The Chebyshev distance (tiles) to the nearest traced tile, separable: horizontal over the marks, then vertical over the
+// horizontal distances (max(|dy|, h)); 255 beyond kTileDistReach.
+Texture2D<uint> TileIn : register(t6);
+RWTexture2D<uint> TileOut : register(u0);
+#	if defined(RTAO_VERTICAL)
+#		define TILE_STEP int2(0, 1)
+#	else
+#		define TILE_STEP int2(1, 0)
+#	endif
+
+[numthreads(8, 8, 1)] void main(uint3 dtid : SV_DispatchThreadID)
+{
+	const int2 tiles = int2((Size.xy + 7u) / 8u);
+	const int2 t = int2(dtid.xy);
+	if (any(t >= tiles))
+		return;
+	uint d = 255u;
+	[loop] for (int i = -kTileDistReach; i <= kTileDistReach; ++i)
+	{
+		const int2 q = t + i * TILE_STEP;
+		if (any(q < 0) || any(q >= tiles))
+			continue;
+		d = min(d, max(uint(abs(i)), TileIn[q]));
+	}
+	TileOut[t] = d;
+}
+
 #else
-#	error "RTAOFilterCS: define one of RTAO_DOWN, RTAO_BLUR, RTAO_UP, RTAO_FULL, RTAO_DETAIL"
+#	error "RTAOFilterCS: define one of RTAO_DOWN, RTAO_BLUR, RTAO_UP, RTAO_FULL, RTAO_DETAIL, RTAO_TILE_MARK, RTAO_TILE_DIST"
 #endif

@@ -85,4 +85,6 @@ namespace RayTracingWind
 	/// refit, none at 35.2 ms and up, the same frame's dt); the scene advances the frozen ones of its swaying plants itself.
 	bool ReadTimer(const RE::NiNode* a_node, float& o_timer);
 	bool WriteTimer(RE::NiNode* a_node, float a_timer);
+	/// (47r) The leaf node's frequency (BSLeafAnimNode +0x160; SEH: false when it cannot be read or is not finite).
+	bool ReadFrequency(const RE::NiNode* a_node, float& o_frequency);
 }

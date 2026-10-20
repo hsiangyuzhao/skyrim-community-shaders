@@ -191,6 +191,9 @@ namespace Util::FrameTrace
 		int windCatchups = -1;
 		int chunkCells = -1;
 		float chunksPerCell = -1.0f, chunkOverlap = -1.0f;
+		// (47r) Keep Leaves Moving: leaf timers frozen this frame without any rate (left as they were), catch-ups at the shared rate
+		// (-1 = sway off).
+		int windFrozenUnlearned = -1, windSharedCatchups = -1;
 	};
 	void OnRayTracingDetail(const RayTracingDetail& a_detail);
 

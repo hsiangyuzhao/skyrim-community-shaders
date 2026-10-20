@@ -70,6 +70,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	reflexFrameLimit,
 	reflexPacerMarginMs,
 	reflexPacerSmoothPhase,
+	reflexPacerRepeatingWaits,
 	neuralRendering);
 
 decltype(&D3D11CreateDeviceAndSwapChain) ptrD3D11CreateDeviceAndSwapChainUpscaling;
@@ -619,6 +620,13 @@ void Upscaling::DrawAdvancedSettings()
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::TextUnformatted("Off (default). On: predicts when the graphics card finishes a frame from the last several finishes instead of");
 			ImGui::TextUnformatted("only the last one, so the pacer's sleep jitters less from frame to frame.");
+		}
+		// (47r)
+		ImGui::Checkbox("Pacer: Learn Repeating Waits", &settings.reflexPacerRepeatingWaits);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted("On (default): when every 3rd or 4th frame gets stuck for a few ms in the middle of its work waiting for the");
+			ImGui::TextUnformatted("graphics card (a 34 / 28 / 30 ms rhythm), the pacer learns that wait at its full size and starts frames that");
+			ImGui::TextUnformatted("much later instead, so the frame times even out. Off: as 47q (it learned only the middle of the last 3 waits).");
 		}
 	}
 

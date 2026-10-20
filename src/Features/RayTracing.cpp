@@ -165,6 +165,7 @@ namespace
 	constexpr std::uint32_t kFlagBlockerEdges = 1024u, kFlagCharCull = 2048u, kFlagFalloff = 4096u;  // TraceShadowsCS
 	constexpr std::uint32_t kPatternNpcReduced = 16u;                                                  // TraceShadowsCS Extra.w
 	constexpr std::uint32_t kFlagSpatial = 512u, kFlagDenoiseHalf = 1024u, kFlagSigma = 2048u, kFlagFalloffDenoise = 4096u;  // Common.hlsli
+	constexpr std::uint32_t kCombineFlagUniformTiles = 8192u;  // (47r) Common.hlsli kFlagUniformTiles: CombineCS fast path (t6 = the denoiser's tiles)
 	constexpr float kBlockerRange = 4096.0f;    // TraceShadowsCS kBlockerRange
 	// (45k) Loading screens: build budgets (frame time does not matter there), warm-up after them.
 	constexpr std::uint32_t kLoadingBuildTriangles = 1u << 20;  // per submission (TDR-safe: about 8 frames' worth of normal builds)
@@ -266,6 +267,7 @@ namespace
 	constexpr std::uint32_t kPointFlagWater = 128u;     // (47i) TracePointLightsCS: trace the sources from last frame's water too
 	constexpr std::uint32_t kPointFlagSunProbe = 256u;  // (47q) TracePointLightsCS: reuse the sun pass's surface probe (its alpha variant)
 	constexpr std::uint32_t kFlagProbeShare = 8192u;    // (47q) TraceShadowsCS: write the probe as the point pass makes it (Output.w 64 / 128)
+	constexpr std::uint32_t kFlagProbeShareOpaque = 16384u;  // (47r) TraceShadowsCS: ... for the non-alpha point variant (no hit / opaque hit only)
 	constexpr std::uint32_t kPointDenoiseHistory = 1u, kPointDenoiseDebug = 2u;                             // PointDenoiseCS
 	constexpr float kBeamRayMargin = 64.0f;  // (46c) a window beam's ray goes this far past the interior's box
 	// (46f) RTAO.
@@ -292,6 +294,7 @@ namespace
 	constexpr std::uint32_t kAOFlagTemporalV2 = 256u;        // RTAOCommon.hlsli: Temporal v2 (RTAOTemporalCS RTAO_TEMPORAL_V2, the filters' world sigma)
 	constexpr std::uint32_t kAOFlagGeometryValid = 512u;     // RTAOCommon.hlsli: last frame's geometry / history lengths valid
 	constexpr std::uint32_t kAOFlagDynamicHistory = 1024u;   // (47n) RTAOCommon.hlsli: RTAO: Tight History Near Moving Things
+	constexpr std::uint32_t kAOFlagTileSkip = 2048u;          // (47r) RTAOCommon.hlsli: RTAO: Filter Only Where Traced (t10 = the tile distances)
 	constexpr float kAOMinHistoryWeight = 0.1f;   // this frame's weight never below 1 / 10 (a = max(1 / (n + 1), 0.1))
 	constexpr float kAOHistoryFixFrames = 4.0f;   // the history fix fades out over the first 4 frames of a pixel's history
 	constexpr float kAOMaxHistoryLength = 32.0f;  // n is stored up to this (only n < 9 changes the weight)
@@ -1084,7 +1087,8 @@ void RayTracing::FillWind(RayTracingRT::FrameInput& a_input)
 		return;
 	// (47q) Keep Leaves Moving on Long Frames: this frame's game time step (0 while the game is paused: nothing advanced).
 	const bool paused = globals::game::ui && globals::game::ui->GameIsPaused();
-	scene.UpdateWindPoses(backend, globals::state->frameCount, settings.FoliageKeepMoving, paused ? 0.0f : RE::GetSecondsSinceLastFrame());
+	scene.UpdateWindPoses(backend, globals::state->frameCount, settings.FoliageKeepMoving, paused ? 0.0f : RE::GetSecondsSinceLastFrame(),
+		settings.FoliageKeepMoving && settings.FoliageLearnAnyFrame);
 }
 
 RayTracingScene::SceneConfig RayTracing::SceneConfigFromSettings() const
@@ -1368,6 +1372,12 @@ void RayTracing::LoadSettings(json& o_json)
 		// Medium 0.27, Custom its CustomSunCone -- so the picture stays as it was.
 		settings.CustomNpcFullDistance = read("CustomNpcFullDistance", defaults.CustomNpcFullDistance);
 		settings.FoliageKeepMoving = read("FoliageKeepMoving", defaults.FoliageKeepMoving);
+		// (47r)
+		settings.AOPostTracedOnly = read("AOPostTracedOnly", defaults.AOPostTracedOnly);
+		settings.SunCombineTiles = read("SunCombineTiles", defaults.SunCombineTiles);
+		settings.SSSTileMask = read("SSSTileMask", defaults.SSSTileMask);
+		settings.PointProbeShareAll = read("PointProbeShareAll", defaults.PointProbeShareAll);
+		settings.FoliageLearnAnyFrame = read("FoliageLearnAnyFrame", defaults.FoliageLearnAnyFrame);
 		const float sunSize = read("SunSize", -1.0f);
 		if (sunSize >= 0.0f) {
 			settings.SunSize = sunSize;
@@ -1479,6 +1489,11 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["SunSize"] = settings.SunSize;          // (47q)
 	o_json["CustomNpcFullDistance"] = settings.CustomNpcFullDistance;
 	o_json["FoliageKeepMoving"] = settings.FoliageKeepMoving;
+	o_json["AOPostTracedOnly"] = settings.AOPostTracedOnly;  // (47r)
+	o_json["SunCombineTiles"] = settings.SunCombineTiles;
+	o_json["SSSTileMask"] = settings.SSSTileMask;
+	o_json["PointProbeShareAll"] = settings.PointProbeShareAll;
+	o_json["FoliageLearnAnyFrame"] = settings.FoliageLearnAnyFrame;
 	o_json["AOSmoothNormals"] = settings.AOSmoothNormals;  // (47j)
 	o_json["AOTemporalV2"] = settings.AOTemporalV2;  // (47l)
 	o_json["FoliageSway"] = settings.FoliageSway;  // (47l)
@@ -1580,6 +1595,8 @@ void RayTracing::ClearShaderCache()
 	for (auto* shader : { &aoFDownCS, &aoFBlurHCS, &aoFBlurVCS, &aoFUpCS, &aoFFullHCS, &aoFFullVCS, &aoFDetailCS, &aoDetailTemporalCS })
 		*shader = nullptr;
 	aoTemporalV2CS = nullptr;  // (47l)
+	for (auto* shader : { &aoTileMarkCS, &aoTileDistHCS, &aoTileDistVCS, &aoTemporalV2WideCS, &sssCasterTilesCS })  // (47r)
+		*shader = nullptr;
 }
 
 void RayTracing::PrecompileShaders()
@@ -1620,6 +1637,13 @@ void RayTracing::PrecompileShaders()
 		GetShaderDefined(aoDetailTemporalCS, L"Data\\Shaders\\RayTracing\\RTAOTemporalCS.hlsl", "RTAOTemporalCS (detail)", "RTAO_DETAIL_HISTORY");
 		if (settings.AOTemporal && aoTier.temporalV2)  // (47l)
 			GetShaderDefined(aoTemporalV2CS, L"Data\\Shaders\\RayTracing\\RTAOTemporalCS.hlsl", "RTAOTemporalCS (v2)", "RTAO_TEMPORAL_V2");
+		if (settings.AOPostTracedOnly) {  // (47r)
+			GetShaderDefined(aoTileMarkCS, kFilter, "RTAOFilterCS (tile mark)", "RTAO_TILE_MARK");
+			GetShaderDefined(aoTileDistHCS, kFilter, "RTAOFilterCS (tile distance)", "RTAO_TILE_DIST");
+			GetShaderDefined(aoTileDistVCS, kFilter, "RTAOFilterCS (tile distance, vertical)", "RTAO_TILE_DIST,RTAO_VERTICAL");
+			if (settings.AOTemporal && aoTier.temporalV2)
+				GetShaderDefined(aoTemporalV2WideCS, L"Data\\Shaders\\RayTracing\\RTAOTemporalCS.hlsl", "RTAOTemporalCS (v2, 16x16)", "RTAO_TEMPORAL_V2,RTAO_WIDE");
+		}
 	}
 }
 
@@ -1744,6 +1768,11 @@ void RayTracing::ReleaseDenoiser()
 	history4Valid = false;
 	d3d11Bytes -= std::min(d3d11Bytes, denoiseBytes);
 	denoiseBytes = 0;
+	if (sssCasterTiles.texture) {  // (47r)
+		d3d11Bytes -= std::min<std::uint64_t>(d3d11Bytes, static_cast<std::uint64_t>(sssCasterTilesWidth) * sssCasterTilesHeight);
+		sssCasterTiles = {};
+		sssCasterTilesWidth = sssCasterTilesHeight = 0;
+	}
 }
 
 namespace
@@ -2730,6 +2759,8 @@ void RayTracing::PublishCpuSplit()
 			detail.windRefitVertices = activeThisFrame || earlyThisFrame ? static_cast<std::int64_t>(ws.refitVerticesLastFrame) : 0;
 			detail.windRadius = sw.radius;
 			detail.windCatchups = static_cast<int>(sw.catchups);  // (47q)
+			detail.windFrozenUnlearned = static_cast<int>(sw.frozenUnlearned);  // (47r)
+			detail.windSharedCatchups = static_cast<int>(sw.catchupsShared);
 		}
 		// (47q) The NPC rule and tiny face parts (characters traced), static chunks (a statistic, refreshed every 120 frames).
 		if (settings.Characters && backend.SkinAvailable()) {
@@ -3162,12 +3193,14 @@ void RayTracing::RunFrame()
 	}
 	// (47q) The point pass reuses the sun's surface probe (both mark the traced-caster surfaces; same depth, rect and probe ray): the sun
 	// writes the probe as the point pass makes it where it probed, the point pass (its cut-out variant) takes it there, traces it elsewhere.
-	if (input.pointLights && (traceFlags & kFlagRtSurface) && pointInput.alpha) {
+	// (47r) "Point Lights: Reuse the Sun's Surface Probe Everywhere" (PointProbeShareAll): the non-alpha variant too (Low / Medium
+	// outdoors): the sun marks only the pixels whose probe hit nothing or a forced-opaque instance (kFlagProbeShareOpaque). Exact.
+	if (input.pointLights && (traceFlags & kFlagRtSurface) && (pointInput.alpha || settings.PointProbeShareAll)) {
 		std::uint32_t pointFlags;
 		std::memcpy(&pointFlags, &pointInput.constants.params[2], sizeof(pointFlags));
 		if (pointFlags & kPointFlagRtSurface) {
 			pointFlags |= kPointFlagSunProbe;
-			traceFlags |= kFlagProbeShare;
+			traceFlags |= kFlagProbeShare | (pointInput.alpha ? 0u : kFlagProbeShareOpaque);
 			std::memcpy(&pointInput.constants.params[2], &pointFlags, sizeof(pointFlags));
 			std::memcpy(&input.constants.params[2], &traceFlags, sizeof(float));
 		}
@@ -3693,7 +3726,9 @@ void RayTracing::FinishFrame()
 
 	// 2. (45k) Screen Space Shadows "non-RT casters only", now that the trace marked the traced casters.
 	if (pending.sssNonRT && sssClaimed) {
-		screenSpaceShadows->DrawDeferred(backend.VisibilitySRV(), settings.RtContactScale, pending.biasConstant, pending.biasPerUnit);
+		// (47r) Tile Mask for RT Casters: the per-tile summary first (timed with Screen Space Shadows: its cost is theirs).
+		ID3D11ShaderResourceView* casterTiles = settings.SSSTileMask ? MakeSSSCasterTiles() : nullptr;
+		screenSpaceShadows->DrawDeferred(backend.VisibilitySRV(), settings.RtContactScale, pending.biasConstant, pending.biasPerUnit, casterTiles);
 		sssClaimed = false;
 	}
 
@@ -3774,8 +3809,15 @@ void RayTracing::FinishFrame()
 		auto* combine = GetShader(combineCS, L"Data\\Shaders\\RayTracing\\CombineCS.hlsl", "CombineCS");
 		const std::uint32_t read4 = history4Index, write4 = history4Index ^ 1u;
 		const bool writeSSS = pending.writeSSS;
-		ID3D11ShaderResourceView* srvs[6] = { mask.SRV, backend.VisibilitySRV(), backend.DepthMaskSRV(), sigmaActive ? sigmaOut.srv.get() : nullptr,
-			(combineFlags & kFlagSpatial) ? denoiseOut.srv.get() : nullptr, penumbraActive ? history4[read4].srv.get() : nullptr };
+		// (47r) Sun: Fast Path for Uniform Tiles: the denoiser's tiles at t6 (Penumbra, this frame's tile pass ran).
+		const bool uniformTiles = settings.SunCombineTiles && penumbraActive && (combineFlags & kFlagSpatial) && !sigmaActive && denoiseTiles.srv;
+		if (uniformTiles) {
+			combineFlags |= kCombineFlagUniformTiles;
+			setFlags();
+		}
+		ID3D11ShaderResourceView* srvs[7] = { mask.SRV, backend.VisibilitySRV(), backend.DepthMaskSRV(), sigmaActive ? sigmaOut.srv.get() : nullptr,
+			(combineFlags & kFlagSpatial) ? denoiseOut.srv.get() : nullptr, penumbraActive ? history4[read4].srv.get() : nullptr,
+			uniformTiles ? denoiseTiles.srv.get() : nullptr };
 		ID3D11UnorderedAccessView* uavs[5] = {
 			maskTempUAV.get(),
 			writeSSS ? screenSpaceShadows->screenSpaceShadowsTexture->uav.get() : nullptr,
@@ -3788,13 +3830,13 @@ void RayTracing::FinishFrame()
 		if (writeSSS)
 			context->PSSetShaderResources(45, 1, nullPs);
 		context->CSSetConstantBuffers(0, 1, cbs);
-		context->CSSetShaderResources(0, 6, srvs);
+		context->CSSetShaderResources(0, 7, srvs);
 		context->CSSetUnorderedAccessViews(0, 5, uavs, nullptr);
 		context->CSSetShader(combine, nullptr, 0);
 		context->Dispatch(groupsX, groupsY, 1);
-		ID3D11ShaderResourceView* nullSrvs[6]{};
+		ID3D11ShaderResourceView* nullSrvs[7]{};
 		ID3D11UnorderedAccessView* nullUavs[5]{};
-		context->CSSetShaderResources(0, 6, nullSrvs);
+		context->CSSetShaderResources(0, 7, nullSrvs);
 		context->CSSetUnorderedAccessViews(0, 5, nullUavs, nullptr);
 		if (penumbraActive) {
 			history4Index = write4;
@@ -4152,7 +4194,7 @@ bool RayTracing::RunAONormalPrep(ID3D11DeviceContext* a_context, ID3D11ShaderRes
 		}
 	}
 	const bool writeDebug = normalView && aoNormalDebug.uav;
-	cb.Flags[0] = 1u;  // (47n) v2 always
+	cb.Flags[0] = 1u | (settings.AOPostTracedOnly ? 2u : 0u);  // (47n) v2 always; (47r) bit 2: the motion candidate reuses the camera one's search
 	cb.Flags[1] = writeDebug ? static_cast<std::uint32_t>(normalView) : 0u;
 	// (47p) Pixels the trace does not read (its weight is 0 there: outside its rect or beyond the fade end) keep "no smooth normal".
 	if (PerfOptions::settings.RtaoNormalFold && !writeDebug) {
@@ -4551,6 +4593,7 @@ void RayTracing::ReleaseAOFilter()
 	aoD3D11Bytes = 0;
 	ReleaseAOExtras();  // (46t)
 	ReleaseAOTemporalV2();  // (47l)
+	ReleaseAOTiles();  // (47r)
 }
 
 void RayTracing::ReleaseAOTemporalV2()
@@ -4604,6 +4647,102 @@ void RayTracing::ReleaseAOExtras()
 	aoDetailHistoryValid = false;
 	d3d11Bytes -= std::min(d3d11Bytes, aoExtrasBytes);
 	aoExtrasBytes = 0;
+}
+
+void RayTracing::ReleaseAOTiles()
+{
+	// (47r)
+	for (auto* t : { &aoTileMark, &aoTileH, &aoTileDist })
+		*t = {};
+	aoTilesWidth = aoTilesHeight = 0;
+	d3d11Bytes -= std::min(d3d11Bytes, aoTilesBytes);
+	aoTilesBytes = 0;
+}
+
+bool RayTracing::EnsureAOTiles()
+{
+	// (47r) RTAO: Filter Only Where Traced: three R8_UINT textures of one texel per 8x8 tile (a few tens of KB). Failing them this session
+	// the filter runs everywhere (47q).
+	if (!aoTilesFault.empty())
+		return false;
+	const std::uint32_t tw = (aoWidth + 7) / 8, th = (aoHeight + 7) / 8;
+	if (!tw || !th)
+		return false;
+	if (aoTileDist.texture && aoTilesWidth == tw && aoTilesHeight == th)
+		return true;
+	ReleaseAOTiles();
+	DenoiseTexture mark, h, dist;
+	bool ok = CreateDenoiseTexture(this, mark.texture, mark.srv, mark.uav, tw, th, DXGI_FORMAT_R8_UINT, "RayTracing RTAO Tile Mark") &&
+	          CreateDenoiseTexture(this, h.texture, h.srv, h.uav, tw, th, DXGI_FORMAT_R8_UINT, "RayTracing RTAO Tile Distance H") &&
+	          CreateDenoiseTexture(this, dist.texture, dist.srv, dist.uav, tw, th, DXGI_FORMAT_R8_UINT, "RayTracing RTAO Tile Distance");
+	if (!ok) {
+		aoTilesFault = "could not create its tile textures (the filter runs everywhere, as 47q)";
+		logger::warn("[RayTracing] RTAO: Filter Only Where Traced: {}", aoTilesFault);
+		return false;
+	}
+	aoTileMark = std::move(mark);
+	aoTileH = std::move(h);
+	aoTileDist = std::move(dist);
+	aoTilesWidth = tw;
+	aoTilesHeight = th;
+	aoTilesBytes = static_cast<std::uint64_t>(tw) * th * 3;
+	d3d11Bytes += aoTilesBytes;
+	return true;
+}
+
+ID3D11ShaderResourceView* RayTracing::MakeSSSCasterTiles()
+{
+	// (47r) Screen Space Shadows: Tile Mask for RT Casters. One texel per 8x8 tile of the whole visibility texture (the contact-shadow pass
+	// reads the mask by its own size); failing the texture or the shader this session: null (the per-pixel mask, 47q).
+	if (!sssCasterTilesFault.empty())
+		return nullptr;
+	auto* visibility = backend.VisibilitySRV();
+	if (!visibility)
+		return nullptr;
+	winrt::com_ptr<ID3D11Resource> resource;
+	visibility->GetResource(resource.put());
+	auto texture = resource.try_as<ID3D11Texture2D>();
+	if (!texture)
+		return nullptr;
+	D3D11_TEXTURE2D_DESC desc{};
+	texture->GetDesc(&desc);
+	const std::uint32_t tw = (desc.Width + 7) / 8, th = (desc.Height + 7) / 8;
+	if (!sssCasterTiles.texture || sssCasterTilesWidth != tw || sssCasterTilesHeight != th) {
+		if (sssCasterTiles.texture)
+			d3d11Bytes -= std::min<std::uint64_t>(d3d11Bytes, static_cast<std::uint64_t>(sssCasterTilesWidth) * sssCasterTilesHeight);
+		sssCasterTiles = {};
+		DenoiseTexture tiles;
+		if (!CreateDenoiseTexture(this, tiles.texture, tiles.srv, tiles.uav, tw, th, DXGI_FORMAT_R8_UINT, "RayTracing SSS Caster Tiles")) {
+			sssCasterTilesFault = "could not create its texture";
+			logger::warn("[RayTracing] Screen Space Shadows: Tile Mask for RT Casters: {} (the per-pixel mask is used)", sssCasterTilesFault);
+			return nullptr;
+		}
+		sssCasterTiles = std::move(tiles);
+		sssCasterTilesWidth = tw;
+		sssCasterTilesHeight = th;
+		d3d11Bytes += static_cast<std::uint64_t>(tw) * th;
+	}
+	auto* shader = GetShaderDefined(sssCasterTilesCS, L"Data\\Shaders\\RayTracing\\DenoiseTileCS.hlsl", "DenoiseTileCS (SSS caster tiles)", "SSS_CASTER_TILES");
+	if (!shader) {
+		sssCasterTilesFault = "its shader did not compile";
+		logger::warn("[RayTracing] Screen Space Shadows: Tile Mask for RT Casters: {} (the per-pixel mask is used)", sssCasterTilesFault);
+		return nullptr;
+	}
+	auto* context = globals::d3d::context;
+	auto* timers = Util::GpuPassTimers::GetSingleton();
+	timers->Begin(Util::GpuBucket::ScreenSpaceShadows);
+	ID3D11UnorderedAccessView* uav = sssCasterTiles.uav.get();
+	context->CSSetShaderResources(0, 1, &visibility);
+	context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+	context->CSSetShader(shader, nullptr, 0);
+	context->Dispatch(tw, th, 1);
+	ID3D11ShaderResourceView* nullSrv = nullptr;
+	ID3D11UnorderedAccessView* nullUav = nullptr;
+	context->CSSetShaderResources(0, 1, &nullSrv);
+	context->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
+	context->CSSetShader(nullptr, nullptr, 0);
+	timers->End(Util::GpuBucket::ScreenSpaceShadows);
+	return sssCasterTiles.srv.get();
 }
 
 bool RayTracing::EnsureAOExtras(bool a_quarter, bool a_full, bool a_detail)
@@ -5001,6 +5140,23 @@ void RayTracing::DrawAmbientOcclusionImpl()
 		cb.Size[2] |= kAOFlagTemporalV2 | (geometryValid ? kAOFlagGeometryValid : 0u);
 	if (settings.AODynamicFlag)
 		cb.Size[2] |= kAOFlagDynamicHistory;  // (47n) v2: n <= 1 and a 3x3 clamp; the 47k history: half of this frame, no slack
+	// (47r) RTAO: Filter Only Where Traced: the tile passes' shaders and textures (failing them: everywhere, as 47q); never with a debug view.
+	ID3D11ComputeShader *tileMarkCS = nullptr, *tileDistHCS = nullptr, *tileDistVCS = nullptr, *temporalWide = nullptr;
+	bool tileSkip = settings.AOPostTracedOnly && aoDebugView == AODebugView::Off && !debugOverlay && EnsureAOTiles();
+	if (tileSkip) {
+		tileMarkCS = GetShaderDefined(aoTileMarkCS, kFilter, "RTAOFilterCS (tile mark)", "RTAO_TILE_MARK");
+		tileDistHCS = GetShaderDefined(aoTileDistHCS, kFilter, "RTAOFilterCS (tile distance)", "RTAO_TILE_DIST");
+		tileDistVCS = GetShaderDefined(aoTileDistVCS, kFilter, "RTAOFilterCS (tile distance, vertical)", "RTAO_TILE_DIST,RTAO_VERTICAL");
+		if (v2)
+			temporalWide = GetShaderDefined(aoTemporalV2WideCS, L"Data\\Shaders\\RayTracing\\RTAOTemporalCS.hlsl", "RTAOTemporalCS (v2, 16x16)", "RTAO_TEMPORAL_V2,RTAO_WIDE");
+		if (!tileMarkCS || !tileDistHCS || !tileDistVCS || (v2 && !temporalWide)) {
+			aoTilesFault = "a tile shader did not compile (the filter runs everywhere, as 47q)";
+			logger::warn("[RayTracing] RTAO: Filter Only Where Traced: {}", aoTilesFault);
+			tileSkip = false;
+		}
+	}
+	if (tileSkip)
+		cb.Size[2] |= kAOFlagTileSkip;
 	std::memcpy(cb.InvViewProj, &fbAO.GetCameraViewProjInverse(0), sizeof(cb.InvViewProj));
 	if (prevCameraUsable)
 		std::copy_n(aoPrevCamera.viewProj, 16, cb.PrevViewProj);
@@ -5048,6 +5204,21 @@ void RayTracing::DrawAmbientOcclusionImpl()
 	timers->Begin(Util::GpuBucket::RayTracingAO);
 	ID3D11Buffer* cbs[1] = { aoCB->CB() };
 	context->CSSetConstantBuffers(0, 1, cbs);
+	if (tileSkip) {
+		// 1b. (47r) Which 8x8 tiles were traced, then the distance (tiles) to the nearest one; t10 for every pass below.
+		const UINT tw = (width + 7) / 8, th = (height + 7) / 8;
+		dispatch(tileMarkCS, { backend.AORawSRV() }, { aoTileMark.uav.get() }, tw, th);
+		ID3D11ShaderResourceView* tileIn = aoTileMark.srv.get();
+		context->CSSetShaderResources(6, 1, &tileIn);
+		dispatch(tileDistHCS, {}, { aoTileH.uav.get() }, (tw + 7) / 8, (th + 7) / 8);
+		tileIn = aoTileH.srv.get();
+		context->CSSetShaderResources(6, 1, &tileIn);
+		dispatch(tileDistVCS, {}, { aoTileDist.uav.get() }, (tw + 7) / 8, (th + 7) / 8);
+		ID3D11ShaderResourceView* tileViews[2] = { nullptr, nullptr };
+		context->CSSetShaderResources(6, 1, tileViews);
+		ID3D11ShaderResourceView* distView = aoTileDist.srv.get();
+		context->CSSetShaderResources(10, 1, &distView);
+	}
 	if (fullRes) {
 		// 2. (46t) Full render resolution: a separable 21-tap edge-aware filter (plane-predicted depth, normal), with two
 		//    scales weighted by the far samples' weights.
@@ -5083,8 +5254,14 @@ void RayTracing::DrawAmbientOcclusionImpl()
 			aoV2Length[v2Write].uav.get(), aoV2Geometry[v2Write].uav.get(), historyView ? debugColorUAV.get() : nullptr };
 		context->CSSetShaderResources(0, 10, srvs);
 		context->CSSetUnorderedAccessViews(0, 5, uavs, nullptr);
-		context->CSSetShader(temporalV2, nullptr, 0);
-		context->Dispatch(groupsX, groupsY, 1);
+		// (47r) With Filter Only Where Traced: 16x16 groups (the same per-pixel work, less of the apron loaded twice).
+		if (tileSkip) {
+			context->CSSetShader(temporalWide, nullptr, 0);
+			context->Dispatch((width + 15) / 16, (height + 15) / 16, 1);
+		} else {
+			context->CSSetShader(temporalV2, nullptr, 0);
+			context->Dispatch(groupsX, groupsY, 1);
+		}
 		ID3D11ShaderResourceView* nullSrvs10[10]{};
 		ID3D11UnorderedAccessView* nullUavs5[5]{};
 		context->CSSetShaderResources(0, 10, nullSrvs10);
@@ -5139,6 +5316,10 @@ void RayTracing::DrawAmbientOcclusionImpl()
 	dispatch(composite, { blended->srv.get(), backend.AORawSRV(), ssgi.GetOwnAoSRV(), contact, detailBlended ? detailBlended->srv.get() : nullptr,
 							normalDebug ? aoNormalDebug.srv.get() : nullptr },
 		{ aoOut.uav.get(), debugOverlay ? debugColorUAV.get() : nullptr }, groupsX, groupsY);
+	if (tileSkip) {
+		ID3D11ShaderResourceView* nullTile = nullptr;
+		context->CSSetShaderResources(10, 1, &nullTile);
+	}
 	timers->End(Util::GpuBucket::RayTracingAO);
 	ID3D11Buffer* nullCb[1]{};
 	context->CSSetConstantBuffers(0, 1, nullCb);
@@ -5790,6 +5971,17 @@ void RayTracing::DrawSunPage()
 				ImGui::Text("  widen with the distance to the caster. Larger = softer, wider shadow edges everywhere (until 47p High and Ultra used 0.5).");
 				ImGui::Text("  Not part of the quality tiers: picking a tier keeps it.");
 			}
+			// (47r) Speed-ups (exact: the picture stays as it was).
+			ImGui::Checkbox("Sun: Fast Path for Uniform Tiles", &settings.SunCombineTiles);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): where a whole patch of screen is fully lit or fully in shadow, the step that merges the ray-traced shadow");
+				ImGui::Text("  into the game's shadow skips its per-pixel checks (same result). Only with the Penumbra denoiser. Off: as 47q.");
+			}
+			ImGui::Checkbox("Screen Space Shadows: Tile Mask for RT Casters", &settings.SSSTileMask);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): the contact shadows look up a small per-patch summary of which surfaces are ray traced and read the");
+				ImGui::Text("  full mask only where a patch has both kinds (same result, less memory traffic). Off: as 47q.");
+			}
 		} else {
 			ImGui::TextDisabled("Sun shadows: the game's own. Objects in Ray Tracing (main page) still decide what blocks point lights and RT AO.");
 		}
@@ -5957,6 +6149,18 @@ void RayTracing::DrawObjectRows()
 			ImGui::Text("  its own pace), before anything is drawn: the leaves, their shadow maps and the ray-traced shadow keep moving.");
 			ImGui::Text("Off: exactly as the game (F7: rt_wind_catchup = plants advanced this frame).");
 		}
+		// (47r)
+		ImGui::Indent();
+		ImGui::BeginDisabled(!settings.FoliageKeepMoving);
+		ImGui::Checkbox("Learn on Any Frame", &settings.FoliageLearnAnyFrame);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): each plant's leaf speed is learned from every frame the game moves its leaves, also when frames are long");
+			ImGui::Text("  (47q learned only on frames under 34.5 ms, so at a steady ~36 ms the leaves never learned and stayed frozen). A plant");
+			ImGui::Text("  that has not learned yet uses the speed the other plants share, once they agree. Off: as 47q.");
+			ImGui::Text("  F7: rt_wind_frozen_unlearned = leaves still frozen without any speed, rt_wind_shared = moved at the shared speed.");
+		}
+		ImGui::EndDisabled();
+		ImGui::Unindent();
 		ImGui::EndDisabled();
 		ImGui::Unindent();
 		ImGui::EndDisabled();
@@ -6166,6 +6370,12 @@ void RayTracing::DrawPointLightPage()
 			ImGui::SliderFloat("Non-RT Casters: RT Caster Contact Length", &settings.PointLightsSSPLSContact, 0.0f, 31.875f, "%.1f x ray offset");
 			if (auto _tt = Util::HoverTooltipWrapper())
 				ImGui::Text("How close to the surface a ray-traced occluder still casts a screen-space contact shadow (the ray tracer starts a little off the surface).");
+			// (47r)
+			ImGui::Checkbox("Reuse the Sun's Surface Probe Everywhere", &settings.PointProbeShareAll);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): outdoors in Low and Medium too, the point lights take the sun's check of which surfaces are ray traced");
+				ImGui::Text("  instead of shooting their own ray per pixel (High and Ultra did so since 47q). Same result. Off: as 47q.");
+			}
 			// (46c, 47m: default on)
 			ImGui::BeginDisabled(!settings.PointLightsInteriors);
 			ImGui::Checkbox("Skip the Game's Shadow Maps for RT-Shadowed Lights", &settings.PointLightsSkipShadowMaps);
@@ -6346,6 +6556,16 @@ void RayTracing::DrawAOPage()
 			ImGui::Text("  keeps almost no history (at most 1 frame) and is held tightly to this frame's neighbours, so walking characters and");
 			ImGui::Text("  swinging doors leave no dark trail on the floor and walls. Elsewhere nothing changes. Strongest with Temporal v2");
 			ImGui::Text("  (Medium and above); without it such pixels take half of this frame and no clamp slack. Off: as in 47m.");
+		}
+		ImGui::EndDisabled();
+		// (47r)
+		ImGui::SeparatorText("Speed-ups");
+		ImGui::BeginDisabled(!settings.AO);
+		ImGui::Checkbox("RTAO: Filter Only Where Traced", &settings.AOPostTracedOnly);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): RTAO's clean-up passes skip the sky, the far distance and everything else that has no ray-traced AO");
+			ImGui::Text("  (with a margin so the traced pixels see exactly what they saw before), the history pass works in larger blocks, and");
+			ImGui::Text("  the Smooth Normals pass reuses one of its two searches where both look at the same spot. Same picture. Off: as 47q.");
 		}
 		ImGui::EndDisabled();
 		{

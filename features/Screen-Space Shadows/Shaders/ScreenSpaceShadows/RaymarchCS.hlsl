@@ -3,6 +3,8 @@
 #if defined(RT_CASTER_MASK)
 // (45k) Ray Tracing visibility texture: alpha bit 4 = the visible surface is a ray-traced caster.
 Texture2D<unorm float4> RTCasterMask : register(t1);
+// (47r) Per 8x8 tile of RTCasterMask: bit 0 some traced caster, bit 1 some other pixel (RtTileMask; RayTracing DenoiseTileCS SSS_CASTER_TILES).
+Texture2D<uint> RTCasterTiles : register(t2);
 #endif
 
 #include "ScreenSpaceShadows/bend_sss_gpu.hlsli"
@@ -50,6 +52,7 @@ SamplerState PointBorderSampler : register(s0);        // A point sampler, with 
 	parameters.ProjInfo = ProjInfo.xy;
 	parameters.RtContactScale = RtContactScale;
 	parameters.RtBias = float2(RtBiasConstant, RtBiasPerUnit);
+	parameters.RtTileMask = RtTileMask;
 
 	WriteScreenSpaceShadow(parameters, groupID, groupThreadID);
 }

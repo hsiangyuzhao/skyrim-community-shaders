@@ -31,6 +31,13 @@ RWTexture2D<unorm float4> Debug : register(u1);
 	const float ssgiOcclusion = saturate(SsgiAo[p]);
 	const float4 raw = Raw[p];
 	const float weight = saturate(raw.g * Params.w);
+	// (47r) RTAO: Filter Only Where Traced: not traced = SSGI's AO exactly (lerp(x, y, 0) = x); the filtered textures are not read (the
+	// filter skipped most such pixels). Not with a debug view (the flag is off then).
+	[branch] if ((Size.z & kFlagTileSkip) && !(weight > 0.0))
+	{
+		Output[p] = ssgiOcclusion;
+		return;
+	}
 	const float largeVis = 1.0 - saturate((1.0 - RTAO[p]) * Params.x);
 	const bool detail = (Size.z & kFlagDetail) != 0;
 	const float detailVis = detail ? 1.0 - saturate((1.0 - DetailAO[p]) * Detail.x) : 1.0;

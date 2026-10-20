@@ -83,7 +83,7 @@ static const uint kFlagSticky = 8u;          // (46g) last frame's sources of th
 static const uint kBeamCull = RAY_FLAG_CULL_FRONT_FACING_TRIANGLES;
 static const uint kFlagRtSurface = 64u;      // (46y) probe whether the visible surface is a traced caster (PLIdx.w bit 7)
 static const uint kFlagWater = 128u;         // (47i) trace the pixel's sources from last frame's water surface too (PLWaterVis)
-static const uint kFlagSunProbe = 256u;      // (47q) with kFlagRtSurface: the sun pass's probe (SunVisibility.w) where it made one (RT_ALPHA only)
+static const uint kFlagSunProbe = 256u;      // (47q) with kFlagRtSurface: the sun pass's probe (SunVisibility.w) where it made one ((47r) both variants)
 static const uint kSunOutProbed = 64u, kSunOutRtSurfaceRaw = 128u;  // TraceShadowsCS kOutProbed / kOutRtSurfaceRaw
 static const float kStickyBonus = 1.5;
 static const uint kChurnWord = 1u;           // (46g) RayCounter words: [1] pixels whose source set changed
@@ -481,15 +481,12 @@ groupshared uint gsMask[2];
 	bool probeShared = false;
 	[branch] if (flags & kFlagRtSurface)
 	{
-#if defined(RT_ALPHA)
 		// (47q, kFlagSunProbe) The sun pass probed this pixel the same way (same depth, rect, depth normal, opaque-forced probe against
-		// every instance): its result. Only in this variant (the other one culls the cut-outs in its probe).
+		// every instance): its result. (47r) The non-alpha variant too (its probe culls the cut-outs): the sun pass then marks a pixel
+		// probed only where its hit was on a forced-opaque instance or there was none (TraceShadowsCS kFlagProbeShareOpaque).
 		const uint sunFlags = (flags & kFlagSunProbe) ? uint(SunVisibility[p].w * 255.0 + 0.5) : 0u;
 		probeShared = (sunFlags & kSunOutProbed) != 0u;
 		rtSurface = probeShared ? (sunFlags & kSunOutRtSurfaceRaw) != 0u : SurfaceProbe(P, V, N, dist);
-#else
-		rtSurface = SurfaceProbe(P, V, N, dist);
-#endif
 	}
 
 	// Top K by contribution.

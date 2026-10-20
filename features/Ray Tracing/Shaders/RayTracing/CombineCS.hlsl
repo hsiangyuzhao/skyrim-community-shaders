@@ -161,13 +161,12 @@ void TemporalStats(int2 p, uint flags, out float mean, out float sigma, out floa
 // expected distance), clamped to this frame's 3x3 mean +- k sigma, blended with 1 / length; the
 // length grows to Denoise.z frames, less while the camera moves fast and where a character casts
 // the shadow.
-float ClampedHistory(int2 p, float3 P, float rt, uint flags, uint anyFlags, out float historyLength)
+// (47r) With this frame's 3x3 statistics given (ClampedHistory computes them; the uniform-tile fast path knows them).
+float ClampedHistoryWith(int2 p, float3 P, float rt, uint flags, uint anyFlags, float mean, float sigma, float n, out float historyLength)
 {
 	historyLength = 1.0;
 	if (!(flags & kFlagHistoryValid))
 		return rt;
-	float mean, sigma, n;
-	TemporalStats(p, flags, mean, sigma, n);
 	if (n <= 0.0)
 		return rt;
 	const float lo = mean - Denoise.w * sigma - 0.02, hi = mean + Denoise.w * sigma + 0.02;
@@ -208,8 +207,49 @@ float ClampedHistory(int2 p, float3 P, float rt, uint flags, uint anyFlags, out 
 	return lerp(hv, rt, 1.0 / historyLength);
 }
 
-[numthreads(8, 8, 1)] void main(uint3 dtid : SV_DispatchThreadID) {
+float ClampedHistory(int2 p, float3 P, float rt, uint flags, uint anyFlags, out float historyLength)
+{
+	historyLength = 1.0;
+	if (!(flags & kFlagHistoryValid))
+		return rt;
+	float mean, sigma, n;
+	TemporalStats(p, flags, mean, sigma, n);
+	return ClampedHistoryWith(p, P, rt, flags, anyFlags, mean, sigma, n, historyLength);
+}
+
+// (47r) "Sun: Fast Path for Uniform Tiles" (kFlagUniformTiles, Penumbra): the denoiser's tiles (DenoiseTileCS: lowest / highest traced
+// visibility per 8x8 tile) of the 5x5 tiles around this group all equal and 0 or 1 (or without traced pixels): the penumbra filter left
+// every traced pixel within 1 tile of this group as it was (its 3x3-tile test was flat there), so the spatial result of a traced pixel is
+// its own visibility (full resolution; at half resolution the upsample keeps the raw value at radius 0) and the 3x3 statistics are
+// mean = that value, sigma = 0, n >= 1. Exactly what the per-pixel path computes, without its positions and loads.
+// Returns 1 + the value (1 or 2) for such a group, 0 otherwise.
+Texture2D<float4> Tiles : register(t6);
+groupshared uint gsTileLo, gsTileHiP1;
+
+uint UniformTiles(int2 a_tile, uint a_gi)
+{
+	if (a_gi == 0u) {
+		gsTileLo = asuint(2.0);
+		gsTileHiP1 = 0u;
+	}
+	GroupMemoryBarrierWithGroupSync();
+	if (a_gi < 25u) {
+		const int2 maxTile = int2((Size.xy + 7u) / 8u) - 1;
+		const float4 t = Tiles[clamp(a_tile + int2(int(a_gi % 5u) - 2, int(a_gi / 5u) - 2), int2(0, 0), maxTile)];
+		InterlockedMin(gsTileLo, asuint(clamp(t.z, 0.0, 2.0)));
+		InterlockedMax(gsTileHiP1, asuint(clamp(t.w, -1.0, 1.0) + 1.0));
+	}
+	GroupMemoryBarrierWithGroupSync();
+	const float lo = asfloat(gsTileLo), hi = asfloat(gsTileHiP1) - 1.0;
+	return (lo == hi && (lo == 0.0 || lo == 1.0)) ? 1u + uint(lo) : 0u;
+}
+
+[numthreads(8, 8, 1)] void main(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
 	const int2 p = int2(dtid.xy);
+	// (47r) Before the bounds test (it has barriers); the flag is the same for the whole dispatch.
+	uint uniformTiles = 0u;
+	[branch] if ((asuint(Band.z) & (kFlagUniformTiles | kFlagSpatial | kFlagPenumbra | kFlagSigma)) == (kFlagUniformTiles | kFlagSpatial | kFlagPenumbra))
+		uniformTiles = UniformTiles(int2(gid.xy), gi);
 	if (any(dtid.xy >= Size.xy))
 		return;
 
@@ -247,7 +287,11 @@ float ClampedHistory(int2 p, float3 P, float rt, uint flags, uint anyFlags, out 
 			else
 			{
 				// This frame's spatial stage.
-				if (flags & kFlagSpatial) {
+				// (47r) Uniform tiles (see UniformTiles), a traced (not skipped) pixel: its own visibility, the known statistics.
+				const bool fast = uniformTiles != 0u && !(signedDepth < 0.0 && (flags & kFlagTraceSkipped));
+				if (fast) {
+					rt = Visibility[p].x;
+				} else if (flags & kFlagSpatial) {
 					if (flags & kFlagDenoiseHalf)
 						rt = PenumbraUpsample(p, dist, radiusShown);
 					else {
@@ -269,7 +313,10 @@ float ClampedHistory(int2 p, float3 P, float rt, uint flags, uint anyFlags, out 
 							anyFlags |= VisFlags(clamp(p + int2(dx, dy), int2(0, 0), int2(Size.xy) - 1));
 						}
 					}
-					rt = ClampedHistory(p, P, rt, flags, anyFlags, historyLength);
+					if (fast)
+						rt = ClampedHistoryWith(p, P, rt, flags, anyFlags, float(uniformTiles - 1u), 0.0, 1.0, historyLength);
+					else
+						rt = ClampedHistory(p, P, rt, flags, anyFlags, historyLength);
 					history4 = float4(rt, dist, historyLength, 0.0);
 				}
 			}

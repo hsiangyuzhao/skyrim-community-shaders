@@ -65,13 +65,18 @@ float2 OctEncode(float3 n)
 // One reprojection candidate at last frame's uv: its world normal and confidence (0..1). a_expected: this pixel's point in last
 // frame's camera space (the camera candidate: where it must be); a_tolerance: allowed distance (units). (47k) The best
 // match (smallest distance) of the 3x3 pixels around it ((47q) always). o_data: last frame had a surface there (in screen, not sky, written).
-float Candidate(float2 prevUv, float3 a_expected, float a_tolerance, float3 Ng, out float3 o_normal, out bool o_data)
+// (47r) Split in two: the 3x3 search (a function of the spot q0 and a_expected only) and the rest (the tolerance), so the motion candidate
+// B reuses A's search where both land on the same pixel (a static surface: nearly everywhere). Exact (Flags.x bit 2, RTAO: Filter Only
+// Where Traced).
+bool CandidateSearch(float2 prevUv, float3 a_expected, out int2 o_q0, out int2 o_q, out float o_err)
 {
-	o_normal = Ng;
-	o_data = false;
+	o_q0 = int2(0, 0);
+	o_q = int2(0, 0);
+	o_err = 1e30;
 	if (any(prevUv <= 0.0) || any(prevUv >= 1.0))
-		return 0.0;
+		return false;
 	const int2 q0 = int2(prevUv * RenderSize.xy);
+	o_q0 = q0;
 	int2 q = q0;
 	float err = 1e30;
 	const int2 maxQ = int2(RenderSize.xy) - 1;
@@ -91,6 +96,17 @@ float Candidate(float2 prevUv, float3 a_expected, float a_tolerance, float3 Ng, 
 			}
 		}
 	}
+	o_q = q;
+	o_err = err;
+	return true;
+}
+
+float CandidateFinish(bool a_inScreen, int2 q, float err, float a_tolerance, float3 Ng, out float3 o_normal, out bool o_data)
+{
+	o_normal = Ng;
+	o_data = false;
+	if (!a_inScreen)
+		return 0.0;
 	if (!(err < 1e29))
 		return 0.0;  // sky
 	const float4 raw = PrevNormal[q];
@@ -108,6 +124,14 @@ float Candidate(float2 prevUv, float3 a_expected, float a_tolerance, float3 Ng, 
 	// Normal agreement with the depth normal: a smooth normal differs from its facet by tens of degrees at most.
 	const float agree = smoothstep(0.1, 0.4, dot(n, Ng));
 	return depthConf * agree;
+}
+
+float Candidate(float2 prevUv, float3 a_expected, float a_tolerance, float3 Ng, out float3 o_normal, out bool o_data)
+{
+	int2 q0, q;
+	float err;
+	const bool inScreen = CandidateSearch(prevUv, a_expected, q0, q, err);
+	return CandidateFinish(inScreen, q, err, a_tolerance, Ng, o_normal, o_data);
 }
 
 // (47k) A forward-difference depth normal at pixel q (facing the camera); false where there is no surface.
@@ -203,7 +227,10 @@ float3 RingSmoothedNormal(int2 p, float3 P, float3 Ng, float footprint)
 		[branch] if (clip.w > 1e-4)
 		{
 			const float2 uvA = float2(clip.x / clip.w * 0.5 + 0.5, 0.5 - clip.y / clip.w * 0.5);
-			cA = Candidate(uvA, prevP, tolA, Ng, nA, dataA);
+			int2 q0A, qA;
+			float errA;
+			const bool inA = CandidateSearch(uvA, prevP, q0A, qA, errA);
+			cA = CandidateFinish(inA, qA, errA, tolA, Ng, nA, dataA);
 			// B. Constant velocity: last frame's motion at the point it moved from (two fixed-point steps from the camera guess).
 			const float2 uv = (float2(p) + 0.5) * RenderSize.zw;
 			float2 uvB = uvA;
@@ -213,7 +240,12 @@ float3 RingSmoothedNormal(int2 p, float3 P, float3 Ng, float footprint)
 				uvB = uv + PrevMotion[q];
 			}
 			// A moving surface moved: allow its motion in a frame (a walking character: a few units) on top of the depth noise.
-			cB = Candidate(uvB, prevP, tolB, Ng, nB, dataB);
+			// (47r) The same spot as A (same pixel, both in screen): A's search with B's tolerance.
+			const bool inB = !(any(uvB <= 0.0) || any(uvB >= 1.0));
+			[branch] if ((Flags.x & 2u) && inA && inB && all(int2(uvB * RenderSize.xy) == q0A))
+				cB = CandidateFinish(true, qA, errA, tolB, Ng, nB, dataB);
+			else
+				cB = Candidate(uvB, prevP, tolB, Ng, nB, dataB);
 		}
 		const float c = max(cA, cB);
 		// (47k) Below full confidence the fallback is the ring-smoothed depth normal (only computed there).

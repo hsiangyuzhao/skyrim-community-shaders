@@ -366,4 +366,16 @@ namespace RayTracingWind
 			return false;
 		}
 	}
+
+	bool ReadFrequency(const RE::NiNode* a_node, float& o_frequency)
+	{
+		if (!a_node || !Available())
+			return false;
+		__try {
+			o_frequency = *reinterpret_cast<const float*>(reinterpret_cast<std::uintptr_t>(a_node) + kNodeFrequency);
+			return std::isfinite(o_frequency);
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
 }

@@ -23,8 +23,8 @@ cbuffer PerFrame : register(b1)
 	float ShadowContrast;
 	uint SettingsEnable;
 	uint SettingsSampleCount;
-	// (47q) World-Space Thickness / Min Thickness / Contact Length are gone: unused slots (the layout stays).
-	uint Unused0;
+	// (47q) World-Space Thickness / Min Thickness / Contact Length are gone: unused slots (the layout stays); (47r) the first is RtTileMask.
+	uint RtTileMask;  // (47r) RT_CASTER_MASK: 1 = t2 holds the per-8x8-tile summary of RTCasterMask (bit 0 any traced caster, bit 1 any other)
 	float Unused1;
 	float Unused2;
 	uint EdgeSmoothing;

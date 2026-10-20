@@ -29,6 +29,7 @@ static const uint kFlagSpatial = 512u;           // (45l) Denoised holds the pen
 static const uint kFlagDenoiseHalf = 1024u;      // (45l) the penumbra filter ran at half resolution (Denoised is half size)
 static const uint kFlagSigma = 2048u;            // (45l) Denoiser NRD SIGMA: rt from its output
 static const uint kFlagFalloffDenoise = 4096u;   // (45l) the filter radius shrinks with distance (Falloff)
+static const uint kFlagUniformTiles = 8192u;     // (47r) CombineCS: the fast path for uniform tiles (t6 = the denoiser's tiles)
 
 static const uint kViewOff = 0u;
 static const uint kViewShadowSource = 1u;

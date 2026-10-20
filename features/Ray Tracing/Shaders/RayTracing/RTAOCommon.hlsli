@@ -51,3 +51,23 @@ bool RawDynamic(float a_b)
 {
 	return a_b > 0.5;
 }
+
+// (47r) "RTAO: Filter Only Where Traced" (kFlagTileSkip): t10 holds, per 8x8 tile of the render size, the Chebyshev distance in tiles to the
+// nearest tile with a traced pixel (TraceAOCS .g > 0; RTAOFilterCS RTAO_TILE_MARK / RTAO_TILE_DIST; 255 = farther than the largest reach).
+// A pass skips a group whose tiles are all farther than the reach its consumers need from it (the traced pixels read nothing it skipped:
+// every traced pixel's value is exactly 47q's). Unbound (the flag off): reads 0, nothing is skipped.
+static const uint kFlagTileSkip = 2048u;
+Texture2D<uint> TileDist : register(t10);
+
+bool TilesFar(int2 a_lo, int2 a_hi, uint a_reach)
+{
+	if (!(Size.z & kFlagTileSkip))
+		return false;
+	const int2 maxT = int2((Size.xy + 7u) / 8u) - 1;
+	const int2 hi = min(a_hi, maxT);
+	uint d = 255u;
+	for (int y = a_lo.y; y <= hi.y; ++y)
+		for (int x = a_lo.x; x <= hi.x; ++x)
+			d = min(d, TileDist[int2(x, y)]);
+	return d > a_reach;
+}

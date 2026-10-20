@@ -946,6 +946,7 @@ namespace Hooks
 				pacer.enabled = upscaling.IsLatencyPacerEnabled();
 				pacer.marginMs = upscaling.settings.reflexPacerMarginMs;
 				pacer.smoothPhase = upscaling.settings.reflexPacerSmoothPhase;  // (46p)
+				pacer.repeatingWaits = upscaling.settings.reflexPacerRepeatingWaits;  // (47r)
 				// (46p) Precompile Lazy Shaders (always, 47m): once, on the first main-menu or loading-screen frame (the main thread,
 				// before this frame renders): the deferred composite variants, screen-space shadows' edge pass, ray tracing's D3D11 passes.
 				static bool precompiled = false;

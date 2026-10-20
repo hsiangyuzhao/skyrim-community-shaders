@@ -1057,6 +1057,9 @@ namespace Util::FrameTrace
 				out << "#   (every other frame, staggered); rt_skip_tiny_face = tiny face parts left out (session); rt_wind_catchup = leaf timers the game\n";
 				out << "#   froze on this long frame (35 ms+) and Keep Leaves Moving advanced; rt_chunk_cells / rt_chunks_per_cell / rt_chunk_overlap =\n";
 				out << "#   captured exterior cells, static chunk BLASes per cell, their boxes' pairwise overlap (intersection / summed volume, 0 = disjoint).\n";
+				out << "# (47r) rt_wind_frozen_unlearned = leaf timers the game froze on this long frame that had no rate to advance them (no own rate,\n";
+				out << "#   no shared one); rt_wind_shared = of rt_wind_catchup, those advanced at the rate the other plants share (Learn on Any Frame).\n";
+				out << "#   pacer_repeat_fed = 1: the learned frame-start sleep was fed the largest of the last 4 waits (Pacer: Learn Repeating Waits).\n";
 				out << "#   rt_pw_* = the work of the RT D3D12 prep submission whose GPU time is rt_prep_gpu_ms on the same row (1 = valid; early =\n";
 				out << "#   recorded at the frame start): static BLAS builds (of which alpha-tested, triangles, MB before compaction), compactions (MB\n";
 				out << "#   written), new character shapes uploaded, own-BLAS character builds / refits, merged character BLAS builds (triangles) /\n";
@@ -1160,7 +1163,8 @@ namespace Util::FrameTrace
 					   "pacer_learned_cap_ms,pacer_learned_cut_ms,"  // (47m)
 					   "rt_wind_in_radius,rt_wind_sources,rt_wind_builds,rt_wind_refit_verts,rt_wind_radius,"  // (47n)
 					   "gpu_spike_ms,jobs,"  // (47p)
-					   "rt_npc_body_only,rt_npc_refit_skipped,rt_skip_tiny_face,rt_wind_catchup,rt_chunk_cells,rt_chunks_per_cell,rt_chunk_overlap\n";  // (47q) the last ones
+					   "rt_npc_body_only,rt_npc_refit_skipped,rt_skip_tiny_face,rt_wind_catchup,rt_chunk_cells,rt_chunks_per_cell,rt_chunk_overlap,"  // (47q)
+					   "rt_wind_frozen_unlearned,rt_wind_shared,pacer_repeat_fed\n";  // (47r) the last ones
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
 					std::string s = std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{},{}", t.scene,
@@ -1350,6 +1354,9 @@ namespace Util::FrameTrace
 					extra.pop_back();
 					extra += std::format(",{},{},{},{},{},{:.2f},{:.3f}\n", r.rt.npcBodyOnly, r.rt.npcRefitSkipped, r.rt.skipTinyFace, r.rt.windCatchups, r.rt.chunkCells,
 						r.rt.chunksPerCell, r.rt.chunkOverlap);
+					// (47r) Keep Leaves Moving (frozen without a rate, at the shared rate) and the pacer's repeating-wait feed, after rt_chunk_overlap.
+					extra.pop_back();
+					extra += std::format(",{},{},{}\n", r.rt.windFrozenUnlearned, r.rt.windSharedCatchups, r.pacer.repeatFed);
 					if (it == a_reflex.end()) {
 						out << (r.reflexFrame == UINT32_MAX ? std::string("-1") : std::to_string(r.reflexFrame)) << ",-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" << engineColumns(r) << extra;
 						continue;

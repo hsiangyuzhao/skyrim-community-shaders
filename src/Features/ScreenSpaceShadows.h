@@ -38,8 +38,8 @@ public:
 		uint Enable = 1;
 		uint SampleCount = 1;
 		// (47q) World-Space Thickness, Min Thickness and Contact Length are gone (the original Bend math only): three unused slots keep
-		// the constant buffer's layout (RaymarchCB.hlsli Unused0-2).
-		uint Unused0 = 0;
+		// the constant buffer's layout (RaymarchCB.hlsli Unused1-2; (47r) the first is RtTileMask).
+		uint RtTileMask = 0;  ///< (47r) set per frame by Ray Tracing, not saved: t2 holds the per-tile summary of the caster mask (RaymarchCB.hlsli)
 		float Unused1 = 0.0f;
 		float Unused2 = 0.0f;
 		uint EdgeSmoothing = 1;       ///< (45 SSS) 3x3 depth-aware blur of the mask, per frame only; (45o) always on, not saved
@@ -118,11 +118,12 @@ public:
 	virtual void SaveSettings(json& o_json) override;
 
 	/// (45k) a_rtMask: Ray Tracing's visibility texture (alpha bit 4 = ray-traced caster); null = the normal ray march.
-	void DrawShadows(ID3D11ShaderResourceView* a_rtMask = nullptr);
+	void DrawShadows(ID3D11ShaderResourceView* a_rtMask = nullptr, ID3D11ShaderResourceView* a_rtTiles = nullptr);
 	/// (45k) Ray Tracing draws the shadows itself this frame (after its trace, with the caster mask).
 	/// Set in Prepass when Ray Tracing claims them; DrawDeferred must then be called once.
 	bool deferredThisFrame = false;
-	void DrawDeferred(ID3D11ShaderResourceView* a_rtMask, float a_contactScale, float a_biasConstant, float a_biasPerUnit);
+	/// (47r) a_rtTiles: the per-8x8-tile summary of a_rtMask (bit 0 some traced caster, bit 1 some other pixel), or null.
+	void DrawDeferred(ID3D11ShaderResourceView* a_rtMask, float a_contactScale, float a_biasConstant, float a_biasPerUnit, ID3D11ShaderResourceView* a_rtTiles = nullptr);
 
 	virtual void RestoreDefaultSettings() override;
 

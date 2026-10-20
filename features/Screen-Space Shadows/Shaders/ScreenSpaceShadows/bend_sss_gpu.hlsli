@@ -67,6 +67,7 @@ struct DispatchParameters
 	float2 ProjInfo;      // 1 / P00, 1 / P11 of the camera projection
 	float RtContactScale;  // (45k) RT_CASTER_MASK: contact range of ray-traced occluders, in multiples of the ray tracer's bias
 	float2 RtBias;         // (45k) the ray tracer's bias: constant, per unit of distance
+	uint RtTileMask;       // (47r) RT_CASTER_MASK: RTCasterTiles holds the per-8x8-tile summary of RTCasterMask
 
 	bool IgnoreEdgePixels;  // If an edge is detected, the edge pixel will not contribute to the shadow.
 							// If a very flat surface is being lit and rendered at an grazing angles, the edge detect may incorrectly detect multiple 'edge' pixels along that flat surface.
@@ -113,6 +114,7 @@ struct DispatchParameters
 		ProjInfo = 1;
 		RtContactScale = 0;
 		RtBias = 0;
+		RtTileMask = 0;
 	}
 
 	// Runtime data returned from BuildDispatchList():
@@ -218,13 +220,23 @@ groupshared uint RtCasterData[READ_COUNT * WAVE_SIZE];
 // (46q) uv is over the full-size depth texture; the mask may be render-sized (Size Buffers to Render Resolution) with the same
 // top-left origin, so its texel is uv x the depth texture's size (exact integers; with the mask full-size this is uv x its own
 // size, as 46p), not uv x the mask's size.
-bool IsRtCaster(half2 uv, float2 uvToPixel)
+// (47r) a_tileMask ("Screen Space Shadows: Tile Mask for RT Casters"): RTCasterTiles (declared by RaymarchCS too) holds per 8x8 tile of
+// the mask bit 0 = some pixel is a traced caster, bit 1 = some pixel is not; a tile of only one kind answers without the mask (exact).
+bool IsRtCaster(half2 uv, float2 uvToPixel, uint a_tileMask)
 {
 	uint w, h;
 	RTCasterMask.GetDimensions(w, h);
 	const int2 texel = int2(floor(float2(uv) * uvToPixel));
 	if (any(texel < 0) || texel.x >= int(w) || texel.y >= int(h))
 		return false;
+	[branch] if (a_tileMask != 0u)
+	{
+		const uint kinds = RTCasterTiles.Load(int3(texel >> 3, 0));
+		if (kinds == 1u)
+			return true;
+		if (kinds == 2u)
+			return false;
+	}
 	return (uint(RTCasterMask.Load(int3(texel, 0)).w * 255.0 + 0.5) & 4u) != 0u;
 }
 #	endif
@@ -345,7 +357,7 @@ void WriteScreenSpaceShadow(DispatchParameters inParameters, int3 inGroupID, int
 		uint depthWidth, depthHeight;
 		inParameters.DepthTexture.GetDimensions(depthWidth, depthHeight);
 		const float2 uvToPixel = float2(depthWidth, depthHeight);
-		rt_caster[i] = IsRtCaster(coord, uvToPixel) || IsRtCaster(coord_with_offset, uvToPixel);
+		rt_caster[i] = IsRtCaster(coord, uvToPixel, inParameters.RtTileMask) || IsRtCaster(coord_with_offset, uvToPixel, inParameters.RtTileMask);
 #	endif
 
 		// Store for later
