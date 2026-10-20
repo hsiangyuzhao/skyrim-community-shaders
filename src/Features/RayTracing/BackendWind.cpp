@@ -302,6 +302,154 @@ namespace RayTracingRT
 		mesh.hasPose = true;
 	}
 
+	bool Backend::WindMesh::Stale() const
+	{
+		// (47u) Built, and its BLAS not at this frame's pose (never refit since its mean-pose build, or refit to another pose).
+		return live && built && hasPose && (!posed || !SamePose(pose, posedPose));
+	}
+
+	void Backend::SetWindCull(BlasHandle a_handle, bool a_cull)
+	{
+		if (a_handle >= blas_.size() || blas_[a_handle].wind == UINT32_MAX)
+			return;
+		const std::uint32_t index = blas_[a_handle].wind;
+		if (index >= winds_.size() || !winds_[index].live || winds_[index].handle != a_handle)
+			return;
+		winds_[index].cull = a_cull;
+		winds_[index].late = false;
+	}
+
+	bool Backend::GetWindReachBox(BlasHandle a_handle, float o_lo[3], float o_hi[3]) const
+	{
+		if (a_handle >= blas_.size() || blas_[a_handle].wind == UINT32_MAX)
+			return false;
+		const std::uint32_t index = blas_[a_handle].wind;
+		if (index >= winds_.size() || !winds_[index].live || winds_[index].handle != a_handle)
+			return false;
+		const auto& mesh = winds_[index];
+		if (mesh.source >= windSources_.size() || !windSources_[mesh.source].live)
+			return false;
+		const auto& source = windSources_[mesh.source];
+		// WindFoliageCS: position + normal x (wave x alpha x amplitude), wave in [0, 1.1] (0.55 for the mean pose), alpha in [0, 1], each
+		// normal component in [-1, 1]: per axis at most 1.1 x |amplitude| from the rest position. The BLAS holds the mean pose, the last
+		// refit's or (after this frame's refit) this frame's.
+		const float amplitude = std::max({ std::abs(mesh.meanAmplitude), mesh.hasPose ? std::abs(mesh.pose[1]) : 0.0f, mesh.posed ? std::abs(mesh.posedPose[1]) : 0.0f });
+		if (!std::isfinite(amplitude))
+			return false;
+		for (int a = 0; a < 3; ++a) {
+			const float pad = 1.1f * amplitude + 1.0f + 1e-4f * std::max(std::abs(source.boundsMin[a]), std::abs(source.boundsMax[a]));
+			o_lo[a] = source.boundsMin[a] - pad;
+			o_hi[a] = source.boundsMax[a] + pad;
+		}
+		return true;
+	}
+
+	bool Backend::WindCulledStale(BlasHandle a_handle) const
+	{
+		if (a_handle >= blas_.size() || blas_[a_handle].wind == UINT32_MAX)
+			return false;
+		const std::uint32_t index = blas_[a_handle].wind;
+		if (index >= winds_.size() || !winds_[index].live || winds_[index].handle != a_handle)
+			return false;
+		return winds_[index].cull && !winds_[index].late && winds_[index].Stale();
+	}
+
+	void Backend::SetWindLate(BlasHandle a_handle)
+	{
+		if (a_handle >= blas_.size() || blas_[a_handle].wind == UINT32_MAX)
+			return;
+		const std::uint32_t index = blas_[a_handle].wind;
+		if (index >= winds_.size() || !winds_[index].live || winds_[index].handle != a_handle || winds_[index].late)
+			return;
+		winds_[index].late = true;
+		++windLatePending_;
+	}
+
+	void Backend::RecordLateWind(ID3D12GraphicsCommandList4* a_list)
+	{
+		// (47u) Early Prep frames only (RecordWind takes the late marks itself otherwise): the plants culled at Early Prep that the exact
+		// region reaches, posed and refit in place now, before the TLAS is built. The early list's refits used scratch regions
+		// [0, windScratchUsed_) of windScratch_; these take the ones after it (a new buffer when it does not fit; the old one stays alive
+		// behind the fence for the early list).
+		if (windLatePending_ == 0)
+			return;
+		windLatePending_ = 0;
+		if (!windFault_.empty() || failed_ || !windPipeline_ || !windRootSignature_)
+			return;
+		std::vector<std::pair<std::uint32_t, std::uint64_t>> refits;
+		std::uint64_t base = WindAlign(windScratchUsed_, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
+		std::uint64_t scratchTotal = 0;
+		for (std::uint32_t i = 0; i < winds_.size(); ++i) {
+			const auto& mesh = winds_[i];
+			if (!mesh.late || !mesh.Stale() || !mesh.allocated)
+				continue;
+			refits.emplace_back(i, scratchTotal);
+			scratchTotal += WindAlign(mesh.updateScratch, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
+		}
+		if (refits.empty())
+			return;
+		if (!windScratch_ || windScratchBytes_ < base + scratchTotal) {
+			const std::uint64_t bytes = WindAlign(std::max<std::uint64_t>(scratchTotal + scratchTotal / 4, 4ull << 20), 64 * 1024);
+			auto fresh = CreateBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true, Util::FrameTrace::VramOwner::RtScratch);
+			if (!fresh) {
+				SetWindFault(std::format("could not create a {:.1f} MB scratch buffer", static_cast<double>(bytes) / (1024.0 * 1024.0)));
+				return;
+			}
+			if (windScratch_)
+				Retire(windScratch_, windScratchBytes_, &windStats_.scratchBytes);
+			windScratch_ = std::move(fresh);
+			windScratch_->SetName(L"CS RayTracing wind scratch");
+			windScratchBytes_ = bytes;
+			windStats_.scratchBytes += bytes;
+			base = 0;
+		}
+		const D3D12_GPU_VIRTUAL_ADDRESS scratch = windScratch_->GetGPUVirtualAddress() + base;
+		windScratchUsed_ = base + scratchTotal;
+		std::vector<std::uint32_t> blocks;
+		for (const auto& [mesh, offset] : refits)
+			blocks.push_back(winds_[mesh].output.block);
+		std::sort(blocks.begin(), blocks.end());
+		blocks.erase(std::unique(blocks.begin(), blocks.end()), blocks.end());
+		a_list->SetComputeRootSignature(windRootSignature_.Get());
+		a_list->SetPipelineState(windPipeline_.Get());
+		TransitionBlocks(a_list, skinOutputPool_, blocks, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+		for (const auto& [index, offset] : refits) {
+			const auto& mesh = winds_[index];
+			const auto& source = windSources_[mesh.source];
+			const std::uint32_t constants[kWindConstants] = { mesh.vertices, 1u, std::bit_cast<std::uint32_t>(mesh.pose[1]), std::bit_cast<std::uint32_t>(mesh.pose[2]),
+				std::bit_cast<std::uint32_t>(mesh.pose[0]), std::bit_cast<std::uint32_t>(mesh.pose[3]), 0u, 0u };
+			a_list->SetComputeRoot32BitConstants(0, kWindConstants, constants, 0);
+			a_list->SetComputeRootShaderResourceView(1, skinStaticPool_.Address(source.rest));
+			a_list->SetComputeRootUnorderedAccessView(2, skinOutputPool_.Address(mesh.output));
+			a_list->Dispatch((mesh.vertices + kWindGroupSize - 1) / kWindGroupSize, 1, 1);
+		}
+		TransitionBlocks(a_list, skinOutputPool_, blocks, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+		for (const auto& [index, offset] : refits) {
+			auto& mesh = winds_[index];
+			D3D12_RAYTRACING_GEOMETRY_DESC geometryDescs[2]{};
+			const UINT descCount = WindGeometryDescs(mesh, mesh.layout, geometryDescs);
+			D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC buildDesc{};
+			buildDesc.Inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+			buildDesc.Inputs.Flags = kWindBuildFlags | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+			buildDesc.Inputs.NumDescs = descCount;
+			buildDesc.Inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+			buildDesc.Inputs.pGeometryDescs = geometryDescs;
+			buildDesc.DestAccelerationStructureData = asPool_.Address(mesh.blas);
+			buildDesc.SourceAccelerationStructureData = buildDesc.DestAccelerationStructureData;  // in place
+			buildDesc.ScratchAccelerationStructureData = scratch + offset;
+			RecordBlasBuild(a_list, buildDesc, 0, nullptr, WindOmm(mesh, mesh.layout));  // (47t) the layout's OMM array, refits too
+			mesh.posed = true;
+			std::copy_n(mesh.pose, 4, mesh.posedPose);
+			++windStats_.refitsLastFrame;
+			++windStats_.lateLastFrame;
+			windStats_.refitVerticesLastFrame += mesh.vertices;
+			windStats_.culledLastFrame -= std::min<std::uint32_t>(windStats_.culledLastFrame, 1u);
+		}
+		windRecorded_ = true;
+		windMustSubmit_ = true;  // marked posed: this list must run
+		// The caller's barrier (before the TLAS) orders these writes before any read of the BLASes.
+	}
+
 	void Backend::ReleaseWindMesh(std::uint32_t a_index)
 	{
 		if (a_index >= winds_.size() || !winds_[a_index].live)
@@ -448,6 +596,9 @@ namespace RayTracingRT
 		windStats_.buildsLastFrame = windStats_.refitsLastFrame = windStats_.deferredLastFrame = 0;
 		windStats_.refitVerticesLastFrame = 0;
 		windStats_.stillLastFrame = false;
+		windStats_.culledLastFrame = windStats_.lateLastFrame = 0;  // (47u)
+		windScratchUsed_ = 0;
+		windLatePending_ = 0;  // this call refits the late ones itself
 		if (windLive_ == 0 && windSourcesLive_ == 0) {
 			windStats_.pending = 0;
 			return;
@@ -582,6 +733,11 @@ namespace RayTracingRT
 			for (const auto& op : builds) {
 				if (!winds_[op.mesh].hasPose)
 					continue;
+				// (47u) Skip Updates That Cannot Affect the Image: a culled plant keeps its build's mean pose (no ray reaches it).
+				if (winds_[op.mesh].cull && !winds_[op.mesh].late) {
+					++windStats_.culledLastFrame;
+					continue;
+				}
 				refits.push_back(Op{ op.mesh, scratchTotal });
 				scratchTotal += WindAlign(winds_[op.mesh].updateScratch, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
 			}
@@ -590,10 +746,16 @@ namespace RayTracingRT
 				// (47s) inBuild: (re)built this frame (its refit is in the list above).
 				if (!mesh.live || !mesh.built || mesh.inBuild || !mesh.hasPose || (mesh.posed && SamePose(mesh.pose, mesh.posedPose)))
 					continue;
+				if (mesh.cull && !mesh.late) {  // (47u) its BLAS keeps the pose it has
+					++windStats_.culledLastFrame;
+					continue;
+				}
+				if (mesh.cull)
+					++windStats_.lateLastFrame;
 				refits.push_back(Op{ i, scratchTotal });
 				scratchTotal += WindAlign(mesh.updateScratch, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
 			}
-			windStats_.stillLastFrame = anyBuilt && refits.size() == builds.size();
+			windStats_.stillLastFrame = anyBuilt && refits.size() == builds.size() && windStats_.culledLastFrame == 0;
 		}
 		windStats_.pending = pending;
 		if (builds.empty() && refits.empty())
@@ -615,6 +777,7 @@ namespace RayTracingRT
 			windStats_.scratchBytes += bytes;
 		}
 		const D3D12_GPU_VIRTUAL_ADDRESS scratch = windScratch_->GetGPUVirtualAddress();
+		windScratchUsed_ = scratchTotal;  // (47u) RecordLateWind starts after these
 		windRecorded_ = true;
 
 		a_list->SetComputeRootSignature(windRootSignature_.Get());

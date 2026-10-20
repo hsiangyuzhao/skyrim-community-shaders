@@ -1069,6 +1069,12 @@ namespace Util::FrameTrace
 				out << "#   their micro-triangles; rt_omm_known_pct = percent of them opaque / transparent (decided by the hardware, never tested per ray);\n";
 				out << "#   rt_omm_vram_mb = OMM arrays + index lists (+ bake output waiting for its array); rt_omm_bake_gpu_ms = GPU ms of the last sort\n";
 				out << "#   that made OMM data (it is in rt_ac_bake_gpu_ms too).\n";
+				out << "# (47u) rt_early_normal = Start Sun Trace Earlier: 1 = RTAO's normal prep ran behind the signal the sun trace waits for, 0 = before\n";
+				out << "#   it (47t order: first frames, size changes), -1 = no normal prep / switch off. rt_rel_* = Skip Updates That Cannot Affect the\n";
+				out << "#   Image (-1 = off): rt_rel_wind_culled = plant refits skipped (no ray could reach them), rt_rel_wind_late = plants culled at the\n";
+				out << "#   frame start that this frame's rays reach after all (refit before the TLAS), rt_rel_npc_culled = NPCs not posed, rt_rel_fallback\n";
+				out << "#   = 1 when a culled NPC was reachable after all (the frame's characters redone without culling). rt_chunk_spatial = Spatial\n";
+				out << "#   Static Chunks on (1) / off (0); with it rt_chunk_overlap is the new packing's.\n";
 				out << "#   rt_pw_* = the work of the RT D3D12 prep submission whose GPU time is rt_prep_gpu_ms on the same row (1 = valid; early =\n";
 				out << "#   recorded at the frame start): static BLAS builds (of which alpha-tested, triangles, MB before compaction), compactions (MB\n";
 				out << "#   written), new character shapes uploaded, own-BLAS character builds / refits, merged character BLAS builds (triangles) /\n";
@@ -1175,7 +1181,8 @@ namespace Util::FrameTrace
 					   "rt_npc_body_only,rt_npc_refit_skipped,rt_skip_tiny_face,rt_wind_catchup,rt_chunk_cells,rt_chunks_per_cell,rt_chunk_overlap,"  // (47q)
 					   "rt_wind_frozen_unlearned,rt_wind_shared,pacer_repeat_fed,"  // (47r)
 					   "rt_ac_opaque_tris,rt_ac_dropped_tris,rt_ac_mixed_tris,rt_ac_instances,rt_ac_waiting,rt_ac_bake_tris,rt_ac_bake_gpu_ms,rt_ac_vram_mb,"  // (47s)
-					   "rt_omm_arrays,rt_omm_micro_tris,rt_omm_known_pct,rt_omm_vram_mb,rt_omm_bake_gpu_ms\n";  // (47t) the last ones
+					   "rt_omm_arrays,rt_omm_micro_tris,rt_omm_known_pct,rt_omm_vram_mb,rt_omm_bake_gpu_ms,"  // (47t)
+				   "rt_early_normal,rt_rel_wind_culled,rt_rel_wind_late,rt_rel_npc_culled,rt_rel_fallback,rt_chunk_spatial\n";  // (47u) the last ones
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
 					std::string s = std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{},{}", t.scene,
@@ -1375,6 +1382,10 @@ namespace Util::FrameTrace
 					// (47t) Opacity Micromaps, after rt_ac_vram_mb (the old last column).
 					extra.pop_back();
 					extra += std::format(",{},{},{:.1f},{:.2f},{:.3f}\n", r.rt.ommArrays, r.rt.ommMicro, r.rt.ommKnownPct, r.rt.ommVramMb, r.rt.ommBakeGpuMs);
+					// (47u) after rt_omm_bake_gpu_ms (the old last column).
+					extra.pop_back();
+					extra += std::format(",{},{},{},{},{},{}\n", r.rt.earlyNormal, r.rt.relWindCulled, r.rt.relWindLate, r.rt.relNpcCulled, r.rt.relFallback,
+						r.rt.spatialChunks);
 					if (it == a_reflex.end()) {
 						out << (r.reflexFrame == UINT32_MAX ? std::string("-1") : std::to_string(r.reflexFrame)) << ",-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" << engineColumns(r) << extra;
 						continue;

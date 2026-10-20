@@ -311,6 +311,63 @@ namespace RayTracingScene
 			a_cell.current[side].reset();
 			a_cell.currentGeometries[side].clear();
 		}
+		a_cell.stagePositions = {};  // (47u)
+		a_cell.stageIndices = {};
+		a_cell.staged = {};
+	}
+
+	std::uint64_t Scene::MortonKey(const float a_lo[3], const float a_hi[3])
+	{
+		// (47u) 2D Morton code of the box centre within the 4096-unit cell (x, y; 16 bits each over 8192 units: shapes may stick out), then
+		// the centre's height as the low bits: neighbours in the cell end up next to each other in the order.
+		auto spread = [](std::uint64_t a_v) {
+			a_v &= 0xFFFFull;
+			a_v = (a_v | (a_v << 8)) & 0x00FF00FFull;
+			a_v = (a_v | (a_v << 4)) & 0x0F0F0F0Full;
+			a_v = (a_v | (a_v << 2)) & 0x33333333ull;
+			a_v = (a_v | (a_v << 1)) & 0x55555555ull;
+			return a_v;
+		};
+		auto quantize = [](float a_value, float a_lo, float a_span) {
+			const float t = std::clamp((a_value - a_lo) / a_span, 0.0f, 1.0f);
+			return static_cast<std::uint64_t>(t * 65535.0f);
+		};
+		const float cx = 0.5f * (a_lo[0] + a_hi[0]), cy = 0.5f * (a_lo[1] + a_hi[1]), cz = 0.5f * (a_lo[2] + a_hi[2]);
+		const std::uint64_t morton = spread(quantize(cx, -2048.0f, 8192.0f)) | (spread(quantize(cy, -2048.0f, 8192.0f)) << 1);
+		return (morton << 16) | quantize(cz, -32768.0f, 65536.0f);
+	}
+
+	void Scene::FlushStaged(RayTracingRT::Backend& a_backend, Cell& a_cell)
+	{
+		// (47u) Spatial Static Chunks: the cell's shapes in Morton order of their box centres, filled into chunks of kChunkTriangles as
+		// before (a chunk closes once it holds at least that many). One- and two-sided shapes stay apart indoors (the window beams' face
+		// culling); outdoors they were staged on one side (no ray culls faces there).
+		std::vector<std::pair<std::uint64_t, std::uint32_t>> order;
+		order.reserve(a_cell.staged.size());
+		for (std::uint32_t i = 0; i < a_cell.staged.size(); ++i) {
+			const auto& shape = a_cell.staged[i];
+			order.emplace_back((static_cast<std::uint64_t>(shape.side) << 63) | (MortonKey(shape.lo, shape.hi) >> 1), i);
+		}
+		std::sort(order.begin(), order.end());
+		for (const auto& [key, i] : order) {
+			const auto& shape = a_cell.staged[i];
+			const int side = shape.side;
+			if (!a_cell.current[side])
+				a_cell.current[side] = std::make_unique<RayTracingRT::ChunkGeometry>();
+			auto& chunk = *a_cell.current[side];
+			const std::uint32_t base = chunk.Vertices();
+			const auto* positions = a_cell.stagePositions.data() + static_cast<std::size_t>(shape.firstVertex) * 3;
+			chunk.positions.insert(chunk.positions.end(), positions, positions + static_cast<std::size_t>(shape.vertices) * 3);
+			chunk.indices.reserve(chunk.indices.size() + shape.indices);
+			for (std::uint32_t k = 0; k < shape.indices; ++k)
+				chunk.indices.push_back(base + a_cell.stageIndices[shape.firstIndex + k]);
+			a_cell.currentGeometries[side].push_back(shape.geometry);
+			if (chunk.Triangles() >= kChunkTriangles)
+				CloseChunk(a_backend, a_cell, side);
+		}
+		a_cell.stagePositions = {};
+		a_cell.stageIndices = {};
+		a_cell.staged = {};
 	}
 
 	void Scene::ReleaseAll(RayTracingRT::Backend& a_backend)
@@ -683,6 +740,39 @@ namespace RayTracingScene
 			return false;
 
 		const int side = (!a_landscape && IsTwoSided(a_shape)) ? 1 : 0;  // (46n) one-sided and two-sided shapes in separate chunks
+		if (a_cell.spatial) {
+			// (47u) Spatial Static Chunks: staged; packed by place when the cell is complete (FlushStaged).
+			Cell::StagedShape staged;
+			staged.geometry = static_cast<std::uint32_t>(a_cell.geometries.size());
+			staged.firstVertex = static_cast<std::uint32_t>(a_cell.stagePositions.size() / 3);
+			staged.vertices = static_cast<std::uint32_t>(placed.size() / 3);
+			staged.firstIndex = static_cast<std::uint32_t>(a_cell.stageIndices.size());
+			staged.indices = static_cast<std::uint32_t>(mesh.indices.size());
+			// Outdoors no ray culls faces (window beams are interior only): one- and two-sided shapes may share a chunk there.
+			staged.side = a_cell.interior ? static_cast<std::uint8_t>(side) : 0u;
+			for (int a = 0; a < 3; ++a) {
+				staged.lo[a] = FLT_MAX;
+				staged.hi[a] = -FLT_MAX;
+			}
+			for (std::size_t v = 0; v + 2 < placed.size(); v += 3)
+				for (int a = 0; a < 3; ++a) {
+					staged.lo[a] = std::min(staged.lo[a], placed[v + a]);
+					staged.hi[a] = std::max(staged.hi[a], placed[v + a]);
+				}
+			a_cell.stagePositions.insert(a_cell.stagePositions.end(), placed.begin(), placed.end());
+			a_cell.stageIndices.insert(a_cell.stageIndices.end(), mesh.indices.begin(), mesh.indices.end());
+			a_cell.staged.push_back(staged);
+			a_cell.geometries.emplace_back(a_shape);
+			IndexGeometry(a_shape, true);
+			a_cell.triangles += mesh.triangleCount;
+			if (a_cell.interior)
+				a_cell.AddBounds(a_shape->worldBound);
+			if (a_landscape)
+				++a_cell.landQuads;
+			else
+				++a_cell.shapes;
+			return true;
+		}
 		if (!a_cell.current[side])
 			a_cell.current[side] = std::make_unique<RayTracingRT::ChunkGeometry>();
 		auto& chunk = *a_cell.current[side];
@@ -1519,6 +1609,7 @@ namespace RayTracingScene
 
 		if (!a_cell.snapshotTaken) {
 			a_cell.snapshotTaken = true;
+			a_cell.spatial = config_.spatialChunks;  // (47u) fixed for this capture
 			CollectCellRefs(a_cell.cell, a_cell.x, a_cell.y, a_cell.pending, &stats_.persistentRefs);
 			if constexpr (!kCaptureLandscape)
 				a_cell.landDone = true;  // (45f) landscape only receives (kCaptureLandscape)
@@ -1612,6 +1703,8 @@ namespace RayTracingScene
 		if (a_cell.cursor < a_cell.pending.size() || !a_cell.landDone)
 			return false;
 
+		if (a_cell.spatial)
+			FlushStaged(a_backend, a_cell);  // (47u)
 		CloseChunk(a_backend, a_cell, 0);
 		CloseChunk(a_backend, a_cell, 1);  // (46n)
 		a_cell.pending.clear();
@@ -2721,7 +2814,39 @@ namespace RayTracingScene
 			o_overlap = static_cast<float>(intersections / summed);
 	}
 
-	void Scene::UpdateWindPoses(RayTracingRT::Backend& a_backend, std::uint32_t a_frame, bool a_keepMoving, float a_dt, bool a_learnAnyFrame)
+	std::uint32_t Scene::MarkLateWind(RayTracingRT::Backend& a_backend, const RayTracingRelevance::Region* a_exact)
+	{
+		// (47u) Every plant whose refit this frame was skipped (culled, not at this frame's pose): reachable by this frame's rays -> late.
+		std::uint32_t late = 0;
+		for (auto& [handle, instance] : windInstances_) {
+			if (!a_backend.WindCulledStale(handle))
+				continue;
+			bool reachable = true;
+			if (a_exact && instance.geometry) {
+				float lo[3], hi[3];
+				if (a_backend.GetWindReachBox(handle, lo, hi)) {
+					const RE::NiTransform& world = instance.geometry->world;
+					float m[3][3];
+					for (int r = 0; r < 3; ++r)
+						for (int c = 0; c < 3; ++c)
+							m[r][c] = world.rotate.entry[r][c] * world.scale;
+					const double t[3] = { world.translate.x, world.translate.y, world.translate.z };
+					double wlo[3], whi[3];
+					RayTracingRelevance::TransformBox(m, t, lo, hi, wlo, whi);
+					reachable = a_exact->Meets(wlo, whi);
+				}
+			}
+			if (reachable) {
+				a_backend.SetWindLate(handle);
+				instance.outsideFrames = 0;  // relevant again: not culled before it has been out for a while
+				++late;
+			}
+		}
+		return late;
+	}
+
+	void Scene::UpdateWindPoses(RayTracingRT::Backend& a_backend, std::uint32_t a_frame, bool a_keepMoving, float a_dt, bool a_learnAnyFrame,
+		const RayTracingRelevance::Region* a_relevance)
 	{
 		if (windInstances_.empty()) {
 			windClocks_.clear();
@@ -2729,6 +2854,7 @@ namespace RayTracingScene
 		}
 		if (a_frame != windPoseStatsFrame_) {
 			windPoseStatsFrame_ = a_frame;
+			windCulled_ = 0;  // (47u)
 			windStats_.poses = windStats_.poseFaults = 0;
 			windStats_.catchups = windStats_.frozenUnlearned = 0;
 			windStats_.catchupsShared = 0;  // (47r)
@@ -2816,11 +2942,37 @@ namespace RayTracingScene
 			RayTracingWind::Pose pose;
 			if (!RayTracingWind::Evaluate(node, globals, pose)) {
 				++windStats_.poseFaults;
+				instance.outsideFrames = 0;
+				a_backend.SetWindCull(handle, false);  // (47u) never culled on a frame without its pose
 				continue;  // the last pose stays
 			}
 			a_backend.SetWindPose(handle, pose.magnitude, pose.amplitude, pose.frequency, pose.timer);
 			RayTracingWind::NoteEarly(node, pose, a_frame);
 			++windStats_.poses;
+			// (47u) Skip Updates That Cannot Affect the Image: outside the early region (last frame's rays, widened) for kCullAfterFrames
+			// frames in a row -> no refit this frame (checked again against this frame's exact rays before the trace: MarkLateWind).
+			bool cull = false;
+			if (a_relevance && a_relevance->Valid() && instance.geometry) {
+				bool reachable = true;
+				float lo[3], hi[3];
+				if (a_backend.GetWindReachBox(handle, lo, hi)) {
+					const RE::NiTransform& world = instance.geometry->world;
+					float m[3][3];
+					for (int r = 0; r < 3; ++r)
+						for (int c = 0; c < 3; ++c)
+							m[r][c] = world.rotate.entry[r][c] * world.scale;
+					const double t[3] = { world.translate.x, world.translate.y, world.translate.z };
+					double wlo[3], whi[3];
+					RayTracingRelevance::TransformBox(m, t, lo, hi, wlo, whi);
+					reachable = a_relevance->Meets(wlo, whi);
+				}
+				instance.outsideFrames = reachable ? 0u : std::min(instance.outsideFrames + 1u, 1000000u);
+				cull = instance.outsideFrames >= kCullAfterFrames;
+			} else {
+				instance.outsideFrames = 0;
+			}
+			a_backend.SetWindCull(handle, cull);
+			windCulled_ += cull ? 1u : 0u;
 		}
 		if (a_learnAnyFrame)
 			UpdateWindSharedRate();

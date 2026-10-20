@@ -204,6 +204,12 @@ namespace Util::FrameTrace
 		int ommArrays = -1;
 		int64_t ommMicro = -1;
 		float ommKnownPct = -1.0f, ommVramMb = -1.0f, ommBakeGpuMs = -1.0f;
+		// (47u) Start Sun Trace Earlier: 1 = RTAO's normal prep ran behind the ready signal, 0 = before it (47t order), -1 = none / off.
+		// Skip Updates That Cannot Affect the Image (-1 = off): plant refits skipped, plants refit late (reachable after all), NPCs
+		// culled, 1 = this frame's characters were redone without culling. Spatial Static Chunks: 1 on, 0 off.
+		int earlyNormal = -1;
+		int relWindCulled = -1, relWindLate = -1, relNpcCulled = -1, relFallback = -1;
+		int spatialChunks = -1;
 	};
 	void OnRayTracingDetail(const RayTracingDetail& a_detail);
 

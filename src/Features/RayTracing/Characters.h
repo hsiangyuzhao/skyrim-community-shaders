@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Backend.h"
+#include "Relevance.h"  // (47u)
 
 #include <atomic>
 
@@ -163,8 +164,19 @@ namespace RayTracingCharacters
 		/// (45n) Still poses: a shape whose bone matrices are bit-identical to the ones it was last skinned
 		/// with keeps its skinned BLAS (no upload, skinning or refit). Count of last frame:
 		[[nodiscard]] std::uint32_t StillReusedLastFrame() const { return stillReused_; }
+		/// (47u) Skip Updates That Cannot Affect the Image: the early region for the next Update (null = nothing culled). An NPC (never the
+		/// player) whose current bounds and the bounds of the pose its BLAS holds stay outside it for kCullAfterFrames Updates keeps its
+		/// skinned BLASes (moved with its root) without skinning or refits, as a body-only NPC on its off frame.
+		void SetRelevance(const RayTracingRelevance::Region* a_region) { relevance_ = a_region; }
+		/// (47u) Whether a_exact (this frame's rays) reaches an NPC culled by the last Update.
+		[[nodiscard]] bool CulledReachable(const RayTracingRelevance::Region& a_exact) const;
+		/// (47u) NPCs culled by the last Update.
+		[[nodiscard]] std::uint32_t CulledLastUpdate() const { return culledActors_; }
 
 	private:
+		static constexpr std::uint32_t kCullAfterFrames = 8;  // (47u)
+		const RayTracingRelevance::Region* relevance_ = nullptr;
+		std::uint32_t culledActors_ = 0;
 		struct Bone
 		{
 			RE::NiPointer<RE::NiAVObject> node;
@@ -218,7 +230,16 @@ namespace RayTracingCharacters
 			bool scanned = false;
 			bool readOk = false;  // this frame's reads completed (otherwise its shapes stay as they were)
 			bool bodyOnly = false;  // (47q) the NPC rule (with hysteresis)
+			// (47u) Skip Updates: frames outside the early region, culled by this Update, and the root's bound sphere (relative to the origin)
+			// of the last Update that posed it (the pose its BLASes hold while culled, moved with the origin).
+			std::uint32_t outsideFrames = 0;
+			bool culled = false;
+			bool skinBoundValid = false;
+			double skinBoundOffset[3]{};
+			double skinBoundRadius = 0.0;
 		};
+		/// (47u) The world boxes an NPC's BLASes can occupy: its root's bound now and the posed bound moved to its origin (+ kMargin).
+		static bool ActorBoxes(const Actor& a_actor, double o_lo[2][3], double o_hi[2][3]);
 
 		void ReleaseShape(RayTracingRT::Backend& a_backend, Shape& a_shape);
 		void ReleaseActor(RayTracingRT::Backend& a_backend, Actor& a_actor);

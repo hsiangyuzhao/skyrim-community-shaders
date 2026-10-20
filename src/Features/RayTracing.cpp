@@ -890,6 +890,7 @@ void RayTracing::TransitionFrame()
 			auto* player = loading ? RE::PlayerCharacter::GetSingleton() : nullptr;
 			if (player)
 				eye = player->GetPosition();
+			characters.SetRelevance(nullptr);  // (47u) nothing traced here
 			characters.Update(backend, world, static_cast<double>(charactersMs), charactersMax, player ? &eye : nullptr);
 		}
 	}
@@ -1088,7 +1089,109 @@ void RayTracing::FillWind(RayTracingRT::FrameInput& a_input)
 	// (47q) Keep Leaves Moving on Long Frames: this frame's game time step (0 while the game is paused: nothing advanced).
 	const bool paused = globals::game::ui && globals::game::ui->GameIsPaused();
 	scene.UpdateWindPoses(backend, globals::state->frameCount, settings.FoliageKeepMoving, paused ? 0.0f : RE::GetSecondsSinceLastFrame(),
-		settings.FoliageKeepMoving && settings.FoliageLearnAnyFrame);
+		settings.FoliageKeepMoving && settings.FoliageLearnAnyFrame, CurrentRelevance());
+}
+
+const RayTracingRelevance::Region* RayTracing::CurrentRelevance()
+{
+	// (47u) Skip Updates That Cannot Affect the Image: the early region, built once a frame from last frame's exact rays (an exterior sun
+	// frame), widened for this frame's camera turn and movement (corner tangents x 1.35 -- about 8 degrees more on each side at the
+	// user's field of view -- and 384 units), point sources grown by 384 units. Not in interiors, with the sun off, after any frame that
+	// did not trace the sun (loading, menus without a world frame): then nothing is culled.
+	const std::uint32_t frame = globals::state->frameCount;
+	if (relevanceEarlyFrame != frame) {
+		relevanceEarlyFrame = frame;
+		relevanceEarlyOk = false;
+		relNpcCulledThisFrame = 0;
+		relFallbackThisFrame = false;
+		auto* sky = globals::game::sky;
+		if (settings.SkipIrrelevantUpdates && SunOn() && !Util::IsInterior() && sky && sky->mode.get() == RE::Sky::Mode::kFull && phase == Phase::Play &&
+			relevanceLast.valid && relevanceLast.frame + 1 == frame) {
+			relevanceEarly.Build(relevanceLast, 1.35, 384.0, 384.0);
+			relevanceEarlyOk = relevanceEarly.Valid() && !relevanceEarly.All();
+		}
+	}
+	return relevanceEarlyOk ? &relevanceEarly : nullptr;
+}
+
+void RayTracing::BuildExactRelevance(const RayTracingRT::FrameInput& a_input, const float a_traceRect[4], double a_camX, double a_camY, double a_camZ)
+{
+	// (47u) Every ray this exterior frame traces: the sun's (from the trace rect toward the sun, kMaxRayLength), the point lights' (to a
+	// point of their emitter ball; beam / aimed sources cannot be bounded: everything) and the short ones (RTAO, probes). The frustum is
+	// the shaders' own (invViewProj), widened by 3 % (the start offsets grow 0.15 % of the distance) with a 64-unit margin.
+	RayTracingRelevance::Inputs in;
+	in.valid = true;
+	in.frame = globals::state->frameCount;
+	in.camera[0] = a_camX;
+	in.camera[1] = a_camY;
+	in.camera[2] = a_camZ;
+	std::copy_n(a_input.constants.invViewProj, 16, in.invViewProj);
+	in.sun = a_input.sun;
+	for (int a = 0; a < 3; ++a)
+		in.toSun[a] = a_input.constants.toSun[a];
+	in.sunLength = static_cast<double>(kMaxRayLength) + 64.0;
+	in.sunSpread = static_cast<double>(std::max(a_input.constants.toSun[3], 0.0f)) * 1.05 + 1e-3;
+	in.rect[0] = a_traceRect[0] + a_camX;
+	in.rect[1] = a_traceRect[1] + a_camY;
+	in.rect[2] = a_traceRect[2] + a_camX;
+	in.rect[3] = a_traceRect[3] + a_camY;
+	const double aoLength = a_input.ao ? static_cast<double>(std::max(a_input.ao->constants.params[2], 0.0f)) : 0.0;
+	in.nearReach = std::max(aoLength + 64.0, 160.0);  // RTAO's long ray; probes <= 96 units
+	if (a_input.pointLights && a_input.pointLights->sources) {
+		const auto* sources = static_cast<const RayTracingPointLights::GpuSource*>(a_input.pointLights->sources);
+		const std::uint32_t count = std::min<std::uint32_t>(a_input.pointLights->scan, a_input.pointLights->sourceBytes / sizeof(RayTracingPointLights::GpuSource));
+		const double emitter = std::max(a_input.pointLights->constants.bias[3], 0.0f);
+		in.targets.reserve(count);
+		for (std::uint32_t s = 0; s < count; ++s) {
+			const auto& src = sources[s];
+			if (src.info[0] & (RayTracingPointLights::kSourceBeam | RayTracingPointLights::kSourceAim)) {
+				in.all = true;
+				break;
+			}
+			const double radius = (src.info[0] & RayTracingPointLights::kSourceEmitter) ? std::max(static_cast<double>(src.spot[3]), emitter) : emitter;
+			if (!std::isfinite(radius) || !std::isfinite(src.posRadius[0]) || !std::isfinite(src.posRadius[1]) || !std::isfinite(src.posRadius[2])) {
+				in.all = true;
+				break;
+			}
+			in.targets.push_back({ src.posRadius[0] + a_camX, src.posRadius[1] + a_camY, src.posRadius[2] + a_camZ, radius });
+		}
+	}
+	relevanceExact.Build(in, 1.03, 64.0, 16.0);
+	relevanceLast = std::move(in);
+}
+
+void RayTracing::ResolveRelevance(const RayTracingRelevance::Region* a_exact, const float* a_world)
+{
+	// (47u) Plants: every culled one this frame's rays reach -> late (RecordLateWind before the TLAS on an Early Prep frame, RecordWind's
+	// own refits otherwise). NPCs: any culled one reachable -> this frame's characters again without culling (the Early Prep context is
+	// given up first: its list ran; ExecuteFrame then records skinning and the late refits itself).
+	if (scene.WindCulledLastFrame() > 0) {
+		const std::uint32_t late = scene.MarkLateWind(backend, a_exact);
+		relLateTotal += late;
+	}
+	relNpcCulledThisFrame = characters.CulledLastUpdate();
+	if (relNpcCulledThisFrame == 0 || (a_exact && !characters.CulledReachable(*a_exact)))
+		return;
+	if (!a_world) {
+		// Cannot happen (NPCs are culled only on exterior sun frames, which pass their rect); counted, never silently.
+		relFallbackThisFrame = true;
+		++relFallbacks;
+		return;
+	}
+	relFallbackThisFrame = true;
+	++relFallbacks;
+	if (backend.HasPrepared())
+		backend.AbandonPrepared();
+	earlyThisFrame = false;
+	charactersUpdatedEarly = false;
+	skinDraws.clear();
+	skinBones.clear();
+	characters.SetRelevance(nullptr);
+	if (a_world && settings.Characters && backend.SkinAvailable()) {
+		characters.Update(backend, a_world, blackScreen ? 6.0 : 1.0, blackScreen ? 32u : 6u);
+		characters.CollectDraws(skinDraws, skinBones);
+	}
+	relNpcCulledThisFrame = 0;
 }
 
 RayTracingScene::SceneConfig RayTracing::SceneConfigFromSettings() const
@@ -1103,6 +1206,7 @@ RayTracingScene::SceneConfig RayTracing::SceneConfigFromSettings() const
 	config.cutoutAsOpaque = true;
 	// (46c) Window Shadows Ultimate's window masks indoors: with the alpha-tested point-light trace only.
 	config.windowMasks = alpha && backend.PointAlphaAvailable() && PointLightsOn() && InteriorsOn();
+	config.spatialChunks = settings.SpatialStaticChunks;  // (47u) a change re-captures the scene
 	return config;
 }
 
@@ -1380,6 +1484,9 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.FoliageLearnAnyFrame = read("FoliageLearnAnyFrame", defaults.FoliageLearnAnyFrame);
 		settings.AlphaClassify = read("AlphaClassify", defaults.AlphaClassify);  // (47s)
 		settings.OpacityMicromaps = read("OpacityMicromaps", defaults.OpacityMicromaps);  // (47t)
+		settings.SunTraceEarly = read("SunTraceEarly", defaults.SunTraceEarly);  // (47u)
+		settings.SkipIrrelevantUpdates = read("SkipIrrelevantUpdates", defaults.SkipIrrelevantUpdates);
+		settings.SpatialStaticChunks = read("SpatialStaticChunks", defaults.SpatialStaticChunks);
 		const float sunSize = read("SunSize", -1.0f);
 		if (sunSize >= 0.0f) {
 			settings.SunSize = sunSize;
@@ -1498,6 +1605,9 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["FoliageLearnAnyFrame"] = settings.FoliageLearnAnyFrame;
 	o_json["AlphaClassify"] = settings.AlphaClassify;  // (47s)
 	o_json["OpacityMicromaps"] = settings.OpacityMicromaps;  // (47t)
+	o_json["SunTraceEarly"] = settings.SunTraceEarly;  // (47u)
+	o_json["SkipIrrelevantUpdates"] = settings.SkipIrrelevantUpdates;
+	o_json["SpatialStaticChunks"] = settings.SpatialStaticChunks;
 	o_json["AOSmoothNormals"] = settings.AOSmoothNormals;  // (47j)
 	o_json["AOTemporalV2"] = settings.AOTemporalV2;  // (47l)
 	o_json["FoliageSway"] = settings.FoliageSway;  // (47l)
@@ -2190,6 +2300,7 @@ void RayTracing::RunEarlyPrep()
 		skinBones.clear();
 		if (settings.Characters && backend.SkinAvailable()) {
 			float world[4];
+			characters.SetRelevance(interior ? nullptr : CurrentRelevance());  // (47u)
 			if (interior)
 				characters.Update(backend, interiorRect, blackScreen ? 6.0 : 1.0, blackScreen ? 32u : 6u);
 			else if (scene.GetLoadedRect(world, false))
@@ -2804,6 +2915,16 @@ void RayTracing::PublishCpuSplit()
 			detail.chunksPerCell = chunkStatsPerCell;
 			detail.chunkOverlap = chunkStatsOverlap;
 		}
+		// (47u) Start Sun Trace Earlier, Skip Updates That Cannot Affect the Image, Spatial Static Chunks.
+		detail.earlyNormal = settings.SunTraceEarly ? earlyNormalThisFrame : -1;
+		if (settings.SkipIrrelevantUpdates) {
+			const auto& ws = backend.GetWindStats();
+			detail.relWindCulled = scene.SwayActive() ? static_cast<int>(ws.culledLastFrame) : 0;
+			detail.relWindLate = scene.SwayActive() ? static_cast<int>(ws.lateLastFrame) : 0;
+			detail.relNpcCulled = static_cast<int>(relNpcCulledThisFrame);
+			detail.relFallback = relFallbackThisFrame ? 1 : 0;
+		}
+		detail.spatialChunks = settings.SpatialStaticChunks ? 1 : 0;
 		detail.plCpuMs = PointLightsOn() ? pointCpuMs : -1.0f;
 		// (46c)
 		// (46h) 2 = indoors traced: point lights and / or RTAO.
@@ -3076,6 +3197,7 @@ void RayTracing::RunFrame()
 		skinBones.clear();
 		if (settings.Characters && backend.SkinAvailable()) {
 			float world[4];
+			characters.SetRelevance(CurrentRelevance());  // (47u)
 			if (scene.GetLoadedRect(world, false))
 				characters.Update(backend, world, blackScreen ? 6.0 : 1.0, blackScreen ? 32u : 6u);
 			// Every captured (and retiring) shape is traced, also on a frame without an update.
@@ -3243,6 +3365,14 @@ void RayTracing::RunFrame()
 		}
 		aoCpuMs = static_cast<float>(static_cast<double>(Qpc() - aoStart) * QpcMs());
 	}
+	// (47u) Skip Updates That Cannot Affect the Image: this frame's exact rays (kept for the next frame's early region); what was culled
+	// and is reachable after all is updated before the trace.
+	{
+		BuildExactRelevance(input, traceRect, camX, camY, camZ);
+		float charWorld[4];
+		const bool haveWorld = scene.GetLoadedRect(charWorld, false);
+		ResolveRelevance(relevanceExact.Valid() ? &relevanceExact : nullptr, haveWorld ? charWorld : nullptr);
+	}
 
 	auto* context = globals::d3d::context;
 	auto* screenSpaceShadows = &globals::features::screenSpaceShadows;
@@ -3318,8 +3448,6 @@ void RayTracing::RunFrame()
 	}
 
 	GpuBucketScope gpuTimer(Util::GpuBucket::RayTracing);
-	ID3D11Buffer* cbs[1] = { combineCB->CB() };
-	const UINT groupsX = (width + 7) / 8, groupsY = (height + 7) / 8;
 
 	// 0. (45h) Alpha copies of textures D3D12 cannot open (before the trace: the D3D12 queue waits for this).
 	const std::int64_t d3d11Start = Qpc();
@@ -3345,25 +3473,9 @@ void RayTracing::RunFrame()
 			backend.RecordAlphaCopies(alphaMaskCS.get(), kAlphaCopiesPerFrame);
 	}
 
-	// 0b. (47j) RTAO: Smooth Normals, from last frame's depth still in DepthMask (before step 1 overwrites it).
-	if (input.ao)
-		RunAONormalPrep(context, depth.depthSRV, width, height);
-	// 1. Depth + engine mask -> the tracer's shared texture.
-	{
-		ID3D11ShaderResourceView* srvs[2] = { depth.depthSRV, mask.SRV };
-		ID3D11UnorderedAccessView* uavs[1] = { backend.DepthMaskUAV() };
-		context->CSSetConstantBuffers(0, 1, cbs);
-		context->CSSetShaderResources(0, 2, srvs);
-		context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
-		context->CSSetShader(prepare, nullptr, 0);
-		context->Dispatch(groupsX, groupsY, 1);
-		ID3D11ShaderResourceView* nullSrvs[2]{};
-		ID3D11UnorderedAccessView* nullUavs[1]{};
-		context->CSSetShaderResources(0, 2, nullSrvs);
-		context->CSSetUnorderedAccessViews(0, 1, nullUavs, nullptr);
-		context->CSSetShader(nullptr, nullptr, 0);
-	}
-	RememberAONormalFrame(width, height);  // (47j) DepthMask now holds this frame's depth
+	// 0b. (47j) RTAO: Smooth Normals, from last frame's depth still in DepthMask (before step 1 overwrites it); (47u) or, with Start Sun
+	// Trace Earlier, right behind the ready signal from its copy. 1. Depth + engine mask -> the tracer's shared texture.
+	PrepareDepthMask(context, prepare, depth.depthSRV, mask.SRV, width, height, input);
 
 	// 2. D3D12: builds, skinning and the TLAS (not waiting for D3D11), then the trace (waiting for the
 	// depth copy above, GPU-side). The D3D11 queue waits for the trace in FinishFrame.
@@ -3372,6 +3484,7 @@ void RayTracing::RunFrame()
 	backend.SetAlphaClassify(settings.AlphaClassify);  // (47s)
 	backend.SetOpacityMicromaps(settings.OpacityMicromaps);  // (47t)
 	const bool traced = backend.ExecuteFrame(input);
+	FlushDeferredAONormal();  // (47u) the frame never reached its ready signal: the deferred normal prep now (nothing else reads it)
 	const std::int64_t executeEnd = Qpc();
 	cpuLast.execute = static_cast<float>(static_cast<double>(executeEnd - executeStart) * QpcMs());
 	if (!traced && backend.HasFailed()) {
@@ -3610,29 +3723,14 @@ void RayTracing::RunNoSunFrame(ID3D11ShaderResourceView* a_depth, ID3D11ShaderRe
 		if (alphaMaskCS)
 			backend.RecordAlphaCopies(alphaMaskCS.get(), kAlphaCopiesPerFrame);
 	}
-	if (input.ao)
-		RunAONormalPrep(context, a_depth, a_width, a_height);
-	{
-		ID3D11Buffer* cbs[1] = { combineCB->CB() };
-		ID3D11ShaderResourceView* srvs[2] = { a_depth, a_mask };
-		ID3D11UnorderedAccessView* uavs[1] = { backend.DepthMaskUAV() };
-		context->CSSetConstantBuffers(0, 1, cbs);
-		context->CSSetShaderResources(0, 2, srvs);
-		context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
-		context->CSSetShader(prepare, nullptr, 0);
-		context->Dispatch((a_width + 7) / 8, (a_height + 7) / 8, 1);
-		ID3D11ShaderResourceView* nullSrvs[2]{};
-		ID3D11UnorderedAccessView* nullUavs[1]{};
-		context->CSSetShaderResources(0, 2, nullSrvs);
-		context->CSSetUnorderedAccessViews(0, 1, nullUavs, nullptr);
-		context->CSSetShader(nullptr, nullptr, 0);
-	}
-	RememberAONormalFrame(a_width, a_height);
+	ResolveRelevance(nullptr);  // (47u) no exact region on a sun "Off" frame: everything left stale by Skip Updates is updated now
+	PrepareDepthMask(context, prepare, a_depth, a_mask, a_width, a_height, input);  // (47u) (47j) normal prep + PrepareCS
 	const std::int64_t executeStart = Qpc();
 	cpuLast.d3d11 = static_cast<float>(static_cast<double>(executeStart - d3d11Start) * QpcMs());
 	backend.SetAlphaClassify(settings.AlphaClassify);  // (47s)
 	backend.SetOpacityMicromaps(settings.OpacityMicromaps);  // (47t)
 	const bool traced = backend.ExecuteFrame(input);
+	FlushDeferredAONormal();  // (47u)
 	cpuLast.execute = static_cast<float>(static_cast<double>(Qpc() - executeStart) * QpcMs());
 	if (!traced && backend.HasFailed()) {
 		Disable(Status::Failed, backend.LastError());
@@ -4159,9 +4257,173 @@ void RayTracing::PrepWaterDistance(ID3D11DeviceContext* a_context)
 // (47j) RTAO: Smooth Normals. The trace runs after the depth prepass, before this frame's G-buffer: last frame's normals
 // (NORMALROUGHNESS is cleared only in StartDeferred) reprojected by the camera and the motion vectors, checked against last
 // frame's depth (the trace's DepthMask, before PrepareCS overwrites it) and blended toward the depth normal by that confidence.
-bool RayTracing::RunAONormalPrep(ID3D11DeviceContext* a_context, ID3D11ShaderResourceView* a_depth, std::uint32_t a_width, std::uint32_t a_height)
+void RayTracing::DispatchAONormal(ID3D11DeviceContext* a_context, ID3D11ShaderResourceView* a_depth, ID3D11ShaderResourceView* a_prevDepth, std::uint32_t a_width,
+	std::uint32_t a_height, bool a_writeDebug)
+{
+	auto* renderer = globals::game::renderer;
+	auto& normal = renderer->GetRuntimeData().renderTargets[NORMALROUGHNESS];
+	auto& motion = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGET::kMOTION_VECTOR];
+	// (47l) F7 rtao_normal_prep_gpu_ms: its own GPU bucket. Buckets do not nest and every caller (RunFrame, RunNoSunFrame, RunInteriorFrame,
+	// and (47u) the deferred dispatch inside ExecuteFrame) is inside the Ray Tracing bucket's scope: that interval pauses around this one.
+	auto* gpuTimers = Util::GpuPassTimers::GetSingleton();
+	gpuTimers->End(Util::GpuBucket::RayTracing);
+	gpuTimers->Begin(Util::GpuBucket::RayTracingAONormalPrep);
+	ID3D11Buffer* cbs[1] = { aoNormalCB->CB() };
+	ID3D11ShaderResourceView* srvs[4] = { a_depth, a_prevDepth, normal.SRV, motion.SRV };
+	ID3D11UnorderedAccessView* uavs[2] = { backend.AONormalUAV(), a_writeDebug ? aoNormalDebug.uav.get() : nullptr };
+	a_context->CSSetConstantBuffers(0, 1, cbs);
+	a_context->CSSetShaderResources(0, 4, srvs);
+	a_context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
+	a_context->CSSetShader(aoNormalCS.get(), nullptr, 0);
+	a_context->Dispatch((a_width + 7) / 8, (a_height + 7) / 8, 1);
+	ID3D11ShaderResourceView* nullSrvs[4]{};
+	ID3D11UnorderedAccessView* nullUavs[2]{};
+	ID3D11Buffer* nullCbs[1]{};
+	a_context->CSSetShaderResources(0, 4, nullSrvs);
+	a_context->CSSetUnorderedAccessViews(0, 2, nullUavs, nullptr);
+	gpuTimers->End(Util::GpuBucket::RayTracingAONormalPrep);
+	gpuTimers->Begin(Util::GpuBucket::RayTracing);
+	if (a_writeDebug)
+		aoNormalDebugFrame = globals::state->frameCount;
+	a_context->CSSetConstantBuffers(0, 1, nullCbs);
+	a_context->CSSetShader(nullptr, nullptr, 0);
+}
+
+bool RayTracing::EarlyNormalPrepPossible(std::uint32_t a_width, std::uint32_t a_height)
+{
+	// (47u) Start Sun Trace Earlier: the normal prep may go behind the ready signal only when its "last frame's depth" can come from the
+	// copy (aoPrevDepth holds exactly last frame's DepthMask, at the same size) and the after-ready fence exists. Otherwise the 47t order.
+	if (!settings.SunTraceEarly || !aoSmoothFault.empty() || !ResolveAOTier().smoothNormals || !aoPrevDepth || !aoPrevDepthSRV)
+		return false;
+	const std::uint32_t frame = globals::state->frameCount;
+	if (aoPrevDepthFrame == UINT32_MAX || aoPrevDepthFrame + 1 != frame || aoNormalPrev.frame != aoPrevDepthFrame || aoNormalPrev.width != a_width ||
+		aoNormalPrev.height != a_height)
+		return false;
+	auto* depthMask = backend.DepthMaskTexture();
+	if (!depthMask)
+		return false;
+	D3D11_TEXTURE2D_DESC desc{};
+	depthMask->GetDesc(&desc);
+	if (desc.Width != aoPrevDepthDesc.Width || desc.Height != aoPrevDepthDesc.Height || desc.Format != aoPrevDepthDesc.Format)
+		return false;
+	return backend.EnsureAfterReadyFence();
+}
+
+bool RayTracing::DispatchDeferredAONormal()
+{
+	// (47u) Inside ExecuteFrame, right after the D3D11 ready signal (or after it, when the frame never got that far): the normal prep with
+	// last frame's depth from its copy, then this frame's DepthMask kept for the next one. True when the RTAO list reads what it wrote.
+	if (!aoNormalDeferred.active)
+		return false;
+	aoNormalDeferred.active = false;
+	auto* context = globals::d3d::context;
+	DispatchAONormal(context, aoNormalDeferred.depth, aoPrevDepthSRV.get(), aoNormalDeferred.width, aoNormalDeferred.height, aoNormalDeferred.writeDebug);
+	FinishDepthMaskFrame(aoNormalDeferred.width, aoNormalDeferred.height);
+	return aoNormalsThisFrame;
+}
+
+void RayTracing::FinishDepthMaskFrame(std::uint32_t a_width, std::uint32_t a_height)
+{
+	// (47u) After PrepareCS wrote this frame's DepthMask (and the normal prep read last frame's): remembered for the next frame's normal
+	// prep, and -- with Start Sun Trace Earlier and Smooth Normals -- copied to aoPrevDepth (D3D11 only; the next frame's normal prep reads
+	// it behind the ready signal while PrepareCS has already overwritten DepthMask). The copy reads DepthMask while the D3D12 traces read
+	// it too (read / read).
+	RememberAONormalFrame(a_width, a_height);
+	auto* depthMask = backend.DepthMaskTexture();
+	const bool wanted = settings.SunTraceEarly && aoSmoothFault.empty() && ResolveAOTier().smoothNormals && AOOn() && depthMask;
+	if (!wanted) {
+		aoPrevDepthFrame = UINT32_MAX;
+		if (aoPrevDepth) {
+			d3d11Bytes -= std::min<std::uint64_t>(d3d11Bytes, static_cast<std::uint64_t>(aoPrevDepthDesc.Width) * aoPrevDepthDesc.Height * 4);
+			aoPrevDepth = nullptr;
+			aoPrevDepthSRV = nullptr;
+		}
+		return;
+	}
+	D3D11_TEXTURE2D_DESC desc{};
+	depthMask->GetDesc(&desc);
+	if (!aoPrevDepth || desc.Width != aoPrevDepthDesc.Width || desc.Height != aoPrevDepthDesc.Height || desc.Format != aoPrevDepthDesc.Format) {
+		if (aoPrevDepth)
+			d3d11Bytes -= std::min<std::uint64_t>(d3d11Bytes, static_cast<std::uint64_t>(aoPrevDepthDesc.Width) * aoPrevDepthDesc.Height * 4);
+		aoPrevDepth = nullptr;
+		aoPrevDepthSRV = nullptr;
+		D3D11_TEXTURE2D_DESC copyDesc = desc;
+		copyDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		copyDesc.MiscFlags = 0;
+		copyDesc.CPUAccessFlags = 0;
+		copyDesc.Usage = D3D11_USAGE_DEFAULT;
+		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+		srvDesc.Format = desc.Format;
+		srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		srvDesc.Texture2D.MipLevels = 1;
+		auto* device = globals::d3d::device;
+		winrt::com_ptr<ID3D11Texture2D> texture;
+		winrt::com_ptr<ID3D11ShaderResourceView> srv;
+		if (!device || FAILED(device->CreateTexture2D(&copyDesc, nullptr, texture.put())) || FAILED(device->CreateShaderResourceView(texture.get(), &srvDesc, srv.put()))) {
+			aoPrevDepthFrame = UINT32_MAX;
+			logger::warn("[RayTracing] Start Sun Trace Earlier: could not create the depth copy ({}x{}); the normal prep keeps its old place", desc.Width, desc.Height);
+			return;
+		}
+		Util::SetResourceName(texture.get(), "RayTracing RTAO PrevDepth");
+		aoPrevDepth = texture;
+		aoPrevDepthSRV = srv;
+		aoPrevDepthDesc = desc;
+		d3d11Bytes += static_cast<std::uint64_t>(desc.Width) * desc.Height * 4;
+	}
+	globals::d3d::context->CopyResource(aoPrevDepth.get(), depthMask);
+	aoPrevDepthFrame = globals::state->frameCount;
+}
+
+void RayTracing::PrepareDepthMask(ID3D11DeviceContext* a_context, ID3D11ComputeShader* a_prepare, ID3D11ShaderResourceView* a_depth, ID3D11ShaderResourceView* a_mask,
+	std::uint32_t a_width, std::uint32_t a_height, RayTracingRT::FrameInput& a_input)
+{
+	// (47j) RTAO's Smooth Normals read last frame's depth; (47u) with Start Sun Trace Earlier from aoPrevDepth, behind the ready signal.
+	earlyNormalThisFrame = -1;
+	bool defer = false;
+	if (a_input.ao) {
+		const bool possible = EarlyNormalPrepPossible(a_width, a_height);
+		RunAONormalPrep(a_context, a_depth, a_width, a_height, possible);
+		defer = possible && aoNormalDeferred.active;
+		earlyNormalThisFrame = aoNormalsThisFrame ? (defer ? 1 : 0) : -1;
+	}
+	// Depth + engine mask -> the tracer's shared texture (combineCB holds this frame's constants).
+	{
+		ID3D11Buffer* cbs[1] = { combineCB->CB() };
+		ID3D11ShaderResourceView* srvs[2] = { a_depth, a_mask };
+		ID3D11UnorderedAccessView* uavs[1] = { backend.DepthMaskUAV() };
+		a_context->CSSetConstantBuffers(0, 1, cbs);
+		a_context->CSSetShaderResources(0, 2, srvs);
+		a_context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+		a_context->CSSetShader(a_prepare, nullptr, 0);
+		a_context->Dispatch((a_width + 7) / 8, (a_height + 7) / 8, 1);
+		ID3D11ShaderResourceView* nullSrvs[2]{};
+		ID3D11UnorderedAccessView* nullUavs[1]{};
+		a_context->CSSetShaderResources(0, 2, nullSrvs);
+		a_context->CSSetUnorderedAccessViews(0, 1, nullUavs, nullptr);
+		a_context->CSSetShader(nullptr, nullptr, 0);
+	}
+	if (defer)
+		a_input.afterReady = [this]() { return DispatchDeferredAONormal(); };
+	else
+		FinishDepthMaskFrame(a_width, a_height);  // DepthMask now holds this frame's depth
+}
+
+void RayTracing::FlushDeferredAONormal()
+{
+	// (47u) After ExecuteFrame: a deferred normal prep the frame never reached (no ready signal) runs now; RTAO did not go out then.
+	if (!aoNormalDeferred.active)
+		return;
+	if (backend.HasFailed()) {
+		aoNormalDeferred.active = false;
+		return;
+	}
+	DispatchDeferredAONormal();
+}
+
+bool RayTracing::RunAONormalPrep(ID3D11DeviceContext* a_context, ID3D11ShaderResourceView* a_depth, std::uint32_t a_width, std::uint32_t a_height, bool a_defer)
 {
 	aoNormalsThisFrame = false;
+	aoNormalDeferred.active = false;
 	// (47k) The Smooth Normals debug views: their texture only while one of them is on.
 	const int normalView = aoDebugView == AODebugView::NormalConfidence ? 1 : (aoDebugView == AODebugView::NormalNs ? 2 : (aoDebugView == AODebugView::NormalNg ? 3 : 0));
 	// (47n) Smooth Normals is a tier knob; a fault (its texture / shader) keeps it off for this session.
@@ -4233,30 +4495,13 @@ bool RayTracing::RunAONormalPrep(ID3D11DeviceContext* a_context, ID3D11ShaderRes
 		cb.SkipFade[1] = 1.0f;
 	}
 	aoNormalCB->Update(cb);
-	// (47l) F7 rtao_normal_prep_gpu_ms: its own GPU bucket. Buckets do not nest and both callers (RunFrame, RunInteriorFrame) are
-	// inside the Ray Tracing bucket's scope: that interval pauses around this one (a bucket may hold several intervals a frame).
-	auto* gpuTimers = Util::GpuPassTimers::GetSingleton();
-	gpuTimers->End(Util::GpuBucket::RayTracing);
-	gpuTimers->Begin(Util::GpuBucket::RayTracingAONormalPrep);
-	ID3D11Buffer* cbs[1] = { aoNormalCB->CB() };
-	ID3D11ShaderResourceView* srvs[4] = { a_depth, backend.DepthMaskSRV(), normal.SRV, motion.SRV };
-	ID3D11UnorderedAccessView* uavs[2] = { backend.AONormalUAV(), writeDebug ? aoNormalDebug.uav.get() : nullptr };
-	a_context->CSSetConstantBuffers(0, 1, cbs);
-	a_context->CSSetShaderResources(0, 4, srvs);
-	a_context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
-	a_context->CSSetShader(aoNormalCS.get(), nullptr, 0);
-	a_context->Dispatch((a_width + 7) / 8, (a_height + 7) / 8, 1);
-	ID3D11ShaderResourceView* nullSrvs[4]{};
-	ID3D11UnorderedAccessView* nullUavs[2]{};
-	ID3D11Buffer* nullCbs[1]{};
-	a_context->CSSetShaderResources(0, 4, nullSrvs);
-	a_context->CSSetUnorderedAccessViews(0, 2, nullUavs, nullptr);
-	gpuTimers->End(Util::GpuBucket::RayTracingAONormalPrep);
-	gpuTimers->Begin(Util::GpuBucket::RayTracing);
-	if (writeDebug)
-		aoNormalDebugFrame = frame;
-	a_context->CSSetConstantBuffers(0, 1, nullCbs);
-	a_context->CSSetShader(nullptr, nullptr, 0);
+	if (a_defer) {
+		// (47u) Start Sun Trace Earlier: everything above is this frame's (constants, the trace's flags below); the dispatch itself goes
+		// behind the D3D11 ready signal (DispatchDeferredAONormal), reading last frame's depth from its own copy (aoPrevDepth).
+		aoNormalDeferred = { true, a_depth, a_width, a_height, writeDebug };
+	} else {
+		DispatchAONormal(a_context, a_depth, backend.DepthMaskSRV(), a_width, a_height, writeDebug);
+	}
 	// The trace reads it.
 	std::uint32_t flags;
 	std::memcpy(&flags, &aoInput.constants.params[1], sizeof(flags));
@@ -4624,6 +4869,13 @@ void RayTracing::ReleaseAOFilter()
 	ReleaseAOExtras();  // (46t)
 	ReleaseAOTemporalV2();  // (47l)
 	ReleaseAOTiles();  // (47r)
+	if (aoPrevDepth) {  // (47u)
+		d3d11Bytes -= std::min<std::uint64_t>(d3d11Bytes, static_cast<std::uint64_t>(aoPrevDepthDesc.Width) * aoPrevDepthDesc.Height * 4);
+		aoPrevDepth = nullptr;
+		aoPrevDepthSRV = nullptr;
+	}
+	aoPrevDepthFrame = UINT32_MAX;
+	aoNormalDeferred.active = false;
 }
 
 void RayTracing::ReleaseAOTemporalV2()
@@ -5491,6 +5743,7 @@ void RayTracing::RunInteriorFrame()
 		skinDraws.clear();
 		skinBones.clear();
 		if (charactersWanted) {
+			characters.SetRelevance(nullptr);  // (47u) interiors: nothing culled
 			characters.Update(backend, world, blackScreen ? 6.0 : 1.0, blackScreen ? 32u : 6u);
 			characters.CollectDraws(skinDraws, skinBones);
 		}
@@ -5611,30 +5864,16 @@ void RayTracing::RunInteriorFrame()
 		if (alphaMaskCS)
 			backend.RecordAlphaCopies(alphaMaskCS.get(), kAlphaCopiesPerFrame);
 	}
-	// (47j) RTAO: Smooth Normals, from last frame's depth still in DepthMask (before PrepareCS overwrites it).
-	if (input.ao)
-		RunAONormalPrep(context, depth.depthSRV, width, height);
-	{
-		ID3D11Buffer* cbs[1] = { combineCB->CB() };
-		ID3D11ShaderResourceView* srvs[2] = { depth.depthSRV, mask.SRV };
-		ID3D11UnorderedAccessView* uavs[1] = { backend.DepthMaskUAV() };
-		context->CSSetConstantBuffers(0, 1, cbs);
-		context->CSSetShaderResources(0, 2, srvs);
-		context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
-		context->CSSetShader(prepare, nullptr, 0);
-		context->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
-		ID3D11ShaderResourceView* nullSrvs[2]{};
-		ID3D11UnorderedAccessView* nullUavs[1]{};
-		context->CSSetShaderResources(0, 2, nullSrvs);
-		context->CSSetUnorderedAccessViews(0, 1, nullUavs, nullptr);
-		context->CSSetShader(nullptr, nullptr, 0);
-	}
-	RememberAONormalFrame(width, height);  // (47j)
+	// (47j) RTAO: Smooth Normals, from last frame's depth still in DepthMask (before PrepareCS overwrites it); (47u) or behind the ready
+	// signal from its copy (Start Sun Trace Earlier).
+	ResolveRelevance(nullptr);  // (47u) indoors: everything left stale by Skip Updates is updated now
+	PrepareDepthMask(context, prepare, depth.depthSRV, mask.SRV, width, height, input);
 	const std::int64_t executeStart = Qpc();
 	cpuLast.d3d11 = static_cast<float>(static_cast<double>(executeStart - d3d11Start) * QpcMs());
 	backend.SetAlphaClassify(settings.AlphaClassify);  // (47s)
 	backend.SetOpacityMicromaps(settings.OpacityMicromaps);  // (47t)
 	const bool traced = backend.ExecuteFrame(input);
+	FlushDeferredAONormal();  // (47u)
 	cpuLast.execute = static_cast<float>(static_cast<double>(Qpc() - executeStart) * QpcMs());
 	if (!traced && backend.HasFailed()) {
 		Disable(Status::Failed, backend.LastError());
@@ -6270,6 +6509,36 @@ void RayTracing::DrawObjectRows()
 				static_cast<double>(cs.ommInputBytes) / (1024.0 * 1024.0), std::max(cs.lastOmmBakeGpuMs, 0.0f));
 		}
 		ImGui::Unindent();
+	}
+	// (47u) Speed-ups of the last overnight package; each off = 47t exactly.
+	ImGui::Spacing();
+	ImGui::TextDisabled("Speed-ups (47u)");
+	ImGui::Checkbox("RT: Start Sun Trace Earlier", &settings.SunTraceEarly);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("On (default): RT ambient occlusion's normal preparation (about 0.3-0.4 ms) no longer runs between the depth pass and the");
+		ImGui::Text("  moment the sun trace may start; it runs right after, beside the sun and point-light traces, reading last frame's depth");
+		ImGui::Text("  from its own copy (about 11-15 MB of video memory). The sun trace starts that much earlier; same result.");
+		ImGui::Text("Off: exactly as 47t. Only does something with RT ambient occlusion's Smooth Normals. F7: rt_early_normal.");
+	}
+	ImGui::Checkbox("RT: Skip Updates That Cannot Affect the Image", &settings.SkipIrrelevantUpdates);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("On (default): swaying plants and NPCs that no ray of the frame can reach (behind the camera and away from the sun's");
+		ImGui::Text("  direction, outside every traced light's reach and beyond ambient occlusion's) are not re-posed for ray tracing. Before");
+		ImGui::Text("  each trace everything skipped is checked against that frame's exact rays; anything reachable is updated first.");
+		ImGui::Text("Off: exactly as 47t. F7: rt_rel_* columns.");
+	}
+	if (settings.SkipIrrelevantUpdates) {
+		const auto& ws = backend.GetWindStats();
+		ImGui::TextDisabled("Last frame: %u plant refits skipped, %u refit late; %u NPCs skipped; %llu character redos so far", ws.culledLastFrame,
+			ws.lateLastFrame, relNpcCulledThisFrame, static_cast<unsigned long long>(relFallbacks));
+	}
+	ImGui::Checkbox("RT: Spatial Static Chunks", &settings.SpatialStaticChunks);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("Off (default): exactly as 47t. On: the buildings and statics of each captured cell are packed into their ray-tracing");
+		ImGui::Text("  blocks by place (nearby shapes together) instead of in the game's reference order, and outdoors one- and two-sided");
+		ImGui::Text("  shapes share blocks. Same shadows. The offline test gained only 1-4 %% of the rays' search time on data like yours");
+		ImGui::Text("  (your blocks already overlap little), so it stays off; for A/B only. Switching it rebuilds the scene (a few seconds).");
+		ImGui::Text("F7: rt_chunk_overlap (how much the blocks overlap), rt_chunk_spatial.");
 	}
 	ImGui::TreePop();
 }
@@ -7211,6 +7480,9 @@ std::string RayTracing::DescribeForProfile() const
 		settings.OpacityMicromaps && !backend.OpacityMicromapsOn() ?
 			(backend.OpacityMicromapsAvailable() ? " (not in effect: Alpha Classify off)" : " (not available: no driver support)") :
 			"");
+	// (47u)
+	text += std::format(", start sun trace earlier {}, skip unreachable updates {}, spatial static chunks {}", settings.SunTraceEarly ? "on" : "off",
+		settings.SkipIrrelevantUpdates ? "on" : "off", settings.SpatialStaticChunks ? "on" : "off");
 	return text;
 }
 
@@ -7307,6 +7579,15 @@ nlohmann::json RayTracing::DescribeJson() const
 			{ "known_micro_triangles", cs.ommKnownMicro }, { "vram_mb", static_cast<double>(cs.ommBytes) / (1024.0 * 1024.0) },
 			{ "waiting_input_mb", static_cast<double>(cs.ommInputBytes) / (1024.0 * 1024.0) }, { "builds_total", cs.ommBuildsTotal },
 			{ "gave_up", cs.ommFailed }, { "last_bake_gpu_ms", cs.lastOmmBakeGpuMs } };
+	}
+	{
+		// (47u)
+		const auto& ws = backend.GetWindStats();
+		j["speedups_47u"] = { { "start_sun_trace_earlier", settings.SunTraceEarly }, { "early_normal_last_frame", earlyNormalThisFrame },
+			{ "prev_depth_mb", aoPrevDepth ? static_cast<double>(aoPrevDepthDesc.Width) * aoPrevDepthDesc.Height * 4.0 / (1024.0 * 1024.0) : 0.0 },
+			{ "skip_unreachable_updates", settings.SkipIrrelevantUpdates }, { "wind_refits_skipped", ws.culledLastFrame }, { "wind_refits_late", ws.lateLastFrame },
+			{ "wind_late_total", relLateTotal }, { "npcs_skipped", relNpcCulledThisFrame }, { "character_redos_total", relFallbacks },
+			{ "spatial_static_chunks", settings.SpatialStaticChunks } };
 	}
 	// (46b)
 	{

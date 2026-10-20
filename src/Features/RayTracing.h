@@ -273,6 +273,18 @@ public:
 		// stops at the solid ones; only the undecided ones come back to the texture test. Needs the driver's OMM support (in effect only
 		// then). Exact for every alpha-tested ray. Off = 47s exactly.
 		bool OpacityMicromaps = true;
+		// (47u) Outside the settings macro. Each off = 47t exactly.
+		// SunTraceEarly "RT: Start Sun Trace Earlier": RTAO's normal prep no longer runs between the depth prepass and the signal the sun
+		// trace waits for, but right behind it (beside the traces), reading last frame's depth from its own copy. Exact.
+		bool SunTraceEarly = true;
+		// SkipIrrelevantUpdates "RT: Skip Updates That Cannot Affect the Image": swaying plants and NPCs whose (swaying / posed) bounds no
+		// ray of the frame can reach (outside the view extruded toward the sun, the point lights' reach and the near rays) are not posed /
+		// refit; checked again against the frame's exact rays before the trace (anything reachable is refit that same frame first).
+		bool SkipIrrelevantUpdates = true;
+		// SpatialStaticChunks "RT: Spatial Static Chunks": a captured cell's statics are packed into their 131k-triangle chunks in spatial
+		// (Morton) order instead of reference order, and outdoors one- and two-sided shapes share chunks (no ray there culls faces).
+		// A change re-captures the scene. Default from the offline traversal test (47u as built).
+		bool SpatialStaticChunks = false;
 	};
 	/// (46f) RTAO modes (Settings::AOMode); with RTAO off the AO is SSGI's, exactly as before.
 	enum class AOModeKind : int
@@ -870,9 +882,54 @@ private:
 	uint32_t aoNormalDebugWidth = 0, aoNormalDebugHeight = 0;
 	uint32_t aoNormalDebugFrame = UINT32_MAX;  // frame it was written in
 	/// Before PrepareCS: the smooth normals for this frame's RTAO trace (sets its flag); false = the trace keeps the depth normal.
-	bool RunAONormalPrep(ID3D11DeviceContext* a_context, ID3D11ShaderResourceView* a_depth, std::uint32_t a_width, std::uint32_t a_height);
+	/// (47u) a_defer: everything but the dispatch now (constants, the trace's flag); the dispatch goes behind the ready signal
+	/// (DispatchDeferredAONormal, reading last frame's depth from aoPrevDepth).
+	bool RunAONormalPrep(ID3D11DeviceContext* a_context, ID3D11ShaderResourceView* a_depth, std::uint32_t a_width, std::uint32_t a_height, bool a_defer = false);
 	/// After PrepareCS: this frame's camera, for next frame's reprojection.
 	void RememberAONormalFrame(std::uint32_t a_width, std::uint32_t a_height);
+	// (47u) "RT: Start Sun Trace Earlier" (Settings::SunTraceEarly): RTAO's normal prep (0.27-0.43 ms of D3D11 work that only RTAO reads)
+	// no longer sits between the depth prepass and the ready signal the sun trace waits for; it runs right behind that signal, beside
+	// the traces, reading last frame's depth from a D3D11 copy of DepthMask (aoPrevDepth) instead of DepthMask itself. RTAO's list waits
+	// for it through the after-ready fence. Exact: the same inputs, the same dispatch.
+	void DispatchAONormal(ID3D11DeviceContext* a_context, ID3D11ShaderResourceView* a_depth, ID3D11ShaderResourceView* a_prevDepth, std::uint32_t a_width,
+		std::uint32_t a_height, bool a_writeDebug);
+	bool EarlyNormalPrepPossible(std::uint32_t a_width, std::uint32_t a_height);
+	bool DispatchDeferredAONormal();
+	void FlushDeferredAONormal();
+	void FinishDepthMaskFrame(std::uint32_t a_width, std::uint32_t a_height);
+	/// PrepareCS + (Smooth Normals) the normal prep in the order Start Sun Trace Earlier allows; a_input.afterReady set when deferred.
+	void PrepareDepthMask(ID3D11DeviceContext* a_context, ID3D11ComputeShader* a_prepare, ID3D11ShaderResourceView* a_depth, ID3D11ShaderResourceView* a_mask,
+		std::uint32_t a_width, std::uint32_t a_height, RayTracingRT::FrameInput& a_input);
+	struct AONormalDeferred
+	{
+		bool active = false;
+		ID3D11ShaderResourceView* depth = nullptr;  // the engine's depth SRV of this frame (alive for the frame)
+		std::uint32_t width = 0, height = 0;
+		bool writeDebug = false;
+	} aoNormalDeferred;
+	winrt::com_ptr<ID3D11Texture2D> aoPrevDepth;
+	winrt::com_ptr<ID3D11ShaderResourceView> aoPrevDepthSRV;
+	D3D11_TEXTURE2D_DESC aoPrevDepthDesc{};
+	std::uint32_t aoPrevDepthFrame = UINT32_MAX;  // frame whose DepthMask aoPrevDepth holds
+	int earlyNormalThisFrame = -1;                // (47u) F7 rt_early_normal: 1 deferred, 0 the 47t order, -1 no normal prep
+	// (47u) "RT: Skip Updates That Cannot Affect the Image" (Settings::SkipIrrelevantUpdates). Early Prep culls with the early region (last
+	// frame's exact rays, widened: relevanceLast); before this frame's trace, everything culled is checked against this frame's exact rays
+	// (ResolveRelevance): plants reachable after all are refit before the TLAS, a reachable NPC redoes the frame's characters unculled.
+	RayTracingRelevance::Inputs relevanceLast;
+	RayTracingRelevance::Region relevanceEarly;
+	std::uint32_t relevanceEarlyFrame = UINT32_MAX;
+	bool relevanceEarlyOk = false;
+	RayTracingRelevance::Region relevanceExact;
+	std::uint32_t relNpcCulledThisFrame = 0;
+	bool relFallbackThisFrame = false;
+	std::uint64_t relFallbacks = 0, relLateTotal = 0;
+	/// This frame's early region (null: nothing is culled this frame -- switch off, interiors, sun off, no exact region last frame).
+	const RayTracingRelevance::Region* CurrentRelevance();
+	/// The exact region of this exterior frame (its sun, point and RTAO inputs), kept for the next frame's early region.
+	void BuildExactRelevance(const RayTracingRT::FrameInput& a_input, const float a_traceRect[4], double a_camX, double a_camY, double a_camZ);
+	/// Checks what this frame culled against a_exact (null: everything is reachable) and updates what is reachable before the trace.
+	/// a_world: the rect a character redo takes (null: none possible).
+	void ResolveRelevance(const RayTracingRelevance::Region* a_exact, const float* a_world = nullptr);
 
 	// (46c) Interiors: the interior cell's capture, its point lights and window beams, and the engine's shadow maps.
 	struct alignas(16) PointMaskCB

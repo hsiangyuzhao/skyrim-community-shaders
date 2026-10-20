@@ -1344,7 +1344,24 @@ namespace RayTracingCharacters
 		// 4. This frame's bone matrices (read in 3a); a bone that could not be read keeps the last ones.
 		const std::int64_t commitStart = Qpc();
 		stillReused_ = 0;
+		culledActors_ = 0;
 		for (auto& actor : actors_) {
+			// (47u) Skip Updates That Cannot Affect the Image: an NPC outside the early region (its bounds now and those of the pose its
+			// BLASes hold) for kCullAfterFrames Updates keeps that pose, moved with its root (as the 47q off frame), without skinning or
+			// refits; RayTracing checks it against the frame's exact rays before the trace (CulledReachable) and redoes the frame's
+			// characters without culling when it is reachable after all.
+			bool cullActor = false;
+			if (relevance_ && relevance_->Valid() && !actor->player && actor->readOk && actor->skinBoundValid) {
+				double lo[2][3], hi[2][3];
+				bool reachable = true;
+				if (ActorBoxes(*actor, lo, hi))
+					reachable = relevance_->Meets(lo[0], hi[0]) || relevance_->Meets(lo[1], hi[1]);
+				actor->outsideFrames = reachable ? 0u : std::min(actor->outsideFrames + 1u, 1000000u);
+				cullActor = actor->outsideFrames >= kCullAfterFrames;
+			} else {
+				actor->outsideFrames = 0;
+			}
+			actor->culled = false;
 			// (47q) A body-only NPC on its off frame (every other frame, staggered by its serial): its merged body keeps last frame's skinned
 			// pose (moved with the actor's root), no skinning, no refit. Explicit user exception (2026-10-20) for distant NPCs only.
 			const bool offFrame = actor->bodyOnly && ((frame_ + actor->serial) & 1u) != 0u;
@@ -1354,6 +1371,13 @@ namespace RayTracingCharacters
 				if (!shape->freshOk)
 					continue;  // not read (captured this frame: read at capture; or a bad read: the last ones)
 				shape->freshOk = false;
+				if (cullActor && shape->drawable && !shape->matrices.empty() && shape->fresh.size() == shape->matrices.size() &&
+					a_backend.IsSkinShapeReady(shape->handle)) {
+					std::copy_n(actor->origin, 3, shape->origin);  // (47u) the pose it holds (its matrices stay), at the root
+					shape->reuse = true;
+					actor->culled = true;
+					continue;
+				}
 				if (offFrame && shape->BodyPart() && shape->drawable && !shape->matrices.empty() && shape->fresh.size() == shape->matrices.size() &&
 					a_backend.IsSkinShapeReady(shape->handle)) {
 					std::copy_n(actor->origin, 3, shape->origin);
@@ -1380,6 +1404,20 @@ namespace RayTracingCharacters
 				}
 			}
 			stats_.refitsSkipped += skipped ? 1 : 0;
+			if (actor->culled) {
+				++culledActors_;
+			} else if (actor->root && actor->readOk) {
+				// (47u) The bound of the pose its BLASes hold from now on (relative to the origin).
+				const auto& bound = actor->root->worldBound;
+				actor->skinBoundValid = std::isfinite(bound.radius) && bound.radius > 0.0f && std::isfinite(bound.center.x) && std::isfinite(bound.center.y) &&
+				                        std::isfinite(bound.center.z);
+				if (actor->skinBoundValid) {
+					actor->skinBoundOffset[0] = static_cast<double>(bound.center.x) - actor->origin[0];
+					actor->skinBoundOffset[1] = static_cast<double>(bound.center.y) - actor->origin[1];
+					actor->skinBoundOffset[2] = static_cast<double>(bound.center.z) - actor->origin[2];
+					actor->skinBoundRadius = bound.radius;
+				}
+			}
 		}
 		stats_.commitMs = msSince(commitStart);
 
@@ -1502,6 +1540,41 @@ namespace RayTracingCharacters
 
 namespace RayTracingCharacters
 {
+	bool Characters::ActorBoxes(const Actor& a_actor, double o_lo[2][3], double o_hi[2][3])
+	{
+		// (47u) As GetBounds' margin (weapons, hair, a pose a frame ahead of the bound), a little wider.
+		constexpr double kMargin = 128.0;
+		if (!a_actor.root || !a_actor.skinBoundValid)
+			return false;
+		const auto& bound = a_actor.root->worldBound;
+		if (!std::isfinite(bound.radius) || !(bound.radius > 0.0f))
+			return false;
+		const double now[3] = { bound.center.x, bound.center.y, bound.center.z };
+		const double r0 = static_cast<double>(bound.radius) + kMargin, r1 = a_actor.skinBoundRadius + kMargin;
+		for (int a = 0; a < 3; ++a) {
+			if (!std::isfinite(now[a]))
+				return false;
+			o_lo[0][a] = now[a] - r0;
+			o_hi[0][a] = now[a] + r0;
+			const double held = a_actor.origin[a] + a_actor.skinBoundOffset[a];
+			o_lo[1][a] = held - r1;
+			o_hi[1][a] = held + r1;
+		}
+		return true;
+	}
+
+	bool Characters::CulledReachable(const RayTracingRelevance::Region& a_exact) const
+	{
+		for (const auto& actor : actors_) {
+			if (!actor->culled)
+				continue;
+			double lo[2][3], hi[2][3];
+			if (!ActorBoxes(*actor, lo, hi) || a_exact.Meets(lo[0], hi[0]) || a_exact.Meets(lo[1], hi[1]))
+				return true;
+		}
+		return false;
+	}
+
 	void Characters::GetBounds(const double a_camera[3], float o_player[4], float o_others[4]) const
 	{
 		// (45l) The engine's world bound of each actor's 3D, with a margin (weapons, hair, a pose that

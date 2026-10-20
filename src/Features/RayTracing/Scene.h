@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Backend.h"
+#include "Relevance.h"  // (47u)
 
 #include <deque>
 
@@ -159,6 +160,8 @@ namespace RayTracingScene
 		// (46c) Interiors: Window Shadows Ultimate's window masks (alpha-tested shapes with a textures\masks\ texture: the
 		// window pattern of its beams) traced with their cut-out whatever the Cut-outs setting (needs the alpha pipeline).
 		bool windowMasks = false;
+		// (47u) Spatial Static Chunks: a cell's statics packed into chunks by place (Morton order), one- and two-sided together outdoors.
+		bool spatialChunks = false;
 		bool operator==(const SceneConfig&) const = default;
 	};
 
@@ -446,9 +449,16 @@ namespace RayTracingScene
 		/// Early Prep (before the frame's prep list), and again before the trace frame for BLASes made since. Render thread.
 		/// (47q) a_keepMoving: "Keep Leaves Moving on Long Frames" (a_dt = this frame's game time step, seconds): leaf timers the game
 		/// left frozen on a long frame are advanced at their learned rate before the poses are read (the frame's draws see it too).
-		void UpdateWindPoses(RayTracingRT::Backend& a_backend, std::uint32_t a_frame, bool a_keepMoving = false, float a_dt = 0.0f, bool a_learnAnyFrame = false);
+		void UpdateWindPoses(RayTracingRT::Backend& a_backend, std::uint32_t a_frame, bool a_keepMoving = false, float a_dt = 0.0f, bool a_learnAnyFrame = false,
+			const RayTracingRelevance::Region* a_relevance = nullptr);
+		/// (47u) Skip Updates That Cannot Affect the Image: the plants culled this frame (their refit skipped) that a_exact (this frame's
+		/// rays) reaches after all are marked late (refit before the TLAS); null = every culled one. Returns how many.
+		std::uint32_t MarkLateWind(RayTracingRT::Backend& a_backend, const RayTracingRelevance::Region* a_exact);
+		/// (47u) Plants culled at the last UpdateWindPoses.
+		[[nodiscard]] std::uint32_t WindCulledLastFrame() const { return windCulled_; }
 
 	private:
+		std::uint32_t windCulled_ = 0;  // (47u)
 		// (45e) Objects: one BLAS per distinct engine mesh (in the shape's own space), one TLAS
 		// instance per shape with the shape's world transform of the frame.
 		struct MeshKey
@@ -486,6 +496,7 @@ namespace RayTracingScene
 			RE::NiPointer<RE::BSGeometry> geometry;
 			RE::NiPointer<RE::NiNode> node;  // the shader property's BSLeafAnimNode / BSTreeNode (null: none)
 			std::uint32_t poseFrame = UINT32_MAX;
+			std::uint32_t outsideFrames = 0;  // (47u) consecutive frames outside the early region (culled from kCullAfterFrames on)
 		};
 		struct ObjectShape
 		{
@@ -539,6 +550,19 @@ namespace RayTracingScene
 			// a one-sided window pane (Window Shadows Ultimate) keeps its face culling for the window-beam rays.
 			std::unique_ptr<RayTracingRT::ChunkGeometry> current[2];
 			std::vector<std::uint32_t> currentGeometries[2];  // indices into `geometries` of the shapes in current[side]
+			// (47u) Spatial Static Chunks: the whole cell's shapes, packed into chunks by place once the capture is complete.
+			struct StagedShape
+			{
+				std::uint32_t geometry = 0;      // index into `geometries`
+				std::uint32_t firstVertex = 0, vertices = 0;
+				std::uint32_t firstIndex = 0, indices = 0;  // into stageIndices (relative to the shape's first vertex)
+				float lo[3]{}, hi[3]{};
+				std::uint8_t side = 0;
+			};
+			bool spatial = false;  // captured with Spatial Static Chunks (fixed for the capture)
+			std::vector<float> stagePositions;
+			std::vector<std::uint32_t> stageIndices;
+			std::vector<StagedShape> staged;
 			std::vector<RayTracingRT::BlasHandle> blas;
 			// (45f) Per BLAS: the shapes (indices into `geometries`) it was made from (for the self-check).
 			std::vector<std::vector<std::uint32_t>> chunkGeometries;
@@ -610,6 +634,9 @@ namespace RayTracingScene
 			std::uint32_t a_positionOffset, bool a_fullPrecision, double a_originX, double a_originY, std::vector<float>& o_positions,
 			bool a_local);
 		void CloseChunk(RayTracingRT::Backend& a_backend, Cell& a_cell, int a_side);
+		/// (47u) Spatial Static Chunks: the staged shapes of a complete cell into chunks, in Morton order.
+		void FlushStaged(RayTracingRT::Backend& a_backend, Cell& a_cell);
+		static std::uint64_t MortonKey(const float a_lo[3], const float a_hi[3]);
 
 		/// The engine's CPU copy of a shape's mesh, read and validated.
 		struct RawMesh
@@ -666,6 +693,7 @@ namespace RayTracingScene
 		static constexpr std::uint32_t kWindNewSourcesTransition = 64;       // ... behind loading screens / during a held hand-off
 		static constexpr std::uint32_t kWindNewInstancesPerFrame = 48;       // wind BLASes made per frame while playing
 		static constexpr std::uint32_t kWindNewInstancesTransition = 512;    // ... behind loading screens / during a held hand-off
+		static constexpr std::uint32_t kCullAfterFrames = 8;  // (47u) frames outside the early region before a plant's refits stop
 		static constexpr float kWindMaxRadius = 8192.0f;   // the sway radius at most (units); else the engine's fade end + kWindRadiusMargin
 		static constexpr float kWindRadiusMargin = 256.0f;
 		static constexpr float kWindReleaseScale = 1.15f;  // a wind BLAS is given back beyond radius x this + kWindRadiusMargin (hysteresis)

@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -265,6 +266,8 @@ namespace RayTracingRT
 		std::uint64_t refitVerticesLastFrame = 0;  // vertices posed for the refits
 		std::uint32_t deferredLastFrame = 0;      // first builds put off (per-frame cap)
 		bool stillLastFrame = false;              // no refit needed: the wind pose did not change (paused, no wind)
+		std::uint32_t culledLastFrame = 0;        // (47u) refits skipped: no ray of the frame could reach the plant
+		std::uint32_t lateLastFrame = 0;          // (47u) culled at Early Prep, reachable after all: refit before the TLAS
 		std::uint64_t buildsTotal = 0;
 		std::uint64_t overBudget = 0;             // meshes refused: VRAM budget
 		std::uint64_t refused = 0;                // meshes refused: too big / bad data / not available
@@ -430,6 +433,11 @@ namespace RayTracingRT
 		bool sun = true;
 		// (46f) RTAO: recorded in its own list, submitted after the trace list, signalling the second fence (null = none).
 		const AOInput* ao = nullptr;
+		// (47u) "RT: Start Sun Trace Earlier": D3D11 work recorded right after the D3D11 ready signal (the sun / point traces wait for
+		// that signal only, so this work runs beside them instead of before them). Called at most once, only when the ready signal was
+		// issued. Returns true when it wrote something the RTAO list reads: that list then waits for a second D3D11 signal (the
+		// after-ready fence). Empty = nothing (the 47t order).
+		std::function<bool()> afterReady;
 	};
 
 	/// (45k) Where the CPU time of the last ExecuteFrame went, call by call (ms). The sum of these
@@ -618,6 +626,10 @@ namespace RayTracingRT
 		bool EnsureTextures(std::uint32_t a_width, std::uint32_t a_height, std::string& o_reason);
 		[[nodiscard]] ID3D11UnorderedAccessView* DepthMaskUAV() const { return depthMask_.uav11.Get(); }
 		[[nodiscard]] ID3D11ShaderResourceView* DepthMaskSRV() const { return depthMask_.srv11.Get(); }
+		[[nodiscard]] ID3D11Texture2D* DepthMaskTexture() const { return depthMask_.resource11.Get(); }  // (47u)
+		/// (47u) The after-ready fence (FrameInput::afterReady): D3D11 signals it, our queue waits for it before the RTAO list. False:
+		/// not available (the caller keeps the 47t order).
+		bool EnsureAfterReadyFence();
 		[[nodiscard]] ID3D11ShaderResourceView* VisibilitySRV() const { return visibility_.srv11.Get(); }
 
 		/// Queues a BLAS build for this geometry (takes it). Built over the next frames.
@@ -837,6 +849,17 @@ namespace RayTracingRT
 		/// (47n) This frame's pose of a wind BLAS: the vertex shader's TreeParams.y (wind magnitude), .z (amplitude), .w (leaf frequency)
 		/// and WindTimers.x, as the engine's BSLightingShader::SetupGeometry computes them for that instance.
 		void SetWindPose(BlasHandle a_handle, float a_magnitude, float a_amplitude, float a_frequency, float a_timer);
+		/// (47u) Skip Updates That Cannot Affect the Image: this frame, no ray can reach the plant (Scene, from the early region and its
+		/// hysteresis): its refit is skipped (its BLAS keeps the pose it has). Set once per frame with its pose; clears the late mark.
+		void SetWindCull(BlasHandle a_handle, bool a_cull);
+		/// (47u) The plant's box in its mesh space, covering every pose its BLAS can hold now or after this frame's refit (rest box grown by
+		/// 1.1 x the largest amplitude of the mean, the posed and this frame's pose along each axis). False: unknown (treat as reachable).
+		bool GetWindReachBox(BlasHandle a_handle, float o_lo[3], float o_hi[3]) const;
+		/// (47u) Culled this frame and its BLAS not at this frame's pose.
+		[[nodiscard]] bool WindCulledStale(BlasHandle a_handle) const;
+		/// (47u) A culled plant some ray of the frame can reach after all (the exact region): refit this frame before the TLAS (the late
+		/// refits of ExecuteFrame, or RecordWind's own on a frame without Early Prep).
+		void SetWindLate(BlasHandle a_handle);
 		[[nodiscard]] bool WindIdle() const { return windLive_ == 0 && windSourcesLive_ == 0; }
 		/// The wind scratch buffer (only when WindIdle()).
 		void ReleaseWindResources();
@@ -1097,6 +1120,10 @@ namespace RayTracingRT
 			std::uint32_t alphaSlot = UINT32_MAX;
 			std::uint32_t layout = UINT32_MAX;
 			bool inBuild = false;
+			// (47u) Skip Updates That Cannot Affect the Image: this frame's cull (SetWindCull) and late mark (SetWindLate).
+			bool cull = false;
+			bool late = false;
+			[[nodiscard]] bool Stale() const;
 			[[nodiscard]] std::uint64_t Bytes() const { return outputBytes + blasBytes; }
 		};
 		std::vector<WindSource> windSources_;
@@ -1111,6 +1138,11 @@ namespace RayTracingRT
 		/// Uploads, first builds (mean pose, up to a_maxBuilds) and this frame's refits (a_input non-null: every instance whose pose
 		/// changed since its last refit). Inside the prep interval.
 		void RecordWind(ID3D12GraphicsCommandList4* a_list, const FrameInput* a_input, std::uint32_t a_maxBuilds, float a_uploadCpuMs);
+		/// (47u) Early Prep frames: the plants culled at Early Prep but marked late (reachable after all), refit into the TLAS list before
+		/// the TLAS build (scratch regions after the ones Early Prep used).
+		void RecordLateWind(ID3D12GraphicsCommandList4* a_list);
+		std::uint64_t windScratchUsed_ = 0;  // (47u) scratch bytes this frame's RecordWind used (the late refits start after them)
+		std::uint32_t windLatePending_ = 0;  // (47u) plants marked late since the last RecordWind / RecordLateWind
 		/// Wind meshes still to upload or to build (BuildOnly has work).
 		[[nodiscard]] bool WindWorkDue() const;
 		ComPtr<ID3D12RootSignature> windRootSignature_;
@@ -1714,6 +1746,11 @@ namespace RayTracingRT
 		std::uint64_t sunFenceValue_ = 0;
 		std::uint64_t pendingSunWait_ = 0;
 		bool sunFenceFailed_ = false;
+		// (47u) The after-ready fence: only the D3D11 queue signals it (increasing), only our queue waits for it (before the RTAO list).
+		ComPtr<ID3D12Fence> afterFence_;
+		ComPtr<ID3D11Fence> afterFence11_;
+		std::uint64_t afterFenceValue_ = 0;
+		bool afterFenceFailed_ = false;
 		bool EnsureSunFence();
 		// (45n) Early Prep: the context PrepareFrame recorded on (reserved: fenceValue UINT64_MAX until the trace
 		// or AbandonPrepared gives it its real done value).

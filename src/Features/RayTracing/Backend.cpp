@@ -1365,6 +1365,10 @@ namespace RayTracingRT
 		sunFenceValue_ = 0;
 		pendingSunWait_ = 0;
 		sunFenceFailed_ = false;
+		afterFence11_.Reset();  // (47u)
+		afterFence_.Reset();
+		afterFenceValue_ = 0;
+		afterFenceFailed_ = false;
 		charAlphaPipeline_.Reset();
 		charPipeline_.Reset();
 		skinPipeline_.Reset();
@@ -2540,6 +2544,14 @@ namespace RayTracingRT
 				return false;
 			}
 		}
+		if (early) {
+			// (47u) Skip Updates That Cannot Affect the Image: plants culled at Early Prep that this frame's rays can reach after all.
+			RecordLateWind(list);
+			if (failed_) {
+				list->Close();
+				return false;
+			}
+		}
 		mark = QpcNow();
 
 		// TLAS over every built BLAS that has an instance this frame.
@@ -2943,6 +2955,17 @@ namespace RayTracingRT
 			return Fail("D3D12 queue Wait", hr);
 		++waitSerial_;  // (47s) every alpha copy recorded so far is visible to our queue's later lists
 		lap(split.wait12);
+		// (47u) Start Sun Trace Earlier: the D3D11 work that may run beside the traces (RTAO's normal prep), recorded only now; when the
+		// RTAO list reads it, the D3D11 queue signals the after-ready fence behind it and our queue waits for that before the RTAO list.
+		std::uint64_t afterValue = 0;
+		if (a_input.afterReady) {
+			const bool aoReads = a_input.afterReady();
+			if (aoReads && aoFrame && afterFence11_ && afterFence_) {
+				afterValue = ++afterFenceValue_;
+				if (FAILED(hr = context11_->Signal(afterFence11_.Get(), afterValue)))
+					return Fail("D3D11 Signal (after ready)", hr);
+			}
+		}
 		QueueExecute(traceList);
 		pendingSunWait_ = 0;
 		if (splitSun) {
@@ -2964,6 +2987,8 @@ namespace RayTracingRT
 		// (46f) RTAO right behind the trace, signalling the second fence (the D3D11 queue waits for it only right
 		// before the AO is used: WaitForAO). Not part of doneValue: rt_sync waits for the sun / point lights alone.
 		if (aoFrame) {
+			if (afterValue != 0 && FAILED(hr = QueueWait(afterFence_.Get(), afterValue, "D3D12 queue Wait (after ready)")))
+				return Fail("D3D12 queue Wait (after ready)", hr);
 			QueueExecute(context.aoList.Get());
 			const std::uint64_t aoValue = ++aoFenceValue_;
 			if (FAILED(hr = QueueSignal(aoFence_.Get(), aoValue, "D3D12 queue Signal (RTAO)")))
@@ -3223,6 +3248,43 @@ namespace RayTracingRT
 		}
 		sunFenceValue_ = 0;
 		pendingSunWait_ = 0;
+		return true;
+	}
+
+	bool Backend::EnsureAfterReadyFence()
+	{
+		// (47u) Start Sun Trace Earlier: shared like the others; the D3D11 queue signals it after the work recorded behind the ready
+		// signal (FrameInput::afterReady), our queue waits for it on the GPU before the RTAO list (which reads that work's output).
+		if (afterFence_ && afterFence11_)
+			return true;
+		if (afterFenceFailed_ || !ready_ || !device_ || !device11_)
+			return false;
+		afterFence_.Reset();
+		afterFence11_.Reset();
+		HRESULT hr;
+		if (FAILED(hr = device_->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&afterFence_)))) {
+			afterFence_.Reset();
+			afterFenceFailed_ = true;
+			logger::warn("[RayTracing] Start Sun Trace Earlier unavailable: could not create its fence ({})", HrString(hr));
+			return false;
+		}
+		HANDLE shared = nullptr;
+		if (FAILED(hr = device_->CreateSharedHandle(afterFence_.Get(), nullptr, GENERIC_ALL, nullptr, &shared))) {
+			afterFence_.Reset();
+			afterFenceFailed_ = true;
+			logger::warn("[RayTracing] Start Sun Trace Earlier unavailable: could not share its fence ({})", HrString(hr));
+			return false;
+		}
+		hr = device11_->OpenSharedFence(shared, IID_PPV_ARGS(&afterFence11_));
+		CloseHandle(shared);
+		if (FAILED(hr)) {
+			afterFence_.Reset();
+			afterFence11_.Reset();
+			afterFenceFailed_ = true;
+			logger::warn("[RayTracing] Start Sun Trace Earlier unavailable: D3D11 could not open its fence ({})", HrString(hr));
+			return false;
+		}
+		afterFenceValue_ = 0;
 		return true;
 	}
 
