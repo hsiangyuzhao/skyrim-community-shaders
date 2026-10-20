@@ -16,64 +16,6 @@
 #include "Utils/DenoiserTimers.h"
 #include "Utils/GpuTimers.h"
 
-#ifdef ENABLE_SHARC
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
-    ScreenSpaceRayTracing::Settings,
-    EnableSpecular,
-    MaxSteps,
-    MaxMips,
-    Thickness,
-    NormalBias,
-    BRDFBias,
-    UseDynamicCubemapsAsFallback,
-    UseDynamicCubemapsAsFallbackSpecular,
-    DiffuseSPP,
-    DiffuseSamplingMode,
-    EnableDiffuse,
-    SpecularMult,
-    DiffuseMult,
-    AmbientMult,
-    EnableAmbientReinjection,
-    AmbientReinjectionStrength,
-    CubemapFillBlend,
-    LowResConfidenceFilter,
-    TemporalAmbientConfidence,
-    AmbientConfidenceMaxFrames,
-    OcclusionStrength,
-    CubemapNormalization,
-    DenoiserMethod,
-    ReblurFeedHitCoverageConfidence,
-    ReblurDiffuse,
-    ReblurSpecular,
-    ReblurHitDistA,
-    ReblurHitDistB,
-    ReblurHitDistC,
-    DistanceLimit,
-    DistanceLimitMeters,
-    EnablePreBlur,
-    MaxAccumulatedFrames,
-    AtrousIterations,
-    ColorPhi,
-    NormalPhi,
-    HitRadiusStrength,
-    AdaptiveFiltering,
-    AdaptiveHistoryThreshold,
-    AdaptiveVarianceEps,
-    FireflyClamp,
-    FireflyClampSigma,
-    SpecularDenoiseRoughnessCutoff,
-    SpecularMaxRoughness,
-    HistoryClampSigma,
-    UseBlueNoise,
-    FreezeNoisePhase,
-    DisableHistoryDepthTest,
-    DisableHistoryNormalTest,
-    ForceAcceptHistory,
-    RotatedNormalGate,
-    HistoryDebugView,
-    EnableSharc
-)
-#else
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     ScreenSpaceRayTracing::Settings,
     EnableSpecular,
@@ -129,7 +71,6 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     RotatedNormalGate,
     HistoryDebugView
 )
-#endif
 
 void ScreenSpaceRayTracing::DrawSettings()
 {
@@ -180,15 +121,7 @@ void ScreenSpaceRayTracing::DrawSettings()
                 "How many pixels share one bounce-light ray. Full = best quality; Half Resolution = cheapest, but bounce light gets softer "
                 "and very thin objects can lose it; Checkerboard = almost as cheap and keeps detail better, but may shimmer slightly in fast motion. "
                 "Reflections are not affected."
-#ifdef ENABLE_SHARC
-                " Ignored while SHARC is enabled."
-#endif
             );
-#ifdef ENABLE_SHARC
-        if (settings.DiffuseSamplingMode != kSamplingFull && settings.EnableSharc)
-            ImGui::TextColored({ 1.0f, 0.7f, 0.2f, 1.0f }, "Sparse diffuse sampling is inactive: SHARC is enabled.");
-        else
-#endif
             if (settings.DiffuseSamplingMode != kSamplingFull && settings.EnableDiffuse) {
             // (44h) activeSamplingMode only means something once ResolveSamplingMode has run for a
             // world frame since the last SetupResources; before that (main menu) it is the initial Full.
@@ -444,11 +377,6 @@ void ScreenSpaceRayTracing::DrawSettings()
                     "saving GPU time with no visible change. 0 = off.");
         }
     }
-#ifdef ENABLE_SHARC
-    ImGui::Checkbox("(Broken) Enable SHARC", &settings.EnableSharc);
-    if (auto _tt = Util::HoverTooltipWrapper())
-        ImGui::Text("(Experimental) Enables Spatially Hashed Radiance Cache (SHARC) to improve diffuse quality. This requires more memory and might impact performance.");
-#endif
     ImGui::SeparatorText("Sampling");
 
     // (S3.10) Default on. Free, and it is the noise the rest of the pipeline is built to remove.
@@ -1184,71 +1112,6 @@ void ScreenSpaceRayTracing::EnsureCoreResources()
     logger::info("SSRT: textures at {}x{} (render resolution)", width, height);
 }
 
-#ifdef ENABLE_SHARC
-// (audit P6) The four SHARC buffers are 44 MB that used to be allocated at feature
-// setup even though SHARC is experimental, marked "(Broken)" in the UI and off by
-// default. Create them the first time SHARC is actually switched on instead. Called
-// from DrawSSRTDiffuse before the first dispatch that binds them, so a runtime enable
-// never dispatches against null UAVs; disabling again binds nullptr rather than
-// releasing, so there is nothing to dangle.
-void ScreenSpaceRayTracing::EnsureSharcResources()
-{
-    if (sharcHashEntries && sharcHashCopyOffsets && sharcVoxelData && sharcVoxelDataPrev)
-        return;
-
-    logger::debug("Creating SHARC buffers...");
-	{
-		D3D11_BUFFER_DESC sbDesc{};
-		sbDesc.Usage = D3D11_USAGE_DEFAULT;
-		sbDesc.CPUAccessFlags = 0;
-		sbDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-		sbDesc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
-
-		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-		srvDesc.Format = DXGI_FORMAT_UNKNOWN;
-		srvDesc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
-		srvDesc.Buffer.FirstElement = 0;
-
-		D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
-		uavDesc.Format = DXGI_FORMAT_UNKNOWN;
-		uavDesc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
-		uavDesc.Buffer.FirstElement = 0;
-		uavDesc.Buffer.Flags = 0;
-
-        std::uint32_t numEntries = sharcNumEntries;
-
-        // Hash entries buffer - structured buffer with 64-bits entries to store the hashes
-        // Voxel data buffer - structured buffer with 128-bit entries which stores accumulated radiance and sample count. Two instances are used to store current and previous frame data
-
-        sbDesc.StructureByteStride = sizeof(std::uint64_t);
-        sbDesc.ByteWidth = sbDesc.StructureByteStride * numEntries;
-        sharcHashEntries = eastl::make_unique<Buffer>(sbDesc);
-        srvDesc.Buffer.NumElements = numEntries;
-        uavDesc.Buffer.NumElements = numEntries;
-        sharcHashEntries->CreateSRV(srvDesc);
-        sharcHashEntries->CreateUAV(uavDesc);
-
-        sbDesc.StructureByteStride = sizeof(std::uint32_t);
-        sbDesc.ByteWidth = sbDesc.StructureByteStride * numEntries;
-        sharcHashCopyOffsets = eastl::make_unique<Buffer>(sbDesc);
-        srvDesc.Buffer.NumElements = numEntries;
-        uavDesc.Buffer.NumElements = numEntries;
-        sharcHashCopyOffsets->CreateSRV(srvDesc);
-        sharcHashCopyOffsets->CreateUAV(uavDesc);
-
-        sbDesc.StructureByteStride = 4 * sizeof(uint32_t);
-        sbDesc.ByteWidth = numEntries * sizeof(float4);
-        sharcVoxelData = eastl::make_unique<Buffer>(sbDesc);
-        srvDesc.Buffer.NumElements = numEntries;
-        uavDesc.Buffer.NumElements = numEntries;
-        sharcVoxelData->CreateSRV(srvDesc);
-        sharcVoxelData->CreateUAV(uavDesc);
-        sharcVoxelDataPrev = eastl::make_unique<Buffer>(sbDesc);
-        sharcVoxelDataPrev->CreateSRV(srvDesc);
-        sharcVoxelDataPrev->CreateUAV(uavDesc);
-	}
-}
-#endif
 
 // (S2.5) The SVGF-only surfaces, allocated on first need rather than at boot -- the same
 // argument EnsureSharcResources and EnsureNRDResources make, applied to the chain that is no
@@ -1596,13 +1459,6 @@ uint ScreenSpaceRayTracing::ResolveSamplingMode()
     if (!settings.EnableDiffuse)
         mode = kSamplingFull;
 
-#ifdef ENABLE_SHARC
-    // SHARC traces into a world-space hash grid whose update pass is tuned for a full-resolution
-    // dispatch, and it is experimental and marked "(Broken)" in the UI; rather than add two more
-    // ray-march permutations for it, sparse sampling yields. The UI says so when both are set.
-    if (settings.EnableSharc)
-        mode = kSamplingFull;
-#endif
 
     // A failed compile falls back to full density rather than to a null CSSetShader, which in
     // D3D11 is a silent no-op: the ray march would write nothing, the resolve would read an
@@ -1631,7 +1487,7 @@ uint ScreenSpaceRayTracing::ResolveSamplingMode()
         ReleaseSparseResources();
 
     // (44h) Log once per change of outcome, never per frame. A request that was Full to begin
-    // with (setting, diffuse off, SHARC) is not a fallback and stays silent.
+    // with (setting, diffuse off) is not a fallback and stays silent.
     const int outcome = fallbackReason ? -1 - (int)requestedMode : (requestedMode != kSamplingFull ? (int)mode : -100);
     if (outcome != lastSamplingLogOutcome) {
         const char* requestedName = requestedMode == kSamplingHalfRes ? "Half-Res" : "Checkerboard";
@@ -1908,9 +1764,7 @@ void ScreenSpaceRayTracing::ResolveDenoisers()
                         denoiserFallbackReason = "REBLUR is not available in VR.";
                     else if (!globals::features::nrd.loaded)
                         denoiserFallbackReason = "the NRD feature is not loaded.";
-                    else if (!globals::features::nrd.settings.Enabled)
-                        denoiserFallbackReason = "NRD is switched off on its own feature page.";
-                    else
+                    else  // (47q) NRD's own "Enabled" switch is gone (always on)
                         denoiserFallbackReason = "REBLUR failed to start (see the log).";
                 }
                 return kDenoiserSVGF;
@@ -1986,9 +1840,6 @@ void ScreenSpaceRayTracing::ClearShaderCache()
         &diffuseCompositePackedCS, &diffuseCompositeExternalConfPackedCS,
         // (batch 12) sparse sampling: the two ray-march permutations and their two resolve passes
         &raymarchDiffuseHalfResCS, &raymarchDiffuseCheckerCS, &sparseResolveHalfResCS, &sparseResolveCheckerCS,
-#ifdef ENABLE_SHARC
-        &raymarchDiffuseSharcCS, &sharcUpdateRaymarchCS, &sharcResolveCS
-#endif
     };
 
     for (auto shader : shaderPtrs)
@@ -2026,13 +1877,6 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
 
     defines.push_back({ "DIFFUSE_SPP", DiffuseSPPStr.c_str() });
 
-#ifdef ENABLE_SHARC
-    auto definesSharcUpdate = defines;
-    definesSharcUpdate.push_back({ "SHARC_UPDATE", "1" });
-
-    auto definesSharc = defines;
-    definesSharc.push_back({ "SHARC_RENDER", "1" });
-#endif
 
     auto definesSpecular = defines;
     definesSpecular.push_back({ "SSRT_SPECULAR", nullptr });
@@ -2119,11 +1963,6 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
             { &raymarchDiffuseCheckerCS, "ssrt_raymarch.hlsl", definesSparseChecker },
             { &sparseResolveHalfResCS, "ssrt_sparse_resolve.hlsl", definesResolveHalfRes },
             { &sparseResolveCheckerCS, "ssrt_sparse_resolve.hlsl", definesResolveChecker },
-#ifdef ENABLE_SHARC
-            { &raymarchDiffuseSharcCS, "ssrt_raymarch.hlsl", definesSharc },
-            { &sharcUpdateRaymarchCS, "ssrt_raymarch.hlsl", definesSharcUpdate },
-            { &sharcResolveCS, "sharc_resolve.hlsl", {} }
-#endif
         };
 
     for (auto& info : shaderInfos) {
@@ -3150,11 +2989,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     // cannot run.
     if (!prepareColorCS || !diffuseCompositeCS || !texSSRTDiffuseColor ||
         !texSSRTDiffuseConfidence || !texSSRTDiffuseConfidenceSmooth || !texSSRTDiffuseHitDistance ||
-#ifdef ENABLE_SHARC
-        (settings.EnableSharc ? (!raymarchDiffuseSharcCS || !sharcUpdateRaymarchCS || !sharcResolveCS) : !raymarchDiffuseCS)
-#else
         !raymarchDiffuseCS
-#endif
     ) {
         auto ctx = globals::d3d::context;
         const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
@@ -3311,11 +3146,10 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     // the packed surface to read at t0 instead of texSSRTDiffuseColor.
     ID3D11ShaderResourceView* compositePackedSRV = nullptr;
 
-    // (audit P6) Raymarch UAV slots: u0 radiance/confidence, u1..u4 SHARC (bound only
-	// while SHARC is enabled, and only declared by the SHARC shader permutations),
+    // (audit P6) Raymarch UAV slots: u0 radiance/confidence, u1..u4 unused ((47q) SHARC, removed),
 	// u5 the raw confidence copy (ambient reinjection), u6 the hit-distance surface
 	// (batch 1, item 2). Keep this in lockstep with the register map at the top of
-	// ssrt_raymarch.hlsl and sharc_resolve.hlsl. The SVGF temporal pass below reuses slots
+	// ssrt_raymarch.hlsl. The SVGF temporal pass below reuses slots
 	// u0/u1 for its own two outputs, and the diffuse composite reuses u0/u1 for kMAIN and the
 	// smoothed confidence, so the array is never smaller than 2. Seven entries against the
 	// eight UAVs a cs_5_0 dispatch may bind.
@@ -3363,15 +3197,6 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     // pass reading a stale or cleared surface. HitRadiusStrength 0 is what makes the mechanism
     // inert, on the consumer side.
     uavs.at(6) = sparseSampling ? texSparseHitDistance->uav.get() : texSSRTDiffuseHitDistance->uav.get();
-#ifdef ENABLE_SHARC
-    if (settings.EnableSharc) {
-        EnsureSharcResources();  // (audit P6) allocate on first enable, before any dispatch binds them
-        uavs.at(1) = sharcHashEntries->uav.get();
-        uavs.at(2) = sharcHashCopyOffsets->uav.get();
-        uavs.at(3) = sharcVoxelData->uav.get();
-        uavs.at(4) = sharcVoxelDataPrev->uav.get();
-    }
-#endif
 
     // (S2.5) t0 stays unbound; see the matching site in DrawSSRTSpecular.
     srvs.at(0) = nullptr;
@@ -3391,27 +3216,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
     context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
     context->CSSetConstantBuffers(1, 1, &buffer);
-#ifdef ENABLE_SHARC
-    if (settings.EnableSharc) {
-        state->BeginPerfEvent("SHARC Update");
-        context->CSSetShader(sharcUpdateRaymarchCS.get(), nullptr, 0);
-
-        context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
-        state->EndPerfEvent();
-
-        state->BeginPerfEvent("SHARC Resolve");
-        context->CSSetShader(sharcResolveCS.get(), nullptr, 0);
-
-        context->Dispatch(sharcNumEntries / 256u, 1, 1);
-        state->EndPerfEvent();
-    }
-
-    // (batch 12) samplingMode is kSamplingFull whenever SHARC is on -- ResolveSamplingMode forces
-    // it -- so the two selectors below cannot both fire.
-    context->CSSetShader(settings.EnableSharc ? raymarchDiffuseSharcCS.get() : SelectDiffuseRaymarchShader(samplingMode), nullptr, 0);
-#else
     context->CSSetShader(SelectDiffuseRaymarchShader(samplingMode), nullptr, 0);
-#endif
     context->Dispatch(traceDispatchX, traceDispatchY, 1);
     resetViews();
 
@@ -3464,11 +3269,6 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         state->EndPerfEvent();
     }
 
-#ifdef ENABLE_SHARC
-    if (settings.EnableSharc) {
-        std::swap(sharcVoxelData, sharcVoxelDataPrev);
-    }
-#endif
 
     // (defect D4) See the derivation at the matching site in DrawSSRTSpecular. False until
     // the a-trous loop has published its first iteration's output as next frame's history;

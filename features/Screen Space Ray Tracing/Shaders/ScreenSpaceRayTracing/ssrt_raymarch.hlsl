@@ -29,10 +29,6 @@
 // ssrt_common.hlsli brings in.
 #include "NRD/NRDReblurSH.hlsli"
 
-#if SHARC_UPDATE || SHARC_RENDER
-#   define SHARC_ENABLE_64_BIT_ATOMICS 1
-#   include "ScreenSpaceRayTracing/sharc/SharcCommon.h"
-#endif
 
 Texture2D<float4> HistoryTexture : register(t0);
 Texture2D<float4> MotionVectorTexture : register(t1);
@@ -111,7 +107,7 @@ RWTexture2D<float> SSRTHitDistanceOutput : register(u1);
 // holds) and its 1/255 quantisation is an order of magnitude below the residual noise of the
 // spatial smoothing this value gets in ssrt_diffuse_composite.hlsl. Being UNORM also means a
 // read is a [0,1] value by construction, so no consumer needs its own finiteness test.
-#if !defined(SSRT_SPECULAR) && !SHARC_UPDATE
+#if !defined(SSRT_SPECULAR)
 RWTexture2D<float> SSRTConfidenceOutput : register(u5);
 
 // (batch 1, item 2) The diffuse per-pixel hit distance, encoded as a correlation length in
@@ -133,12 +129,6 @@ RWTexture2D<float> SSRTConfidenceOutput : register(u5);
 RWTexture2D<float> SSRTDiffuseHitDistanceOutput : register(u6);
 #endif
 
-#if SHARC_UPDATE || SHARC_RENDER
-RWStructuredBuffer<uint2> u_SharcHashEntriesBuffer : register(u1);
-RWStructuredBuffer<uint> u_HashCopyOffsetBuffer : register(u2);
-RWStructuredBuffer<uint4> u_SharcVoxelDataBuffer : register(u3);
-RWStructuredBuffer<uint4> u_SharcVoxelDataBufferPrev : register(u4);
-#endif
 
 cbuffer SSRTCB : register(b1)
 {
@@ -253,8 +243,6 @@ cbuffer SSRTCB : register(b1)
 #define SSRT_FLOAT_MAX 3.402823466e+38
 #define SSRT_DEPTH_HIERARCHY_MAX_MIP MaxMips
 #if defined(SSRT_SPECULAR)
-#   define SAMPLES_PER_PIXEL 1
-#elif SHARC_UPDATE
 #   define SAMPLES_PER_PIXEL 1
 #else
 #   define SAMPLES_PER_PIXEL DIFFUSE_SPP
@@ -748,7 +736,7 @@ float3 ScreenSpaceToViewSpace(float3 screen_uv_coord, float4x4 invProj)
 // specular permutation and the SHARC update pass both run one sample per pixel, so
 // there the whole LDS round trip -- and the group-wide barrier that goes with it --
 // is pure overhead; they use a plain local instead.
-#if defined(SSRT_SPECULAR) || SHARC_UPDATE
+#if defined(SSRT_SPECULAR)
 #   define SSRT_USE_SAMPLE_LDS 0
 #else
 #   define SSRT_USE_SAMPLE_LDS 1
@@ -781,19 +769,6 @@ groupshared float hitNorms[64][SAMPLES_PER_PIXEL];
 // swapped L/N arguments at the single call site (audit #10) permanently. Reintroducing
 // BRDF weighting is a separate, look-changing piece of work.
 
-#if SHARC_UPDATE
-uint Hash(uint2 pos, uint seed)
-{
-    uint hash = pos.x + pos.y * 8 + seed * 64;
-    hash = hash * 1103515245u + 12345u;
-    return hash;
-}
-bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
-{
-    uint hash = Hash(GroupThreadID, FrameCount);
-    return (hash % 4) == 0;
-}
-#endif
 
 // (guard G2) Last gate before the radiance leaves the ray march and becomes the input of
 // the SVGF chain, whose history textures are persistent and -- until G8 -- never cleared.
@@ -1018,7 +993,7 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
     float z = SSRT_LoadDepth(uv * mip_resolution, most_detailed_mip);  // (audit #7) no rescale
     float3 screen_uv_space_ray_origin = float3(uv, z);
     float3 view_space_ray = ScreenSpaceToViewSpace(screen_uv_space_ray_origin, FrameBuffer::CameraProjInverse[eyeIndex]);
-#if !defined(SSRT_SPECULAR) && !SHARC_UPDATE
+#if !defined(SSRT_SPECULAR)
     // (batch 1, item 2) The world-space length the encoding's half-way point stands for, i.e.
     // SSRT_HITT_REF_TEXELS texels measured in game units at this pixel's depth. The per-sample
     // encode below is then one mad and one divide: u = L / (L + hitDistRefWorld).
@@ -1121,7 +1096,6 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
     // high roughness only -- a polished floor at roughness 0.05 would show the difference at once.
     valid_ray = valid_ray && roughness <= SpecularMaxRoughness;
 #endif
-#if !SHARC_UPDATE
     // (batch 36f) Distance limit: past DistanceCapEnd the pixel is not traced at all. Joining
     // valid_ray (not returning) for the reason the sky test above gives: the diffuse permutation's
     // LDS barrier must stay uniform. The pixel then ends exactly like a sky pixel -- radiance 0,
@@ -1130,10 +1104,6 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
     // denoisingRange, so it skips these pixels too.
     [branch] if (DistanceCapEnd > 0.0f)
         valid_ray = valid_ray && SSRT_NRDViewZ(depth) < DistanceCapEnd;
-#endif
-#if SHARC_UPDATE
-    valid_ray = valid_ray && ShouldProcessPixel(coords.xy, SharedData::FrameCount);
-#endif
     uint hit_counter = 0;
     float3 hit = float3(0.0, 0.0, 0.0);
     float confidence = 0.0;
@@ -1144,7 +1114,7 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
 	positionWS = mul(FrameBuffer::CameraViewProjInverse[eyeIndex], positionWS);
 	positionWS.xyz = positionWS.xyz / positionWS.w;
 
-#if !defined(SSRT_SPECULAR) && !SHARC_UPDATE
+#if !defined(SSRT_SPECULAR)
     // (batch 1, item 2) "As distant as the encoding can say", i.e. the full kernel, and it is
     // the value every path that does not produce a screen-space hit ends on:
     //
@@ -1175,35 +1145,6 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
     float hit_distance = 65536;  // "no hit"; fed to DLSS-RR as the specular hit distance
 #endif
 
-#if SHARC_RENDER
-    SharcParameters sharcParameters;
-
-    sharcParameters.gridParameters.cameraPosition = FrameBuffer::CameraPosAdjust[0].xyz;
-    sharcParameters.gridParameters.sceneScale = GAME_UNIT_TO_M;
-    sharcParameters.gridParameters.logarithmBase = SHARC_GRID_LOGARITHM_BASE;
-    sharcParameters.gridParameters.levelBias = SHARC_GRID_LEVEL_BIAS;
-
-    sharcParameters.hashMapData.capacity = 0x100000;
-    sharcParameters.hashMapData.hashEntriesBuffer = u_SharcHashEntriesBuffer;
-#if !SHARC_ENABLE_64_BIT_ATOMICS
-    sharcParameters.hashMapData.lockBuffer = u_HashCopyOffsetBuffer;
-#endif
-
-    sharcParameters.voxelDataBuffer = u_SharcVoxelDataBuffer;
-    sharcParameters.voxelDataBufferPrev = u_SharcVoxelDataBufferPrev;
-
-    SharcHitData hitData;
-    hitData.positionWorld = positionWS.xyz + FrameBuffer::CameraPosAdjust[0].xyz;
-    hitData.normalWorld = world_space_normal;
-
-    float3 sharcColor = 0;
-
-    if (valid_ray && SharcGetCachedRadiance(sharcParameters, hitData, sharcColor, true))
-    {
-        samples[SSRT_SAMPLE_SLOT][sample_id] = float4(sharcColor, 1);
-    }
-    else
-#endif
     if (valid_ray)
     {
         bool valid_hit;
@@ -1240,7 +1181,7 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
                                                       occlusion
                                                       )
                                      : 0;
-#if !defined(SSRT_SPECULAR) && !SHARC_UPDATE
+#if !defined(SSRT_SPECULAR)
         // (batch 1, item 2) Encode this sample's hit distance, here and not later: `confidence`
         // is overwritten twice further down -- the cubemap fallback sets it to 1 and the ambient
         // reinjection folds the back-face occlusion into it -- and what this test needs is the
@@ -1310,7 +1251,7 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
         // fully grazing view. Negate the pre-bias ray direction (:787) to get the
         // surface->camera vector; the result now lands in (0, 1] as intended.
         const float NdotV = saturate(dot(-view_space_ray_direction, view_space_surface_normal));
-#if defined(DYNAMIC_CUBEMAPS) && !defined(SSRT_SPECULAR) && !SHARC_UPDATE
+#if defined(DYNAMIC_CUBEMAPS) && !defined(SSRT_SPECULAR)
         // (batch 8, cubemap fill) The (radiance, weight) pair the beta fill contributes. It has to
         // live out here because the two halves of it are produced and spent in different blocks:
         // the cubemap estimate is only built inside the fallback block below, and the weight can
@@ -1324,7 +1265,7 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
         float3 ambientFillColor = 0.0;
         float ambientFillBlend = 0.0;
 #endif
-#if defined(DYNAMIC_CUBEMAPS) && !SHARC_UPDATE
+#if defined(DYNAMIC_CUBEMAPS)
         if (UseDynamicCubemapsAsFallback != 0 && (confidence < 0.999f))
         {
 #   if defined(SSRT_SPECULAR)            
@@ -1516,7 +1457,7 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
         }
 #endif
 
-#if !defined(SSRT_SPECULAR) && !SHARC_UPDATE
+#if !defined(SSRT_SPECULAR)
         // (ambient reinjection) Turn this sample into a matched (radiance, coverage) pair, so
         // that the composite can spend the *rest* of the hemisphere on the vanilla ambient
         // without counting any direction twice.
@@ -1598,47 +1539,11 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
 
 #if SSRT_USE_SAMPLE_LDS
         samples[SSRT_SAMPLE_SLOT][sample_id] = float4(sampleColor, confidence);
-#   if !SHARC_UPDATE
         hitNorms[SSRT_SAMPLE_SLOT][sample_id] = hit_norm;  // (batch 1, item 2)
-#   endif
 #else
         localSample = float4(sampleColor, confidence);
 #endif
 
-#if SHARC_UPDATE
-        if (confidence > 0.99f)
-        {
-            SharcParameters sharcParameters;
-
-            sharcParameters.gridParameters.cameraPosition = FrameBuffer::CameraPosAdjust[0].xyz;
-            sharcParameters.gridParameters.sceneScale = GAME_UNIT_TO_M;
-            sharcParameters.gridParameters.logarithmBase = SHARC_GRID_LOGARITHM_BASE;
-            sharcParameters.gridParameters.levelBias = SHARC_GRID_LEVEL_BIAS;
-
-            sharcParameters.hashMapData.capacity = 0x100000;
-            sharcParameters.hashMapData.hashEntriesBuffer = u_SharcHashEntriesBuffer;
-#   if !SHARC_ENABLE_64_BIT_ATOMICS
-            sharcParameters.hashMapData.lockBuffer = u_HashCopyOffsetBuffer;
-#   endif
-
-            sharcParameters.voxelDataBuffer = u_SharcVoxelDataBuffer;
-            sharcParameters.voxelDataBufferPrev = u_SharcVoxelDataBufferPrev;
-
-            SharcState sharcState;
-            for (int i = 0; i < 4; ++i) {
-                sharcState.cacheIndices[i] = 0;
-                sharcState.sampleWeights[i] = 0;
-            }
-            sharcState.pathLength = 0;
-
-            SharcHitData hitData;
-            hitData.positionWorld = positionWS.xyz + FrameBuffer::CameraPosAdjust[0].xyz;
-            hitData.normalWorld = world_space_normal;
-
-            float random = Random::InterleavedGradientNoise(uv, SharedData::FrameCount);
-            SharcUpdateHit(sharcParameters, sharcState, hitData, sampleColor, random);
-        }
-#endif
     }
 #if SSRT_USE_SAMPLE_LDS
     // Publish this z slice's sample to the other slices of the same pixel before the
@@ -1666,7 +1571,6 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
     } else {
         SSRColorOutput[coords.xy] = outColor;
     }
-#elif SHARC_UPDATE
 #else
 
     if (sample_id == 0) {

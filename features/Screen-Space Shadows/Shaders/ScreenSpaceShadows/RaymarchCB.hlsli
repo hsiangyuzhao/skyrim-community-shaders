@@ -23,9 +23,10 @@ cbuffer PerFrame : register(b1)
 	float ShadowContrast;
 	uint SettingsEnable;
 	uint SettingsSampleCount;
-	uint WorldSpaceThickness;
-	float MinThickness;
-	float ContactLength;
+	// (47q) World-Space Thickness / Min Thickness / Contact Length are gone: unused slots (the layout stays).
+	uint Unused0;
+	float Unused1;
+	float Unused2;
 	uint EdgeSmoothing;
 	// (45k) Ray Tracing "non-RT casters only" (RT_CASTER_MASK variant): occluders that are ray-traced
 	// casters shadow only within RtContactScale x the ray tracer's start offset (bias) along the light ray.
@@ -33,7 +34,7 @@ cbuffer PerFrame : register(b1)
 	float RtBiasConstant;
 	float RtBiasPerUnit;
 
-	// (45 SSS) World-space path data
+	// (45 SSS) Edge Smoothing; (45k) the RT_CASTER_MASK contact range
 	float4 CameraData;  // far, near, far - near, far * near
 	float4 SunDirVS;    // xyz: towards the sun, view space
 	float4 ProjInfo;    // 1 / P00, 1 / P11, render width, render height

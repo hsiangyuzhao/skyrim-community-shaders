@@ -9,10 +9,10 @@
 // is blended toward Ng by that confidence: N = normalize(lerp(Ng, Ns, c)). Disoccluded, cleared or fast-moving pixels drift to
 // Ng (the 47i look) instead of flickering between the two.
 //
-// (47k) "RTAO: Smooth Normals v2" (Flags.x): each candidate takes the best match in the 3x3 pixels around its spot in last frame's
+// (47k) "RTAO: Smooth Normals v2" ((47n) always; (47q) the 47j v1 path is gone, Flags.x unused): each candidate takes the best match in the 3x3 pixels around its spot in last frame's
 // depth; the tolerances grow with the pixel footprint / max(N.V, 0.2) (slanted surfaces reconstruct less exactly); the fallback
 // at low confidence is a depth-only smoothed normal (a sparse ring of depth normals around the pixel, weighted by how well they
-// agree with its plane: the same surface, not across a real corner or a depth edge) instead of the raw facet. Off = 47j exactly.
+// agree with its plane: the same surface, not across a real corner or a depth edge) instead of the raw facet.
 // Motion vectors: B validates its own guess against last frame's depth, so whether kMOTION_VECTOR still holds last frame's vectors
 // at this point (before the G-buffer pass) or was cleared, a wrong guess only lowers B's confidence (the debug view shows it).
 //
@@ -30,7 +30,7 @@ cbuffer AONormalCB : register(b0)
 	row_major float4x4 PrevViewInverse;  // last frame's view-to-world (rotation part used)
 	float4 CameraDelta;                  // xyz: this camera minus last frame's camera (world units), w unused
 	float4 RenderSize;                   // xy size, zw 1 / size (the same this frame and last)
-	uint4 Flags;                         // (47k) x 1 = v2; y debug view (0 none, 1 confidence, 2 Ns, 3 Ng)
+	uint4 Flags;                         // (47k) x unused ((47q) v2 always), y debug view (0 none, 1 confidence, 2 Ns, 3 Ng)
 	float4 SkipRect;                     // (47p) the trace's rect (camera-relative xy min / max)
 	float4 SkipFade;                     // (47p) x: the trace's fade end (units), y: 1 = skip the pixels the trace never reads
 };
@@ -63,9 +63,9 @@ float2 OctEncode(float3 n)
 }
 
 // One reprojection candidate at last frame's uv: its world normal and confidence (0..1). a_expected: this pixel's point in last
-// frame's camera space (the camera candidate: where it must be); a_tolerance: allowed distance (units). (47k) a_search: the best
-// match (smallest distance) of the 3x3 pixels around it. o_data: last frame had a surface there (in screen, not sky, written).
-float Candidate(float2 prevUv, float3 a_expected, float a_tolerance, float3 Ng, bool a_search, out float3 o_normal, out bool o_data)
+// frame's camera space (the camera candidate: where it must be); a_tolerance: allowed distance (units). (47k) The best
+// match (smallest distance) of the 3x3 pixels around it ((47q) always). o_data: last frame had a surface there (in screen, not sky, written).
+float Candidate(float2 prevUv, float3 a_expected, float a_tolerance, float3 Ng, out float3 o_normal, out bool o_data)
 {
 	o_normal = Ng;
 	o_data = false;
@@ -75,7 +75,7 @@ float Candidate(float2 prevUv, float3 a_expected, float a_tolerance, float3 Ng, 
 	int2 q = q0;
 	float err = 1e30;
 	const int2 maxQ = int2(RenderSize.xy) - 1;
-	const int reach = a_search ? 1 : 0;
+	const int reach = 1;
 	[loop] for (int j = -reach; j <= reach; ++j)
 	{
 		[loop] for (int i = -reach; i <= reach; ++i)
@@ -158,7 +158,6 @@ float3 RingSmoothedNormal(int2 p, float3 P, float3 Ng, float footprint)
 	const int2 p = int2(dtid.xy);
 	if (any(float2(p) >= RenderSize.xy))
 		return;
-	const bool v2 = (Flags.x & 1u) != 0u;
 	const uint debugView = Flags.y;
 	const float depth = Depth[p];
 	uint packed = 0u;
@@ -189,11 +188,11 @@ float3 RingSmoothedNormal(int2 p, float3 P, float3 Ng, float footprint)
 		Ng = nLen > 1e-12 ? Ng / nLen : V;
 		if (dot(Ng, V) < 0.0)
 			Ng = -Ng;
-		// (47k) v2: tolerances by the pixel's world size over the view angle (47j: by the distance only).
+		// (47k) Tolerances by the pixel's world size over the view angle.
 		const float footprint = length(PositionAt((float2(p) + float2(1.5, 0.5)) * RenderSize.zw, depth, InvViewProj) - P);
 		const float slant = footprint / max(dot(Ng, V), 0.2);
-		const float tolA = v2 ? 1.5 + 4.0 * slant : 0.004 * dist + 1.5;
-		const float tolB = v2 ? 6.0 + 8.0 * slant : 0.008 * dist + 6.0;
+		const float tolA = 1.5 + 4.0 * slant;
+		const float tolB = 6.0 + 8.0 * slant;
 
 		// A. Camera only: this point in last frame's camera space and screen.
 		const float3 prevP = P + CameraDelta.xyz;
@@ -204,7 +203,7 @@ float3 RingSmoothedNormal(int2 p, float3 P, float3 Ng, float footprint)
 		[branch] if (clip.w > 1e-4)
 		{
 			const float2 uvA = float2(clip.x / clip.w * 0.5 + 0.5, 0.5 - clip.y / clip.w * 0.5);
-			cA = Candidate(uvA, prevP, tolA, Ng, v2, nA, dataA);
+			cA = Candidate(uvA, prevP, tolA, Ng, nA, dataA);
 			// B. Constant velocity: last frame's motion at the point it moved from (two fixed-point steps from the camera guess).
 			const float2 uv = (float2(p) + 0.5) * RenderSize.zw;
 			float2 uvB = uvA;
@@ -214,12 +213,12 @@ float3 RingSmoothedNormal(int2 p, float3 P, float3 Ng, float footprint)
 				uvB = uv + PrevMotion[q];
 			}
 			// A moving surface moved: allow its motion in a frame (a walking character: a few units) on top of the depth noise.
-			cB = Candidate(uvB, prevP, tolB, Ng, v2, nB, dataB);
+			cB = Candidate(uvB, prevP, tolB, Ng, nB, dataB);
 		}
 		const float c = max(cA, cB);
-		// (47k) v2: below full confidence the fallback is the ring-smoothed depth normal (only computed there).
+		// (47k) Below full confidence the fallback is the ring-smoothed depth normal (only computed there).
 		float3 fallback = Ng;
-		[branch] if (v2 && c < 0.999)
+		[branch] if (c < 0.999)
 			fallback = RingSmoothedNormal(p, P, Ng, footprint);
 		float3 n = Ng;
 		[branch] if (c > 0.0)

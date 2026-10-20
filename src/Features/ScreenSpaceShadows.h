@@ -37,10 +37,12 @@ public:
 		float ShadowContrast = 2.5f;
 		uint Enable = 1;
 		uint SampleCount = 1;
-		uint WorldSpaceThickness = 0;  ///< (45 SSS, 45o default off) occluder window >= MinThickness units + contact-length fade; 0 = original Bend math
-		float MinThickness = 30.0f;    ///< (45 SSS) game units (70 units = 1 m)
-		float ContactLength = 150.0f;  ///< (45 SSS) game units along the light ray before casters start to fade
-		uint EdgeSmoothing = 1;        ///< (45 SSS) 3x3 depth-aware blur of the mask, per frame only; (45o) always on, not saved
+		// (47q) World-Space Thickness, Min Thickness and Contact Length are gone (the original Bend math only): three unused slots keep
+		// the constant buffer's layout (RaymarchCB.hlsli Unused0-2).
+		uint Unused0 = 0;
+		float Unused1 = 0.0f;
+		float Unused2 = 0.0f;
+		uint EdgeSmoothing = 1;       ///< (45 SSS) 3x3 depth-aware blur of the mask, per frame only; (45o) always on, not saved
 		// (45k) Set per frame by Ray Tracing ("non-RT casters only"), not saved: contact range of
 		// ray-traced occluders in multiples of the ray tracer's start offset (constant + per unit).
 		float RtContactScale = 0.0f;
@@ -73,7 +75,7 @@ public:
 
 		BendSettings settings;
 
-		// (45 SSS) World-Space Thickness / Edge Smoothing data
+		// (45 SSS) Edge Smoothing data; (45k) the RT_CASTER_MASK contact range uses CameraData / SunDirVS / ProjInfo too
 		float CameraData[4];  // far, near, far - near, far * near (Util::GetCameraData)
 		float SunDirVS[4];    // towards the sun, view space
 		float ProjInfo[4];    // 1 / P00, 1 / P11, render width, render height

@@ -54,13 +54,8 @@ void NRD::DrawSettings()
 		"NVIDIA's REBLUR denoiser for Screen Space Ray Tracing. Whether it runs "
 		"is chosen there, with the Denoiser setting; its tuning options are there too.");
 
+	// (47q) The "Enabled" checkbox is gone: it duplicated Screen Space Ray Tracing's Denoiser choice (the single switch now).
 	ImGui::Separator();
-	ImGui::Checkbox("Enabled", &settings.Enabled);
-	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text(
-			"Off = REBLUR is unavailable, and Screen Space Ray Tracing switches "
-			"to its other denoiser (SVGF) instead.");
-	}
 
 	if (ImGui::TreeNode("Buffer Viewer")) {
 		static float debugRescale = .3f;
@@ -87,6 +82,10 @@ void NRD::DrawSettings()
 void NRD::LoadSettings(json& o_json)
 {
 	settings = o_json;
+	// (47q) Always available: Screen Space Ray Tracing's Denoiser dropdown alone decides whether REBLUR runs.
+	if (!settings.Enabled)
+		logger::info("[NRD] Enabled was off: removed in 47q (SSRT's Denoiser setting decides)");
+	settings.Enabled = true;
 }
 
 void NRD::SaveSettings(json& o_json)

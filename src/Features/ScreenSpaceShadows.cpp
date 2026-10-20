@@ -23,10 +23,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	SampleCount,
 	SurfaceThickness,
 	BilinearThreshold,
-	ShadowContrast,
-	WorldSpaceThickness,
-	MinThickness,
-	ContactLength)
+	ShadowContrast)  // (47q) WorldSpaceThickness / MinThickness / ContactLength: gone (their keys are ignored and dropped on the next save)
 
 void ScreenSpaceShadows::DrawSettings()
 {
@@ -46,19 +43,7 @@ void ScreenSpaceShadows::DrawSettings()
 		ImGui::SliderFloat("Shadow Contrast", &bendSettings.ShadowContrast, 0.0f, 4.0f);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("Sharpens the fade into and out of shadow. Higher = harder, darker contact shadows.");
-
-		ImGui::Spacing();
-		ImGui::Checkbox("World-Space Thickness", (bool*)&bendSettings.WorldSpaceThickness);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("Treats objects as at least Min Thickness deep, so long shadows come out solid instead of hollow, and fades shadows from casters farther than Contact Length. Off = the old behaviour.");
-		if (bendSettings.WorldSpaceThickness) {
-			ImGui::SliderFloat("Min Thickness", &bendSettings.MinThickness, 0.0f, 100.0f, "%.0f units");
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("How deep an object is assumed to be at least, in game units (70 = 1 m). Higher = fuller shadows, but more shadow leaking behind thin objects.");
-			ImGui::SliderFloat("Contact Length", &bendSettings.ContactLength, 30.0f, 1000.0f, "%.0f units");
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("Shadows from casters farther away than this (along the sun's direction) fade out. Lower = only short contact shadows; higher = longer ones, with more mistakes far away.");
-		}
+		// (47q) World-Space Thickness (+ Min Thickness, Contact Length) removed.
 
 		ImGui::Spacing();
 		ImGui::Spacing();
@@ -246,7 +231,7 @@ void ScreenSpaceShadows::DrawShadows(ID3D11ShaderResourceView* a_rtMask)
 	common.settings = bendSettings;
 	common.settings.SampleCount = std::clamp(bendSettings.SampleCount, 1u, 4u);
 	{
-		// (45 SSS) World-Space Thickness: linear depth, the sun in view space and the projection scale.
+		// (45 SSS) Linear depth, the sun in view space and the projection scale: Edge Smoothing and (45k) the RT_CASTER_MASK contact range.
 		const float4 cameraData = Util::GetCameraData();
 		common.CameraData[0] = cameraData.x;
 		common.CameraData[1] = cameraData.y;
@@ -419,6 +404,9 @@ void ScreenSpaceShadows::LoadSettings(json& o_json)
 {
 	bendSettings = o_json;
 	bendSettings.EdgeSmoothing = 1;  // (45o) always on
+	// (47q) World-Space Thickness removed: the original Bend math for everyone.
+	if (o_json.is_object() && o_json.contains("WorldSpaceThickness") && o_json["WorldSpaceThickness"].is_number() && o_json["WorldSpaceThickness"].get<double>() != 0.0)
+		logger::info("[ScreenSpaceShadows] World-Space Thickness was on: removed in 47q (the original contact shadow math is used)");
 	// (45o) Once: Shadow Contrast and Surface Thickness take the current defaults (2.5 / 0.01); the rest stays.
 	const int savedVersion = o_json.is_object() && o_json.contains("SettingsVersion") && o_json["SettingsVersion"].is_number_integer() ? o_json["SettingsVersion"].get<int>() : 1;
 	if (o_json.is_object() && !o_json.empty() && savedVersion < kSettingsVersion) {

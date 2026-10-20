@@ -6,9 +6,9 @@
 //   Two scales     TraceAOCS writes the far sample in .r with its weight in .b (kFlagValidity) and the near visibility
 //                  in .a: the far term is a weighted mean (sum w v / sum w: the share of open far segments among the
 //                  directions whose near segment was open), the detail term is filtered on its own (RTAO_DETAIL).
-//   Normal-Guided  Detail.y > 0: besides the 45 degree gate every tap is weighted by dot(N, N_tap)^Detail.y with the
+//   Normal-Guided  (always since 47n; (47q) the Detail.y 0 path is gone) besides the 45 degree gate every tap is weighted by dot(N, N_tap)^Detail.y with the
 //                  G-buffer normal (normal-mapped), so the sides of a crevice or a door frame and the wall next to it
-//                  are not averaged together. Detail.y = 0: only the gate (the confidence filter's rule).
+//                  are not averaged together.
 //   Full Res       the large-scale term filtered at full render resolution (RTAO_FULL, separable, edge-aware) instead
 //                  of the quarter-resolution chain (RTAO_DOWN, RTAO_BLUR, RTAO_UP).
 //
@@ -55,13 +55,13 @@ float3 GNormal(int2 a_p)
 	return float3(GBuffer::DecodeNormal(NormalRoughness[a_p].xy));
 }
 
-// The 45 degree gate, and with Normal-Guided the weight dot^power.
+// The 45 degree gate and the Normal-Guided weight dot^power ((47q) always: the gate-only weights, Detail.y 0, are gone).
 float NormalWeight(float3 a_centre, float3 a_tap)
 {
 	const float c = dot(a_centre, a_tap);
 	if (!(c >= kNormalCos))
 		return 0.0;
-	return Detail.y > 0.0 ? pow(saturate(c), Detail.y) : 1.0;
+	return pow(saturate(c), Detail.y);
 }
 
 bool DepthNear(float a_centre, float a_tap, float a_tol)

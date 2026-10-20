@@ -61,10 +61,7 @@ struct DispatchParameters
 	// (45 SSS) SAMPLE_COUNT is compiled from the render (dynamic) resolution, so the per-dispatch
 	// DynamicSampleCount / DynamicReadCount loop breaks are gone (the read-loop one never fired).
 
-	// (45 SSS) World-Space Thickness toggle (false = the original Bend path, unchanged).
-	bool WorldSpaceThickness;
-	float MinThickness;   // minimum occluder depth window, game units
-	float ContactLength;  // casters farther than this along the light ray fade out over the next ContactLength
+	// (47q) The World-Space Thickness path (45 SSS) is gone: the original Bend math only. These feed the RT_CASTER_MASK contact range.
 	float4 CameraData;    // SharedData::CameraData layout (far, near, far - near, far * near)
 	float3 SunDirVS;      // direction towards the sun, view space, normalized
 	float2 ProjInfo;      // 1 / P00, 1 / P11 of the camera projection
@@ -111,9 +108,6 @@ struct DispatchParameters
 		DebugOutputEdgeMask = false;
 		DebugOutputThreadIndex = false;
 		DebugOutputWaveIndex = false;
-		WorldSpaceThickness = false;
-		MinThickness = 0;
-		ContactLength = 1e6;
 		CameraData = 0;
 		SunDirVS = float3(0, 0, 1);
 		ProjInfo = 1;
@@ -277,14 +271,9 @@ void WriteScreenSpaceShadow(DispatchParameters inParameters, int3 inGroupID, int
 		// Interpolation should only occur on the minor axis of the ray - major axis coordinates should be at pixel centers
 		half2 read_xy = floor(pixel_xy);
 
-		// (45 SSS) World-Space Thickness path also takes upstream's coordinate fix: apply DynamicRes
-		// after the half-pixel and neighbour offsets, so the bilinear neighbour is exactly one texel
-		// away (with DLSS at 67% it was 1.5 texels). Off = the old order, unchanged.
+		// (47q) The original order (the World-Space Thickness path's coordinate variant is gone).
 		half2 coord_scale = inParameters.InvDepthTextureSize;
-		if (inParameters.WorldSpaceThickness)
-			coord_scale *= inParameters.DynamicRes;
-		else
-			read_xy *= inParameters.DynamicRes;
+		read_xy *= inParameters.DynamicRes;
 
 #	if defined(VR)
 		read_xy *= half2(0.5, 1.0);
@@ -417,24 +406,14 @@ void WriteScreenSpaceShadow(DispatchParameters inParameters, int3 inGroupID, int
 	// Start by reading the next value
 	int sample_index = inGroupThreadID.x + 1;
 
-	// (45 SSS) World-Space Thickness: the occluder window is at least MinThickness game units deep
-	// (SurfaceThickness alone is a fraction of the distance: 0.01 = ~2 units at 3 m, which made long
-	// shadows hollow), and casters farther than ContactLength along the light ray fade out over the
-	// next ContactLength (the ray is a fixed number of pixels, so far away it reached metres).
-	half surface_thickness = inParameters.SurfaceThickness;
+#	if defined(RT_CASTER_MASK)
+	// (45k) RT_CASTER_MASK: the contact range of ray-traced occluders (game units) and the game units travelled along the light ray per
+	// sample. (47q) Only this variant computes them now (the World-Space Thickness path that shared the block is gone; unchanged math).
 	float world_per_sample = 0;
-	float rt_contact = 0;  // (45k) RT_CASTER_MASK: contact range of ray-traced occluders, game units
-#	if !defined(RT_CASTER_MASK)  // (45k) with the mask: always (rt_contact needs view_z)
-	[branch] if (inParameters.WorldSpaceThickness)
-#	endif
+	float rt_contact = 0;
 	{
 		const float4 cam = inParameters.CameraData;
 		const float view_z = max(cam.w / (-sampling_depth[0] * cam.z + cam.x), 1.0);
-		// Bend's window is 2 x SurfaceThickness x z game units deep (1 - depth ~= near / z), so
-		// 0.5 x MinThickness / z puts its far edge at MinThickness units behind the surface.
-		// Only the far edge uses this; the near edge keeps SurfaceThickness (see below).
-		if (inParameters.WorldSpaceThickness)
-			surface_thickness = max(surface_thickness, 0.5 * inParameters.MinThickness / view_z);
 		rt_contact = inParameters.RtContactScale * (inParameters.RtBias.x + inParameters.RtBias.y * view_z);
 
 		// Game units travelled along the light ray per sample: screen motion of P + t*L is
@@ -446,6 +425,7 @@ void WriteScreenSpaceShadow(DispatchParameters inParameters, int3 inGroupID, int
 		const float pixels_per_sample = length((float2)xy_delta) / WAVE_SIZE;
 		world_per_sample = pixels_per_sample * view_z * tan_per_pixel / max(screen_rate, 1e-4);
 	}
+#	endif
 
 	// This is the inverse of how large the shadowing window is for the projected sample data.
 	// All values in the LDS sample list are scaled by 1.0 / sample_distance, such that all light directions become parallel.
@@ -455,43 +435,10 @@ void WriteScreenSpaceShadow(DispatchParameters inParameters, int3 inGroupID, int
 	// The min() function is to make sure the window is a minimum width when very close to the light. The +direction term will bias the result so the pixel at the very center of the light is either fully lit or shadowed
 	half depth_scale = min(sample_distance[0] + direction, 1.0 / inParameters.SurfaceThickness) * sample_distance[0] / depth_thickness_scale[0];
 
-	// (45 SSS) Perspective-corrected start depth before the window scaling (World-Space Thickness path).
-	const half start_depth_raw = start_depth;
-
 	start_depth = start_depth * depth_scale - z_sign;
 
 	half result = 0;
 
-	[branch] if (inParameters.WorldSpaceThickness)
-	{
-		// Bend's test |x - 1| < 1, x = how far the occluder is in front of the light ray in window
-		// units, is a window CENTRED one unit in front of the ray: occlusion = saturate(C * min(x, 2 - x)).
-		// Widening the whole window (the first 45 version) also moved its near edge: a caster needed to be
-		// ~0.2 x window (12 units with Min Thickness 30) in front of the ray to shadow fully, so the shadow
-		// came from a copy of the caster pushed back along the VIEW ray -- offset in the camera's
-		// direction, not the sun's. Here the near edge keeps SurfaceThickness (depth_scale) and only the
-		// far edge widens (far_scale), so the shadow stays where it was and just gets deeper casters.
-		// With far_scale == depth_scale this is exactly the else-branch below; the contrast is applied
-		// per sample (max of occlusion == min of visibility) so each sample can be faded by its
-		// distance along the ray.
-		const half far_scale = min(sample_distance[0] + direction, 1.0 / surface_thickness) * sample_distance[0] / depth_thickness_scale[0];
-		const float fade_rate = world_per_sample / max(inParameters.ContactLength, 1.0);
-		half4 occlusion = 0;
-		[unroll] for (i = 0; i < SAMPLE_COUNT; i++)
-		{
-			half in_front = z_sign * (start_depth_raw - DepthData[sample_index + i]);
-			half sample_occlusion = saturate(inParameters.ShadowContrast * min(in_front * depth_scale, 2.0 - in_front * far_scale));
-			half fade = saturate(2.0 - (i + 1) * fade_rate);
-#	if defined(RT_CASTER_MASK)
-			// (45k) A ray-traced occluder: only its contact part (fades out over the next rt_contact).
-			if (RtCasterData[sample_index + i])
-				fade *= saturate(2.0 - (i + 1) * world_per_sample / max(rt_contact, 0.01));
-#	endif
-			occlusion[i & 3] = max(occlusion[i & 3], sample_occlusion * fade);
-		}
-		result = 1 - dot(occlusion, 0.25);
-	}
-	else
 	{
 		half4 shadow_value = 1;
 

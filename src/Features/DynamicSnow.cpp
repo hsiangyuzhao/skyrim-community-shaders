@@ -47,7 +47,6 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	NoLodSnow,
 	SnowLineHeight,
 	SnowLineFade,
-	ParticleSnowTest,
 	BodyAndObjectTrails,
 	TrailRim,
 	OverrideAmount,
@@ -140,6 +139,10 @@ namespace
 			return SnowTest::ParticleTexture;
 		return SnowTest::None;
 	}
+
+	// (47q) The 44i "Count Snow by Precipitation Particles" switch (ParticleSnowTest) is gone: always the classification only. The
+	// particle test stays for the region diagnostics' hints.
+	constexpr bool kParticleSnowTest = false;
 
 	SnowTest ClassifySnow(const RE::TESWeather* a_weather, bool a_particles)
 	{
@@ -244,7 +247,7 @@ bool DynamicSnow::IsColdRegion(RE::TESObjectCELL* a_cell, RE::TESWorldSpace* a_w
 			for (auto* data : region->dataList->regionDataList) {
 				if (!data || data->GetType() != RE::TESRegionData::Type::kWeather)
 					continue;
-				const float share = SnowShare(static_cast<RE::TESRegionDataWeather*>(data)->weatherTypes, settings.ParticleSnowTest);
+				const float share = SnowShare(static_cast<RE::TESRegionDataWeather*>(data)->weatherTypes, kParticleSnowTest);
 				if (share > best) {
 					best = share;
 					const char* id = region->GetFormEditorID();
@@ -255,7 +258,7 @@ bool DynamicSnow::IsColdRegion(RE::TESObjectCELL* a_cell, RE::TESWorldSpace* a_w
 	}
 	// No region weather here: the worldspace's climate.
 	if (best < 0.0f && a_worldSpace && a_worldSpace->climate) {
-		best = SnowShare(a_worldSpace->climate->weatherList, settings.ParticleSnowTest);
+		best = SnowShare(a_worldSpace->climate->weatherList, kParticleSnowTest);
 		const char* id = a_worldSpace->climate->GetFormEditorID();
 		status.region = std::format("climate {}", (id && id[0]) ? std::string(id) : std::format("{:08X}", a_worldSpace->climate->GetFormID()));
 	}
@@ -290,7 +293,7 @@ void DynamicSnow::UpdateAccumulation()
 	const float fadeCurrent = PrecipitationFade(sky->currentWeather, pct, true);
 	const float fadeLast = PrecipitationFade(sky->lastWeather, pct, false);
 
-	const bool particles = settings.ParticleSnowTest;
+	const bool particles = kParticleSnowTest;
 	const float snowFade = std::min(1.0f, (IsSnowWeather(sky->currentWeather, particles) ? fadeCurrent : 0.0f) + (IsSnowWeather(sky->lastWeather, particles) ? fadeLast : 0.0f));
 	const float precipFade = std::min(1.0f, (HasPrecipitation(sky->currentWeather, particles) ? fadeCurrent : 0.0f) + (HasPrecipitation(sky->lastWeather, particles) ? fadeLast : 0.0f));
 	status.snowWeather = snowFade > 0.0f;
@@ -462,7 +465,7 @@ void DynamicSnow::BuildColdShareGrid(RE::TESWorldSpace* a_worldSpace)
 		for (auto* region : dataHandler->GetFormArray<RE::TESRegion>()) {
 			if (!region || region->worldSpace != a_ws || !region->pointLists || (region->formFlags & skipFlags))
 				continue;
-			const float share = RegionSnowShare(region, particleSnowTestBuilt);
+			const float share = RegionSnowShare(region, kParticleSnowTest);
 			if (share < 0.0f)
 				continue;  // not a weather region: it says nothing about cold
 			bool any = false;
@@ -510,7 +513,7 @@ void DynamicSnow::BuildColdShareGrid(RE::TESWorldSpace* a_worldSpace)
 	RE::TESClimate* climate = a_worldSpace->climate;
 	if (!climate && a_worldSpace->parentWorld)
 		climate = a_worldSpace->parentWorld->climate;
-	coldClimateShare = climate ? SnowShare(climate->weatherList, particleSnowTestBuilt) : -1.0f;
+	coldClimateShare = climate ? SnowShare(climate->weatherList, kParticleSnowTest) : -1.0f;
 
 	// Bounds of all weather regions plus a two-cell margin, so the mask's edge texels (repeated
 	// outside it by the shader) are "no region".
@@ -686,11 +689,9 @@ void DynamicSnow::UpdateColdMap()
 	auto* worldSpace = player ? player->GetWorldspace() : nullptr;
 	if (!worldSpace)
 		return;
-	// (44i) Also rebuilt when the snow test changes (it changes every region's share).
-	if (worldSpace != coldMapWorldSpace || !coldMapTried || particleSnowTestBuilt != settings.ParticleSnowTest) {
+	if (worldSpace != coldMapWorldSpace || !coldMapTried) {
 		coldMapWorldSpace = worldSpace;
 		coldMapTried = true;
-		particleSnowTestBuilt = settings.ParticleSnowTest;
 		try {
 			BuildColdShareGrid(worldSpace);
 		} catch (const std::exception& e) {
@@ -806,7 +807,7 @@ void DynamicSnow::UpdateRegionDiagnostics()
 		return;
 	}
 	const auto pos = player->GetPosition();
-	const bool particles = settings.ParticleSnowTest;
+	const bool particles = kParticleSnowTest;
 	const float threshold = settings.ColdRegionSnowShare;
 
 	lines.push_back(std::format("Worldspace {}, position {:.0f}, {:.0f}, height {:.0f} ({:.0f} m)",
@@ -2323,15 +2324,7 @@ void DynamicSnow::DrawSettings()
 			settings.SnowLineFade = std::max(settings.SnowLineFade, 1.0f);
 		}
 		ImGui::EndDisabled();
-		{
-			if (ImGui::Checkbox("Count Snow by Precipitation Particles", &settings.ParticleSnowTest))
-				coldCacheCell = nullptr;  // every region's share changes; the cold map rebuilds itself
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted(
-					"Off (default): a weather counts as snow only when it is classified as a snow weather.\n"
-					"On: also when its falling particles are snow (particle type or a snow particle texture),\n"
-					"for weather mods whose snowstorms are not classified as snow. Changes which regions are cold.");
-		}
+		// (47q) "Count Snow by Precipitation Particles" removed (always off: the weather's Snow classification decides).
 
 		if (ImGui::TreeNodeEx("Snow Look")) {
 			ImGui::ColorEdit3("Snow Colour", &settings.SnowColor.x);

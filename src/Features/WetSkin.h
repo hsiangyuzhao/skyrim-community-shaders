@@ -167,7 +167,7 @@ struct WetSkin : Feature
 		// surface: they are drawn after the water, whose depth hides them. On: those draws test against the
 		// depth from before the water (Skin::OnDrawStatesApplied), and their part below the surface is
 		// tinted and faded by UnderWaterTint. Off = the game's behaviour.
-		bool TranslucentUnderWater = false;
+		bool TranslucentUnderWater = true;  // (47q) default on (switched on once for settings saved before 47q)
 		float UnderWaterTint = 0.6f;
 	} settings;
 

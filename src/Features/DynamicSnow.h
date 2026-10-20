@@ -149,10 +149,7 @@ public:
 		/// Snow is full at the line and fades out over SnowLineFade below it.
 		float SnowLineHeight = 18000.0f;
 		float SnowLineFade = 4000.0f;
-		/// (44i) A weather also counts as snow when its precipitation particles are snow (particle
-		/// type, or a "snow" particle texture), not only when it carries the Snow classification.
-		/// Off = the 44h test (classification only).
-		bool ParticleSnowTest = false;
+		// (47q) ParticleSnowTest (44i, count snow by precipitation particles) removed: always the classification only.
 		/// Ragdolls being dragged or sliding and loose objects moving through snow carve trenches
 		/// (Havok collision shapes, after community-shaders PR #2659).
 		bool BodyAndObjectTrails = true;
@@ -517,7 +514,6 @@ private:
 	std::chrono::steady_clock::time_point diagTime{};  ///< real time of the last build
 	RE::TESObjectCELL* diagLogCell = nullptr;       ///< cell last logged (debug view on)
 	std::chrono::steady_clock::time_point diagLogTime{};
-	bool particleSnowTestBuilt = false;             ///< ParticleSnowTest the share grid was built with
 
 	RE::TESWorldSpace* coldMapWorldSpace = nullptr;  ///< worldspace the share grid was built for
 	bool coldMapTried = false;                       ///< BuildColdShareGrid ran for coldMapWorldSpace

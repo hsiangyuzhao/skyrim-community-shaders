@@ -1,5 +1,4 @@
 #pragma once
-#define ENABLE_SHARC
 
 #include "NRD.h"
 
@@ -38,12 +37,6 @@ struct ScreenSpaceRayTracing : Feature
 	virtual void SetupResources() override;
 	virtual void ClearShaderCache() override;
 	void CompileComputeShaders();
-#ifdef ENABLE_SHARC
-	/// @brief Allocates the four SHARC structured buffers on first use (audit P6).
-	/// Called from DrawSSRTDiffuse before any dispatch that binds them, so enabling
-	/// SHARC at runtime cannot dispatch against null UAVs.
-	void EnsureSharcResources();
-#endif
 
     bool HasShaderDefine(RE::BSShader::Type) override { return true; };
     virtual bool SupportsVR() override { return true; };
@@ -879,9 +872,6 @@ struct ScreenSpaceRayTracing : Feature
         /// alpha = 1 and the denoiser a passthrough. Speckles of colour along silhouettes and
         /// moving edges are normal and correct.
         bool HistoryDebugView = false;
-#ifdef ENABLE_SHARC
-        bool EnableSharc = false;
-#endif
     } settings;
 
     /// @brief Mirrored by the `SSRTSettings` struct in Common/SharedData.hlsli, which lives
@@ -1304,9 +1294,7 @@ struct ScreenSpaceRayTracing : Feature
     /// the setting again, which is what makes the ray march's output surface, the resolve's input
     /// surface and the choice of shader unable to disagree.
     ///
-    /// Falls back to kSamplingFull -- never to a broken dispatch -- if SHARC is enabled (its
-    /// ray-march permutations have no sparse variants and its hash-grid update is tuned for a
-    /// full-resolution dispatch), if either shader of the selected mode failed to compile, or if
+    /// Falls back to kSamplingFull -- never to a broken dispatch -- ((47q) SHARC, which forced it, is gone) if either shader of the selected mode failed to compile, or if
     /// the compact textures could not be allocated.
     ///
     /// @return the effective SamplingModeValue for this frame.
@@ -1704,8 +1692,8 @@ struct ScreenSpaceRayTracing : Feature
     /// the light's correlation length expressed in render texels at this pixel's depth. That is
     /// the quantity the kernel actually needs, it is dimensionless, and it makes the surface
     /// dynamic-resolution and FOV proof; the reciprocal form is what lets eight bits hold t's
-    /// four-orders-of-magnitude range across an exterior. A miss, a rejected hit and a SHARC
-    /// cache hit all encode exactly 1.0 -- "no screen-space hit at all" -- which the consumer
+    /// four-orders-of-magnitude range across an exterior. A miss and a rejected hit ((47q) a SHARC
+    /// cache hit too, until it was removed) all encode exactly 1.0 -- "no screen-space hit at all" -- which the consumer
     /// maps to the unmodified kernel bit for bit. See the derivation at that constant in
     /// ssrt_common.hlsli.
     ///
@@ -1766,12 +1754,6 @@ struct ScreenSpaceRayTracing : Feature
     nrd::ReblurSettings reblurDiffuseSettings{};
     nrd::ReblurSettings reblurSpecularSettings{};
 
-#ifdef ENABLE_SHARC
-    eastl::unique_ptr<Buffer> sharcHashEntries = nullptr;
-    eastl::unique_ptr<Buffer> sharcHashCopyOffsets = nullptr;
-    eastl::unique_ptr<Buffer> sharcVoxelData = nullptr;
-    eastl::unique_ptr<Buffer> sharcVoxelDataPrev = nullptr;
-#endif
 
     winrt::com_ptr<ID3D11ShaderResourceView> noiseSRV = nullptr;
 
@@ -1794,8 +1776,6 @@ struct ScreenSpaceRayTracing : Feature
     /// draw. Zero until the first pyramid build, which makes the traversal mip-0-only rather
     /// than letting it read the far-plane clear.
     uint hiZTopMipBuilt = 0;
-
-    static const uint sharcNumEntries = 0x100000;
 
     std::array<winrt::com_ptr<ID3D11ShaderResourceView>, maxMips> depthSRVs = { nullptr };
 	std::array<winrt::com_ptr<ID3D11UnorderedAccessView>, maxMips> depthUAVs = { nullptr };
@@ -1855,9 +1835,4 @@ struct ScreenSpaceRayTracing : Feature
     winrt::com_ptr<ID3D11ComputeShader> raymarchDiffuseCheckerCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> sparseResolveHalfResCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> sparseResolveCheckerCS = nullptr;
-#ifdef ENABLE_SHARC
-    winrt::com_ptr<ID3D11ComputeShader> raymarchDiffuseSharcCS = nullptr;
-    winrt::com_ptr<ID3D11ComputeShader> sharcUpdateRaymarchCS = nullptr;
-    winrt::com_ptr<ID3D11ComputeShader> sharcResolveCS = nullptr;
-#endif
 };
