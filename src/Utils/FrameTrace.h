@@ -194,16 +194,6 @@ namespace Util::FrameTrace
 		// (47r) Keep Leaves Moving: leaf timers frozen this frame without any rate (left as they were), catch-ups at the shared rate
 		// (-1 = sway off).
 		int windFrozenUnlearned = -1, windSharedCatchups = -1;
-		// (47s) Alpha Classify (-1 = off): triangles of the meshes in use sorted solid / left out / tested per ray, instances traced
-		// classified this frame, meshes waiting for their sort, triangles sorted this frame and the last sort's GPU ms, its video memory (MB).
-		int64_t acOpaque = -1, acDropped = -1, acMixed = -1;
-		int acInstances = -1, acWaiting = -1, acBakeTriangles = -1;
-		float acBakeGpuMs = -1.0f, acVramMb = -1.0f;
-		// (47t) Opacity Micromaps (-1 = off / not available): meshes with an OMM array, micro-triangles in use and the share of them the
-		// hardware decides (%), their video memory (MB, + the bake output waiting for its array), GPU ms of the last bake with OMM data.
-		int ommArrays = -1;
-		int64_t ommMicro = -1;
-		float ommKnownPct = -1.0f, ommVramMb = -1.0f, ommBakeGpuMs = -1.0f;
 		// (47u) Start Sun Trace Earlier: 1 = RTAO's normal prep ran behind the ready signal, 0 = before it (47t order), -1 = none / off.
 		// Skip Updates That Cannot Affect the Image (-1 = off): plant refits skipped, plants refit late (reachable after all), NPCs
 		// culled, 1 = this frame's characters were redone without culling. Spatial Static Chunks: 1 on, 0 off.

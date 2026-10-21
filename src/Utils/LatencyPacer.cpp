@@ -100,13 +100,6 @@ namespace Util::LatencyPacer
 		float g_prevFrameGpuWaitMs = 0.0f;  // (47h) the frame before's (PreviousFrameGpuWaitMs: read before this frame's submit)
 		std::array<float, 3> g_waitHist{};  // the last three frames' waits
 		size_t g_waitHistHead = 0;
-		// (47r) Learn Repeating Waits: the last 8 frames' waits (the same values as g_waitHist).
-		constexpr size_t kRepeatRing = 8;
-		constexpr size_t kRepeatMaxOf = 4;          // fed: the largest of the last 4
-		constexpr size_t kRepeatMinCount = 2;       // ... when at least 2 of the last 8 waited ...
-		constexpr float kRepeatMinMs = 2.0f;        // ... this long or more
-		std::array<float, kRepeatRing> g_waitRing{};
-		size_t g_waitRingHead = 0, g_waitRingCount = 0;
 		// The hidden wait the frame has anyway (job joins, preemption, our RT lanes): p25 of the hidden waits of frames that slept
 		// 1 ms or more at their start (no GPU lock then). Only what is above it counts, so a constant non-GPU wait never grows the
 		// learned sleep.
@@ -190,8 +183,6 @@ namespace Util::LatencyPacer
 			g_lastStallMs = 0.0f;
 			g_lastWaitMs = 0.0f;
 			g_waitHist.fill(0.0f);
-			g_waitRing.fill(0.0f);  // (47r)
-			g_waitRingHead = g_waitRingCount = 0;
 			g_backstopMs = 0.0f;
 			g_lockRun = 0;
 			g_periodCount = 0;
@@ -458,25 +449,7 @@ namespace Util::LatencyPacer
 		if (g_stallFresh) {
 			g_stallFresh = false;
 			// (46o) F1a: the median of the last three frames' waits (46n stall or hidden wait, the larger).
-			float wait = Median3(g_waitHist);
-			// (47r) Learn Repeating Waits: a wait that recurs every few frames (2 of the last 8 at kRepeatMinMs or more) is learned at its
-			// size: the largest of the last 4 (the median of 3 hides a 1-in-3 wait: 47q RT-off traces 020459 / 020644 kept the learned
-			// sleep at ~3 ms under its own cap while every 3rd-4th frame blocked 4-6 ms in the world pass). The cap, the bound by the
-			// predicted completion and the never-over-sleep fence wait still apply. Spike frames are not in the ring (not fed).
-			if (a_options.repeatingWaits && g_waitRingCount >= kRepeatRing) {
-				size_t repeats = 0;
-				for (size_t i = 0; i < kRepeatRing; ++i)
-					repeats += g_waitRing[i] >= kRepeatMinMs ? 1u : 0u;
-				if (repeats >= kRepeatMinCount) {
-					float largest = 0.0f;
-					for (size_t i = 1; i <= kRepeatMaxOf; ++i)
-						largest = std::max(largest, g_waitRing[(g_waitRingHead + kRepeatRing - i) % kRepeatRing]);
-					if (largest > wait) {
-						wait = largest;
-						info.repeatFed = 1;
-					}
-				}
-			}
+			const float wait = Median3(g_waitHist);
 			// (46p) Right after a GPU spike the wait is the spike's, not a steady one: not learned (the learned sleep decays).
 			const bool skip = g_skipFeed;
 			info.spikeSkip = skip ? 1 : 0;
@@ -752,9 +725,6 @@ namespace Util::LatencyPacer
 		if (!skipFeed) {
 			g_waitHist[g_waitHistHead] = wait;
 			g_waitHistHead = (g_waitHistHead + 1) % g_waitHist.size();
-			g_waitRing[g_waitRingHead] = wait;  // (47r)
-			g_waitRingHead = (g_waitRingHead + 1) % kRepeatRing;
-			g_waitRingCount = std::min(g_waitRingCount + 1, kRepeatRing);
 		}
 		g_lastStallMs = stall;
 		g_stallFresh = true;

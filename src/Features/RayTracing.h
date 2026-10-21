@@ -263,17 +263,7 @@ public:
 		// FoliageLearnAnyFrame "Keep Leaves Moving: Learn on Any Frame": a plant's leaf rate is learned from every advance the game
 		// makes (any frame time), and a plant that never learned uses the rate shared by the others once they agree. Off = 47q.
 		bool FoliageLearnAnyFrame = true;
-		// (47s) AlphaClassify "Alpha Classify (leaves and cut-outs)": every triangle of an alpha-tested caster (leaves, cut-outs, swaying
-		// plants, hair) is sorted once against its cut-out on the GPU: fully solid ones become opaque geometry (no texture test per ray),
-		// fully see-through ones are left out, only the rest is tested per ray as before. Sun, point lights and RTAO. Exact for every
-		// alpha-tested ray. Off = 47r exactly.
-		bool AlphaClassify = true;
-		// (47t) OpacityMicromaps "Opacity Micromaps (RTX 40)": with Alpha Classify, each still-tested triangle is also cut into up to 256
-		// micro-triangles sorted the same way (NVAPI opacity micromaps, 4-state): the graphics card itself skips the see-through ones and
-		// stops at the solid ones; only the undecided ones come back to the texture test. Needs the driver's OMM support (in effect only
-		// then). Exact for every alpha-tested ray. Off = 47s exactly.
-		bool OpacityMicromaps = true;
-		// (47u) Outside the settings macro. Each off = 47t exactly.
+		// (47u) Outside the settings macro. Each off = 47t exactly (for these paths the same as 47r; 47v removed 47s / 47t).
 		// SunTraceEarly "RT: Start Sun Trace Earlier": RTAO's normal prep no longer runs between the depth prepass and the signal the sun
 		// trace waits for, but right behind it (beside the traces), reading last frame's depth from its own copy. Exact.
 		bool SunTraceEarly = true;

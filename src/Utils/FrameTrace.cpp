@@ -1059,16 +1059,6 @@ namespace Util::FrameTrace
 				out << "#   captured exterior cells, static chunk BLASes per cell, their boxes' pairwise overlap (intersection / summed volume, 0 = disjoint).\n";
 				out << "# (47r) rt_wind_frozen_unlearned = leaf timers the game froze on this long frame that had no rate to advance them (no own rate,\n";
 				out << "#   no shared one); rt_wind_shared = of rt_wind_catchup, those advanced at the rate the other plants share (Learn on Any Frame).\n";
-				out << "#   pacer_repeat_fed = 1: the learned frame-start sleep was fed the largest of the last 4 waits (Pacer: Learn Repeating Waits).\n";
-				out << "# (47s) rt_ac_* = Alpha Classify (-1 = off): rt_ac_opaque_tris / rt_ac_dropped_tris / rt_ac_mixed_tris = triangles of the sorted\n";
-				out << "#   alpha-tested meshes in use traced as solid geometry / left out / still tested per ray; rt_ac_instances = TLAS instances\n";
-				out << "#   traced classified this frame; rt_ac_waiting = meshes waiting for their sort or their classified BLAS; rt_ac_bake_tris =\n";
-				out << "#   triangles sorted this frame; rt_ac_bake_gpu_ms = GPU ms of the last sort (not in rt_prep_gpu_ms); rt_ac_vram_mb = video\n";
-				out << "#   memory of the classified BLASes, records, index lists and the sort buffer.\n";
-				out << "# (47t) rt_omm_* = Opacity Micromaps (-1 = off / not available): rt_omm_arrays = meshes in use with an OMM array; rt_omm_micro_tris =\n";
-				out << "#   their micro-triangles; rt_omm_known_pct = percent of them opaque / transparent (decided by the hardware, never tested per ray);\n";
-				out << "#   rt_omm_vram_mb = OMM arrays + index lists (+ bake output waiting for its array); rt_omm_bake_gpu_ms = GPU ms of the last sort\n";
-				out << "#   that made OMM data (it is in rt_ac_bake_gpu_ms too).\n";
 				out << "# (47u) rt_early_normal = Start Sun Trace Earlier: 1 = RTAO's normal prep ran behind the signal the sun trace waits for, 0 = before\n";
 				out << "#   it (47t order: first frames, size changes), -1 = no normal prep / switch off. rt_rel_* = Skip Updates That Cannot Affect the\n";
 				out << "#   Image (-1 = off): rt_rel_wind_culled = plant refits skipped (no ray could reach them), rt_rel_wind_late = plants culled at the\n";
@@ -1179,10 +1169,8 @@ namespace Util::FrameTrace
 					   "rt_wind_in_radius,rt_wind_sources,rt_wind_builds,rt_wind_refit_verts,rt_wind_radius,"  // (47n)
 					   "gpu_spike_ms,jobs,"  // (47p)
 					   "rt_npc_body_only,rt_npc_refit_skipped,rt_skip_tiny_face,rt_wind_catchup,rt_chunk_cells,rt_chunks_per_cell,rt_chunk_overlap,"  // (47q)
-					   "rt_wind_frozen_unlearned,rt_wind_shared,pacer_repeat_fed,"  // (47r)
-					   "rt_ac_opaque_tris,rt_ac_dropped_tris,rt_ac_mixed_tris,rt_ac_instances,rt_ac_waiting,rt_ac_bake_tris,rt_ac_bake_gpu_ms,rt_ac_vram_mb,"  // (47s)
-					   "rt_omm_arrays,rt_omm_micro_tris,rt_omm_known_pct,rt_omm_vram_mb,rt_omm_bake_gpu_ms,"  // (47t)
-				   "rt_early_normal,rt_rel_wind_culled,rt_rel_wind_late,rt_rel_npc_culled,rt_rel_fallback,rt_chunk_spatial\n";  // (47u) the last ones
+					   "rt_wind_frozen_unlearned,rt_wind_shared,"  // (47r)
+					   "rt_early_normal,rt_rel_wind_culled,rt_rel_wind_late,rt_rel_npc_culled,rt_rel_fallback,rt_chunk_spatial\n";  // (47u) the last ones
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
 					std::string s = std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{},{}", t.scene,
@@ -1372,17 +1360,10 @@ namespace Util::FrameTrace
 					extra.pop_back();
 					extra += std::format(",{},{},{},{},{},{:.2f},{:.3f}\n", r.rt.npcBodyOnly, r.rt.npcRefitSkipped, r.rt.skipTinyFace, r.rt.windCatchups, r.rt.chunkCells,
 						r.rt.chunksPerCell, r.rt.chunkOverlap);
-					// (47r) Keep Leaves Moving (frozen without a rate, at the shared rate) and the pacer's repeating-wait feed, after rt_chunk_overlap.
+					// (47r) Keep Leaves Moving (frozen without a rate, at the shared rate), after rt_chunk_overlap.
 					extra.pop_back();
-					extra += std::format(",{},{},{}\n", r.rt.windFrozenUnlearned, r.rt.windSharedCatchups, r.pacer.repeatFed);
-					// (47s) Alpha Classify, after pacer_repeat_fed (the old last column).
-					extra.pop_back();
-					extra += std::format(",{},{},{},{},{},{},{:.3f},{:.1f}\n", r.rt.acOpaque, r.rt.acDropped, r.rt.acMixed, r.rt.acInstances, r.rt.acWaiting,
-						r.rt.acBakeTriangles, r.rt.acBakeGpuMs, r.rt.acVramMb);
-					// (47t) Opacity Micromaps, after rt_ac_vram_mb (the old last column).
-					extra.pop_back();
-					extra += std::format(",{},{},{:.1f},{:.2f},{:.3f}\n", r.rt.ommArrays, r.rt.ommMicro, r.rt.ommKnownPct, r.rt.ommVramMb, r.rt.ommBakeGpuMs);
-					// (47u) after rt_omm_bake_gpu_ms (the old last column).
+					extra += std::format(",{},{}\n", r.rt.windFrozenUnlearned, r.rt.windSharedCatchups);
+					// (47u) after rt_wind_shared (the old last column; 47v removed 47r's pacer_repeat_fed and 47s / 47t's rt_ac_* / rt_omm_*).
 					extra.pop_back();
 					extra += std::format(",{},{},{},{},{},{}\n", r.rt.earlyNormal, r.rt.relWindCulled, r.rt.relWindLate, r.rt.relNpcCulled, r.rt.relFallback,
 						r.rt.spatialChunks);

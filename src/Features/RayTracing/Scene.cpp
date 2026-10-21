@@ -2649,7 +2649,7 @@ namespace RayTracingScene
 		RayTracingWind::Pose pose;
 		const float amplitude = RayTracingWind::Evaluate(node, globals, pose) ? pose.amplitude : 0.0f;
 		const std::uint64_t overBudgetBefore = a_backend.GetWindStats().overBudget;
-		const auto handle = a_backend.CreateWindBlas(it->second.source, amplitude, a_shape.alpha ? a_shape.info : RayTracingRT::kInvalidAlphaInfo);  // (47s)
+		const auto handle = a_backend.CreateWindBlas(it->second.source, amplitude);
 		if (handle == RayTracingRT::kInvalidBlas) {
 			if (it->second.users == 0) {
 				a_backend.ReleaseWindSource(it->second.source);

@@ -162,12 +162,9 @@ float2 UnpackTexcoord(uint packed)
 
 // True when the candidate blocks the ray. footprint: world size the ray covers there (mip choice;
 // a coarser mip than the screen would pick keeps the texture reads cheap).
-// (47s) Alpha Classify: a classified BLAS holds its mixed triangles as geometry 0 (the record lists only those, Triangles = their
-// count) and its fully opaque ones as a later geometry (OPAQUE; they reach this code only on a forced-non-opaque instance or ray):
-// any geometry but 0, or a primitive past the record, blocks. An unclassified BLAS has geometry 0 only (unchanged).
-bool AlphaBlocks(uint instanceID, uint geometry, uint primitive, float2 bary, float footprint)
+bool AlphaBlocks(uint instanceID, uint primitive, float2 bary, float footprint)
 {
-	if (instanceID == 0u || geometry != 0u)
+	if (instanceID == 0u)
 		return true;
 	const AlphaInfo info = AlphaInfos[instanceID - 1u];
 	if (primitive >= info.Triangles)
@@ -221,7 +218,7 @@ bool AnyHit(float3 origin, float3 direction, float tMax, float footprint, inout 
 			continue;
 		outFlags |= kOutAlphaCandidate;
 		// Opaque triangles end the search on their own; a kept cut-out triangle ends it too.
-		if (budget == 0u || AlphaBlocks(q.CandidateInstanceID(), q.CandidateGeometryIndex(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(),
+		if (budget == 0u || AlphaBlocks(q.CandidateInstanceID(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(),
 								footprint + q.CandidateTriangleRayT() * C.ToSun.w))
 			q.CommitNonOpaqueTriangleHit();
 		else
@@ -250,7 +247,7 @@ bool ClosestHit(float3 origin, float3 direction, float tMax, float footprint, ui
 			continue;
 		}
 		budget -= 1u;
-		if (AlphaBlocks(q.CandidateInstanceID(), q.CandidateGeometryIndex(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(), footprint + q.CandidateTriangleRayT() * C.ToSun.w))
+		if (AlphaBlocks(q.CandidateInstanceID(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(), footprint + q.CandidateTriangleRayT() * C.ToSun.w))
 			q.CommitNonOpaqueTriangleHit();
 	}
 	tHit = q.CommittedRayT();
@@ -306,7 +303,7 @@ bool CharacterAnyHit(float3 origin, float3 direction, float tMin, float tMax, fl
 	while (q.Proceed()) {
 		if (q.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE)
 			continue;
-		if (budget == 0u || AlphaBlocks(q.CandidateInstanceID(), q.CandidateGeometryIndex(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(),
+		if (budget == 0u || AlphaBlocks(q.CandidateInstanceID(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(),
 								footprint + q.CandidateTriangleRayT() * C.ToSun.w))
 			q.CommitNonOpaqueTriangleHit();
 		else

@@ -229,9 +229,6 @@ public:
 		// always on now, as are all of 46p/46q "Save GPU Memory" (render-resolution buffers, resident memory, RR / SSGI / mask
 		// textures only when used, shared NRD scratch, render-rect copies, lazy-shader precompile); DLSS-G memory is always retained.
 		bool reflexPacerSmoothPhase = false;
-		// (47r) "Pacer: Learn Repeating Waits" (LatencyPacer::Options::repeatingWaits): a wait inside the frame that recurs every few frames
-		// is learned at its size (the frame starts that much later instead of blocking mid-frame). Off = 47q.
-		bool reflexPacerRepeatingWaits = true;
 
 		NeuralRenderingSettings neuralRendering;
 	};

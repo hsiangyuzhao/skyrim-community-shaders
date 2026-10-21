@@ -80,37 +80,6 @@ namespace RayTracingRT
 			}();
 			return static_cast<std::int64_t>(a_ms * perMs);
 		}
-
-		// (47s) The geometry descriptions of a static BLAS: one (opaque, or alpha-tested non-opaque), or for a classified one (Alpha
-		// Classify) its mixed triangles (non-opaque, geometry 0) and then its fully opaque ones (OPAQUE), an empty part left out.
-		UINT ChunkGeometryDescs(const ChunkGeometry& a_geometry, D3D12_GPU_VIRTUAL_ADDRESS a_vertices, D3D12_GPU_VIRTUAL_ADDRESS a_indices,
-			D3D12_RAYTRACING_GEOMETRY_DESC (&o_descs)[2])
-		{
-			D3D12_RAYTRACING_GEOMETRY_DESC desc{};
-			desc.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
-			desc.Triangles.VertexBuffer.StartAddress = a_vertices;
-			desc.Triangles.VertexBuffer.StrideInBytes = sizeof(float) * 3;
-			desc.Triangles.VertexCount = a_geometry.Vertices();
-			desc.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
-			desc.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
-			const std::uint32_t triangles = a_geometry.Triangles();
-			// Triangles [0, split) non-opaque, [split, triangles) opaque.
-			const std::uint32_t split = a_geometry.Classified() ? std::min(a_geometry.opaqueFrom, triangles) : (a_geometry.Opaque() ? 0u : triangles);
-			UINT count = 0;
-			if (split > 0) {
-				desc.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
-				desc.Triangles.IndexBuffer = a_indices;
-				desc.Triangles.IndexCount = split * 3;
-				o_descs[count++] = desc;
-			}
-			if (split < triangles) {
-				desc.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
-				desc.Triangles.IndexBuffer = a_indices ? a_indices + static_cast<std::uint64_t>(split) * 3 * sizeof(std::uint32_t) : 0;
-				desc.Triangles.IndexCount = (triangles - split) * 3;
-				o_descs[count++] = desc;
-			}
-			return count;
-		}
 	}
 
 	// Process exit: no GPU wait (the GPU work of a closing game does not matter any more).
@@ -252,11 +221,9 @@ namespace RayTracingRT
 		{
 			D3D12_QUERY_HEAP_DESC heapDesc{};
 			heapDesc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-			// (45l) per context: prep begin / end, trace begin / end; (46b) + point lights begin / end after them; (46f) + RTAO; (47s) + the
-			// Alpha Classify bakes (kContexts * 8 + context * 2).
-			heapDesc.Count = static_cast<UINT>(kContexts * 10);
+			heapDesc.Count = static_cast<UINT>(kContexts * 8);  // (45l) per context: prep begin / end, trace begin / end; (46b) + point lights begin / end after them; (46f) + RTAO
 			UINT64 frequency = 0;
-			timestampReadback_ = CreateBuffer(sizeof(std::uint64_t) * kContexts * 10, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false);
+			timestampReadback_ = CreateBuffer(sizeof(std::uint64_t) * kContexts * 8, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false);
 			if (FAILED(device_->CreateQueryHeap(&heapDesc, IID_PPV_ARGS(&timestampHeap_))) || !timestampReadback_ ||
 				FAILED(queue_->GetTimestampFrequency(&frequency)) || frequency == 0) {
 				timestampHeap_.Reset();
@@ -280,12 +247,7 @@ namespace RayTracingRT
 		InitPools();  // (46g)
 
 		std::string pipelineReason;
-		// (47t) Opacity Micromaps: NVAPI caps on this device; the trace pipelines are created with the NVAPI OMM option when supported.
-		InitOpacityMicromaps();
-		SetOmmPipelineOption(true);
-		const bool pipelineOk = CreatePipeline(pipelineReason);
-		SetOmmPipelineOption(false);
-		if (!pipelineOk)
+		if (!CreatePipeline(pipelineReason))
 			return fail(pipelineReason);
 
 		ready_ = true;
@@ -481,9 +443,6 @@ namespace RayTracingRT
 		// (47l) Foliage sway: not fatal either (wind meshes then stay frozen).
 		if (!CreateWindPipeline())
 			windPipeline_.Reset();
-		// (47s) Alpha Classify: not fatal either (the alpha-tested BLASes then stay unclassified).
-		if (!CreateBakePipeline())
-			bakePipeline_.Reset();
 		return true;
 	}
 
@@ -1335,28 +1294,6 @@ namespace RayTracingRT
 		windMustSubmit_ = false;
 		windPipeline_.Reset();
 		windRootSignature_.Reset();
-		// (47s) Alpha Classify (its ranges went with the pools and buffers above).
-		variants_.clear();
-		freeVariants_.clear();
-		variantIndex_.clear();
-		alphaInfoUsed_.clear();
-		slotVariant_.clear();
-		slotBase_.clear();
-		bakeQueue_.clear();
-		variantUploads_.clear();
-		variantMustSubmit_ = false;
-		ommBuildQueue_.clear();  // (47t)
-		ommOn_ = false;
-		waitSerial_ = 0;
-		classifyStats_ = {};
-		if (bakeReadback_ && bakeMapped_)
-			bakeReadback_->Unmap(0, nullptr);
-		bakeMapped_ = nullptr;
-		bakeReadback_.Reset();
-		bakeOut_.Reset();
-		bakeBuffersFailed_ = false;
-		bakePipeline_.Reset();
-		bakeRootSignature_.Reset();
 		// (46m) Merged BLASes (their pool is gone with the pools above) and the sun fence.
 		skinGroups_.clear();
 		skinGroupFrame_.clear();
@@ -1876,12 +1813,8 @@ namespace RayTracingRT
 		// (45h) An alpha BLAS keeps its texcoords in the shared buffer ((47q) packed: 2 entries of 8 bytes per triangle).
 		std::uint32_t uvOffset = UINT32_MAX, uvCount = 0;
 		if (!a_geometry->Opaque()) {
-			// (47s) A classified BLAS (Alpha Classify) comes packed, with records for its mixed triangles only.
-			const std::uint32_t recordTriangles = a_geometry->AlphaTriangles();
-			uvCount = recordTriangles * 2;
-			const bool packed = a_geometry->Classified() ? a_geometry->alphaUV.size() == static_cast<std::size_t>(recordTriangles) * 4 :
-			                                               PackAlphaCorners(a_geometry->alphaUV, a_geometry->Triangles());
-			if (!packed || recordTriangles == 0 || !AlphaAvailable() || !AllocateAlphaUv(uvCount, uvOffset))
+			uvCount = a_geometry->Triangles() * 2;
+			if (!PackAlphaCorners(a_geometry->alphaUV, a_geometry->Triangles()) || !AlphaAvailable() || !AllocateAlphaUv(uvCount, uvOffset))
 				return kInvalidBlas;
 		}
 		const BlasHandle handle = AllocateHandle();
@@ -1924,8 +1857,6 @@ namespace RayTracingRT
 			freeHandles_.push_back(a_handle);
 			return;
 		}
-		// (47s) Its classified variants lose their base (a variant not classified yet never will be; one in use keeps its own BLAS).
-		OrphanVariants(blas.variants);
 		if (blas.state == BlasState::Queued) {
 			std::erase(buildQueue_, a_handle);
 			stats_.blasQueued -= std::min<std::uint32_t>(stats_.blasQueued, 1);
@@ -2122,16 +2053,22 @@ namespace RayTracingRT
 				continue;
 			}
 			const ChunkGeometry& geometry = *blas.geometry;
-			D3D12_RAYTRACING_GEOMETRY_DESC geometryDescs[2]{};
-			const UINT descCount = ChunkGeometryDescs(geometry, 0, 0, geometryDescs);  // (47s) 2 for a classified BLAS
+			D3D12_RAYTRACING_GEOMETRY_DESC geometryDesc{};
+			geometryDesc.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+			geometryDesc.Flags = geometry.Opaque() ? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE : D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
+			geometryDesc.Triangles.VertexBuffer.StrideInBytes = sizeof(float) * 3;
+			geometryDesc.Triangles.VertexCount = geometry.Vertices();
+			geometryDesc.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+			geometryDesc.Triangles.IndexCount = static_cast<UINT>(geometry.indices.size());
+			geometryDesc.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
 			D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs{};
 			inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
 			inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION;
-			inputs.NumDescs = descCount;
+			inputs.NumDescs = 1;
 			inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
-			inputs.pGeometryDescs = geometryDescs;
+			inputs.pGeometryDescs = &geometryDesc;
 			D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info{};
-			PrebuildBlas(inputs, &geometry.omm, info);  // (47t) with the OMM array, if any
+			device_->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &info);
 			if (info.ResultDataMaxSizeInBytes == 0) {
 				// Degenerate input: drop it rather than retry forever.
 				buildQueue_.pop_front();
@@ -2215,17 +2152,24 @@ namespace RayTracingRT
 			const ChunkGeometry& geometry = *blas.geometry;
 			const D3D12_GPU_VIRTUAL_ADDRESS upload = uploadPool_.Address(entry.upload);
 
-			// (45h) Alpha-tested meshes are non-opaque: the trace tests each candidate against its cut-out. (47s) A classified one: its
-			// mixed triangles non-opaque (geometry 0), its fully opaque ones OPAQUE (geometry 1).
-			D3D12_RAYTRACING_GEOMETRY_DESC geometryDescs[2]{};
-			const UINT descCount = ChunkGeometryDescs(geometry, upload, upload + entry.indexOffset, geometryDescs);
+			D3D12_RAYTRACING_GEOMETRY_DESC geometryDesc{};
+			geometryDesc.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+			// (45h) Alpha-tested meshes are non-opaque: the trace tests each candidate against its cut-out.
+			geometryDesc.Flags = geometry.Opaque() ? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE : D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
+			geometryDesc.Triangles.VertexBuffer.StartAddress = upload;
+			geometryDesc.Triangles.VertexBuffer.StrideInBytes = sizeof(float) * 3;
+			geometryDesc.Triangles.VertexCount = geometry.Vertices();
+			geometryDesc.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+			geometryDesc.Triangles.IndexBuffer = upload + entry.indexOffset;
+			geometryDesc.Triangles.IndexCount = static_cast<UINT>(geometry.indices.size());
+			geometryDesc.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
 
 			D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs{};
 			inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
 			inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION;
-			inputs.NumDescs = descCount;
+			inputs.NumDescs = 1;
 			inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
-			inputs.pGeometryDescs = geometryDescs;
+			inputs.pGeometryDescs = &geometryDesc;
 
 			if (built > 0 && !parallel) {
 				// The builds share one scratch buffer.
@@ -2250,7 +2194,7 @@ namespace RayTracingRT
 			buildDesc.DestAccelerationStructureData = asPool_.Address(entry.result);
 			buildDesc.ScratchAccelerationStructureData = scratch_->GetGPUVirtualAddress() + (parallel ? scratchOffset : 0);
 			scratchOffset += Align(entry.info.ScratchDataSizeInBytes, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
-			RecordBlasBuild(a_list, buildDesc, 1, &postbuild, &geometry.omm);  // (47t) through NVAPI with an OMM array
+			a_list->BuildRaytracingAccelerationStructure(&buildDesc, 1, &postbuild);
 
 			const std::uint64_t bytes = entry.result.size;
 			// (46p) This submission's prep work.
@@ -2258,11 +2202,6 @@ namespace RayTracingRT
 			recWork_.buildsAlpha += geometry.Opaque() ? 0u : 1u;
 			recWork_.buildTriangles += blas.triangles;
 			recWork_.buildBytes += bytes;
-			// (47s) An unclassified alpha BLAS keeps its geometry: the source of its classified variants (Alpha Classify).
-			if (!geometry.Opaque() && !geometry.Classified() && bakePipeline_) {
-				blas.sourceBytes = geometry.positions.size() * sizeof(float) + (geometry.indices.size() + geometry.alphaUV.size()) * sizeof(std::uint32_t);
-				blas.source = std::move(blas.geometry);
-			}
 			blas.geometry.reset();
 			blas.alloc = entry.result;
 			blas.bytes = bytes;
@@ -2461,13 +2400,9 @@ namespace RayTracingRT
 			}
 		}
 		lap(split.collect);
-		for (std::size_t i = 0; i < kContexts; ++i) {
-			if (contexts_[i].fenceValue != 0 && contexts_[i].fenceValue <= completed && contexts_[i].aoFenceValue <= aoCompleted) {
+		for (std::size_t i = 0; i < kContexts; ++i)
+			if (contexts_[i].fenceValue != 0 && contexts_[i].fenceValue <= completed && contexts_[i].aoFenceValue <= aoCompleted)
 				CollectTimestamps(i);
-				CollectBakes(i);  // (47s)
-			}
-		}
-		UpdateClassifyStats();  // (47s)
 		lap(split.timestamps);  // (46g)
 		if (index == kContexts) {
 			++stats_.skippedFramesBusy;
@@ -2523,9 +2458,6 @@ namespace RayTracingRT
 			stats_.buildsLastFrame = builtNow;
 			const std::int64_t buildEnd = QpcNow();
 
-			variantMustSubmit_ = false;
-			RecordOmmBuilds(list);  // (47t) Opacity Micromaps: OMM arrays before the character / wind builds (and the classified BLASes queued now)
-			RecordVariantUploads(list);  // (47s) Alpha Classify: character-part / wind index lists before their builds
 			skinReady_.assign(skinDraws.size(), 0);
 			skinRecorded_ = false;
 			skinGroupFrame_.clear();  // (46m)
@@ -2560,11 +2492,8 @@ namespace RayTracingRT
 		if (!EnsureTlas(maxInstances) || !EnsureInstanceBuffer(context, maxInstances)) {
 			// (47l) Wind uploads / first builds are marked done when recorded: a list holding them must run, so
 			// one that cannot takes the feature down (as the alpha record buffer below) instead of leaving BLASes never built.
-			// (47s) Alpha Classify uploads likewise.
-			if (windMustSubmit_ || (variantMustSubmit_ && !early))
+			if (windMustSubmit_)
 				return Fail("TLAS / instance buffer (with foliage sway work recorded)", E_OUTOFMEMORY);
-			if (!early)
-				DropBakes(context);
 			list->Close();
 			return false;
 		}
@@ -2580,13 +2509,6 @@ namespace RayTracingRT
 				count = 0;
 		}
 		std::uint32_t alphaInstances = 0;
-		// (47s) Alpha Classify: a pass this frame that culls the cut-outs (the point lights' or RTAO's non-alpha variant, CULL_NON_OPAQUE)
-		// must not see a classified BLAS's opaque geometry: the classified instances are then forced non-opaque (that geometry comes back
-		// to AlphaBlocks as a candidate, which keeps it at once). Otherwise the hardware takes it as opaque.
-		const bool cullingPass = (a_input.pointLights && !(a_input.pointLights->alpha && pointAlphaPipeline_)) || (a_input.ao && !(a_input.ao->alpha && aoAlphaPipeline_));
-		const D3D12_RAYTRACING_INSTANCE_FLAGS classifiedFlags =
-			D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE | (cullingPass ? D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_NON_OPAQUE : D3D12_RAYTRACING_INSTANCE_FLAG_NONE);
-		std::uint32_t classifiedInstances = 0, classifiedWind = 0, classifiedSkin = 0;
 		for (const auto& instance : instances) {
 			const auto category = std::min<std::uint32_t>(instance.category, kInstanceCategories - 1);
 			if (instance.blas >= blas_.size()) {
@@ -2614,36 +2536,13 @@ namespace RayTracingRT
 			desc.InstanceMask = kInstanceMask;
 			desc.InstanceContributionToHitGroupIndex = instance.moving ? kMovingInstanceKey : 0u;  // (47n) TraceAOCS dynamic-occluder flag
 			desc.Flags = instance.twoSided ? kInstanceFlags : D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;  // (46g)
-			desc.AccelerationStructure = asPool_.Address(blas.alloc);
 			if (alpha) {
 				// The shader finds the record through the instance ID (0 = opaque); no force-opaque flag.
 				desc.InstanceID = instance.alphaInfo + 1;
 				desc.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE;
 				++alphaInstances;
-				// (47s) Alpha Classify: a swaying copy built classified traces with its variant's record; a frozen shape whose variant is in
-				// use traces its classified BLAS (while on).
-				std::uint32_t record = UINT32_MAX;
-				if (blas.wind != UINT32_MAX) {
-					if (blas.wind < winds_.size() && winds_[blas.wind].layout != UINT32_MAX) {
-						record = variants_[winds_[blas.wind].layout].record;
-						++classifiedWind;
-					}
-				} else if (classifyOn_) {
-					const std::uint32_t variant = VariantForSlot(instance.alphaInfo);
-					if (variant != UINT32_MAX && VariantReady(variant) && variants_[variant].kind == VariantKind::Static) {
-						const auto& classified = blas_[variants_[variant].blas];
-						if (classified.alloc.Valid()) {
-							record = variants_[variant].record;
-							desc.AccelerationStructure = asPool_.Address(classified.alloc);
-						}
-					}
-				}
-				if (record != UINT32_MAX) {
-					desc.InstanceID = record + 1;  // records < kAlphaMaxInfos (far below 2^24)
-					desc.Flags = classifiedFlags;
-					++classifiedInstances;
-				}
 			}
+			desc.AccelerationStructure = asPool_.Address(blas.alloc);
 			if (a_input.validate && instance.hasExpected)
 				CheckInstance(desc, instance, blas, a_input);
 			++check_.written[category];
@@ -2688,16 +2587,6 @@ namespace RayTracingRT
 				desc.InstanceID = draw.alphaInfo + 1;
 				desc.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE;
 				++alphaInstances;
-				// (47s) Alpha Classify: a part built classified traces with its variant's record (its BLAS holds that layout). While on, the
-				// part's variant is looked up (made) here: RecordSkinning rebuilds the part once it is ready.
-				if (skin.layout != UINT32_MAX && skin.layout < variants_.size() && variants_[skin.layout].record != kInvalidAlphaInfo) {
-					desc.InstanceID = variants_[skin.layout].record + 1;
-					desc.Flags = classifiedFlags;
-					++classifiedInstances;
-					++classifiedSkin;
-				} else if (classifyOn_ && skin.alphaSlot != UINT32_MAX) {
-					VariantForSlot(skin.alphaSlot);
-				}
 			}
 			desc.AccelerationStructure = asPool_.Address(skin.blas);
 			++check_.written[kCategoryCharacter];
@@ -2738,19 +2627,13 @@ namespace RayTracingRT
 			// (45i) Character uploads / builds recorded in this list must run (later refits rely on
 			// them): a list that cannot be submitted takes the whole feature down instead.
 			// (47l) Wind uploads / builds likewise (a wind BLAS is marked built when its build is recorded).
-			if ((skinRecorded_ || windMustSubmit_ || variantMustSubmit_) && !early)
+			if ((skinRecorded_ || windMustSubmit_) && !early)
 				return Fail("alpha record buffer (with character work recorded)", E_OUTOFMEMORY);
 			// Nothing written above can be traced without its record: drop the frame's trace.
-			if (!early)
-				DropBakes(context);  // (47s)
 			list->Close();
 			return false;
 		}
 		alphaStats_.instancesLastFrame = alphaInstances;
-		classifyStats_.instancesLastFrame = classifiedInstances;  // (47s)
-		classifyStats_.windLastFrame = classifiedWind;
-		classifyStats_.skinLastFrame = classifiedSkin;
-		classifyStats_.forcedNonOpaqueLastFrame = cullingPass && classifiedInstances > 0;
 		lap(split.alpha);
 
 		{
@@ -2774,9 +2657,6 @@ namespace RayTracingRT
 		// (45n) Early Prep: prep begin / end were written by PrepareFrame (the TLAS list is not timed).
 		if (timestampHeap_ && !early)
 			list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 1);
-		// (47s) Alpha Classify: this frame's bakes (Early Prep: recorded with the prep list), outside the prep interval.
-		if (!early)
-			RecordAlphaBakes(list, context, index);
 
 		// The trace: in its own list behind the wait.
 		if (FAILED(hr = list->Close()))
@@ -2786,10 +2666,6 @@ namespace RayTracingRT
 			// (46g) This first ExecuteCommandLists (builds / TLAS) counts as execute too (it was inside record before).
 			ID3D12CommandList* prepLists[] = { list };
 			QueueExecute(prepLists[0]);  // (46q) right away, or staged for the submit thread
-			if (!early) {
-				CommitBakes(context);  // (47s) read back once this context's done value completes
-				variantMustSubmit_ = false;
-			}
 		}
 		lap(split.execute);
 		ID3D12GraphicsCommandList4* traceList = context.traceList.Get();
@@ -2953,7 +2829,6 @@ namespace RayTracingRT
 		lap(split.flush11);
 		if (FAILED(hr = QueueWait(fence_.Get(), readyValue, "D3D12 queue Wait")))
 			return Fail("D3D12 queue Wait", hr);
-		++waitSerial_;  // (47s) every alpha copy recorded so far is visible to our queue's later lists
 		lap(split.wait12);
 		// (47u) Start Sun Trace Earlier: the D3D11 work that may run beside the traces (RTAO's normal prep), recorded only now; when the
 		// RTAO list reads it, the D3D11 queue signals the after-ready fence behind it and our queue waits for that before the RTAO list.
@@ -3064,12 +2939,9 @@ namespace RayTracingRT
 			}
 		}
 		lap(split.collect);
-		for (std::size_t i = 0; i < kContexts; ++i) {
-			if (contexts_[i].fenceValue != 0 && contexts_[i].fenceValue <= completed && contexts_[i].aoFenceValue <= aoCompleted) {
+		for (std::size_t i = 0; i < kContexts; ++i)
+			if (contexts_[i].fenceValue != 0 && contexts_[i].fenceValue <= completed && contexts_[i].aoFenceValue <= aoCompleted)
 				CollectTimestamps(i);
-				CollectBakes(i);  // (47s)
-			}
-		}
 		lap(split.timestamps);
 		if (index == kContexts)
 			return false;
@@ -3115,9 +2987,6 @@ namespace RayTracingRT
 		skinReady_.assign(skinDraws.size(), 0);
 		skinRecorded_ = false;
 		skinGroupFrame_.clear();  // (46m)
-		variantMustSubmit_ = false;
-		RecordOmmBuilds(list);  // (47t) Opacity Micromaps: OMM arrays before the character / wind builds (and the classified BLASes queued now)
-		RecordVariantUploads(list);  // (47s) Alpha Classify: character-part / wind index lists before their builds
 		if (!skinDraws.empty() || !skinUploadQueue_.empty()) {
 			const std::uint64_t uploadsBefore = skinUploadsTotal_;
 			RecordSkinning(list, context, a_input, skinReady_);
@@ -3141,15 +3010,10 @@ namespace RayTracingRT
 		}
 		if (timestampHeap_)
 			list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 1);
-		// (47s) Alpha Classify: this frame's bakes, outside the prep interval (its GPU time feeds the build-cost model; the bakes have
-		// their own pair). They read the base records the builds above wrote (the barrier above).
-		RecordAlphaBakes(list, context, index);
 		if (FAILED(hr = list->Close()))
 			return Fail("command list Close", hr);
 		lap(split.close);
 		QueueExecute(list);  // (46q) right away, or handed to the submit thread on the way out
-		CommitBakes(context);  // (47s) read back once this context's done value completes
-		variantMustSubmit_ = false;
 		lap(split.execute);
 		stats_.earlyCpuMs = static_cast<float>(QpcToMs(QpcNow() - cpuStart));
 		return true;
