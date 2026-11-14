@@ -290,6 +290,21 @@ namespace RayTracingRT
 		bool alpha = false;  // alpha-tested instances tested against their cut-out (else culled)
 	};
 
+	/// (47w) Adaptive skip: an engine shadow-map light and its source slot this frame (PointLightInput::coverage).
+	inline constexpr std::uint32_t kPointCoverageLights = 8;
+	struct PointCoverageKey
+	{
+		const void* light = nullptr;
+		std::uint32_t slot = 0;
+	};
+	/// (47w) Its counts as read back (per frame): pixels it lit, of which not in the pixel's top K (no traced shadow there).
+	struct PointCoverage
+	{
+		const void* light = nullptr;
+		std::uint32_t lit = 0;
+		std::uint32_t uncovered = 0;
+	};
+
 	/// (46b) This frame's point-light trace (FrameInput::pointLights; null = none, the 45 frame exactly).
 	struct PointLightInput
 	{
@@ -298,6 +313,10 @@ namespace RayTracingRT
 		std::uint32_t sourceBytes = 0;  // of the whole array
 		std::uint32_t scan = 0;         // slots to scan (> 0)
 		bool alpha = false;             // (46c) alpha-tested instances (window masks) are tested against their cut-out (interiors)
+		// (47w) Adaptive skip: the engine shadow-map lights whose coverage the trace counts this frame (the caller sets the shader's
+		// coverage flag); read back with the timestamps (Stats::coverage). coverageCount = 0: nothing counted.
+		std::array<PointCoverageKey, kPointCoverageLights> coverage{};
+		std::uint32_t coverageCount = 0;
 	};
 
 	/// (45f) What a TLAS instance holds, for the per-category counts and the self-check.
@@ -460,6 +479,10 @@ namespace RayTracingRT
 		std::int64_t pointChurnPerFrame = -1;
 		std::array<std::uint32_t, 64> beamTraced{}, beamBlocked{};
 		std::uint64_t beamSamples = 0;
+		// (47w) Adaptive skip: the last read-back's counts per engine shadow-map light (per frame), coverageSamples counts the read-backs.
+		std::array<PointCoverage, kPointCoverageLights> coverage{};
+		std::uint32_t coverageCount = 0;
+		std::uint64_t coverageSamples = 0;
 		// (46f) RTAO: GPU ms of its dispatch (not inside lastGpuMs' trace), rays per frame (read back late; -1 = not known), last frame traced or not.
 		float lastAOGpuMs = -1.0f;
 		std::int64_t aoRaysPerFrame = -1;
@@ -927,6 +950,9 @@ namespace RayTracingRT
 			std::uint32_t pointCapacity = 0;  // bytes
 			bool pointPending = false;
 			std::uint64_t pointFrame = 0;     // pointFrame_ when it was submitted
+			// (47w) Adaptive skip: the lights whose coverage this submission counted (PointLightInput::coverage).
+			std::array<PointCoverageKey, kPointCoverageLights> coverage{};
+			std::uint32_t coverageCount = 0;
 			// (46f) RTAO: its own list (same allocator, recorded after the trace list), the second fence's value its
 			// submission signalled (0 = none: the context is free once fenceValue completed), read-back pending.
 			ComPtr<ID3D12GraphicsCommandList4> aoList;
@@ -1469,7 +1495,9 @@ namespace RayTracingRT
 		std::uint32_t pointCounterLast_ = 0;
 		// (46g) Counter words (TracePointLightsCS RayCounter): [0] rays, [1] pixels whose top-K source set changed, from
 		// kPointBeamBase per slot: sampled cone pixels traced / blocked of a window beam. The whole block is read back per context.
-		static constexpr std::uint32_t kPointCounterWords = 256, kPointBeamBase = 64, kPointBeamSlots = 64;
+		// (47w) From kPointCoverageBase per slot: an engine shadow-map light's lit pixels / of which not in the pixel's top K.
+		static constexpr std::uint32_t kPointCounterWords = 384, kPointBeamBase = 64, kPointBeamSlots = 64, kPointCoverageBase = 256;
+		static_assert(kPointBeamBase + kPointBeamSlots * 2 <= kPointCoverageBase && kPointCoverageBase + kPointBeamSlots * 2 <= kPointCounterWords);
 		std::array<std::uint32_t, kPointCounterWords> pointCounterWords_{};
 		std::uint64_t pointCounterLastFrame_ = 0;
 		bool pointCounterValid_ = false;

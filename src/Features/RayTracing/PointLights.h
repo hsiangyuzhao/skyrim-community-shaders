@@ -147,8 +147,9 @@ namespace RayTracingPointLights
 		// player's, not spells / effects, not spots) take a steady position instead of the engine's flicker-jittered one: their parent
 		// node's when the light's local offset is within 2 x its LIGH's movement amplitude + 1, else a per-light average (EMA 0.05 per
 		// frame, snaps on a jump over 128 units). Used for the rules, the merge, the slots (and so the denoiser's motion), the GPU
-		// source. (46s) Merge hysteresis: a light merged into a group last frame stays in the group of the same seed light up to
-		// 1.5 x the merge distance.
+		// source. (46s) Merge hysteresis; (47w) keyed on membership: a light stays in last frame's group (the same group identity,
+		// whichever member is brightest now) while it is within 1.5 x the merge distance of that group's last centre; the centre is
+		// the unweighted mean of the members (flicker does not move it); a group keeps its identity and slot while any member stays.
 		// (46s) Meshless lights near fires (placed LIGH without a mesh, classified a fixture by its name only, not shadow-casting):
 		// MeshlessOwn = a source of its own (46r), MeshlessSnap = its tag goes to the nearest visible fixture's source within
 		// snapDistance (its intensity added, no weight in the centre; none in range: own), MeshlessSkip = no RT source.
@@ -266,6 +267,7 @@ namespace RayTracingPointLights
 			history_.clear();
 			reach_.clear();
 			decisions_.clear();
+			groupMemory_.clear();  // (47w)
 		}
 		/// (46x) This frame's decision for a light of the 46x classes (Decision | why << 8; 0 = none). Render thread.
 		[[nodiscard]] std::uint16_t DecisionFor(const RE::BSLight* a_light) const;
@@ -299,9 +301,9 @@ namespace RayTracingPointLights
 			bool steadyParent = false;
 			std::uint32_t steadyFrame = 0;
 			double steady[3]{};
-			// (46s) Merge hysteresis: the seed light of the group it joined (null = it seeded one / none).
-			const RE::BSLight* seed = nullptr;
-			std::uint32_t seedFrame = 0;
+			// (46s) Merge hysteresis; (47w) the identity of the group it was in (seed or member; 0 = none, snapped).
+			std::uint32_t groupId = 0;
+			std::uint32_t groupFrame = 0;
 			// (46s) Snap: the visible fixture its tag went to last time (kept while in range).
 			const RE::BSLight* anchor = nullptr;
 			std::uint32_t anchorFrame = 0;
@@ -310,6 +312,19 @@ namespace RayTracingPointLights
 			std::uint32_t aimFrame = 0;
 		};
 		std::unordered_map<const RE::BSLight*, History> history_;
+		// (47w) Merge groups by identity: last frame's centre (the members' unweighted mean, world), representative light (the GPU
+		// source's fade / size terms), slot, kind and carrier. Entries not seen for a few frames are dropped.
+		struct GroupMemory
+		{
+			double centre[3]{};
+			const RE::BSLight* representative = nullptr;
+			std::uint32_t slot = UINT32_MAX;
+			std::uint32_t frame = 0;
+			std::uint32_t owner = 0;
+			std::uint8_t kind = 0;
+		};
+		std::unordered_map<std::uint32_t, GroupMemory> groupMemory_;
+		std::uint32_t nextGroupId_ = 1;
 		std::vector<Reach> reach_;  // (46s)
 		std::vector<std::pair<const RE::BSLight*, std::uint16_t>> decisions_;  // (46x) sorted by pointer
 		std::uint64_t emitterSlots_ = 0;                                        // (46x)

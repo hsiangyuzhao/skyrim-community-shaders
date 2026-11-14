@@ -200,6 +200,10 @@ namespace Util::FrameTrace
 		int earlyNormal = -1;
 		int relWindCulled = -1, relWindLate = -1, relNpcCulled = -1, relFallback = -1;
 		int spatialChunks = -1;
+		// (47w) Adaptive skip (-1 = off): engine shadow maps left out this frame, kept because RT does not fully cover their light, and the
+		// largest uncovered share (percent of the pixels such a light lights) in the newest read-back.
+		int smNativeSkipped = -1, smNativeRestored = -1;
+		float smUncoveredMaxPct = -1.0f;
 	};
 	void OnRayTracingDetail(const RayTracingDetail& a_detail);
 

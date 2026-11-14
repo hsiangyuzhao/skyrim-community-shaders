@@ -84,12 +84,17 @@ static const uint kBeamCull = RAY_FLAG_CULL_FRONT_FACING_TRIANGLES;
 static const uint kFlagRtSurface = 64u;      // (46y) probe whether the visible surface is a traced caster (PLIdx.w bit 7)
 static const uint kFlagWater = 128u;         // (47i) trace the pixel's sources from last frame's water surface too (PLWaterVis)
 static const uint kFlagSunProbe = 256u;      // (47q) with kFlagRtSurface: the sun pass's probe (SunVisibility.w) where it made one ((47r) both variants)
+// (47w) Adaptive skip: per slot of an engine shadow-map light (kSourceNative), the pixels it lights (contribution above the pixel's cut,
+// or traced there) and of those the pixels whose top K do not hold it (they get no traced shadow), into RayCounter from kCoverageWordBase.
+static const uint kFlagCoverage = 512u;
 static const uint kSunOutProbed = 64u, kSunOutRtSurfaceRaw = 128u;  // TraceShadowsCS kOutProbed / kOutRtSurfaceRaw
 static const float kStickyBonus = 1.5;
 static const uint kChurnWord = 1u;           // (46g) RayCounter words: [1] pixels whose source set changed
 static const uint kWaterRayWord = 2u;        // (47j) RayCounter word [2]: the rays traced from the water surface (also in [0])
 static const uint kBeamWordBase = 64u;       // ... from 64: per slot, sampled beam cone pixels traced / blocked
+static const uint kCoverageWordBase = 256u;  // (47w) ... from 256: per slot, lit pixels / of which not in the pixel's top K (Backend kPointCoverageBase)
 static const uint kSourceISL = 1u;
+static const uint kSourceNative = 4u;  // (47w) RayTracingPointLights::kSourceNative: holds an engine shadow-map light
 static const uint kSourceSpot = 8u;   // (46c) RayTracingPointLights::kSourceSpot
 static const uint kSourceBeam = 16u;  // (46c) RayTracingPointLights::kSourceBeam
 static const uint kSourceNoPlayer = 32u;  // (46d) RayTracingPointLights::kSourceNoPlayer: the player's own light
@@ -215,6 +220,29 @@ float SpotFactor(PLSource s, float3 P)
 	if (r >= 1.0)
 		return 0.0;
 	return saturate(1.0 - pow(max(r, 1e-6), max(asfloat(s.Info.z), 0.01)));
+}
+
+// The ranking's contribution of a source at P (normal N): attenuation x N.L x intensity x the spot's cone; 0 = it does not light P
+// (outside its rooms' box, facing away, out of range or outside the cone). (47w) Shared by the ranking and the coverage count.
+float Contribution(PLSource src, float3 P, float3 N)
+{
+	// (46x) A room-bound light (Light Limit Fix lights only the geometry of its rooms): not ranked outside its rooms' box.
+	[branch] if (src.Info.x & kSourceRoomBox)
+	{
+		const uint3 b = asuint(src.Spot.xyz);
+		const float3 lo = float3(f16tof32(b.x), f16tof32(b.x >> 16), f16tof32(b.y));
+		const float3 hi = float3(f16tof32(b.y >> 16), f16tof32(b.z), f16tof32(b.z >> 16));
+		if (any(P < lo) || any(P > hi))
+			return 0.0;
+	}
+	const float3 toLight = src.PosRadius.xyz - P;
+	const float d = length(toLight);
+	const float ndl = d > 1e-3 ? dot(N, toLight / d) : 0.0;
+	if (ndl <= 0.0)
+		return 0.0;
+	// (46c) Window beams: the sun through a window, no fall-off with distance; spots: inside their cone only.
+	const float atten = (src.Info.x & kSourceBeam) ? 1.0 : Attenuation(src, d);
+	return src.Atten.w * atten * ndl * SpotFactor(src, P);
 }
 
 // (46c) Distance along dir from origin to where the ray leaves the interior box (Rect xy, Bounds xy as z).
@@ -504,23 +532,7 @@ groupshared uint gsMask[2];
 			bits &= bits - 1u;
 			const uint i = word * 32u + bit;
 			const PLSource src = Sources[i];
-			// (46x) A room-bound light (Light Limit Fix lights only the geometry of its rooms): not ranked outside its rooms' box.
-			[branch] if (src.Info.x & kSourceRoomBox)
-			{
-				const uint3 b = asuint(src.Spot.xyz);
-				const float3 lo = float3(f16tof32(b.x), f16tof32(b.x >> 16), f16tof32(b.y));
-				const float3 hi = float3(f16tof32(b.y >> 16), f16tof32(b.z), f16tof32(b.z >> 16));
-				if (any(P < lo) || any(P > hi))
-					continue;
-			}
-			const float3 toLight = src.PosRadius.xyz - P;
-			const float d = length(toLight);
-			const float ndl = d > 1e-3 ? dot(N, toLight / d) : 0.0;
-			if (ndl <= 0.0)
-				continue;
-			// (46c) Window beams: the sun through a window, no fall-off with distance; spots: inside their cone only.
-			const float atten = (src.Info.x & kSourceBeam) ? 1.0 : Attenuation(src, d);
-			const float contribution = src.Atten.w * atten * ndl * SpotFactor(src, P);
+			const float contribution = Contribution(src, P, N);  // (47w) the same terms as before, in a function
 			if (contribution <= 0.0)
 				continue;
 			total += contribution;
@@ -643,6 +655,36 @@ groupshared uint gsMask[2];
 	if (WaveIsFirstLane() && churned > 0u) {
 		uint previousChurn;
 		RayCounter.InterlockedAdd(kChurnWord * 4u, churned, previousChurn);
+	}
+	// (47w) Adaptive skip: how much of each engine shadow-map light's lit area its traced shadow covers. The mask is the group's (the
+	// same for every lane of the wave), so the loop and the wave counts are uniform; lanes that returned above are not counted.
+	// Lit = it lights the pixel above the pixel's cut (or the pixel traced it anyway: the sticky half cut); uncovered = lit, not traced.
+	[branch] if (flags & kFlagCoverage)
+	{
+		[loop] for (uint cw = 0u; cw < 2u; ++cw)
+		{
+			uint cbits = mask[cw];
+			[loop] while (cbits != 0u)
+			{
+				const uint cbit = firstbitlow(cbits);
+				cbits &= cbits - 1u;
+				const uint ci = cw * 32u + cbit;
+				const PLSource csrc = Sources[ci];
+				if (!(csrc.Info.x & kSourceNative))
+					continue;
+				const float cc = Contribution(csrc, P, N);
+				const bool covered = any(idx == (ci + 1u).xxxx);
+				const bool lit = cc > 0.0 && (covered || cc >= threshold);
+				const uint litCount = WaveActiveCountBits(lit);
+				const uint uncoveredCount = WaveActiveCountBits(lit && !covered);
+				if (WaveIsFirstLane() && litCount > 0u) {
+					uint previousCoverage;
+					RayCounter.InterlockedAdd((kCoverageWordBase + ci * 2u) * 4u, litCount, previousCoverage);
+					if (uncoveredCount > 0u)
+						RayCounter.InterlockedAdd((kCoverageWordBase + ci * 2u + 1u) * 4u, uncoveredCount, previousCoverage);
+				}
+			}
+		}
 	}
 	count = min(count, 7u);  // (46y) 3 bits; byte 3's bit 7 is the traced-caster mark
 	[unroll] for (uint b = 0u; b < 3u; ++b)

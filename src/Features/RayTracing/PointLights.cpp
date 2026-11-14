@@ -401,6 +401,12 @@ namespace RayTracingPointLights
 			double aim[3]{};
 			bool boxed = false;
 			double boxLo[3]{}, boxHi[3]{};
+			// (47w) Identity across frames (Selector::groupMemory_), the fixed point lights join against this frame (last frame's centre,
+			// or a new group's first light), and the members' position sum (the centre is their unweighted mean).
+			std::uint32_t id = 0;
+			double anchor[3]{};
+			double sum[3]{};
+			std::uint32_t count = 0;
 		};
 
 		/// (46x) Grows a group's room box by a member's (a member without one: the group has none).
@@ -525,6 +531,8 @@ namespace RayTracingPointLights
 		tags_.clear();
 		maskEntries_.clear();
 		history_.clear();    // (46g)
+		groupMemory_.clear();  // (47w)
+		nextGroupId_ = 1;
 		reach_.clear();      // (46s)
 		decisions_.clear();  // (46x)
 		emitterSlots_ = 0;
@@ -1173,73 +1181,133 @@ namespace RayTracingPointLights
 			}
 		}
 
+		// (47w) Merge by membership. 47v keyed the hysteresis on the seed (the brightest member): flickering candles of about the same
+		// brightness swapped order, the seed changed, the hysteresis no longer applied and the groups (and their count, slots and the
+		// per-pixel selection) flipped from frame to frame. Now: pass 1 keeps every light in last frame's group (by identity) while it
+		// is within 1.5 x the merge distance of that group's last centre, whichever member is brightest; pass 2 places the rest
+		// (brightest first, as before) into a group whose anchor (last centre, or a new group's first light) is within the merge
+		// distance, else a new group. The centre is the members' unweighted mean, so flicker no longer moves it.
 		const double keepMergeSq = mergeSq * 2.25;  // (46s) merge hysteresis: 1.5 x the merge distance
+		const auto newGroup = [&](std::uint32_t a_index, std::uint32_t a_id, const double (&a_anchor)[3]) {
+			const auto& c = candidates[a_index];
+			Group group;
+			std::copy_n(c.pos, 3, group.pos);
+			group.weight = std::max(c.intensity, 1e-4f);
+			group.radius = c.read.radius;
+			group.intensity = c.intensity;
+			group.score = c.score;
+			group.strongest = &c;
+			group.native = c.native;
+			group.spot = c.spot;
+			group.kind = c.kind;
+			group.owner = c.owner;
+			group.direct = c.direct;  // (46x)
+			group.aimed = c.aimed;
+			std::copy_n(c.aim, 3, group.aim);
+			group.boxed = c.boxed;
+			std::copy_n(c.boxLo, 3, group.boxLo);
+			std::copy_n(c.boxHi, 3, group.boxHi);
+			group.id = a_id != 0 ? a_id : nextGroupId_++;
+			if (nextGroupId_ == 0)
+				nextGroupId_ = 1;  // 0 means "none"
+			std::copy_n(a_anchor, 3, group.anchor);
+			std::copy_n(c.pos, 3, group.sum);
+			group.count = 1;
+			groups.push_back(group);
+			memberGroup[a_index] = static_cast<std::uint32_t>(groups.size() - 1);
+		};
+		const auto joinGroup = [&](std::uint32_t a_index, std::uint32_t a_group) {
+			const auto& c = candidates[a_index];
+			auto& group = groups[a_group];
+			group.weight += std::max(c.intensity, 1e-4f);
+			for (int k = 0; k < 3; ++k)
+				group.sum[k] += c.pos[k];
+			++group.count;
+			group.radius = std::max(group.radius, c.read.radius);
+			group.intensity += c.intensity;
+			group.score += c.score;
+			group.native = group.native || c.native;
+			JoinBox(group, c);  // (46x)
+			memberGroup[a_index] = a_group;
+			++stats_.merged;
+		};
+		// Pass 1: last frame's groups, by identity.
 		for (std::uint32_t i = 0; i < candidates.size(); ++i) {
 			const auto& c = candidates[i];
 			if (c.anchor != UINT32_MAX)
 				continue;  // (46s) snapped: after the groups exist
+			const auto* h = static_cast<const History*>(c.hist);
+			if (!h || h->groupId == 0 || a_frame - h->groupFrame > 2u)
+				continue;
+			const auto mem = groupMemory_.find(h->groupId);
+			if (mem == groupMemory_.end() || a_frame - mem->second.frame > 2u || mem->second.kind != c.kind || mem->second.owner != c.owner)
+				continue;
+			const double d = DistSq(mem->second.centre, c.pos);
+			if (d > keepMergeSq)
+				continue;
 			std::uint32_t found = UINT32_MAX;
-			// (46s) Merge hysteresis: last frame's group (the same seed light) while within 1.5 x the merge distance.
-			if (!c.spot && !c.direct) {
-				const auto* h = static_cast<const History*>(c.hist);
-				if (h && h->seed && a_frame - h->seedFrame <= 2u) {
-					for (std::uint32_t g = 0; g < groups.size(); ++g) {
-						const auto& group = groups[g];
-						if (!group.strongest || group.strongest->light != h->seed)
-							continue;
-						if (!group.spot && !group.direct && group.kind == c.kind && group.owner == c.owner && DistSq(group.pos, c.pos) <= keepMergeSq) {
-							found = g;
-							stats_.mergeKept += DistSq(group.pos, c.pos) > mergeSq ? 1 : 0;
-						}
-						break;
-					}
-				}
-			}
-			// (46c) Spot lights keep a source of their own (their cone and direction are theirs). (46x) Direct fills too (their aim).
-			for (std::uint32_t g = 0; g < groups.size() && !c.spot && !c.direct && found == UINT32_MAX; ++g) {
-				const auto& group = groups[g];
-				if (group.spot || group.direct || group.kind != c.kind || group.owner != c.owner)
-					continue;
-				const double ex = group.pos[0] - c.pos[0], ey = group.pos[1] - c.pos[1], ez = group.pos[2] - c.pos[2];
-				if (ex * ex + ey * ey + ez * ez <= mergeSq) {
+			for (std::uint32_t g = 0; g < groups.size(); ++g) {
+				if (groups[g].id == h->groupId) {
 					found = g;
 					break;
 				}
 			}
 			if (found == UINT32_MAX) {
-				Group group;
-				std::copy_n(c.pos, 3, group.pos);
-				group.weight = std::max(c.intensity, 1e-4f);
-				group.radius = c.read.radius;
-				group.intensity = c.intensity;
-				group.score = c.score;
-				group.strongest = &c;
-				group.native = c.native;
-				group.spot = c.spot;
-				group.kind = c.kind;
-				group.owner = c.owner;
-				group.direct = c.direct;  // (46x)
-				group.aimed = c.aimed;
-				std::copy_n(c.aim, 3, group.aim);
-				group.boxed = c.boxed;
-				std::copy_n(c.boxLo, 3, group.boxLo);
-				std::copy_n(c.boxHi, 3, group.boxHi);
-				groups.push_back(group);
-				memberGroup[i] = static_cast<std::uint32_t>(groups.size() - 1);
+				newGroup(i, h->groupId, mem->second.centre);
 			} else {
-				auto& group = groups[found];
-				const double w = std::max(c.intensity, 1e-4f);
-				for (int k = 0; k < 3; ++k)
-					group.pos[k] = (group.pos[k] * group.weight + c.pos[k] * w) / (group.weight + w);
-				group.weight += w;
-				group.radius = std::max(group.radius, c.read.radius);
-				group.intensity += c.intensity;
-				group.score += c.score;
-				group.native = group.native || c.native;
-				JoinBox(group, c);  // (46x)
-				memberGroup[i] = found;
-				++stats_.merged;
+				// (46c) Spot lights keep a source of their own (their cone and direction are theirs). (46x) Direct fills too (their aim).
+				// (A spot or direct fill was alone in its group: a second light under the same identity cannot happen; defensive.)
+				if (c.spot || c.direct || groups[found].spot || groups[found].direct)
+					continue;
+				joinGroup(i, found);
 			}
+			stats_.mergeKept += d > mergeSq ? 1 : 0;
+		}
+		// Pass 2: the rest, brightest first.
+		for (std::uint32_t i = 0; i < candidates.size(); ++i) {
+			const auto& c = candidates[i];
+			if (c.anchor != UINT32_MAX || memberGroup[i] != UINT32_MAX)
+				continue;
+			std::uint32_t found = UINT32_MAX;
+			for (std::uint32_t g = 0; g < groups.size() && !c.spot && !c.direct; ++g) {
+				const auto& group = groups[g];
+				if (group.spot || group.direct || group.kind != c.kind || group.owner != c.owner)
+					continue;
+				if (DistSq(group.anchor, c.pos) <= mergeSq) {
+					found = g;
+					break;
+				}
+			}
+			if (found == UINT32_MAX)
+				newGroup(i, 0, c.pos);
+			else
+				joinGroup(i, found);
+		}
+		// The centres (unweighted means) and the representative light: last frame's while it is still a member and within 80 % of the
+		// brightest member's (smoothed) intensity, else the brightest. It gives the GPU source its fade / size terms and the label.
+		for (auto& group : groups) {
+			if (group.count > 1) {
+				for (int k = 0; k < 3; ++k)
+					group.pos[k] = group.sum[k] / static_cast<double>(group.count);
+			}
+		}
+		for (std::uint32_t i = 0; i < candidates.size(); ++i) {
+			const std::uint32_t g = memberGroup[i];
+			if (g == UINT32_MAX || candidates[i].anchor != UINT32_MAX)
+				continue;
+			auto& group = groups[g];
+			if (group.strongest && candidates[i].intensity > group.strongest->intensity)
+				group.strongest = &candidates[i];
+		}
+		for (std::uint32_t i = 0; i < candidates.size(); ++i) {
+			const std::uint32_t g = memberGroup[i];
+			if (g == UINT32_MAX || candidates[i].anchor != UINT32_MAX)
+				continue;
+			auto& group = groups[g];
+			const auto mem = groupMemory_.find(group.id);
+			if (mem != groupMemory_.end() && mem->second.representative == candidates[i].light && group.strongest &&
+				candidates[i].intensity >= group.strongest->intensity * 0.8f)
+				group.strongest = &candidates[i];
 		}
 		// (46s) Snapped lights join their fixture's group: their intensity counts, the centre stays the fixture's.
 		for (std::uint32_t i = 0; i < candidates.size(); ++i) {
@@ -1277,12 +1345,11 @@ namespace RayTracingPointLights
 			const auto& c = candidates[i];
 			if (c.meshless && c.anchor == UINT32_MAX)
 				++stats_.meshlessOwn;
-			// (46s) Merge hysteresis: the seed of the group each light joined (none for seeds and snapped lights).
+			// (46s) Merge hysteresis; (47w) the identity of the group each light is in (seeds too; none for snapped lights).
 			if (auto* h = static_cast<History*>(c.hist)) {
 				const std::uint32_t g = memberGroup[i];
-				const bool joined = g != UINT32_MAX && c.anchor == UINT32_MAX && groups[g].strongest && groups[g].strongest != &c;
-				h->seed = joined ? groups[g].strongest->light : nullptr;
-				h->seedFrame = a_frame;
+				h->groupId = (g != UINT32_MAX && c.anchor == UINT32_MAX) ? groups[g].id : 0u;
+				h->groupFrame = a_frame;
 			}
 		}
 
@@ -1305,8 +1372,25 @@ namespace RayTracingPointLights
 		// source moved since last frame goes to the denoiser (SlotMotion): a moving light drops its history in proportion.
 		std::array<bool, kMaxSources> taken{};
 		motion_.fill(255);
+		// (47w) First a group's own slot from last frame (same identity: a member stayed), so membership changes do not move it to a
+		// new slot (the denoiser's history goes with the slot); the motion of its centre goes to the denoiser as below.
 		for (const std::uint32_t g : order) {
 			auto& group = groups[g];
+			const auto mem = groupMemory_.find(group.id);
+			if (mem == groupMemory_.end() || a_frame - mem->second.frame > 2u)
+				continue;
+			const std::uint32_t s = mem->second.slot;
+			if (s >= kMaxSources || !slots_[s].live || taken[s] || slots_[s].kind != group.kind)
+				continue;
+			group.slot = s;
+			taken[s] = true;
+			const double moved = std::sqrt(DistSq(slots_[s].pos, group.pos));
+			motion_[s] = static_cast<std::uint8_t>(std::clamp(moved / kMotionFullUnits * 255.0, 0.0, 255.0));
+		}
+		for (const std::uint32_t g : order) {
+			auto& group = groups[g];
+			if (group.slot != UINT32_MAX)
+				continue;  // (47w) kept its own slot
 			double best = mergeSq;
 			std::uint32_t bestSlot = UINT32_MAX;
 			for (std::uint32_t s = 0; s < kMaxSources; ++s) {
@@ -1356,6 +1440,18 @@ namespace RayTracingPointLights
 			taken[pick] = true;
 			++stats_.slotChanges;
 		}
+
+		// (47w) This frame's groups for the next frame's merge and slots (capped ones too: no slot); groups not seen for a few frames go.
+		for (const auto& group : groups) {
+			auto& mem = groupMemory_[group.id];
+			std::copy_n(group.pos, 3, mem.centre);
+			mem.representative = group.strongest ? group.strongest->light : nullptr;
+			mem.slot = group.slot;
+			mem.frame = a_frame;
+			mem.owner = group.owner;
+			mem.kind = group.kind;
+		}
+		std::erase_if(groupMemory_, [&](const auto& a_entry) { return a_frame - a_entry.second.frame > 2u; });
 
 		// GPU records and tags.
 		slotBeams_.fill(nullptr);  // (46g)

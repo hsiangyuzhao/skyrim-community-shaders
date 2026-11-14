@@ -788,6 +788,9 @@ namespace RayTracingRT
 			a_list->ResolveQueryData(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase, 2, timestampReadback_.Get(), sizeof(std::uint64_t) * queryBase);
 		a_context.pointPending = true;
 		a_context.pointFrame = ++pointFrame_;
+		// (47w) Adaptive skip: which light each counted slot held in this submission (read back with its counters).
+		a_context.coverage = pl.coverage;
+		a_context.coverageCount = std::min(pl.coverageCount, kPointCoverageLights);
 	}
 
 	// ---------------------------------------------------------------------------------------------
@@ -1714,6 +1717,21 @@ namespace RayTracingRT
 					stats_.beamBlocked[slot] = static_cast<std::uint32_t>(words[w + 1] - pointCounterWords_[w + 1]) / frames;
 				}
 				++stats_.beamSamples;
+				// (47w) Adaptive skip: the counted lights' lit / uncovered pixels per frame. Several frames in one read-back (contexts
+				// collected together) are averaged under this submission's slot assignment (slots stay with their light while it lives).
+				stats_.coverageCount = 0;
+				for (std::uint32_t c = 0; c < context.coverageCount && c < kPointCoverageLights; ++c) {
+					const auto& key = context.coverage[c];
+					if (!key.light || key.slot >= kPointBeamSlots)
+						continue;
+					const std::uint32_t w = kPointCoverageBase + key.slot * 2;
+					auto& out = stats_.coverage[stats_.coverageCount++];
+					out.light = key.light;
+					out.lit = static_cast<std::uint32_t>(words[w] - pointCounterWords_[w]) / frames;
+					out.uncovered = static_cast<std::uint32_t>(words[w + 1] - pointCounterWords_[w + 1]) / frames;
+				}
+				if (context.coverageCount > 0)
+					++stats_.coverageSamples;
 			}
 			if (!pointCounterValid_ || context.pointFrame > pointCounterLastFrame_) {
 				pointCounterLast_ = value;

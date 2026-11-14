@@ -145,6 +145,8 @@ public:
 		int PointLightsPerPixelInterior = 4;    // K indoors: 1, 2 or 4
 		bool PointLightsWindowBeams = true;     // Window Shadows Ultimate's window beams traced (their shadow mask channel written)
 		bool PointLightsSkipShadowMaps = true;  // the engine does not draw shadow maps for lights fully handled by RT (interiors); (47m) default on
+		// (47w) Adaptive: a light's shadow map is skipped only while its traced shadow covers (nearly) every pixel it lights; off = 47v.
+		bool PointLightsAdaptiveSkip = true;
 		// (46d)
 		bool PointLightsPlayer = true;          // the player's own lights (torch in hand, Quick Light, light spells) cast RT shadows (not of the player)
 		bool PointLightsEffects = true;         // spell / effect lights without an owner (Magelight, projectiles) cast RT shadows
@@ -980,6 +982,25 @@ private:
 	std::uint32_t skippedLastFrame = 0;
 	std::uint64_t skippedTotal = 0;
 	std::uint64_t skipFallbackFrames = 0;           // frames whose skipped maps got only the fallback (no trace)
+	// (47w) Adaptive skip (PointLightsAdaptiveSkip): per engine shadow-map light, how much of the area it lights its traced shadow covers
+	// (TracePointLightsCS counts it, read back a couple of frames late). Its shadow map is skipped only while skipAllowed: set after a
+	// run of good frames, cleared at once by one bad frame, and treated as not allowed when the counts are stale (unsure = draw it).
+	struct CoverageState
+	{
+		bool skipAllowed = false;
+		bool everRestored = false;   // a bad frame was seen: the long run (kCoverageRestoreFrames) is needed to skip again
+		std::uint32_t goodFrames = 0;
+		std::uint32_t lastSampleFrame = 0;  // globals::state->frameCount of the last read-back holding it
+		float share = 0.0f;                 // last uncovered share of its lit pixels
+	};
+	std::unordered_map<const RE::BSLight*, CoverageState> coverageStates;
+	std::uint64_t coverageSamplesSeen = 0;
+	std::uint32_t restoredThisFrame = 0;     // native lights SkipShadowMap left drawn this frame because of the coverage
+	std::uint32_t restoredLastFrame = 0;
+	float coverageShareMax = -1.0f;          // last read-back: the largest uncovered share among the counted lights (-1 = none)
+	std::uint64_t restoreEvents = 0;         // lights switched from skipped to drawn (diagnostics)
+	void UpdateCoverage();
+	void ClearCoverage();
 	bool hooksInstalled = false;
 
 	// (46f) Automatic switch-offs are a runtime state, not the saved setting: the user's choice stays on and is retried

@@ -1065,6 +1065,9 @@ namespace Util::FrameTrace
 				out << "#   frame start that this frame's rays reach after all (refit before the TLAS), rt_rel_npc_culled = NPCs not posed, rt_rel_fallback\n";
 				out << "#   = 1 when a culled NPC was reachable after all (the frame's characters redone without culling). rt_chunk_spatial = Spatial\n";
 				out << "#   Static Chunks on (1) / off (0); with it rt_chunk_overlap is the new packing's.\n";
+				out << "# (47w) rt_sm_native_skipped / rt_sm_native_restored = Adaptive skip (-1 = off): the game shadow maps left out this frame / kept\n";
+				out << "#   because ray tracing does not shadow every pixel their light lights; rt_sm_uncovered_max_pct = the largest such uncovered share\n";
+				out << "#   (percent of a light's lit pixels, newest read-back, -1 = none).\n";
 				out << "#   rt_pw_* = the work of the RT D3D12 prep submission whose GPU time is rt_prep_gpu_ms on the same row (1 = valid; early =\n";
 				out << "#   recorded at the frame start): static BLAS builds (of which alpha-tested, triangles, MB before compaction), compactions (MB\n";
 				out << "#   written), new character shapes uploaded, own-BLAS character builds / refits, merged character BLAS builds (triangles) /\n";
@@ -1170,7 +1173,8 @@ namespace Util::FrameTrace
 					   "gpu_spike_ms,jobs,"  // (47p)
 					   "rt_npc_body_only,rt_npc_refit_skipped,rt_skip_tiny_face,rt_wind_catchup,rt_chunk_cells,rt_chunks_per_cell,rt_chunk_overlap,"  // (47q)
 					   "rt_wind_frozen_unlearned,rt_wind_shared,"  // (47r)
-					   "rt_early_normal,rt_rel_wind_culled,rt_rel_wind_late,rt_rel_npc_culled,rt_rel_fallback,rt_chunk_spatial\n";  // (47u) the last ones
+					   "rt_early_normal,rt_rel_wind_culled,rt_rel_wind_late,rt_rel_npc_culled,rt_rel_fallback,rt_chunk_spatial,"  // (47u)
+					   "rt_sm_native_skipped,rt_sm_native_restored,rt_sm_uncovered_max_pct\n";  // (47w) the last ones
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
 					std::string s = std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{},{}", t.scene,
@@ -1367,6 +1371,9 @@ namespace Util::FrameTrace
 					extra.pop_back();
 					extra += std::format(",{},{},{},{},{},{}\n", r.rt.earlyNormal, r.rt.relWindCulled, r.rt.relWindLate, r.rt.relNpcCulled, r.rt.relFallback,
 						r.rt.spatialChunks);
+					// (47w) Adaptive skip, after rt_chunk_spatial (the old last column).
+					extra.pop_back();
+					extra += std::format(",{},{},{:.2f}\n", r.rt.smNativeSkipped, r.rt.smNativeRestored, r.rt.smUncoveredMaxPct);
 					if (it == a_reflex.end()) {
 						out << (r.reflexFrame == UINT32_MAX ? std::string("-1") : std::to_string(r.reflexFrame)) << ",-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" << engineColumns(r) << extra;
 						continue;

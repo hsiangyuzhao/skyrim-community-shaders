@@ -1215,9 +1215,11 @@ void ScreenSpaceGI::DrawSSGI()
 		contactDepthValid = texContactDepth[0] && texContactDepth[1];  // (47n) written every dispatch
 	} else {
 		contactDepthValid = false;
-
-		Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSGIContactAO);
 	}
+	// (47w) After the if/else: 47n moved this into the else branch, so with contact AO on the interval was never closed. GPU timer
+	// intervals do not nest, so every later timed pass of the frame lost its row (and its CsPasses scope stayed pushed) until the
+	// next frame closed it: inflated overlay numbers. End with no open interval is a no-op, so the skipped path is safe too.
+	Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSGIContactAO);
 
 	// upsample
 	if (settings.ResolutionMode != 0) {

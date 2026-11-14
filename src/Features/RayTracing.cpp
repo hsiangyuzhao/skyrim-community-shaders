@@ -54,6 +54,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	PointLightsPerPixelInterior,
 	PointLightsWindowBeams,
 	PointLightsSkipShadowMaps,
+	PointLightsAdaptiveSkip,
 	PointLightsPlayer,
 	PointLightsEffects,
 	PointLightsAlphaOutdoors,
@@ -266,6 +267,14 @@ namespace
 	constexpr std::uint32_t kPointFlagRtSurface = 64u;  // (46y) TracePointLightsCS: mark traced-caster surfaces for SSPLS
 	constexpr std::uint32_t kPointFlagWater = 128u;     // (47i) TracePointLightsCS: trace the sources from last frame's water too
 	constexpr std::uint32_t kPointFlagSunProbe = 256u;  // (47q) TracePointLightsCS: reuse the sun pass's surface probe (its alpha variant)
+	constexpr std::uint32_t kPointFlagCoverage = 512u;  // (47w) TracePointLightsCS: count the engine shadow-map lights' uncovered pixels
+	// (47w) Adaptive skip thresholds (per frame, read back). Bad: more than 1 % of its lit pixels uncovered (and at least 32 pixels, so a
+	// light lighting a handful of pixels does not flip on noise), or 4096 uncovered pixels whatever the share. Good: under 0.25 % and
+	// under 1024 pixels. Skip again after kCoverageEnterFrames good frames (first time) or kCoverageRestoreFrames (after a bad frame);
+	// the counts are stale (unsure: draw the map) kCoverageStaleFrames frames after the last read-back holding the light.
+	constexpr float kCoverageBadShare = 0.01f, kCoverageGoodShare = 0.0025f;
+	constexpr std::uint32_t kCoverageBadMinPixels = 32, kCoverageBadPixels = 4096, kCoverageGoodPixels = 1024;
+	constexpr std::uint32_t kCoverageEnterFrames = 10, kCoverageRestoreFrames = 60, kCoverageStaleFrames = 15, kCoverageForgetFrames = 600;
 	constexpr std::uint32_t kFlagProbeShare = 8192u;    // (47q) TraceShadowsCS: write the probe as the point pass makes it (Output.w 64 / 128)
 	constexpr std::uint32_t kFlagProbeShareOpaque = 16384u;  // (47r) TraceShadowsCS: ... for the non-alpha point variant (no hit / opaque hit only)
 	constexpr std::uint32_t kPointDenoiseHistory = 1u, kPointDenoiseDebug = 2u;                             // PointDenoiseCS
@@ -716,6 +725,7 @@ void RayTracing::UpdatePhase()
 		inTransition = true;
 		fade = 0.0f;
 		pointSelector.ForgetHistory();  // (46s) per-light positions / groups of the place left behind
+		ClearCoverage();                // (47w) the adaptive skip states belong to it too
 		scene.SetHold(true);
 		for (auto& entry : transitionLog)
 			entry = {};
@@ -1654,6 +1664,17 @@ bool RayTracing::SkipShadowMap(RE::BSShadowLight* a_light)
 		return false;
 	if (!std::binary_search(skipCandidates.begin(), skipCandidates.end(), static_cast<const RE::BSLight*>(a_light)))
 		return false;
+	// (47w) Adaptive: only a light whose traced shadow covered (nearly) all it lights, by recent counts; else (or unsure) the map is drawn
+	// and PointMaskCS keeps the engine's value wherever the pixel did not trace the light.
+	if (settings.PointLightsAdaptiveSkip) {
+		const auto it = coverageStates.find(static_cast<const RE::BSLight*>(a_light));
+		const bool allowed = it != coverageStates.end() && it->second.skipAllowed &&
+		                     globals::state->frameCount - it->second.lastSampleFrame <= kCoverageStaleFrames;
+		if (!allowed) {
+			++restoredThisFrame;
+			return false;
+		}
+	}
 	const std::uint32_t channel = ReadShadowChannel(a_light);
 	if (channel > 3)
 		return false;
@@ -1669,6 +1690,56 @@ bool RayTracing::SkipShadowMap(RE::BSShadowLight* a_light)
 	skippedLights.insert(std::upper_bound(skippedLights.begin(), skippedLights.end(), static_cast<const RE::BSLight*>(a_light)), a_light);
 	++skippedTotal;
 	return true;
+}
+
+void RayTracing::UpdateCoverage()
+{
+	// (47w) Adaptive skip: fold in the newest read-back of the trace's per-light coverage counts (render thread, LatchFrame).
+	const auto& stats = backend.GetStats();
+	const std::uint32_t frame = globals::state->frameCount;
+	if (stats.coverageSamples != coverageSamplesSeen) {
+		coverageSamplesSeen = stats.coverageSamples;
+		coverageShareMax = -1.0f;
+		for (std::uint32_t i = 0; i < stats.coverageCount && i < stats.coverage.size(); ++i) {
+			const auto& c = stats.coverage[i];
+			auto& state = coverageStates[static_cast<const RE::BSLight*>(c.light)];
+			// Frames since the last read-back holding this light (several frames can arrive in one read-back): the good run counts frames.
+			const std::uint32_t frames = state.lastSampleFrame != 0 ? std::clamp<std::uint32_t>(frame - state.lastSampleFrame, 1u, 8u) : 1u;
+			state.lastSampleFrame = frame;
+			state.share = c.lit > 0 ? static_cast<float>(c.uncovered) / static_cast<float>(c.lit) : 0.0f;
+			coverageShareMax = std::max(coverageShareMax, state.share);
+			const bool bad = (state.share > kCoverageBadShare && c.uncovered >= kCoverageBadMinPixels) || c.uncovered >= kCoverageBadPixels;
+			const bool good = state.share < kCoverageGoodShare && c.uncovered < kCoverageGoodPixels;
+			if (bad) {
+				if (state.skipAllowed)
+					++restoreEvents;
+				state.skipAllowed = false;
+				state.everRestored = true;
+				state.goodFrames = 0;
+			} else if (good) {
+				state.goodFrames += frames;
+				if (!state.skipAllowed && state.goodFrames >= (state.everRestored ? kCoverageRestoreFrames : kCoverageEnterFrames))
+					state.skipAllowed = true;
+			} else {
+				state.goodFrames = 0;  // between the two thresholds: the current state holds, the good run starts over
+			}
+		}
+	}
+	// Lights not counted for a long time (gone, another cell): forgotten.
+	if ((frame & 63u) == 0u) {
+		for (auto it = coverageStates.begin(); it != coverageStates.end();) {
+			if (frame - it->second.lastSampleFrame > kCoverageForgetFrames)
+				it = coverageStates.erase(it);
+			else
+				++it;
+		}
+	}
+}
+
+void RayTracing::ClearCoverage()
+{
+	coverageStates.clear();
+	coverageShareMax = -1.0f;
 }
 
 void RayTracing::SetupResources()
@@ -1788,6 +1859,7 @@ void RayTracing::Disable(Status a_status, std::string a_reason)
 	interiorTracedLastFrame = false;
 	skipLatched = false;
 	skipCandidates.clear(); skipEntries.clear();
+	ClearCoverage();  // (47w)
 	aoThisFrame = false;  // (46f) SSGI's own AO from the next frame on
 	aoHistoryValid = false;
 	aoDetailHistoryValid = false;  // (46t)
@@ -2245,7 +2317,9 @@ void RayTracing::LatchFrame()
 	// after the trace (or with the fallback, should it not run after all).
 	skippedMaps.clear();
 	skippedLights.clear();
-	skipLatched = RtWanted() && PointLightsOn() && InteriorsOn() &&
+	restoredThisFrame = 0;  // (47w)
+	UpdateCoverage();       // (47w) the newest read-back's coverage counts decide which maps may be skipped this frame
+	skipLatched =RtWanted() && PointLightsOn() && InteriorsOn() &&
 	              settings.PointLightsSkipShadowMaps && hooksInstalled && status == Status::Active && phase == Phase::Play && !loadingOpen.load() &&
 	              interiorTracedLastFrame && Util::IsInterior() && backend.HasFreeContext() && scene.HasCoverage() && !skipCandidates.empty();
 	auto* sky = globals::game::sky;
@@ -2380,6 +2454,7 @@ void RayTracing::Prepass()
 	pointMaskDone = false;
 	maskChannelsWritten = 0;
 	skippedLastFrame = static_cast<std::uint32_t>(skippedMaps.size());
+	restoredLastFrame = restoredThisFrame;  // (47w)
 	// (46f) RTAO: nothing for the AO consumers until this frame's trace carries it.
 	aoThisFrame = false;
 	aoInteriorThisFrame = false;  // (46h)
@@ -2906,6 +2981,11 @@ void RayTracing::PublishCpuSplit()
 		detail.plBeams = pointThisFrame ? ps.beams : 0;
 		detail.plCarried = pointThisFrame ? ps.carried : 0;  // (46e)
 		detail.smSkipped = static_cast<std::uint32_t>(skippedMaps.size());
+		if (settings.PointLightsSkipShadowMaps && settings.PointLightsAdaptiveSkip && InteriorsOn() && PointLightsOn() && Util::IsInterior()) {  // (47w)
+			detail.smNativeSkipped = static_cast<int>(skippedMaps.size());
+			detail.smNativeRestored = static_cast<int>(restoredThisFrame);
+			detail.smUncoveredMaxPct = coverageShareMax >= 0.0f ? coverageShareMax * 100.0f : -1.0f;
+		}
 		detail.maskChannels = maskChannelsWritten;
 		detail.interiorShapes = scene.GetStats().interior ? scene.GetStats().interiorShapes : 0;
 		// (46f) RTAO (-1 = not run this frame).
@@ -4661,6 +4741,20 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 		backend.ReleasePointWaterTextures();
 		waterDistValid = false;
 	}
+	// (47w) Adaptive skip: indoors with Skip the Game's Shadow Maps, the trace counts per engine shadow-map light (this frame's mask
+	// entries: skipped or drawn) the pixels it lights that did not get it in their top K. The ranking itself is untouched.
+	pointInput.coverageCount = 0;
+	if (a_interior && settings.PointLightsSkipShadowMaps && settings.PointLightsAdaptiveSkip) {
+		for (const auto& e : pointSelector.MaskEntries()) {
+			if (pointInput.coverageCount >= RayTracingRT::kPointCoverageLights)
+				break;
+			if (!e.light || e.source == 0 || e.source > RayTracingPointLights::kMaxSources)
+				continue;
+			pointInput.coverage[pointInput.coverageCount++] = { e.light, e.source - 1 };
+		}
+		if (pointInput.coverageCount > 0)
+			flags |= kPointFlagCoverage;
+	}
 	c.params[0] = static_cast<float>(scan);
 	c.params[1] = static_cast<float>(frameIndex % 1024);
 	std::memcpy(&c.params[2], &flags, sizeof(float));
@@ -5619,6 +5713,7 @@ void RayTracing::SwitchOffInteriors(std::string a_reason)
 	pointHistoryValid = false;
 	interiorTracedLastFrame = false;
 	skipCandidates.clear(); skipEntries.clear();
+	ClearCoverage();  // (47w)
 	UnbindPointLights();
 	if (status == Status::Active && Util::IsInterior()) {
 		status = Status::Inactive;
@@ -6655,6 +6750,19 @@ void RayTracing::DrawPointLightPage()
 				ImGui::Text("  spot lights); the Diagnostics line \"with the fallback only\" counts such frames.");
 				ImGui::Text("Off: the game keeps drawing those shadow maps too (wasted work).");
 			}
+			// (47w)
+			ImGui::BeginDisabled(!settings.PointLightsSkipShadowMaps);
+			ImGui::Indent();
+			ImGui::Checkbox("Adaptive: keep maps for lights RT can't fully cover", &settings.PointLightsAdaptiveSkip);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): a light's own shadow map is left out only while ray tracing gives it a shadow on (nearly) every pixel");
+				ImGui::Text("  it lights. Where a pixel traces other, stronger lights instead (each pixel traces only its brightest few), the");
+				ImGui::Text("  game's shadow map of that light is kept and used there, so no light ever ends up with no shadow at all.");
+				ImGui::Text("  Lights switch back to skipped only after about a second of full coverage (no flipping back and forth).");
+				ImGui::Text("Off: as 47v (every RT-shadowed light skipped; where a pixel did not trace it, that light shines unshadowed).");
+			}
+			ImGui::Unindent();
+			ImGui::EndDisabled();
 			ImGui::EndDisabled();
 			ImGui::EndDisabled();
 			ImGui::TreePop();
@@ -6683,6 +6791,13 @@ void RayTracing::DrawPointLightPage()
 					ImGui::Text("Fallback: a light whose shadow map was left out but whose ray-traced result was missing gets no shadow that frame (should stay 0).");
 					ImGui::Text("Box: %.0f x %.0f x %.0f units", sc.interiorBounds[3] - sc.interiorBounds[0], sc.interiorBounds[4] - sc.interiorBounds[1],
 						sc.interiorBounds[5] - sc.interiorBounds[2]);
+				}
+				if (settings.PointLightsSkipShadowMaps && settings.PointLightsAdaptiveSkip) {  // (47w)
+					ImGui::Text("  Adaptive: %u maps kept (RT does not cover those lights fully), largest uncovered share %s, %llu switches to kept so far",
+						restoredLastFrame, coverageShareMax >= 0.0f ? std::format("{:.2f} %", coverageShareMax * 100.0f).c_str() : "-",
+						static_cast<unsigned long long>(restoreEvents));
+					if (auto _tt = Util::HoverTooltipWrapper())
+						ImGui::Text("Uncovered share: of the pixels a game shadow light lights, those whose few traced lights do not include it.");
 				}
 			}
 			if (PointLightsOn() && settings.Enabled) {
@@ -7505,7 +7620,9 @@ nlohmann::json RayTracing::DescribeJson() const
 			{ "captured", sc.interior }, { "shapes", sc.interiorShapes }, { "triangles", sc.interiorTriangles }, { "capture_cpu_ms", sc.interiorGatherMs },
 			{ "window_masks", sc.windowMasks }, { "ready_ms", interiorReadyMs }, { "beams", ps.beams }, { "spots", ps.spots }, { "spots_invalid", ps.spotsInvalid },
 			{ "mask_channels", maskChannelsWritten }, { "shadow_maps_skipped", skippedLastFrame }, { "shadow_maps_skipped_total", skippedTotal },
-			{ "fallback_frames", skipFallbackFrames }, { "off_reason", interiorOffReason } };
+			{ "fallback_frames", skipFallbackFrames }, { "off_reason", interiorOffReason },
+			{ "adaptive_skip", settings.PointLightsAdaptiveSkip }, { "adaptive_maps_kept", restoredLastFrame }, { "adaptive_uncovered_share_max", coverageShareMax },
+			{ "adaptive_switches_to_kept", restoreEvents } };  // (47w)
 	}
 	// (46f)
 	j["rtao"] = { { "enabled", settings.AO }, { "mode", settings.AOMode }, { "ray_length", settings.AORayLength }, { "strength", settings.AOStrength },
