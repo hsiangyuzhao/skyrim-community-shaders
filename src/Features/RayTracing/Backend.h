@@ -290,6 +290,24 @@ namespace RayTracingRT
 		bool alpha = false;  // alpha-tested instances tested against their cut-out (else culled)
 	};
 
+	/// (48a) RT reflections step 1 (trace only): TraceReflectCS's root constants.
+	struct ReflectTraceConstants
+	{
+		float invViewProj[16];
+		float renderSize[4];  // w, h, 1/w, 1/h
+		float params[4];      // frame, flags (bit pattern), max ray length (units), unused
+		float bias[4];        // constant ray offset, per unit of distance, character ray TMin, unused
+		float spheres[8];     // character bounds, as TraceConstants::spheres
+	};
+	static_assert(sizeof(ReflectTraceConstants) == 36 * 4);
+	/// (48a) This frame's reflection rays (FrameInput::reflect; null = none): recorded into the RTAO list behind the AO dispatch (no
+	/// fence or wait of their own: the game's queue takes them with the RTAO wait).
+	struct ReflectInput
+	{
+		ReflectTraceConstants constants{};
+		bool alpha = false;  // alpha-tested instances tested against their cut-out (else culled), as RTAO
+	};
+
 	/// (47w) Adaptive skip: an engine shadow-map light and its source slot this frame (PointLightInput::coverage).
 	inline constexpr std::uint32_t kPointCoverageLights = 8;
 	struct PointCoverageKey
@@ -337,10 +355,11 @@ namespace RayTracingRT
 		kCategoryTree,     // opaque parts of trees and plants
 		kCategoryAlpha,    // (45h) alpha-tested shapes traced with their cut-out (leaves, banners, fences)
 		kCategoryCharacter,  // (45i) skinned character shapes
+		kCategoryTerrain,    // (48a) landscape quadrants of a cell, for RT reflections only (instance mask kTerrainMask)
 		kInstanceCategories
 	};
 	inline constexpr const char* kInstanceCategoryNames[kInstanceCategories] = { "cell chunk", "door/activator/movable", "item", "tree/plant",
-		"alpha-tested", "character" };
+		"alpha-tested", "character", "terrain" };
 
 	struct Instance
 	{
@@ -368,6 +387,10 @@ namespace RayTracingRT
 	};
 	/// (47n) InstanceContributionToHitGroupIndex of a moving scene instance (character instances carry their small owner keys).
 	inline constexpr std::uint32_t kMovingInstanceKey = 0x800000u;
+	/// (48a) RT reflections: InstanceContributionToHitGroupIndex of a terrain instance, and of a (not moving) object instance while
+	/// reflections run (FrameInput::reflectTags): TraceReflectCS tells the hit types apart by them.
+	inline constexpr std::uint32_t kTerrainInstanceKey = 0x400000u;
+	inline constexpr std::uint32_t kObjectInstanceKey = 0x200000u;
 
 	struct FrameInput
 	{
@@ -398,6 +421,10 @@ namespace RayTracingRT
 		// issued. Returns true when it wrote something the RTAO list reads: that list then waits for a second D3D11 signal (the
 		// after-ready fence). Empty = nothing (the 47t order).
 		std::function<bool()> afterReady;
+		// (48a) RT reflections step 1: their rays in the RTAO list (needs `ao`; null = none), and the instance tags they read (object key,
+		// terrain mask; false = every instance descriptor exactly as before).
+		const ReflectInput* reflect = nullptr;
+		bool reflectTags = false;
 	};
 
 	/// (45k) Where the CPU time of the last ExecuteFrame went, call by call (ms). The sum of these
@@ -497,6 +524,11 @@ namespace RayTracingRT
 		std::int64_t aoRaysPerFrame = -1;
 		bool aoTracedLastFrame = false;
 		bool aoAlphaLastFrame = false;
+		// (48a) RT reflections step 1: GPU ms of their dispatch (in the RTAO list, its own timestamps), pixels traced per frame (read back late;
+		// -1 = not known), traced last frame.
+		float lastReflectGpuMs = -1.0f;
+		std::int64_t reflectPixelsPerFrame = -1;
+		bool reflectTracedLastFrame = false;
 		// (46m) Split Trace Sync: the last ExecuteFrame signalled the sun fence between the sun and the point lights.
 		bool sunSplitLastFrame = false;
 		// (46p) What the submission behind lastPrepGpuMs recorded (set with it).
@@ -611,6 +643,9 @@ namespace RayTracingRT
 			std::copy_n(blas_[a_handle].boundsMax, 3, o_max);
 			return true;
 		}
+
+		/// (48a) Bytes of a built BLAS (0 = unknown / not built yet).
+		[[nodiscard]] std::uint64_t BlasBytes(BlasHandle a_handle) const { return a_handle < blas_.size() ? blas_[a_handle].bytes : 0; }
 
 		/// Records and submits this frame's D3D12 work between two GPU-side fence waits.
 		/// Returns false when nothing was traced (busy ring or a failure; see LastError()).
@@ -873,6 +908,18 @@ namespace RayTracingRT
 		[[nodiscard]] const std::string& AOFault() const { return aoFault_; }
 		void ClearAOFault() { aoFault_.clear(); }
 		[[nodiscard]] std::uint64_t AOBytes() const { return aoBytes_; }
+		/// (48a) RT reflections step 1 (trace only): TraceReflectCS (in the RTAO list), the shared R32_UINT prep texture D3D11 writes (last frame's
+		/// normal, roughness, confidence; AONormalPrepCS RT_REFLECT) and its R32_UINT output (hit type, distance; debug views only). Created on
+		/// use, released when the switch goes off.
+		[[nodiscard]] bool ReflectAvailable() const { return AOAvailable() && reflectPipeline_ && reflectFault_.empty(); }
+		bool EnsureReflectTextures(std::uint32_t a_width, std::uint32_t a_height);
+		void ReleaseReflectResources();
+		[[nodiscard]] bool ReflectReady() const { return reflectPrep_.resource12 && reflectOut_.resource12 && reflectCounter_ && reflectCounterMapped_; }
+		[[nodiscard]] ID3D11UnorderedAccessView* ReflectPrepUAV() const { return reflectPrep_.uav11.Get(); }
+		[[nodiscard]] ID3D11ShaderResourceView* ReflectOutSRV() const { return reflectOut_.srv11.Get(); }
+		[[nodiscard]] std::uint64_t ReflectBytes() const { return reflectBytes_; }
+		[[nodiscard]] const std::string& ReflectFault() const { return reflectFault_; }
+		void ClearReflectFault() { reflectFault_.clear(); }
 		/// (47h) The RTAO trace output fell back to RGBA8 (TraceAOCS dithers its 8-bit weight then).
 		[[nodiscard]] bool AOIs8Bit() const { return aoFormat_ == kAOFormat8; }
 		/// The D3D11 queue waits (on the GPU) for the last RTAO trace (its second fence). No-op when nothing is pending.
@@ -908,6 +955,9 @@ namespace RayTracingRT
 		/// coverage view marked every static surface as a character). The scene ray's mask
 		/// (0xFF without characters, 0x01 with them) still takes every scene instance.
 		static constexpr std::uint32_t kInstanceMask = 0x01;
+		/// (48a) Terrain instances (RT reflections only): the sun, point-light and RTAO rays never include this bit (their scene masks are
+		/// 0x01, or 0xF7 where they took 0xFF), so their results are the same with or without terrain in the TLAS.
+		static constexpr std::uint32_t kTerrainMask = 0x08;
 		static constexpr D3D12_RAYTRACING_INSTANCE_FLAGS kInstanceFlags =
 			D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE | D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
 		[[nodiscard]] std::string AdapterDescription() const { return adapterDescription_; }
@@ -976,6 +1026,8 @@ namespace RayTracingRT
 			std::uint64_t aoFenceValue = 0;
 			bool aoPending = false;
 			std::uint64_t aoFrame = 0;
+			bool reflectPending = false;  // (48a)
+			std::uint64_t reflectFrame = 0;
 			// (46m) Split Trace Sync: the point lights' own list (same allocator, recorded after the sun list); the
 			// trace timestamps of this submission then end with the sun (the point lights have their own pair).
 			ComPtr<ID3D12GraphicsCommandList4> pointList;
@@ -1544,7 +1596,7 @@ namespace RayTracingRT
 		// (47n) The 47l RTAO blue noise SRV (slot 11) is gone.
 		// (47z) + last frame's PLIdx SRV (point table offset 9, t8).
 		static constexpr std::uint32_t kDynSun = 0, kDynPoint = 2, kDynAO = 6, kDynWater = 8, kDynAONormal = 10, kDynPointPrev = 11, kDynPointWide = 12, kDynPointWidePrev = 13,
-		                               kDynamicDescriptors = 14;  // (47j) + the RTAO smooth normals SRV (RTAO table offset 4); (48a) + the wide slots UAV / prev SRV (point table offsets 10, 11)
+		                               kDynReflect = 14, kDynamicDescriptors = 17;  // (47j) + the RTAO smooth normals SRV (RTAO table offset 4); (48a) + the wide slots UAV / prev SRV (point table offsets 10, 11) and the reflection table (depth SRV t1, output UAV u0, prep SRV t5)
 		static constexpr std::uint32_t kDynamicBase = kPointDescriptorBase + kPointDescriptors;  // after the (unused) 46b point slots
 		ComPtr<ID3D12DescriptorHeap> stagingHeap_;
 		[[nodiscard]] D3D12_CPU_DESCRIPTOR_HANDLE StagingCpu(std::uint32_t a_slot) const;
@@ -1585,6 +1637,26 @@ namespace RayTracingRT
 		ComPtr<ID3D11Fence> aoFence11_;
 		std::uint64_t aoFenceValue_ = 0;
 		std::uint64_t pendingAOWait_ = 0;
+		// (48a) RT reflections step 1.
+		static constexpr DXGI_FORMAT kReflectFormat = DXGI_FORMAT_R32_UINT;
+		ComPtr<ID3D12RootSignature> reflectRootSignature_;
+		ComPtr<ID3D12PipelineState> reflectPipeline_;
+		ComPtr<ID3D12PipelineState> reflectAlphaPipeline_;
+		SharedTexture reflectPrep_, reflectOut_;
+		std::uint32_t reflectWidth_ = 0, reflectHeight_ = 0;
+		ComPtr<ID3D12Resource> reflectCounter_;          // default heap, UAV: [0] pixels traced (monotonic, wraps)
+		ComPtr<ID3D12Resource> reflectCounterReadback_;  // per context one uint32 copy of it
+		const std::uint32_t* reflectCounterMapped_ = nullptr;
+		std::uint32_t reflectCounterLast_ = 0;
+		std::uint64_t reflectCounterLastFrame_ = 0;
+		bool reflectCounterValid_ = false;
+		std::uint64_t reflectFrame_ = 0;
+		std::uint64_t reflectBytes_ = 0;
+		std::string reflectFault_;
+		bool CreateReflectPipeline();
+		void WriteReflectDescriptors();
+		void RecordReflectTrace(ID3D12GraphicsCommandList4* a_list, CommandContext& a_context, std::size_t a_index, const FrameInput& a_input, bool a_alphaFrame,
+			D3D12_GPU_DESCRIPTOR_HANDLE a_table);
 		bool CreateAOPipeline();
 		void SetAOFault(std::string a_reason);
 		void WriteAODescriptors();

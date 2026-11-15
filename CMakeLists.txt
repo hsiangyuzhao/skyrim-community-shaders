@@ -329,9 +329,41 @@ add_custom_command(
     COMMENT "Compiling Ray Tracing DXIL (TraceAOCS with RT_ALPHA, cs_6_5)"
     VERBATIM
 )
+# (48a) RT reflections step 1: closest-hit reflection rays (trace only), in the RTAO list.
+set(CS_RT_REFLECT_SHADER_SOURCE
+    "${CMAKE_SOURCE_DIR}/src/Features/RayTracing/Shaders/TraceReflectCS.hlsl"
+)
+set(CS_RT_REFLECT_SHADER_HEADER
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/RayTracing/TraceReflectCS.dxil.h"
+)
+add_custom_command(
+    OUTPUT "${CS_RT_REFLECT_SHADER_HEADER}"
+    COMMAND
+        "${CS_SDK_DXC}" -nologo -T cs_6_5 -E main -O3 -WX -Qstrip_reflect -Fh
+        "${CS_RT_REFLECT_SHADER_HEADER}" -Vn g_TraceReflectCS
+        "${CS_RT_REFLECT_SHADER_SOURCE}"
+    DEPENDS "${CS_RT_REFLECT_SHADER_SOURCE}"
+    COMMENT "Compiling Ray Tracing DXIL (TraceReflectCS, cs_6_5)"
+    VERBATIM
+)
+set(CS_RT_REFLECT_ALPHA_SHADER_HEADER
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/RayTracing/TraceReflectAlphaCS.dxil.h"
+)
+add_custom_command(
+    OUTPUT "${CS_RT_REFLECT_ALPHA_SHADER_HEADER}"
+    COMMAND
+        "${CS_SDK_DXC}" -nologo -T cs_6_5 -E main -O3 -WX -Qstrip_reflect -D
+        RT_ALPHA=1 -Fh "${CS_RT_REFLECT_ALPHA_SHADER_HEADER}" -Vn
+        g_TraceReflectAlphaCS "${CS_RT_REFLECT_SHADER_SOURCE}"
+    DEPENDS "${CS_RT_REFLECT_SHADER_SOURCE}"
+    COMMENT "Compiling Ray Tracing DXIL (TraceReflectCS with RT_ALPHA, cs_6_5)"
+    VERBATIM
+)
 target_sources(
     "${PROJECT_NAME}"
     PRIVATE
+        "${CS_RT_REFLECT_SHADER_HEADER}"
+        "${CS_RT_REFLECT_ALPHA_SHADER_HEADER}"
         "${CS_RT_AO_SHADER_HEADER}"
         "${CS_RT_AO_ALPHA_SHADER_HEADER}"
         "${CS_RT_POINT_SHADER_HEADER}"

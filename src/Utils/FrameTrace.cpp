@@ -1068,6 +1068,8 @@ namespace Util::FrameTrace
 				out << "# (47w) rt_sm_native_skipped / rt_sm_native_restored = Adaptive skip (-1 = off): the game shadow maps left out this frame / kept\n";
 				out << "#   because ray tracing does not shadow every pixel their light lights; rt_sm_uncovered_max_pct = the largest such uncovered share\n";
 				out << "#   (percent of a light's lit pixels, newest read-back, -1 = none).\n";
+				out << "# (48a) rt_refl_gpu_ms = RT reflections step 1 (trace only): GPU ms of the reflection rays (in the RTAO list, D3D12 queue; -1 = not\n";
+				out << "#   traced); rt_refl_traced_pct = the share of the render pixels that traced one (last frame's reflecting surfaces; -1 = not traced).\n";
 				out << "#   rt_pw_* = the work of the RT D3D12 prep submission whose GPU time is rt_prep_gpu_ms on the same row (1 = valid; early =\n";
 				out << "#   recorded at the frame start): static BLAS builds (of which alpha-tested, triangles, MB before compaction), compactions (MB\n";
 				out << "#   written), new character shapes uploaded, own-BLAS character builds / refits, merged character BLAS builds (triangles) /\n";
@@ -1174,7 +1176,8 @@ namespace Util::FrameTrace
 					   "rt_npc_body_only,rt_npc_refit_skipped,rt_skip_tiny_face,rt_wind_catchup,rt_chunk_cells,rt_chunks_per_cell,rt_chunk_overlap,"  // (47q)
 					   "rt_wind_frozen_unlearned,rt_wind_shared,"  // (47r)
 					   "rt_early_normal,rt_rel_wind_culled,rt_rel_wind_late,rt_rel_npc_culled,rt_rel_fallback,rt_chunk_spatial,"  // (47u)
-					   "rt_sm_native_skipped,rt_sm_native_restored,rt_sm_uncovered_max_pct\n";  // (47w) the last ones
+					   "rt_sm_native_skipped,rt_sm_native_restored,rt_sm_uncovered_max_pct,"  // (47w)
+					   "rt_refl_gpu_ms,rt_refl_traced_pct\n";  // (48a) the last ones
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
 					std::string s = std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{},{}", t.scene,
@@ -1374,6 +1377,9 @@ namespace Util::FrameTrace
 					// (47w) Adaptive skip, after rt_chunk_spatial (the old last column).
 					extra.pop_back();
 					extra += std::format(",{},{},{:.2f}\n", r.rt.smNativeSkipped, r.rt.smNativeRestored, r.rt.smUncoveredMaxPct);
+					// (48a) RT reflections step 1, after rt_sm_uncovered_max_pct (the old last column).
+					extra.pop_back();
+					extra += std::format(",{:.3f},{:.1f}\n", r.rt.reflGpuMs, r.rt.reflTracedPct);
 					if (it == a_reflex.end()) {
 						out << (r.reflexFrame == UINT32_MAX ? std::string("-1") : std::to_string(r.reflexFrame)) << ",-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" << engineColumns(r) << extra;
 						continue;

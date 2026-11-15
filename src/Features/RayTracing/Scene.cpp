@@ -286,8 +286,137 @@ namespace RayTracingScene
 		times_.releasePending = static_cast<std::uint32_t>(geometryGrave_.size() + refGrave_.size());
 	}
 
+	void Scene::ReleaseTerrain(RayTracingRT::Backend& a_backend, Cell& a_cell)
+	{
+		// (48a)
+		if (a_cell.terrainBlas != RayTracingRT::kInvalidBlas)
+			a_backend.ReleaseBlas(a_cell.terrainBlas);
+		a_cell.terrainBlas = RayTracingRT::kInvalidBlas;
+		a_cell.terrainSignature = nullptr;
+		a_cell.terrainTriangles = 0;
+		a_cell.terrainTried = false;
+	}
+
+	bool Scene::ReadTerrainQuad(Cell& a_cell, int a_quad, RE::BSTriShape* a_shape, const RE::TESObjectLAND::LoadedLandData& a_land, RayTracingRT::ChunkGeometry& o_chunk)
+	{
+		// (48a) One landscape quadrant (17 x 17 vertices, 16 x 16 quads) into the cell's terrain chunk, positions relative to the cell's
+		// origin (as its static chunks). First the engine's CPU vertex copy (the 45e path, placed with the shape's world transform); without
+		// it the quadrant is rebuilt from LoadedLandData::heights (world heights; quadrant q covers x half q & 1, y half q >> 1, 128 units per
+		// vertex), accepted only where that agrees with the shape's own world bound.
+		const double originX = static_cast<double>(a_cell.x) * kCellUnits;
+		const double originY = static_cast<double>(a_cell.y) * kCellUnits;
+		static thread_local RawMesh mesh;
+		static thread_local std::vector<float> placed;
+		placed.clear();
+		bool ok = false;
+		if (a_shape) {
+			const SkipCounts savedSkips = stats_.skipped;  // this is not a capture of a caster: its skips do not count there
+			ok = ReadMesh(a_shape, true, mesh) && mesh.vertexCount == 289 &&
+			     PlaceVertices(a_shape, mesh.vertexBytes.data(), mesh.vertexCount, mesh.stride, mesh.positionOffset, mesh.fullPrecision, originX, originY, placed, false);
+			stats_.skipped = savedSkips;
+		}
+		if (ok) {
+			++stats_.terrainQuadsCpu;
+		} else {
+			placed.clear();
+			const float qx = static_cast<float>(a_quad & 1) * 2048.0f, qy = static_cast<float>(a_quad >> 1) * 2048.0f;
+			bool finite = true;
+			for (std::uint32_t i = 0; i < 289; ++i) {
+				const float z = a_land.heights[a_quad][i];
+				finite = finite && std::isfinite(z) && std::abs(z) < 1.0e6f;
+				placed.push_back(qx + static_cast<float>(i % 17) * 128.0f);
+				placed.push_back(qy + static_cast<float>(i / 17) * 128.0f);
+				placed.push_back(z);
+			}
+			bool agrees = finite;
+			if (agrees && a_shape) {
+				const auto& b = a_shape->worldBound;
+				if (std::isfinite(b.radius) && b.radius > 0.0f) {
+					const double cx = originX + qx + 1024.0, cy = originY + qy + 1024.0;
+					agrees = std::abs(cx - b.center.x) < 1024.0 && std::abs(cy - b.center.y) < 1024.0;
+				}
+			}
+			if (!agrees) {
+				++stats_.terrainQuadsFailed;
+				return false;
+			}
+			++stats_.terrainQuadsHeights;
+		}
+		const std::uint32_t base = o_chunk.Vertices();
+		o_chunk.positions.insert(o_chunk.positions.end(), placed.begin(), placed.end());
+		for (std::uint32_t y = 0; y < 16; ++y) {
+			for (std::uint32_t x = 0; x < 16; ++x) {
+				const std::uint32_t v0 = base + y * 17 + x, v1 = v0 + 1, v2 = v0 + 17, v3 = v2 + 1;
+				o_chunk.indices.insert(o_chunk.indices.end(), { v0, v1, v2, v1, v3, v2 });
+			}
+		}
+		return true;
+	}
+
+	void Scene::UpdateTerrain(RayTracingRT::Backend& a_backend, std::int64_t a_deadline)
+	{
+		// (48a) Terrain for RT reflections only. Off: every terrain BLAS goes (no capture, nothing in the TLAS). On: per captured exterior
+		// cell (nearest first is not needed: at most a few cells a frame, 2048 triangles each, through the normal BLAS build budget) one
+		// BLAS of its 4 quadrants, rebuilt when the cell's land changed (LandSignature). Never in the cell's `blas` (caster filter, chunks).
+		const std::int64_t start = Qpc();
+		stats_.terrainCells = stats_.terrainBuilt = 0;
+		stats_.terrainTriangles = 0;
+		stats_.terrainBytes = 0;
+		std::uint32_t made = 0;
+		for (auto* list : { &cells_, &retiring_ }) {
+			for (auto& cell : *list) {
+				if (!terrain_ || cell->interior) {
+					if (cell->terrainBlas != RayTracingRT::kInvalidBlas || cell->terrainTried)
+						ReleaseTerrain(a_backend, *cell);
+					continue;
+				}
+				// Retiring captures: their cell may be gone (never read); only released with the capture.
+				auto* land = (list == &cells_ && cell->cell) ? cell->cell->GetRuntimeData().cellLand : nullptr;
+				const void* signature = list == &cells_ ? LandSignature(cell->cell) : cell->terrainSignature;
+				if (list == &cells_ && (cell->terrainBlas != RayTracingRT::kInvalidBlas || cell->terrainTried) && signature != cell->terrainSignature)
+					ReleaseTerrain(a_backend, *cell);  // the land changed: rebuilt below
+				if (cell->terrainBlas == RayTracingRT::kInvalidBlas && !cell->terrainTried && list == &cells_ && made < 4 && Qpc() < a_deadline) {
+					cell->terrainTried = true;
+					cell->terrainSignature = signature;
+					if (land && land->loadedData) {
+						auto chunk = std::make_unique<RayTracingRT::ChunkGeometry>();
+						chunk->positions.reserve(4 * 289 * 3);
+						chunk->indices.reserve(4 * 16 * 16 * 6);
+						for (int q = 0; q < 4; ++q) {
+							auto* shape = land->loadedData->geom[q].get();
+							if (shape && shape->GetFlags().any(RE::NiAVObject::Flag::kHidden))
+								continue;
+							ReadTerrainQuad(*cell, q, shape, *land->loadedData, *chunk);
+						}
+						if (chunk->Triangles() > 0) {
+							cell->terrainTriangles = chunk->Triangles();
+							cell->terrainBlas = a_backend.CreateBlas(std::move(chunk));
+							if (cell->terrainBlas == RayTracingRT::kInvalidBlas)
+								cell->terrainTriangles = 0;
+						}
+					}
+					++made;
+				}
+				if (cell->terrainBlas != RayTracingRT::kInvalidBlas) {
+					++stats_.terrainCells;
+					stats_.terrainTriangles += cell->terrainTriangles;
+					if (a_backend.IsBlasBuilt(cell->terrainBlas)) {
+						++stats_.terrainBuilt;
+						stats_.terrainBytes += a_backend.BlasBytes(cell->terrainBlas);
+					}
+				}
+			}
+		}
+		stats_.terrainMs = static_cast<float>(static_cast<double>(Qpc() - start) * QpcMs());
+		if (made > 0)
+			logger::info("[RayTracing] Terrain for reflections: {} cell(s) made this frame, {} with a BLAS ({} built); quadrants so far: {} from the CPU vertex copy, "
+						 "{} rebuilt from heights, {} failed",
+				made, stats_.terrainCells, stats_.terrainBuilt, stats_.terrainQuadsCpu, stats_.terrainQuadsHeights, stats_.terrainQuadsFailed);
+	}
+
 	void Scene::Release(RayTracingRT::Backend& a_backend, Cell& a_cell)
 	{
+		ReleaseTerrain(a_backend, a_cell);  // (48a)
 		for (const auto handle : a_cell.blas)
 			a_backend.ReleaseBlas(handle);
 		a_cell.blas.clear();
@@ -2017,6 +2146,8 @@ namespace RayTracingScene
 		times_.registration = static_cast<float>(static_cast<double>(objectsStart - registrationStart) * QpcMs());
 		// 6. (45e) Objects with their own instances (doors, items, trees): validation, scan, filter.
 		UpdateObjects(a_backend, deadline, a_budgetMs > 0.0f);
+		// 6b. (48a) Terrain for RT reflections only (its own BLAS per cell; nothing else changes).
+		UpdateTerrain(a_backend, std::max(deadline, Qpc() + static_cast<std::int64_t>(0.25 / std::max(QpcMs(), 1e-9))));
 		times_.objects = static_cast<float>(static_cast<double>(Qpc() - objectsStart) * QpcMs());
 
 		// (45h) Alpha shapes held / traced now.
@@ -2086,6 +2217,13 @@ namespace RayTracingScene
 				// (45h) The cell's alpha shapes: an instance each (registered ones only).
 				for (const auto& shape : cell->alphaShapes)
 					AppendShapeInstance(shape, RayTracingRT::kCategoryAlpha, 0, a_expected, o_instances);
+				// (48a) Its terrain (RT reflections only; kCategoryTerrain: its own instance mask). Not a caster: no expected box.
+				if (terrain_ && cell->shown && cell->terrainBlas != RayTracingRT::kInvalidBlas) {
+					RayTracingRT::Instance instance{ cell->terrainBlas, x, y, 0.0 };
+					instance.category = RayTracingRT::kCategoryTerrain;
+					instance.twoSided = false;
+					o_instances.push_back(instance);
+				}
 			}
 		}
 		AppendObjectInstances(objects_, o_instances, a_expected);

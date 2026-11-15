@@ -260,6 +260,16 @@ namespace RayTracingScene
 		std::uint32_t missedPending = 0;           // re-armed: cell still capturing, BLAS building, ... (total)
 		std::uint32_t missedRecaptures = 0;        // recaptures the self-check requested (total)
 		AlphaSceneStats alpha{};                   // (45h)
+		// (48a) Terrain for RT reflections only (SetTerrain): one BLAS per captured exterior cell (its 4 quadrants), instance mask
+		// Backend::kTerrainMask (only reflection rays include it); never registered in the caster filter.
+		std::uint32_t terrainCells = 0;            // cells with a terrain BLAS (built or building)
+		std::uint32_t terrainBuilt = 0;            // ... of which built
+		std::uint64_t terrainTriangles = 0;
+		std::uint64_t terrainBytes = 0;            // the built ones' BLAS memory
+		std::uint32_t terrainQuadsCpu = 0;         // quadrants read from the engine's CPU vertex copy (total since the scene was reset)
+		std::uint32_t terrainQuadsHeights = 0;     // ... rebuilt from LoadedLandData::heights (no CPU copy)
+		std::uint32_t terrainQuadsFailed = 0;      // ... neither
+		float terrainMs = 0.0f;                    // CPU of this frame's terrain capture
 		// (46c) The captured interior cell (Ray Tracing's point lights indoors).
 		bool interior = false;                     // an interior cell is captured / being captured
 		std::uint32_t interiorShapes = 0;          // its shapes (statics, furniture, alpha-tested) captured so far
@@ -411,6 +421,10 @@ namespace RayTracingScene
 		/// (46c) Interiors: whether the player's interior cell may be captured (Ray Tracing's point lights indoors).
 		/// Off: Update drops an interior capture (and never starts one), as before 46c.
 		void SetInteriorEnabled(bool a_enabled) { interiorEnabled_ = a_enabled; }
+		/// (48a) Terrain in the RT scene for reflections only. No re-capture of anything else: on, Update builds one terrain BLAS per
+		/// captured exterior cell (a few per frame, within its CPU budget); off, every terrain BLAS is released on the next Update.
+		void SetTerrain(bool a_terrain) { terrain_ = a_terrain; }
+		[[nodiscard]] bool Terrain() const { return terrain_; }
 		[[nodiscard]] bool InteriorEnabled() const { return interiorEnabled_; }
 		/// (46c) The world box of the captured interior (min xyz, max xyz, with a margin); false when no interior is captured
 		/// or nothing of it yet.
@@ -576,6 +590,12 @@ namespace RayTracingScene
 			bool filterRegistered = false;
 			bool replaces = false;   // (45e) a re-capture of a cell whose old capture is still live
 			bool replacing = false;  // (45e) an old capture waiting for its replacement
+			// (48a) Terrain for RT reflections only (Scene::SetTerrain): its own BLAS, never in `blas` (so never registered in the caster
+			// filter, never in a chunk of the statics), its land when captured (LandSignature) and its size.
+			RayTracingRT::BlasHandle terrainBlas = RayTracingRT::kInvalidBlas;
+			const void* terrainSignature = nullptr;
+			std::uint32_t terrainTriangles = 0;
+			bool terrainTried = false;  // tried with this land (no geometry: not retried until the land changes)
 			std::uint32_t shapes = 0;
 			std::uint32_t landQuads = 0;
 			std::uint64_t triangles = 0;
@@ -727,6 +747,11 @@ namespace RayTracingScene
 		}
 		bool gatherInterior_ = false;  // (46c) the cell being captured is an interior
 		bool interiorEnabled_ = false;  // (46c)
+		bool terrain_ = false;          // (48a)
+		/// (48a) Builds / releases the cells' terrain BLASes (SetTerrain), within a_deadline (QPC).
+		void UpdateTerrain(RayTracingRT::Backend& a_backend, std::int64_t a_deadline);
+		bool ReadTerrainQuad(Cell& a_cell, int a_quad, RE::BSTriShape* a_shape, const RE::TESObjectLAND::LoadedLandData& a_land, RayTracingRT::ChunkGeometry& o_chunk);
+		void ReleaseTerrain(RayTracingRT::Backend& a_backend, Cell& a_cell);
 		/// (45h) The shape's cut-out as the ray tracer needs it: the game's diffuse texture, threshold,
 		/// material alpha and texcoord transform; false when it cannot be traced (SEH-guarded).
 		struct AlphaSource

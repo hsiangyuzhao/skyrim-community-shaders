@@ -23,6 +23,9 @@
 // (46f) RTAO (TraceAOCS) and its alpha-tested variant.
 #include "RayTracing/TraceAOAlphaCS.dxil.h"
 #include "RayTracing/TraceAOCS.dxil.h"
+// (48a) RT reflections step 1 (TraceReflectCS) and its alpha-tested variant.
+#include "RayTracing/TraceReflectAlphaCS.dxil.h"
+#include "RayTracing/TraceReflectCS.dxil.h"
 
 namespace RayTracingRT
 {
@@ -221,9 +224,9 @@ namespace RayTracingRT
 		{
 			D3D12_QUERY_HEAP_DESC heapDesc{};
 			heapDesc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-			heapDesc.Count = static_cast<UINT>(kContexts * 8);  // (45l) per context: prep begin / end, trace begin / end; (46b) + point lights begin / end after them; (46f) + RTAO
+			heapDesc.Count = static_cast<UINT>(kContexts * 10);  // (45l) per context: prep begin / end, trace begin / end; (46b) + point lights begin / end after them; (46f) + RTAO; (48a) + reflections
 			UINT64 frequency = 0;
-			timestampReadback_ = CreateBuffer(sizeof(std::uint64_t) * kContexts * 8, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false);
+			timestampReadback_ = CreateBuffer(sizeof(std::uint64_t) * kContexts * 10, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false);
 			if (FAILED(device_->CreateQueryHeap(&heapDesc, IID_PPV_ARGS(&timestampHeap_))) || !timestampReadback_ ||
 				FAILED(queue_->GetTimestampFrequency(&frequency)) || frequency == 0) {
 				timestampHeap_.Reset();
@@ -393,6 +396,13 @@ namespace RayTracingRT
 			nullUav.Format = kPointFormat;
 			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynPointWide));
 			device_->CreateShaderResourceView(nullptr, &nullSrv, StagingCpu(kDynPointWidePrev));
+			// (48a) RT reflections: depth SRV (t1), output UAV (u0), prep SRV (t5) (filled while their textures exist).
+			nullSrv.Format = kDepthMaskFormat;
+			device_->CreateShaderResourceView(nullptr, &nullSrv, StagingCpu(kDynReflect));
+			nullUav.Format = kReflectFormat;
+			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynReflect + 1));
+			nullSrv.Format = kReflectFormat;
+			device_->CreateShaderResourceView(nullptr, &nullSrv, StagingCpu(kDynReflect + 2));
 		}
 
 		// (45h) Null views in every alpha slot (the copy layers and the bindless table are filled on use).
@@ -447,6 +457,9 @@ namespace RayTracingRT
 		// (46f) RTAO: not fatal either (RTAO then stays unavailable).
 		if (!CreateAOPipeline())
 			aoPipeline_.Reset();
+		// (48a) RT reflections step 1: not fatal either (the switch then stays unavailable); rides in the RTAO list.
+		if (aoPipeline_ && !CreateReflectPipeline())
+			reflectPipeline_.Reset();
 		// (47l) Foliage sway: not fatal either (wind meshes then stay frozen).
 		if (!CreateWindPipeline())
 			windPipeline_.Reset();
@@ -1300,11 +1313,252 @@ namespace RayTracingRT
 		list->ResourceBarrier(1, &toUav);
 		if (timestampHeap_ && timestampReadback_)
 			list->ResolveQueryData(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase, 2, timestampReadback_.Get(), sizeof(std::uint64_t) * queryBase);
+		// (48a) RT reflections step 1: right behind the RTAO rays, in the same list (the same second fence and wait; nothing new).
+		stats_.reflectTracedLastFrame = false;
+		if (a_input.reflect && ReflectAvailable() && ReflectReady())
+			RecordReflectTrace(list, a_context, a_index, a_input, a_alphaFrame, Offset(a_table, kDynReflect - kDynAO, descriptorSize_));
 		if (FAILED(hr = list->Close())) {
 			Fail("RTAO command list Close", hr);
 			return false;
 		}
 		return true;
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// (48a) RT reflections step 1 (trace only)
+	// ---------------------------------------------------------------------------------------------
+
+	bool Backend::CreateReflectPipeline()
+	{
+		// Its own root signature: constants b0, TLAS t0, table (depth t1, output u0, prep t5), ray counter u1; the alpha-tested variant
+		// also: records t2, texcoords t3, table (copy layers t4, bindless game textures t0 space1), s0 (as RTAO's).
+		// 36 + 2 + 1 + 2 + 2 + 2 + 1 = 46 DWORDs.
+		D3D12_DESCRIPTOR_RANGE ranges[3]{};
+		ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+		ranges[0].NumDescriptors = 1;
+		ranges[0].BaseShaderRegister = 1;
+		ranges[0].OffsetInDescriptorsFromTableStart = 0;
+		ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+		ranges[1].NumDescriptors = 1;
+		ranges[1].BaseShaderRegister = 0;
+		ranges[1].OffsetInDescriptorsFromTableStart = 1;
+		ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+		ranges[2].NumDescriptors = 1;
+		ranges[2].BaseShaderRegister = 5;
+		ranges[2].OffsetInDescriptorsFromTableStart = 2;
+		D3D12_DESCRIPTOR_RANGE alphaRanges[2]{};
+		alphaRanges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+		alphaRanges[0].NumDescriptors = 1;
+		alphaRanges[0].BaseShaderRegister = 4;
+		alphaRanges[0].OffsetInDescriptorsFromTableStart = 0;
+		alphaRanges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+		alphaRanges[1].NumDescriptors = kAlphaTextureSlots;
+		alphaRanges[1].BaseShaderRegister = 0;
+		alphaRanges[1].RegisterSpace = 1;
+		alphaRanges[1].OffsetInDescriptorsFromTableStart = 1;
+		D3D12_ROOT_PARAMETER params[7]{};
+		params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+		params[0].Constants.ShaderRegister = 0;
+		params[0].Constants.Num32BitValues = sizeof(ReflectTraceConstants) / 4;
+		params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+		params[1].Descriptor.ShaderRegister = 0;
+		params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+		params[2].DescriptorTable.NumDescriptorRanges = 3;
+		params[2].DescriptorTable.pDescriptorRanges = ranges;
+		params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+		params[3].Descriptor.ShaderRegister = 1;
+		params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+		params[4].Descriptor.ShaderRegister = 2;
+		params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+		params[5].Descriptor.ShaderRegister = 3;
+		params[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		params[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+		params[6].DescriptorTable.NumDescriptorRanges = 2;
+		params[6].DescriptorTable.pDescriptorRanges = alphaRanges;
+		params[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		D3D12_STATIC_SAMPLER_DESC sampler{};
+		sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+		sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+		sampler.MaxLOD = D3D12_FLOAT32_MAX;
+		sampler.ShaderRegister = 0;
+		sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		D3D12_ROOT_SIGNATURE_DESC rootDesc{};
+		rootDesc.NumParameters = 7;
+		rootDesc.pParameters = params;
+		rootDesc.NumStaticSamplers = 1;
+		rootDesc.pStaticSamplers = &sampler;
+		ComPtr<ID3DBlob> blob, error;
+		HRESULT hr = D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error);
+		if (FAILED(hr) || FAILED(hr = device_->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&reflectRootSignature_)))) {
+			logger::warn("[RayTracing] Reflection root signature failed ({}); RT reflections unavailable", HrString(hr));
+			reflectRootSignature_.Reset();
+			return false;
+		}
+		D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{};
+		psoDesc.pRootSignature = reflectRootSignature_.Get();
+		psoDesc.CS.pShaderBytecode = g_TraceReflectCS;
+		psoDesc.CS.BytecodeLength = sizeof(g_TraceReflectCS);
+		if (FAILED(hr = device_->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&reflectPipeline_)))) {
+			logger::warn("[RayTracing] The reflection ray query shader was rejected by the driver ({}); RT reflections unavailable", HrString(hr));
+			reflectPipeline_.Reset();
+			reflectRootSignature_.Reset();
+			return false;
+		}
+		psoDesc.CS.pShaderBytecode = g_TraceReflectAlphaCS;
+		psoDesc.CS.BytecodeLength = sizeof(g_TraceReflectAlphaCS);
+		if (FAILED(hr = device_->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&reflectAlphaPipeline_)))) {
+			logger::warn("[RayTracing] The alpha-tested reflection ray query shader was rejected by the driver ({}); reflection rays ignore cut-outs", HrString(hr));
+			reflectAlphaPipeline_.Reset();
+		}
+		return true;
+	}
+
+	bool Backend::EnsureReflectTextures(std::uint32_t a_width, std::uint32_t a_height)
+	{
+		if (!ReflectAvailable() || !stagingHeap_ || !depthMask_.resource12)
+			return false;
+		if (a_width == reflectWidth_ && a_height == reflectHeight_ && ReflectReady())
+			return true;
+		ReleaseReflectResources();
+		if (!CreateSharedTexture(a_width, a_height, kReflectFormat, true, false, reflectPrep_, "RayTracing ReflectPrep", false) ||
+			!CreateSharedTexture(a_width, a_height, kReflectFormat, false, true, reflectOut_, "RayTracing ReflectOut", false)) {
+			reflectPrep_ = {};
+			reflectOut_ = {};
+			reflectFault_ = "could not create its shared textures (see the log)";
+			logger::warn("[RayTracing] RT reflections: {}", reflectFault_);
+			return false;
+		}
+		reflectCounter_ = CreateBuffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+		reflectCounterReadback_ = CreateBuffer(sizeof(std::uint32_t) * kContexts, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false);
+		void* mapped = nullptr;
+		if (!reflectCounter_ || !reflectCounterReadback_ || FAILED(reflectCounterReadback_->Map(0, nullptr, &mapped)) || !mapped) {
+			reflectPrep_ = {};
+			reflectOut_ = {};
+			reflectCounter_.Reset();
+			reflectCounterReadback_.Reset();
+			reflectFault_ = "could not create its ray counter";
+			logger::warn("[RayTracing] RT reflections: {}", reflectFault_);
+			return false;
+		}
+		reflectCounterMapped_ = static_cast<const std::uint32_t*>(mapped);
+		reflectCounterValid_ = false;
+		reflectWidth_ = a_width;
+		reflectHeight_ = a_height;
+		reflectBytes_ = static_cast<std::uint64_t>(a_width) * a_height * 8;
+		WriteReflectDescriptors();
+		logger::info("[RayTracing] RT reflections: textures {}x{} ({:.1f} MB)", a_width, a_height, static_cast<double>(reflectBytes_) / (1024.0 * 1024.0));
+		return true;
+	}
+
+	void Backend::ReleaseReflectResources()
+	{
+		// A submission in flight may still use them: D3D12 keeps them until it is done (Retire).
+		if (reflectPrep_.resource12)
+			Retire(reflectPrep_.resource12, 0, nullptr);
+		if (reflectOut_.resource12)
+			Retire(reflectOut_.resource12, 0, nullptr);
+		if (reflectCounterReadback_ && reflectCounterMapped_)
+			reflectCounterReadback_->Unmap(0, nullptr);
+		reflectCounterMapped_ = nullptr;
+		if (reflectCounter_)
+			Retire(reflectCounter_, 0, nullptr);
+		if (reflectCounterReadback_)
+			Retire(reflectCounterReadback_, 0, nullptr);
+		reflectCounter_.Reset();
+		reflectCounterReadback_.Reset();
+		reflectPrep_ = {};
+		reflectOut_ = {};
+		reflectWidth_ = reflectHeight_ = 0;
+		reflectBytes_ = 0;
+		reflectCounterValid_ = false;
+		for (auto& context : contexts_)
+			context.reflectPending = false;
+		stats_.lastReflectGpuMs = -1.0f;
+		stats_.reflectPixelsPerFrame = -1;
+		stats_.reflectTracedLastFrame = false;
+		if (stagingHeap_ && device_) {
+			D3D12_UNORDERED_ACCESS_VIEW_DESC nullUav{};
+			nullUav.Format = kReflectFormat;
+			nullUav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynReflect + 1));
+			D3D12_SHADER_RESOURCE_VIEW_DESC nullSrv{};
+			nullSrv.Format = kReflectFormat;
+			nullSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+			nullSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			nullSrv.Texture2D.MipLevels = 1;
+			device_->CreateShaderResourceView(nullptr, &nullSrv, StagingCpu(kDynReflect + 2));
+		}
+	}
+
+	void Backend::WriteReflectDescriptors()
+	{
+		if (!stagingHeap_ || !reflectPipeline_ || !reflectOut_.resource12 || !reflectPrep_.resource12)
+			return;
+		D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+		srvDesc.Format = kDepthMaskFormat;
+		srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		srvDesc.Texture2D.MipLevels = 1;
+		device_->CreateShaderResourceView(depthMask_.resource12.Get(), &srvDesc, StagingCpu(kDynReflect));
+		D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+		uavDesc.Format = kReflectFormat;
+		uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+		device_->CreateUnorderedAccessView(reflectOut_.resource12.Get(), nullptr, &uavDesc, StagingCpu(kDynReflect + 1));
+		srvDesc.Format = kReflectFormat;
+		device_->CreateShaderResourceView(reflectPrep_.resource12.Get(), &srvDesc, StagingCpu(kDynReflect + 2));
+	}
+
+	void Backend::RecordReflectTrace(ID3D12GraphicsCommandList4* a_list, CommandContext& a_context, std::size_t a_index, const FrameInput& a_input, bool a_alphaFrame,
+		D3D12_GPU_DESCRIPTOR_HANDLE a_table)
+	{
+		// Inside the RTAO list (depth already back in COMMON after the AO dispatch): its own transitions, timestamps and counter.
+		D3D12_RESOURCE_BARRIER pre[3] = {
+			Transition(depthMask_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+			Transition(reflectPrep_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+			Transition(reflectOut_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+		};
+		a_list->ResourceBarrier(3, pre);
+		const UINT queryBase = static_cast<UINT>(kContexts * 8 + a_index * 2);
+		if (timestampHeap_)
+			a_list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase);
+		const bool alpha = a_input.reflect->alpha && a_alphaFrame && reflectAlphaPipeline_ && alphaUv_ && a_context.alphaInfoBuffer;
+		a_list->SetComputeRootSignature(reflectRootSignature_.Get());
+		a_list->SetPipelineState(alpha ? reflectAlphaPipeline_.Get() : reflectPipeline_.Get());
+		a_list->SetComputeRoot32BitConstants(0, sizeof(ReflectTraceConstants) / 4, &a_input.reflect->constants, 0);
+		a_list->SetComputeRootShaderResourceView(1, tlas_->GetGPUVirtualAddress());
+		a_list->SetComputeRootDescriptorTable(2, a_table);
+		a_list->SetComputeRootUnorderedAccessView(3, reflectCounter_->GetGPUVirtualAddress());
+		if (alpha) {
+			a_list->SetComputeRootShaderResourceView(4, a_context.alphaInfoBuffer->GetGPUVirtualAddress());
+			a_list->SetComputeRootShaderResourceView(5, alphaUv_->GetGPUVirtualAddress());
+			auto alphaTable = descriptorHeap_->GetGPUDescriptorHandleForHeapStart();
+			alphaTable.ptr += static_cast<UINT64>(descriptorSize_) * (kAlphaDescriptorBase - 1);
+			a_list->SetComputeRootDescriptorTable(6, alphaTable);
+		}
+		a_list->Dispatch((a_input.renderWidth + 7) / 8, (a_input.renderHeight + 7) / 8, 1);
+		if (timestampHeap_)
+			a_list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 1);
+		D3D12_RESOURCE_BARRIER post[3] = {
+			Transition(depthMask_.resource12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+			Transition(reflectPrep_.resource12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+			Transition(reflectOut_.resource12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+		};
+		a_list->ResourceBarrier(3, post);
+		D3D12_RESOURCE_BARRIER toCopy = Transition(reflectCounter_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+		a_list->ResourceBarrier(1, &toCopy);
+		a_list->CopyBufferRegion(reflectCounterReadback_.Get(), sizeof(std::uint32_t) * a_index, reflectCounter_.Get(), 0, sizeof(std::uint32_t));
+		D3D12_RESOURCE_BARRIER toUav = Transition(reflectCounter_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+		a_list->ResourceBarrier(1, &toUav);
+		if (timestampHeap_ && timestampReadback_)
+			a_list->ResolveQueryData(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase, 2, timestampReadback_.Get(), sizeof(std::uint64_t) * queryBase);
+		a_context.reflectPending = true;
+		a_context.reflectFrame = ++reflectFrame_;
+		stats_.reflectTracedLastFrame = true;
 	}
 
 	float Backend::WaitForAO()
@@ -1415,6 +1669,22 @@ namespace RayTracingRT
 		pendingAOWait_ = 0;
 		aoNormal_ = {};  // (47j)
 		aoNormalWidth_ = aoNormalHeight_ = 0;
+		// (48a)
+		if (reflectCounterReadback_ && reflectCounterMapped_)
+			reflectCounterReadback_->Unmap(0, nullptr);
+		reflectCounterMapped_ = nullptr;
+		reflectCounter_.Reset();
+		reflectCounterReadback_.Reset();
+		reflectPrep_ = {};
+		reflectOut_ = {};
+		reflectWidth_ = reflectHeight_ = 0;
+		reflectBytes_ = 0;
+		reflectCounterValid_ = false;
+		reflectFrame_ = 0;
+		reflectFault_.clear();
+		reflectPipeline_.Reset();
+		reflectAlphaPipeline_.Reset();
+		reflectRootSignature_.Reset();
 		stagingHeap_.Reset();
 		depthMask_ = {};
 		visibility_ = {};
@@ -1755,6 +2025,8 @@ namespace RayTracingRT
 			WritePointDescriptors();  // (46b) the depth SRV of its table
 		if (aoRaw_.resource12)
 			WriteAODescriptors();  // (46f) likewise
+		if (reflectOut_.resource12)
+			WriteReflectDescriptors();  // (48a) likewise
 		logger::info("[RayTracing] Shared textures {}x{}", a_width, a_height);
 		return true;
 	}
@@ -1950,6 +2222,33 @@ namespace RayTracingRT
 					timestampReadback_->Unmap(0, &none);
 					if (ae >= ab)
 						stats_.lastAOGpuMs = static_cast<float>(static_cast<double>(ae - ab) * 1000.0 / static_cast<double>(timestampFrequency_));
+				}
+			}
+		}
+		// (48a) This submission's reflection rays (in the RTAO list): pixels traced and their two timestamps.
+		if (context.reflectPending) {
+			context.reflectPending = false;
+			if (reflectCounterMapped_) {
+				const std::uint32_t value = reflectCounterMapped_[a_index];
+				if (reflectCounterValid_ && context.reflectFrame > reflectCounterLastFrame_)
+					stats_.reflectPixelsPerFrame = static_cast<std::int64_t>(static_cast<std::uint32_t>(value - reflectCounterLast_) / (context.reflectFrame - reflectCounterLastFrame_));
+				if (!reflectCounterValid_ || context.reflectFrame > reflectCounterLastFrame_) {
+					reflectCounterLast_ = value;
+					reflectCounterLastFrame_ = context.reflectFrame;
+					reflectCounterValid_ = true;
+				}
+			}
+			if (timestampReadback_ && timestampFrequency_ != 0) {
+				const SIZE_T offset = sizeof(std::uint64_t) * (kContexts * 8 + a_index * 2);
+				D3D12_RANGE range{ offset, offset + sizeof(std::uint64_t) * 2 };
+				void* mapped = nullptr;
+				if (SUCCEEDED(timestampReadback_->Map(0, &range, &mapped)) && mapped) {
+					const auto* t = reinterpret_cast<const std::uint64_t*>(static_cast<const std::byte*>(mapped) + offset);
+					const std::uint64_t rb = t[0], re = t[1];
+					D3D12_RANGE none{ 0, 0 };
+					timestampReadback_->Unmap(0, &none);
+					if (re >= rb)
+						stats_.lastReflectGpuMs = static_cast<float>(static_cast<double>(re - rb) * 1000.0 / static_cast<double>(timestampFrequency_));
 				}
 			}
 		}
@@ -2740,6 +3039,17 @@ namespace RayTracingRT
 			desc.InstanceMask = kInstanceMask;
 			desc.InstanceContributionToHitGroupIndex = instance.moving ? kMovingInstanceKey : 0u;  // (47n) TraceAOCS dynamic-occluder flag
 			desc.Flags = instance.twoSided ? kInstanceFlags : D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;  // (46g)
+			// (48a) RT reflections: object instances carry kObjectInstanceKey (the reflection hit-type view; no other ray compares it with
+			// anything but kMovingInstanceKey / a character key), terrain its own mask (only reflection rays include it). Without
+			// reflections (reflectTags false) every descriptor is exactly as before.
+			if (a_input.reflectTags && !instance.moving &&
+				(category == kCategoryMovable || category == kCategoryItem || category == kCategoryTree))
+				desc.InstanceContributionToHitGroupIndex = kObjectInstanceKey;
+			if (category == kCategoryTerrain) {
+				desc.InstanceMask = kTerrainMask;
+				desc.InstanceContributionToHitGroupIndex = kTerrainInstanceKey;
+				desc.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
+			}
 			if (alpha) {
 				// The shader finds the record through the instance ID (0 = opaque); no force-opaque flag.
 				desc.InstanceID = instance.alphaInfo + 1;
@@ -3000,6 +3310,8 @@ namespace RayTracingRT
 		if (failed_)
 			return false;
 		stats_.aoTracedLastFrame = aoFrame;
+		if (!aoFrame)
+			stats_.reflectTracedLastFrame = false;  // (48a) they ride in that list
 		lap(split.ao);  // (46g)
 
 		// (46f) A second-fence wait never issued last frame (the AO was not used): the D3D11 queue takes it before this

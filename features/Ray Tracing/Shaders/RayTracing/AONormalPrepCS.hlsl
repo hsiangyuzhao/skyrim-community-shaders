@@ -41,6 +41,14 @@ Texture2D<float4> PrevNormal : register(t2);   // last frame's NORMALROUGHNESS (
 Texture2D<float2> PrevMotion : register(t3);   // last frame's motion vectors (uv: previous = uv + motion)
 RWTexture2D<float> Output : register(u0);
 RWTexture2D<unorm float4> DebugOut : register(u1);  // (47k) only bound while a Smooth Normals debug view is on
+// (48a) RT_REFLECT (RT reflections step 1 on): the same reprojection also feeds the reflection rays (TraceReflectCS): every pixel (also
+// those RTAO skips), its normal, last frame's roughness (1 - NORMALROUGHNESS.z) and confidence, where last frame's REFLECTANCE was not
+// black (the pixels the composite reflects at all). Packed: bits 0-10 / 11-21 octahedral normal (0..2047 = -1..1), 22-27 roughness
+// (0..63), 28-30 confidence (0..7), bit 31 valid (0 = no reflection ray: no reflectance, sky, nothing reprojected).
+#if defined(RT_REFLECT)
+Texture2D<float4> PrevReflectance : register(t4);  // last frame's REFLECTANCE (Deferred.h)
+RWTexture2D<uint> ReflectPrep : register(u2);
+#endif
 
 float3 PositionAt(float2 uv, float depth, float4x4 invViewProj)
 {
@@ -186,19 +194,26 @@ float3 RingSmoothedNormal(int2 p, float3 P, float3 Ng, float footprint)
 	const float depth = Depth[p];
 	uint packed = 0u;
 	float4 debug = 0.0;
+	bool unusedForAO = false;  // (48a) RTAO never reads this pixel (RT_REFLECT: still prepared for the reflection rays)
+#if defined(RT_REFLECT)
+	uint reflectPacked = 0u;
+	int2 reflectQ = int2(-1, -1);  // last frame's pixel the reflection data is read from (-1 = none)
+#endif
 	[branch] if (depth > 0.0 && depth < 0.999999)
 	{
 		const float3 P = PositionAtPixel(p, depth);
 		const float dist = length(P);
 		// (47p) The trace reads this only where its weight is above 0 (inside its rect, nearer than its fade end): elsewhere "no
 		// smooth normal", as for the sky. 64 units / 1 % of margin cover the two passes' float differences.
-		const bool unused = SkipFade.y > 0.0 && debugView == 0u &&
-		                    (dist >= SkipFade.x * 1.01 + 64.0 || P.x < SkipRect.x - 64.0 || P.y < SkipRect.y - 64.0 || P.x > SkipRect.z + 64.0 || P.y > SkipRect.w + 64.0);
-		[branch] if (unused)
+		unusedForAO = SkipFade.y > 0.0 && debugView == 0u &&
+		              (dist >= SkipFade.x * 1.01 + 64.0 || P.x < SkipRect.x - 64.0 || P.y < SkipRect.y - 64.0 || P.x > SkipRect.z + 64.0 || P.y > SkipRect.w + 64.0);
+#if !defined(RT_REFLECT)
+		[branch] if (unusedForAO)
 		{
 			Output[p] = 0.0;
 			return;
 		}
+#endif
 		// This frame's depth normal, exactly as TraceAOCS builds Ng (per axis the neighbour with the smaller depth step).
 		const int2 maxP = int2(RenderSize.xy) - 1;
 		const int2 pl = int2(max(p.x - 1, 0), p.y), pr = int2(min(p.x + 1, maxP.x), p.y);
@@ -231,6 +246,10 @@ float3 RingSmoothedNormal(int2 p, float3 P, float3 Ng, float footprint)
 			float errA;
 			const bool inA = CandidateSearch(uvA, prevP, q0A, qA, errA);
 			cA = CandidateFinish(inA, qA, errA, tolA, Ng, nA, dataA);
+#if defined(RT_REFLECT)
+			if (dataA)
+				reflectQ = qA;
+#endif
 			// B. Constant velocity: last frame's motion at the point it moved from (two fixed-point steps from the camera guess).
 			const float2 uv = (float2(p) + 0.5) * RenderSize.zw;
 			float2 uvB = uvA;
@@ -246,6 +265,10 @@ float3 RingSmoothedNormal(int2 p, float3 P, float3 Ng, float footprint)
 				cB = CandidateFinish(true, qA, errA, tolB, Ng, nB, dataB);
 			else
 				cB = Candidate(uvB, prevP, tolB, Ng, nB, dataB);
+#if defined(RT_REFLECT)
+			if (!dataA && dataB)
+				reflectQ = clamp(int2(uvB * RenderSize.xy), int2(0, 0), int2(RenderSize.xy) - 1);
+#endif
 		}
 		const float c = max(cA, cB);
 		// (47k) Below full confidence the fallback is the ring-smoothed depth normal (only computed there).
@@ -267,6 +290,17 @@ float3 RingSmoothedNormal(int2 p, float3 P, float3 Ng, float footprint)
 			const float2 e = OctEncode(n) * 0.25 + 0.5;
 			packed = (f32tof16(e.x) << 16) | f32tof16(e.y);
 		}
+#if defined(RT_REFLECT)
+		[branch] if (reflectQ.x >= 0)
+		{
+			const float3 reflectance = PrevReflectance[reflectQ].rgb;
+			if (any(reflectance > 0.0)) {
+				const float roughness = saturate(1.0 - PrevNormal[reflectQ].z);
+				const uint2 o = uint2(round(saturate(OctEncode(n) * 0.5 + 0.5) * 2047.0));
+				reflectPacked = o.x | (o.y << 11) | (uint(round(roughness * 63.0)) << 22) | (uint(round(saturate(c) * 7.0)) << 28) | 0x80000000u;
+			}
+		}
+#endif
 		[branch] if (debugView != 0u)
 		{
 			if (debugView == 1u) {
@@ -281,7 +315,12 @@ float3 RingSmoothedNormal(int2 p, float3 P, float3 Ng, float footprint)
 			}
 		}
 	}
+#if defined(RT_REFLECT)
+	Output[p] = asfloat(unusedForAO ? 0u : packed);
+	ReflectPrep[p] = reflectPacked;
+#else
 	Output[p] = asfloat(packed);
+#endif
 	[branch] if (debugView != 0u)
 		DebugOut[p] = debug;
 }

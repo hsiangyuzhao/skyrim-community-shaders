@@ -322,6 +322,12 @@ public:
 		// pattern stepped along R2 per frame (not the denoiser's sliding IGN), a beam ray into its own surface counting as blocked.
 		// Off = 47z exactly.
 		bool PointBeamSmooth = true;
+		// (48a) Outside the settings macro. RT reflections step 1 (Ray Tracing > Reflections (experimental)): ReflectionsMode 0 Off (47z
+		// exactly: no terrain, no textures, no dispatch), 1 Trace Only (reflection rays in the RTAO batch, no shading, debug views and F7
+		// only; needs RTAO). ReflectionsTerrain "Terrain in RT Scene (reflections only)": with the rays on, the landscape of the captured
+		// cells is in the TLAS under its own instance mask, which no shadow or AO ray includes.
+		int ReflectionsMode = 0;
+		bool ReflectionsTerrain = true;
 	};
 	/// (46f) RTAO modes (Settings::AOMode); with RTAO off the AO is SSGI's, exactly as before.
 	enum class AOModeKind : int
@@ -963,7 +969,7 @@ private:
 	// the traces, reading last frame's depth from a D3D11 copy of DepthMask (aoPrevDepth) instead of DepthMask itself. RTAO's list waits
 	// for it through the after-ready fence. Exact: the same inputs, the same dispatch.
 	void DispatchAONormal(ID3D11DeviceContext* a_context, ID3D11ShaderResourceView* a_depth, ID3D11ShaderResourceView* a_prevDepth, std::uint32_t a_width,
-		std::uint32_t a_height, bool a_writeDebug);
+		std::uint32_t a_height, bool a_writeDebug, bool a_reflect = false);
 	bool EarlyNormalPrepPossible(std::uint32_t a_width, std::uint32_t a_height);
 	bool DispatchDeferredAONormal();
 	void FlushDeferredAONormal();
@@ -977,7 +983,29 @@ private:
 		ID3D11ShaderResourceView* depth = nullptr;  // the engine's depth SRV of this frame (alive for the frame)
 		std::uint32_t width = 0, height = 0;
 		bool writeDebug = false;
+		bool reflect = false;  // (48a) the RT_REFLECT variant (also writes the reflection prep)
 	} aoNormalDeferred;
+	// (48a) RT reflections step 1 (trace only).
+	enum class ReflectDebugView : int
+	{
+		Off = 0,
+		HitType,           // static / object / foliage-cutout / character / terrain / miss
+		HitDistance,       // near white .. far dark, miss blue
+		NormalConfidence,  // the reprojected last-frame normal: green sure .. red fell back
+		Count
+	};
+	ReflectDebugView reflectDebugView = ReflectDebugView::Off;  // not persisted
+	RayTracingRT::ReflectInput reflectInput{};
+	bool reflectWantedThisFrame = false;  // PrepareAO: the rays may go out this frame (their textures exist)
+	bool reflectPrepThisFrame = false;    // the normal prep wrote the reflection prep this frame
+	bool reflectDebugDrawn = false;       // the reflection debug view wrote debugColor this frame
+	std::string reflectOffReason;
+	bool reflectRequested = false;
+	winrt::com_ptr<ID3D11ComputeShader> aoNormalReflectCS, reflectDebugCS;
+	std::unique_ptr<ConstantBuffer> reflectDebugCB;
+	[[nodiscard]] bool ReflectionsWanted() const;
+	void PrepareReflections(RayTracingRT::FrameInput& a_input);
+	void DrawReflectionDebug();
 	winrt::com_ptr<ID3D11Texture2D> aoPrevDepth;
 	winrt::com_ptr<ID3D11ShaderResourceView> aoPrevDepthSRV;
 	D3D11_TEXTURE2D_DESC aoPrevDepthDesc{};

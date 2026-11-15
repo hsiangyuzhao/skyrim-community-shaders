@@ -204,6 +204,9 @@ namespace Util::FrameTrace
 		// largest uncovered share (percent of the pixels such a light lights) in the newest read-back.
 		int smNativeSkipped = -1, smNativeRestored = -1;
 		float smUncoveredMaxPct = -1.0f;
+		// (48a) RT reflections step 1 (trace only): GPU ms of the reflection rays (in the RTAO list; -1 = not traced this frame) and the share
+		// of the render pixels they traced (percent, read back a few frames late; -1 = not traced).
+		float reflGpuMs = -1.0f, reflTracedPct = -1.0f;
 	};
 	void OnRayTracingDetail(const RayTracingDetail& a_detail);
 

@@ -399,7 +399,7 @@ bool SurfaceProbe(float3 P, float3 V, float3 N, float dist)
 #else
 	RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES | RAY_FLAG_CULL_NON_OPAQUE> q;
 #endif
-	q.TraceRayInline(Scene, RAY_FLAG_NONE, 0xFF, ray);
+	q.TraceRayInline(Scene, RAY_FLAG_NONE, 0xF7, ray);  // (48a) not the terrain (reflections only)
 	q.Proceed();
 	return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
 }

@@ -82,7 +82,7 @@ static const uint kAllCharacters = 0x06u;
 static const float kFirstPersonNear = 96.0;
 #	define RT_SCENE_MASK kSceneMask
 #else
-#	define RT_SCENE_MASK 0xFF
+#	define RT_SCENE_MASK 0xF7  // (48a) every instance but terrain (Backend::kTerrainMask 0x08, RT reflections only); 0xFF before: identical without terrain
 #endif
 
 float3 PositionAt(int2 p, float depth)
@@ -358,7 +358,7 @@ bool SurfaceProbe(float3 P, float3 V, float3 N, float dist, out bool o_opaque)
 	ray.TMin = 0.0;
 	ray.TMax = tolerance * 2.0;
 	RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES | RAY_FLAG_FORCE_OPAQUE> q;
-	q.TraceRayInline(Scene, RAY_FLAG_NONE, 0xFF, ray);
+	q.TraceRayInline(Scene, RAY_FLAG_NONE, 0xF7, ray);  // (48a) not the terrain (reflections only)
 	q.Proceed();
 	// (47r) Whether the hit found is on an instance without a cut-out record (ID 0: forced opaque in the TLAS) -- the point pass's
 	// non-alpha probe (it culls the non-opaque ones) would find a hit too then.
