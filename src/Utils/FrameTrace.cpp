@@ -2,6 +2,7 @@
 
 #include "Features/ExponentialHeightFog.h"
 #include "Features/PerformanceOverlay.h"
+#include "Features/PhysicalSky.h"
 #include "Features/RayTracing.h"
 #include "Features/ScreenSpaceGI.h"
 #include "Features/ScreenSpacePointLightShadows.h"
@@ -835,6 +836,7 @@ namespace Util::FrameTrace
 				text += "; SSGI not loaded";
 			}
 			text += "; " + globals::features::screenSpacePointLightShadows.DescribeForTrace();  // (47k)
+			text += "; " + globals::features::physicalSky.DescribeForTrace();  // (48b)
 			return text;
 		}
 

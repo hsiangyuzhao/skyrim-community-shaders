@@ -286,20 +286,26 @@ namespace SkyFixes
 	// at dawn. The extra brightness (k - 1) drowns a texel in proportion to how faint it is itself (c0 =
 	// its own brightness x alpha, before the weather tint and the clock fade), so the Milky Way's glow and
 	// the faint stars go first and the brightest stars last. Moonless night: exactly 1.
-	float StarVisibility(float3 a_dir, float a_texelBrightness)
+	// (48b) a_moonDrown: "Moonlight Fades Stars" (MoonSky::StarDrown, 0 when off or no moon is up), added to the same
+	// drowning amount; without Sky Fixes' own fade it is the only term. 0 gives exactly the 47a / 48a result.
+	float StarVisibility(float3 a_dir, float a_texelBrightness, float a_moonDrown)
 	{
-		const float unfade = NightBaseUnfade();
+		const bool skyFade = On() && StarFadeStrength() > 0.0;
+		const float unfade = skyFade ? NightBaseUnfade() : 1.0;
 		float visibility = 0.0;  // the night base light has faded out: daylight
-		[branch] if (unfade > 0.0)
+		[branch] if (!skyFade)
+			visibility = saturate(1.0 - a_moonDrown / max(a_texelBrightness, 1e-6));
+		else [branch] if (unfade > 0.0)
 		{
-			visibility = 1.0;
+			float drown = a_moonDrown;
 			const float base = Color::RGBToLuminance(NightSkyBase(a_dir)) * unfade;
 			[branch] if (base > 0.0)
 			{
 				const float sky = Color::RGBToLuminance(PhysSky::TexSvLut.SampleLevel(PhysSky::SampSv, PhysSky::SkyViewLutUv(a_dir), 0).rgb);
 				const float excess = max(sky / base - 1.0 - StarDeadZone, 0.0);
-				visibility = saturate(1.0 - StarFadeStrength() * excess / max(a_texelBrightness, 1e-6));
+				drown += StarFadeStrength() * excess;
 			}
+			visibility = saturate(1.0 - drown / max(a_texelBrightness, 1e-6));
 		}
 		return visibility;
 	}
@@ -383,6 +389,63 @@ namespace SkyFixes
 #			endif
 	}
 #		endif
+}
+
+// (48b) "Moonlight Fades Stars" and "Moon Planetshine": PhysicalSky::NightFlags bits 6 / 7 and the two spare floats of
+// PhysSkyMoonData (each holds two halves: x = Masser, y = Secunda), named here so SharedData.hlsli stays byte-identical.
+namespace MoonSky
+{
+	static const uint StarFadeFlag = (1 << 6);
+	static const uint PlanetshineFlag = (1 << 7);
+	// Brightness of the planetshine grey, relative to the moon's lit colour: the mean luminance of the game's full
+	// moon picture (masser_full.dds after the sky gamma, 0.26).
+	static const float PlanetshineGrey = 0.25;
+
+	bool StarFadeOn() { return (SharedData::physSkyNightData.Flags & StarFadeFlag) != 0; }
+	bool PlanetshineOn() { return (SharedData::physSkyNightData.Flags & PlanetshineFlag) != 0; }
+
+	float2 UnpackHalves(float a_packed)
+	{
+		const uint bits = asuint(a_packed);
+		return float2(f16tof32(bits & 0xFFFF), f16tof32(bits >> 16));
+	}
+	// Drowning amount of each moon (phase x height x weather x daylight x its light, C++ UpdateMoonData).
+	float2 StarFadeAmounts() { return UnpackHalves(SharedData::physSkyMoonData.pad0.x); }
+	// Opacity of each moon's planetshine fill ((1 - phase) x strength x night, C++ UpdateMoonData).
+	float2 PlanetshineAmounts() { return UnpackHalves(SharedData::physSkyMoonData.pad0.y); }
+
+	// How much of the sky around a moon is clouded over (0 clear .. 1 covered): Cloud Shadows' cloud cube, five taps
+	// within about 2 degrees of the moon so a cloud edge passing the disc does not switch the stars on and off.
+	// Without Cloud Shadows there is no cloud term.
+	float CloudCoverAt(float3 a_dir, SamplerState a_sampler)
+	{
+#		if defined(CLOUD_SHADOWS)
+		const float3 up = abs(a_dir.z) < 0.999 ? float3(0, 0, 1) : float3(1, 0, 0);
+		const float3 t = normalize(cross(up, a_dir)) * 0.035;
+		const float3 b = cross(a_dir, t);
+		float sum = CloudShadows::CloudShadowsTexture.SampleLevel(a_sampler, a_dir, 0).x;
+		sum += CloudShadows::CloudShadowsTexture.SampleLevel(a_sampler, a_dir + t, 0).x;
+		sum += CloudShadows::CloudShadowsTexture.SampleLevel(a_sampler, a_dir - t, 0).x;
+		sum += CloudShadows::CloudShadowsTexture.SampleLevel(a_sampler, a_dir + b, 0).x;
+		sum += CloudShadows::CloudShadowsTexture.SampleLevel(a_sampler, a_dir - b, 0).x;
+		return saturate(sum * 0.2);
+#		else
+		return 0.0;
+#		endif
+	}
+
+	// The moonlit sky's drowning amount for the star layer (same units as SkyFixes' T x excess): both moons, each
+	// x (1 - cloud cover around it). 0 with no moon up.
+	float StarDrown(SamplerState a_sampler)
+	{
+		const float2 amounts = StarFadeAmounts();
+		float drown = 0.0;
+		[branch] if (amounts.x > 0.0)
+			drown += amounts.x * (1.0 - CloudCoverAt(normalize(SharedData::physSkyData.masserDir), a_sampler));
+		[branch] if (amounts.y > 0.0)
+			drown += amounts.y * (1.0 - CloudCoverAt(normalize(SharedData::physSkyData.secundaDir), a_sampler));
+		return drown;
+	}
 }
 #	endif
 
@@ -519,8 +582,12 @@ PS_OUTPUT main(PS_INPUT input)
 #		elif defined(HORIZFADE)
 		// (47a) Sky Fixes: the star layer (stars and the Milky Way) fades as the physical sky behind it gets
 		// brighter than the moonless night base (moonlight, dawn); the game's clock fade stays multiplied in.
-		[branch] if (SkyFixes::On() && SkyFixes::StarFadeStrength() > 0.0)
-			psout.Color.w *= SkyFixes::StarVisibility(normalize(input.WorldPosition.xyz), Color::RGBToLuminance(baseColor.xyz) * baseColor.w);
+		// (48b) "Moonlight Fades Stars": the moonlit sky (both moons in full, not their dimmed glow in the LUT) drowns the
+		// same faint-first way, also without Sky Fixes. Off or no moon up: the 48a result exactly.
+		const bool moonStarFade = MoonSky::StarFadeOn();
+		[branch] if ((SkyFixes::On() && SkyFixes::StarFadeStrength() > 0.0) || moonStarFade)
+			psout.Color.w *= SkyFixes::StarVisibility(normalize(input.WorldPosition.xyz), Color::RGBToLuminance(baseColor.xyz) * baseColor.w,
+				moonStarFade ? MoonSky::StarDrown(SampBaseSampler) : 0.0);
 #		elif defined(DEFERRED) && defined(TEX) && !defined(MOONMASK)
 		// (batch 37c) Not the moon/star mask: it is TEX too, but a sun disk has no business on it.
 		const uint extFlags = SharedData::physSkyExtData.Flags;
@@ -529,6 +596,38 @@ PS_OUTPUT main(PS_INPUT input)
 		// IsMoon is only set on the two discs, never on the star mask.
 		[branch] if (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsMoon)  // (47o) MoonPhysicalRadiance always on
 			psout.Color.xyz *= (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsSecunda) ? SharedData::physSkyMoonData.SecundaDiskScale : SharedData::physSkyMoonData.MasserDiskScale;
+		// (48b) "Moon Planetshine". The game's phase pictures are see-through on the unlit side (alpha 0), so in front of
+		// the Milky Way that side showed as a starless hole. A faint grey fill now lies under the lit part, only where the
+		// picture is unlit (alpha below 0.02-0.2; the lit side and its translucent parts are left exactly as they were),
+		// inside the round disc (the pictures' disc fills the quad, edge at r ~0.97), with the game's horizon fade
+		// (vertex alpha). The fill's colour is the sky drawn behind it plus the grey, so over the sky it only adds the
+		// grey (x its opacity) and never darkens. Opacity from C++: strength x (1 - phase) x night; 0 at full and new moon.
+		[branch] if (MoonSky::PlanetshineOn() && (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsMoon))
+		{
+			const bool secunda = (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsSecunda) != 0;
+			const float2 planetshine = MoonSky::PlanetshineAmounts();
+			const float amount = secunda ? planetshine.y : planetshine.x;
+			const float r = length(input.TexCoord0.xy * 2.0 - 1.0);
+			const float fillAlpha = amount * (1.0 - smoothstep(0.90, 0.99, r)) * (1.0 - smoothstep(0.02, 0.2, baseColor.w)) * saturate(input.Color.w);
+			[branch] if (fillAlpha > 0.0)
+			{
+				const float3 moonViewDir = normalize(input.WorldPosition.xyz);
+				float3 behind;
+				[branch] if (UseReflectionSkyShadow())
+					behind = PhysSky::SampleSkyShadow(moonViewDir, GetReflectionSkyShadow(moonViewDir), PhysSky::SampSv);
+				else
+					behind = PhysSky::SampleSky(moonViewDir, input.Position.xy, PhysSky::SampSv);
+				const float discLuminance = Color::RGBToLuminance(Color::Sky(input.Color.xyz)) *
+				                            (secunda ? SharedData::physSkyMoonData.SecundaDiskScale : SharedData::physSkyMoonData.MasserDiskScale);
+				// Slightly darker towards the limb, as the lit side.
+				const float grey = discLuminance * MoonSky::PlanetshineGrey * (0.6 + 0.4 * sqrt(saturate(1.0 - r * r)));
+				const float3 fillColor = max(behind, 0.0) + grey;
+				const float litAlpha = psout.Color.w;
+				const float outAlpha = litAlpha + fillAlpha * (1.0 - litAlpha);
+				psout.Color.xyz = (psout.Color.xyz * litAlpha + fillColor * (fillAlpha * (1.0 - litAlpha))) / max(outAlpha, 1e-6);
+				psout.Color.w = outAlpha;
+			}
+		}
 		// (42b) Moons Fade in Daylight. The disc is drawn in the weather's moon colour whatever the time
 		// of day; the physical sky by day is far darker than that colour (it is brought up later by the
 		// exposure), so a daytime moon stood out as at night. A real daytime moon is pale: the bright

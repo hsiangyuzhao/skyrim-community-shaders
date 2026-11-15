@@ -1,6 +1,7 @@
 #include "PhysicalSky.h"
 
 #include <cfloat>
+#include <DirectXPackedVector.h>
 #include <imgui_stdlib.h>
 
 #include "CloudShadows.h"
@@ -124,6 +125,10 @@ void PhysicalSky::LoadSettings(json& o_json)
 		settings.skyPrecision = o_json.value("skyPrecision", defaults.skyPrecision);  // (47b)
 		// (47m) horizonFix (47f) removed; the old key is ignored.
 		settings.aerosolPreset = o_json.value("aerosolPreset", defaults.aerosolPreset);  // (47b)
+		settings.moonFadesStars = o_json.value("moonFadesStars", defaults.moonFadesStars);  // (48b)
+		settings.moonStarFadeStrength = o_json.value("moonStarFadeStrength", defaults.moonStarFadeStrength);
+		settings.moonPlanetshine = o_json.value("moonPlanetshine", defaults.moonPlanetshine);
+		settings.moonPlanetshineStrength = o_json.value("moonPlanetshineStrength", defaults.moonPlanetshineStrength);
 	}
 	settings.aerosolPreset = std::clamp(settings.aerosolPreset, 0, kAerosolPresetCount - 1);
 	settings.nightBaseLight = std::clamp(settings.nightBaseLight, 0.f, 1.f);
@@ -134,6 +139,8 @@ void PhysicalSky::LoadSettings(json& o_json)
 	settings.moonDaylightFade = std::clamp(settings.moonDaylightFade, 0.f, 100.f);
 	settings.moonCloudStrength = std::clamp(settings.moonCloudStrength, 0.f, 3.f);
 	settings.moonCloudHalo = std::clamp(settings.moonCloudHalo, 0.f, 4.f);
+	settings.moonStarFadeStrength = std::isfinite(settings.moonStarFadeStrength) ? std::clamp(settings.moonStarFadeStrength, 0.f, 3.f) : 1.f;  // (48b)
+	settings.moonPlanetshineStrength = std::isfinite(settings.moonPlanetshineStrength) ? std::clamp(settings.moonPlanetshineStrength, 0.f, 0.5f) : 0.1f;
 
 	// (batch 37b) A saved whitelist replaces the default one wholesale. Merge the defaults back
 	// in, except those the user removed, so defaults added later still reach older configs.
@@ -266,6 +273,10 @@ void PhysicalSky::SaveSettings(json& o_json)
 	o_json["skyFixes"] = settings.skyFixes;  // (47a)
 	o_json["skyPrecision"] = settings.skyPrecision;  // (47b)
 	o_json["aerosolPreset"] = settings.aerosolPreset;  // (47b)
+	o_json["moonFadesStars"] = settings.moonFadesStars;  // (48b)
+	o_json["moonStarFadeStrength"] = settings.moonStarFadeStrength;
+	o_json["moonPlanetshine"] = settings.moonPlanetshine;
+	o_json["moonPlanetshineStrength"] = settings.moonPlanetshineStrength;
 }
 
 void PhysicalSky::GetUploadedAerosol(float3& a_scatter, float3& a_absorption, float& a_phaseG) const
@@ -698,6 +709,41 @@ void PhysicalSky::SettingsCelestials()
 			"Higher = paler moons by day. Default 20: at noon a moon keeps roughly 40%% of its contrast,\n"
 			"in the early morning about 60%%, in twilight almost all of it. No change at night.");
 
+	// (48b) Moonlight on the stars and the dark side of the discs.
+	ImGui::Checkbox("Moonlight Fades Stars", &settings.moonFadesStars);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"A bright moon lights up the whole night sky, so the Milky Way and faint stars get hard to see.\n"
+			"On: stars fade by the moonlight itself (how full and how high each moon is, both moons added,\n"
+			"less when clouds cover the moon), not by the glow set above. The Milky Way and faint stars go\n"
+			"first, bright stars stay. No moon up, or off: exactly as before.\n"
+			"Needs Cloud Shadows for the cloud part (without it clouds do not count).");
+	if (settings.moonFadesStars) {
+		ImGui::SliderFloat("Star Fade Strength", &settings.moonStarFadeStrength, 0.f, 3.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text(
+				"How strongly moonlight hides the stars. Default 1: a full Masser high on a clear night leaves\n"
+				"the Milky Way at about 40%% of its brightness; a half moon leaves about 60%%, a thin crescent 75%%.\n"
+				"Now: Masser %.4f, Secunda %.4f (0 = no effect; before clouds).",
+				moonStarFadeAmount[0], moonStarFadeAmount[1]);
+	}
+	ImGui::Checkbox("Moon Planetshine", &settings.moonPlanetshine);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"A faint grey glow on the dark side of each moon, strongest at a thin crescent, none at full moon.\n"
+			"Without it the dark side is see-through and shows as a starless hole in front of the Milky Way;\n"
+			"with it the whole disc reads as a moon. The lit side is not changed; gone by day.\n"
+			"Off: exactly as before.");
+	if (settings.moonPlanetshine) {
+		ImGui::SliderFloat("Planetshine Strength", &settings.moonPlanetshineStrength, 0.f, 0.5f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text(
+				"How visible the dark side is. Default 0.10: at a thin crescent the dark side gets a grey of\n"
+				"about 7%% of the lit side's brightness on top of the sky behind it.\n"
+				"Now: Masser %.3f, Secunda %.3f.",
+				moonPlanetshineAmount[0], moonPlanetshineAmount[1]);
+	}
+
 	// (44h) removed the "New Moon" section ("Hide New Moon Disc"): fixed on (47m: in the code).
 }
 
@@ -1100,7 +1146,7 @@ void PhysicalSky::UpdateExtCbData()
 	extCbData.sunGlowWidth = DirectX::XMConvertToRadians(std::clamp(s.sunGlowWidthDeg, 0.1f, 5.f));
 }
 
-void PhysicalSky::UpdateMoonData(float a_exposure, float3& a_masserGlow, float3& a_secundaGlow)
+void PhysicalSky::UpdateMoonData(float a_exposure, float a_sunElevation, float3& a_masserGlow, float3& a_secundaGlow)
 {
 	// (40d) The moon colours stay the user's (they light the scene through Sky Sync); only their
 	// glow in the scattering LUTs is scaled here.
@@ -1109,6 +1155,8 @@ void PhysicalSky::UpdateMoonData(float a_exposure, float3& a_masserGlow, float3&
 	a_masserGlow = settings.masserColor * (a_exposure * strength);
 	a_secundaGlow = settings.secundaColor * (a_exposure * strength);
 	moonCbData = {};
+	moonStarFadeAmount[0] = moonStarFadeAmount[1] = 0.f;  // (48b)
+	moonPlanetshineAmount[0] = moonPlanetshineAmount[1] = 0.f;
 
 	auto* sky = globals::game::sky;
 	if (!sky)
@@ -1148,6 +1196,91 @@ void PhysicalSky::UpdateMoonData(float a_exposure, float3& a_masserGlow, float3&
 		moonCbData.masserDiskScale = discScale(sky->masser, settings.masserColor);
 		moonCbData.secundaDiskScale = discScale(sky->secunda, settings.secundaColor);
 	}
+
+	UpdateMoonSky(a_exposure, a_sunElevation);
+}
+
+void PhysicalSky::UpdateMoonSky(float a_exposure, float a_sunElevation)
+{
+	// (48b) "Moonlight Fades Stars" and "Moon Planetshine". Off: no flag and zero values, Sky.hlsl runs the 48a code.
+	moonStarFadeAmount[0] = moonStarFadeAmount[1] = 0.f;
+	moonPlanetshineAmount[0] = moonPlanetshineAmount[1] = 0.f;
+	moonCbData.starFadeHalves = 0;
+	moonCbData.planetshineHalves = 0;
+	const auto& s = effective;
+	auto* sky = globals::game::sky;
+	if (!sky || (!s.moonFadesStars && !s.moonPlanetshine))
+		return;
+
+	// Gone as the sun comes up, as the moonlight on the ground and clouds (sun -2 -> +6 degrees).
+	const float dayFade = SkySync::MoonDayFade(DirectX::XMConvertToDegrees(a_sunElevation));
+	const auto& skySync = globals::features::skySync;
+	const RE::Moon* moons[2] = { sky->masser, sky->secunda };
+	const float3* colors[2] = { &settings.masserColor, &settings.secundaColor };
+	const float sinElevation[2] = { skySync.rawDirections[static_cast<int>(SkySync::Caster::Masser)].z,
+		skySync.rawDirections[static_cast<int>(SkySync::Caster::Secunda)].z };
+	auto toHalves = [](const float a_low, const float a_high) {
+		return static_cast<uint32_t>(DirectX::PackedVector::XMConvertFloatToHalf(a_low)) |
+		       (static_cast<uint32_t>(DirectX::PackedVector::XMConvertFloatToHalf(a_high)) << 16);
+	};
+
+	if (s.moonFadesStars) {
+		// The moonlit sky's brightness relative to the clear moonless night, as one drowning amount D per moon (the
+		// shader adds them, each x (1 - cloud cover around that moon), and a star texel of brightness c0 keeps
+		// saturate(1 - D / c0) of its alpha, as with Sky Fixes' own fade):
+		//   D = strength x kMoonStarFadeScale x phase x horizon visibility (weather, -2..+3 degrees) x night x height
+		//       weight x luminance of the full moonlight (light colour x exposure; Secunda x 0.67 as on the ground).
+		// Height weight: the moon's light reaching the air through the atmosphere, relative to the zenith (Krisciunas &
+		// Schaefer 1991 airmass, V-band extinction 0.172): 1 high up, 0.85 at 30 degrees, 0.5 at 10, 0.1 at 3.
+		const float strength = std::clamp(s.moonStarFadeStrength, 0.f, 3.f);
+		for (int i = 0; i < 2; ++i) {
+			if (!moons[i] || !(strength > 0.f) || !(dayFade > 0.f))
+				continue;
+			const float cosZenith = std::max(sinElevation[i], 0.f);
+			const float airmass = 1.f / (cosZenith + 0.025f * std::exp(-11.f * cosZenith));
+			const float height = std::pow(10.f, -0.4f * kMoonSkyExtinction * (airmass - 1.f));
+			const float3 light = *colors[i] * a_exposure;
+			const float luminance = std::max(0.2126f * light.x + 0.7152f * light.y + 0.0722f * light.z, 0.f);
+			const float amount = strength * kMoonStarFadeScale * SkySync::PhaseFactorFromTexture(moons[i]) *
+			                     MoonHorizonVisibility(moons[i], sky, sinElevation[i]) * dayFade * height * luminance *
+			                     (i == 1 ? SkySync::SecundaIntensityFactor : 1.f);
+			// D >= 1 drowns every texel (c0 <= 1); the half keeps it exactly.
+			moonStarFadeAmount[i] = std::isfinite(amount) ? std::clamp(amount, 0.f, 1.f) : 0.f;
+		}
+		moonCbData.starFadeHalves = toHalves(moonStarFadeAmount[0], moonStarFadeAmount[1]);
+		nightCbData.flags |= kNightMoonFadesStars;
+	}
+
+	if (s.moonPlanetshine) {
+		// Opacity of the grey fill on the unlit side: strength x (1 - phase brightness) x night. Thin crescent (phase
+		// 0.25): 0.75 x strength; quarter 0.5x; gibbous 0.25x; full none. A new moon's disc is not drawn at all.
+		const float strength = std::clamp(s.moonPlanetshineStrength, 0.f, 0.5f);
+		for (int i = 0; i < 2; ++i) {
+			if (!moons[i] || !(strength > 0.f) || !(dayFade > 0.f))
+				continue;
+			const float phase = SkySync::PhaseFactorFromTexture(moons[i]);
+			if (phase <= SkySync::NewMoonIntensityFactor)
+				continue;
+			const float amount = strength * (1.f - phase) * dayFade;
+			moonPlanetshineAmount[i] = std::isfinite(amount) ? std::clamp(amount, 0.f, 1.f) : 0.f;
+		}
+		moonCbData.planetshineHalves = toHalves(moonPlanetshineAmount[0], moonPlanetshineAmount[1]);
+		nightCbData.flags |= kNightPlanetshine;
+	}
+}
+
+std::string PhysicalSky::DescribeForTrace() const
+{
+	// (48b) Physical Sky's moon / star options, as in effect when the trace starts.
+	if (!loaded)
+		return "Physical Sky not loaded";
+	const auto& s = effective;
+	return std::format(
+		"Physical Sky {} (sky fixes {}, moon sky glow {:.2f}); moonlight fades stars {} (strength {:.2f}, now Masser {:.4f} / Secunda {:.4f} before clouds); "
+		"moon planetshine {} (strength {:.2f}, now Masser {:.3f} / Secunda {:.3f})",
+		s.enabled && cbData.enabled ? "on" : (s.enabled ? "on (not drawn here)" : "off"), SkyFixesActive() ? "on" : "off", s.moonGlowStrength,
+		s.moonFadesStars ? "on" : "off", s.moonStarFadeStrength, moonStarFadeAmount[0], moonStarFadeAmount[1],
+		s.moonPlanetshine ? "on" : "off", s.moonPlanetshineStrength, moonPlanetshineAmount[0], moonPlanetshineAmount[1]);
 }
 
 float PhysicalSky::MoonHorizonVisibility(const RE::Moon* a_moon, const RE::Sky* a_sky, float a_sinElevation)
@@ -1613,7 +1746,8 @@ void PhysicalSky::Reset()
 		exposure = 1.f;
 
 	float3 masserGlow, secundaGlow;
-	UpdateMoonData(exposure, masserGlow, secundaGlow);
+	// (48b) The sun's true elevation, as for the clouds just below.
+	UpdateMoonData(exposure, std::asin(std::clamp(skySync.rawDirections[static_cast<int>(SkySync::Caster::Sun)].z, -1.f, 1.f)), masserGlow, secundaGlow);
 	UpdateCloudData(exposure, std::asin(std::clamp(skySync.rawDirections[static_cast<int>(SkySync::Caster::Sun)].z, -1.f, 1.f)));
 
 	// (47a) Sky Fixes: the ozone layer moved to 10-40 km, keeping the user's absorption colour and the

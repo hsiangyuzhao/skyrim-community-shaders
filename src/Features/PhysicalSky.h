@@ -194,6 +194,18 @@ struct PhysicalSky final : public Feature
 		/// (40d) Moon disc brightness = moonlight / disc solid angle (like the sun's Physical Brightness),
 		/// capped at this; the phase picture keeps its shading.
 		float moonRadianceCap = 2.f;  // (44h) default 8 -> 2 (user's tuned value)
+		/// (48b) "Moonlight Fades Stars": stars and the Milky Way fade with the moonlit sky, worked out from the full
+		/// moonlight (phase x height x weather x night x light colour, both moons, x 1 - cloud cover around each), not
+		/// from the glow above (Moon Sky Glow Strength). Faint stars and the Milky Way go first. Off = 48a exactly.
+		/// Saved outside the NLOHMANN macro.
+		bool moonFadesStars = true;
+		/// (48b) Its strength, 0-3. 1: Masser full and high on a clear night keeps about 40% of the Milky Way's light.
+		float moonStarFadeStrength = 1.f;
+		/// (48b) "Moon Planetshine": a faint grey fill on the unlit side of each moon disc (strongest at crescent, none at
+		/// full or new moon), so in front of the Milky Way it reads as a dim disc instead of a hole. Off = 48a exactly.
+		bool moonPlanetshine = true;
+		/// (48b) Its strength, 0-0.5: the fill's opacity at a thin crescent / 0.75.
+		float moonPlanetshineStrength = 0.1f;
 
 		/// (41b, F1) Night sky base light: the current weather's night sky colours (SkyUpper,
 		/// Horizon, SkyLower) x this, with a faint airglow floor, faded out as the sun rises from
@@ -360,12 +372,27 @@ struct PhysicalSky final : public Feature
 	{
 		float masserDiskScale = 1.f;
 		float secundaDiskScale = 1.f;
-		float pad0 = 0.f;
-		float pad1 = 0.f;
+		/// (48b, HLSL pad0.x) "Moonlight Fades Stars" amounts, two halves: low 16 bits Masser, high Secunda (Sky.hlsl MoonSky).
+		uint32_t starFadeHalves = 0;
+		/// (48b, HLSL pad0.y) "Moon Planetshine" fill opacities, two halves: low 16 bits Masser, high Secunda.
+		uint32_t planetshineHalves = 0;
 	} moonCbData;
 	static_assert(sizeof(MoonCbData) == 16);
 	/// (40d) Moon glow scale for the LUTs (strength x phase x visibility) and disc scales.
-	void UpdateMoonData(float a_exposure, float3& a_masserGlow, float3& a_secundaGlow);
+	/// (48b) Also the "Moonlight Fades Stars" / "Moon Planetshine" values and their NightFlags bits (after
+	/// UpdateNightBaseLight, which resets the flags). a_sunElevation: the sun's true elevation, radians.
+	void UpdateMoonData(float a_exposure, float a_sunElevation, float3& a_masserGlow, float3& a_secundaGlow);
+	/// (48b) Fills the starFade / planetshine halves and their NightFlags bits.
+	void UpdateMoonSky(float a_exposure, float a_sunElevation);
+	/// (48b) Values written this frame, for the menu and the F7 header: [0] Masser, [1] Secunda.
+	float moonStarFadeAmount[2] = { 0.f, 0.f };
+	float moonPlanetshineAmount[2] = { 0.f, 0.f };
+	/// (48b) Drowning amount per unit of moonlight luminance at strength 1 (see UpdateMoonData).
+	static constexpr float kMoonStarFadeScale = 0.15f;
+	/// (48b) V-band extinction (magnitudes per airmass) for the moon-height weight (Krisciunas & Schaefer 1991).
+	static constexpr float kMoonSkyExtinction = 0.172f;
+	/// (48b) "Moonlight Fades Stars" / "Moon Planetshine" in the F7 trace header.
+	std::string DescribeForTrace() const;
 
 	/// (41b) Mirrors SharedData::PhysSkyNightData (HLSL), appended after PhysSkyMoonData. Read only
 	/// by LutGen (sky-view and aerial perspective LUTs).
@@ -380,6 +407,9 @@ struct PhysicalSky final : public Feature
 		// (47b) Sky Fixes additions.
 		kNightDistantSea = 1u << 4,  // LutGen.cs.hlsl: below the planet horizon the sky view sees a calm sea (no dark band)
 		kNightWaterAp = 1u << 5,     // Water.hlsl: the water surface gets the aerial perspective
+		// (48b) Sky.hlsl only (MoonSky), independent of Sky Fixes.
+		kNightMoonFadesStars = 1u << 6,  // "Moonlight Fades Stars": MoonCbData::starFadeHalves
+		kNightPlanetshine = 1u << 7,     // "Moon Planetshine": MoonCbData::planetshineHalves
 	};
 	struct NightCbData
 	{
