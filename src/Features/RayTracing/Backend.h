@@ -322,6 +322,9 @@ namespace RayTracingRT
 		// sources at record kPointReprojectRecord.
 		bool reproject = false;
 		float reprojectMatrix[16]{};
+		// (48a) Lights per pixel 5 - 6 (the caller sets the shader's wide flags): slots 4 - 5 are written to the wide texture (u4; with
+		// reproject, last frame's is copied to t9 first). Only when PointWideReady().
+		bool wide = false;
 	};
 	inline constexpr std::uint32_t kPointReprojectRecord = 64;  // (47z) TracePointLightsCS kReprojectRecord (after the 64 sources)
 
@@ -843,6 +846,14 @@ namespace RayTracingRT
 		[[nodiscard]] ID3D11ShaderResourceView* PointWaterDistSRV() const { return pointWaterDist_.srv11.Get(); }
 		[[nodiscard]] ID3D11ShaderResourceView* PointWaterVisSRV() const { return pointWaterVis_.srv11.Get(); }
 		[[nodiscard]] std::uint64_t PointWaterBytes() const { return pointWaterBytes_; }
+		/// (48a) Lights per pixel 5 - 6: the shared RGBA8 texture of slots 4 - 5 (xy source + 1, zw PLVis values) and its D3D12 copy of
+		/// last frame (sticky selection). Created on first use (K > 4), sized like the point textures; released by the caller when K
+		/// stays <= 4 for a while (and with the point textures). False = not available (the caller then traces 4 slots).
+		bool EnsurePointWideTextures();
+		void ReleasePointWideTextures();
+		[[nodiscard]] bool PointWideReady() const { return pointWide_.resource12 != nullptr; }
+		[[nodiscard]] ID3D11ShaderResourceView* PointWideSRV() const { return pointWide_.srv11.Get(); }
+		[[nodiscard]] std::uint64_t PointWideBytes() const { return pointWideBytes_; }
 
 		// (46f) RTAO. Its pipeline is created with the others; its texture, ray counter and second fence on first use only.
 		[[nodiscard]] bool AOAvailable() const { return ready_ && !failed_ && aoPipeline_ && aoFault_.empty(); }
@@ -1496,6 +1507,10 @@ namespace RayTracingRT
 		ComPtr<ID3D12Resource> pointIdxPrev_;
 		SharedTexture pointWaterDist_, pointWaterVis_;  // (47i) Point Light Shadows on Water
 		std::uint64_t pointWaterBytes_ = 0;
+		// (48a) Lights per pixel 5 - 6: slots 4 - 5 (u4) and last frame's copy (t9, D3D12 only, COMMON between frames).
+		SharedTexture pointWide_;
+		ComPtr<ID3D12Resource> pointWidePrev_;
+		std::uint64_t pointWideBytes_ = 0;
 		static constexpr DXGI_FORMAT kPointWaterDistFormat = DXGI_FORMAT_R32_FLOAT;
 		std::uint32_t pointWidth_ = 0, pointHeight_ = 0;
 		ComPtr<ID3D12Resource> pointCounter_;          // default heap, UAV: rays traced (monotonic, wraps)
@@ -1528,7 +1543,8 @@ namespace RayTracingRT
 		// (47i) + the point table's water views (water distance SRV, water visibility UAV) after the RTAO table (offsets 6, 7 of the point table).
 		// (47n) The 47l RTAO blue noise SRV (slot 11) is gone.
 		// (47z) + last frame's PLIdx SRV (point table offset 9, t8).
-		static constexpr std::uint32_t kDynSun = 0, kDynPoint = 2, kDynAO = 6, kDynWater = 8, kDynAONormal = 10, kDynPointPrev = 11, kDynamicDescriptors = 12;  // (47j) + the RTAO smooth normals SRV (RTAO table offset 4)
+		static constexpr std::uint32_t kDynSun = 0, kDynPoint = 2, kDynAO = 6, kDynWater = 8, kDynAONormal = 10, kDynPointPrev = 11, kDynPointWide = 12, kDynPointWidePrev = 13,
+		                               kDynamicDescriptors = 14;  // (47j) + the RTAO smooth normals SRV (RTAO table offset 4); (48a) + the wide slots UAV / prev SRV (point table offsets 10, 11)
 		static constexpr std::uint32_t kDynamicBase = kPointDescriptorBase + kPointDescriptors;  // after the (unused) 46b point slots
 		ComPtr<ID3D12DescriptorHeap> stagingHeap_;
 		[[nodiscard]] D3D12_CPU_DESCRIPTOR_HANDLE StagingCpu(std::uint32_t a_slot) const;

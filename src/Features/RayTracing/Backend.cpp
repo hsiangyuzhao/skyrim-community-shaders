@@ -389,6 +389,10 @@ namespace RayTracingRT
 			// (47z) Last frame's PLIdx (filled with the point textures).
 			nullSrv.Format = kPointFormat;
 			device_->CreateShaderResourceView(nullptr, &nullSrv, StagingCpu(kDynPointPrev));
+			// (48a) Lights per pixel 5 - 6 (filled while their texture exists).
+			nullUav.Format = kPointFormat;
+			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynPointWide));
+			device_->CreateShaderResourceView(nullptr, &nullSrv, StagingCpu(kDynPointWidePrev));
 		}
 
 		// (45h) Null views in every alpha slot (the copy layers and the bindless table are filled on use).
@@ -456,7 +460,16 @@ namespace RayTracingRT
 		// 52 + 2 + 1 + 2 + 2 + 2 + 2 + 1 = 64 DWORDs (the limit).
 		// (47i) + the water views in the same table (water distance t7, water visibility u3; past the RTAO table in the block).
 		// (47z) + last frame's PLIdx (t8) in the same table (past the RTAO normals SRV in the block).
-		D3D12_DESCRIPTOR_RANGE ranges[5]{};
+		// (48a) + the wide slots (u4) and last frame's copy (t9) in the same table (after the 47z SRV in the block).
+		D3D12_DESCRIPTOR_RANGE ranges[7]{};
+		ranges[5].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+		ranges[5].NumDescriptors = 1;
+		ranges[5].BaseShaderRegister = 4;
+		ranges[5].OffsetInDescriptorsFromTableStart = kDynPointWide - kDynPoint;
+		ranges[6].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+		ranges[6].NumDescriptors = 1;
+		ranges[6].BaseShaderRegister = 9;
+		ranges[6].OffsetInDescriptorsFromTableStart = kDynPointWidePrev - kDynPoint;
 		ranges[4].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
 		ranges[4].NumDescriptors = 1;
 		ranges[4].BaseShaderRegister = 8;
@@ -496,7 +509,7 @@ namespace RayTracingRT
 		params[1].Descriptor.ShaderRegister = 0;
 		params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-		params[2].DescriptorTable.NumDescriptorRanges = 5;
+		params[2].DescriptorTable.NumDescriptorRanges = 7;
 		params[2].DescriptorTable.pDescriptorRanges = ranges;
 		params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
@@ -684,9 +697,88 @@ namespace RayTracingRT
 		}
 	}
 
+	bool Backend::EnsurePointWideTextures()
+	{
+		// (48a) Lights per pixel 5 - 6.
+		if (!PointAvailable() || !pointVis_.resource12 || pointWidth_ == 0 || pointHeight_ == 0)
+			return false;
+		if (PointWideReady()) {
+			D3D11_TEXTURE2D_DESC d{};
+			pointWide_.resource11->GetDesc(&d);
+			if (d.Width == pointWidth_ && d.Height == pointHeight_)
+				return true;
+		}
+		ReleasePointWideTextures();
+		if (!CreateSharedTexture(pointWidth_, pointHeight_, kPointFormat, false, true, pointWide_, "RayTracing PointWideSlots", false)) {
+			pointWide_ = {};
+			logger::warn("[RayTracing] Lights per pixel above 4: could not create the slot 4 - 5 texture; 4 lights per pixel are traced");
+			return false;
+		}
+		{
+			D3D12_HEAP_PROPERTIES heap{};
+			heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+			D3D12_RESOURCE_DESC desc{};
+			desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+			desc.Width = pointWidth_;
+			desc.Height = pointHeight_;
+			desc.DepthOrArraySize = 1;
+			desc.MipLevels = 1;
+			desc.Format = kPointFormat;
+			desc.SampleDesc.Count = 1;
+			desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+			const HRESULT hrPrev = device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&pointWidePrev_));
+			if (FAILED(hrPrev)) {
+				pointWidePrev_.Reset();  // not fatal: the sticky selection reads zeros for slots 4 - 5
+				logger::warn("[RayTracing] Point-light previous wide slots texture failed ({})", HrString(hrPrev));
+			} else {
+				pointWidePrev_->SetName(L"RayTracing PointWideSlotsPrev");
+				if (ResidencyHigh())
+					ApplyResidency(pointWidePrev_.Get());
+			}
+		}
+		pointWideBytes_ = static_cast<std::uint64_t>(pointWidth_) * pointHeight_ * (pointWidePrev_ ? 8 : 4);
+		D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+		uavDesc.Format = kPointFormat;
+		uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+		device_->CreateUnorderedAccessView(pointWide_.resource12.Get(), nullptr, &uavDesc, StagingCpu(kDynPointWide));
+		D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+		srvDesc.Format = kPointFormat;
+		srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		srvDesc.Texture2D.MipLevels = 1;
+		device_->CreateShaderResourceView(pointWidePrev_.Get(), &srvDesc, StagingCpu(kDynPointWidePrev));
+		logger::info("[RayTracing] Lights per pixel above 4: slot 4 - 5 textures {}x{} ({})", pointWidth_, pointHeight_,
+			std::format("{:.1f} MB", static_cast<double>(pointWideBytes_) / (1024.0 * 1024.0)));
+		return true;
+	}
+
+	void Backend::ReleasePointWideTextures()
+	{
+		if (pointWide_.resource12)
+			Retire(pointWide_.resource12, 0, nullptr);
+		if (pointWidePrev_)
+			Retire(pointWidePrev_, 0, nullptr);
+		pointWide_ = {};
+		pointWidePrev_.Reset();
+		pointWideBytes_ = 0;
+		if (stagingHeap_ && device_) {
+			D3D12_UNORDERED_ACCESS_VIEW_DESC nullUav{};
+			nullUav.Format = kPointFormat;
+			nullUav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynPointWide));
+			D3D12_SHADER_RESOURCE_VIEW_DESC nullSrv{};
+			nullSrv.Format = kPointFormat;
+			nullSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+			nullSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			nullSrv.Texture2D.MipLevels = 1;
+			device_->CreateShaderResourceView(nullptr, &nullSrv, StagingCpu(kDynPointWidePrev));
+		}
+	}
+
 	void Backend::ReleasePointResources()
 	{
 		ReleasePointWaterTextures();  // (47i) sized like them
+		ReleasePointWideTextures();   // (48a) likewise
 		// A submission in flight may still use them: D3D12 keeps them until it is done.
 		if (pointVis_.resource12)
 			Retire(pointVis_.resource12, 0, nullptr);
@@ -826,10 +918,38 @@ namespace RayTracingRT
 			};
 			a_list->ResourceBarrier(2, copyPost);
 		}
+		// (48a) Lights per pixel 5 - 6: slots 4 - 5 written (UAV), last frame's copied first for the sticky selection (as above).
+		const bool wide = pl.wide && PointWideReady();
+		const bool widePrevCopy = wide && pl.reproject && pointWidePrev_;
+		if (wide) {
+			if (widePrevCopy) {
+				D3D12_RESOURCE_BARRIER widePre[2] = {
+					Transition(pointWide_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
+					Transition(pointWidePrev_.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST),
+				};
+				a_list->ResourceBarrier(2, widePre);
+				a_list->CopyResource(pointWidePrev_.Get(), pointWide_.resource12.Get());
+				D3D12_RESOURCE_BARRIER widePost[2] = {
+					Transition(pointWide_.resource12.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+					Transition(pointWidePrev_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+				};
+				a_list->ResourceBarrier(2, widePost);
+			} else {
+				D3D12_RESOURCE_BARRIER widePre = Transition(pointWide_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+				a_list->ResourceBarrier(1, &widePre);
+			}
+		}
 		a_list->Dispatch((a_input.renderWidth + 7) / 8, (a_input.renderHeight + 7) / 8, 1);
 		if (prevCopy) {
 			D3D12_RESOURCE_BARRIER prevPost = Transition(pointIdxPrev_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
 			a_list->ResourceBarrier(1, &prevPost);
+		}
+		if (wide) {
+			D3D12_RESOURCE_BARRIER widePost[2] = {
+				Transition(pointWide_.resource12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+				Transition(pointWidePrev_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+			};
+			a_list->ResourceBarrier(widePrevCopy ? 2 : 1, widePost);
 		}
 		if (water) {
 			D3D12_RESOURCE_BARRIER waterPost[2] = {
@@ -1262,6 +1382,9 @@ namespace RayTracingRT
 		pointCounterReadback_.Reset();
 		pointVis_ = {};
 		pointIdx_ = {};
+		pointWide_ = {};  // (48a)
+		pointWidePrev_.Reset();
+		pointWideBytes_ = 0;
 		pointWidth_ = pointHeight_ = 0;
 		pointBytes_ = 0;
 		pointCounterValid_ = false;
@@ -1460,7 +1583,7 @@ namespace RayTracingRT
 		}
 		for (auto* resource : { tlas_.Get(), scratch_.Get(), skinScratch_.Get(), alphaUv_.Get(), alphaLayers12_.Get(), postbuild_.Get(), pointCounter_.Get(),
 				 aoCounter_.Get(), depthMask_.resource12.Get(), visibility_.resource12.Get(), pointVis_.resource12.Get(), pointIdx_.resource12.Get(),
-				 aoRaw_.resource12.Get(), aoNormal_.resource12.Get() })
+				 aoRaw_.resource12.Get(), aoNormal_.resource12.Get(), pointWide_.resource12.Get(), pointWidePrev_.Get() })
 			if (resource)
 				objects.push_back(resource);
 		ApplyResidency(objects.data(), objects.size());

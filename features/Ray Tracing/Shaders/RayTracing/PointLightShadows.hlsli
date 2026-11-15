@@ -28,6 +28,11 @@ namespace RTPointShadows
 	// (46y) Screen-Space Shadows for Non-RT Casters: SSPLS beside RT, an occluder that is a traced caster (Sources.w bit 7 at its
 	// pixel, TracePointLightsCS) counts only within the contact length; bits 16-23 = that length in eighths of the trace's start offset.
 	static const uint kSSPLSNonRT = 1u << 11;
+	// (48a) Lights per pixel 5 - 6 this frame (Ray Tracing sets it in every traced light's tag only then): a light not in slots 0 - 3 is
+	// looked up in slots 4 - 5 (WideSlots: xy source + 1, zw denoised visibility). The bit is the same for all lights of the frame, so
+	// with K <= 4 the branch is never taken and WideSlots (null then) is never read.
+	static const uint kWide = 1u << 14;
+	Texture2D<unorm float4> WideSlots : register(t46);
 
 	/// True when this pixel has a ray-traced visibility for the light with this tag (o_visibility, 0..1).
 	/// a_position: SV_Position.xy (render-target pixel); a_screenUV: the shader's screen UV; a_viewDepth:
@@ -43,14 +48,23 @@ namespace RTPointShadows
 			const int3 pixel = int3(int2(a_position), 0);
 			const uint4 ids = uint4(Sources.Load(pixel) * 255.0 + 0.5) & kSourceMask;
 			const bool4 match = ids == source.xxxx;
-			[branch] if (any(match))
+			bool traced = any(match);
+			float wideVisibility = 1.0;
+			[branch] if (!traced && (a_tag & kWide))
+			{
+				const float4 wide = WideSlots.Load(pixel);
+				const uint2 wideIds = uint2(wide.xy * 255.0 + 0.5) & kSourceMask;
+				traced = wideIds.x == source || wideIds.y == source;
+				wideVisibility = wideIds.x == source ? wide.z : wide.w;
+			}
+			[branch] if (traced)
 			{
 				// The traced surface is the one in the depth buffer.
 				const float sceneDepth = SharedData::GetScreenDepth(a_screenUV, a_eyeIndex);
 				[branch] if (abs(sceneDepth - a_viewDepth) <= a_viewDepth * 0.02 + 4.0)
 				{
 					const float4 visibility = Visibility.Load(pixel);
-					o_visibility = match.x ? visibility.x : (match.y ? visibility.y : (match.z ? visibility.z : visibility.w));
+					o_visibility = match.x ? visibility.x : (match.y ? visibility.y : (match.z ? visibility.z : (match.w ? visibility.w : wideVisibility)));
 					found = true;
 				}
 			}

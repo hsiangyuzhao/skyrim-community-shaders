@@ -53,6 +53,9 @@ namespace RayTracingPointLights
 	// (47z) The light's engine shadow map was left out this frame (Skip the Game's Shadow Maps): set by RayTracing::PointLightTag, also
 	// without a source; read only by Lighting.hlsl's SSPLS Coverage debug view (where the pixel did not trace it: red, not orange).
 	inline constexpr std::uint32_t kTagMapSkipped = 1u << 13;
+	// (48a) Lights per pixel 5 - 6 this frame: set by RayTracing::PointLightTag on every light with a source; PointLightShadows.hlsli then
+	// also looks in slots 4 - 5 (t46). Never set with K <= 4 (the shader's branch is not taken, t46 is null).
+	inline constexpr std::uint32_t kTagWide = 1u << 14;
 
 	// GpuSource::info[0] bits (TracePointLightsCS).
 	inline constexpr std::uint32_t kSourceISL = 1u;     // inverse-square attenuation (InverseSquareLighting)

@@ -316,6 +316,12 @@ public:
 		// last frame's traced lights where this surface was last frame (camera reprojection into a copy of last frame's PLIdx), not at
 		// the same screen pixel.
 		bool PointStickyReproject = true;
+		// (48a) Outside the settings macro. PointBeamSmooth "Window Beams: Smooth Edges" (Point Lights > Indoors, under Window Beam Softness):
+		// soft window-beam slots get their own denoiser path (wide pass wherever the penumbra can be, radius up to 24 px, clamp to the
+		// filtered mean +- 2 sigma, more history for static beams, tighter plane test) and the trace samples their disc with a static
+		// pattern stepped along R2 per frame (not the denoiser's sliding IGN), a beam ray into its own surface counting as blocked.
+		// Off = 47z exactly.
+		bool PointBeamSmooth = true;
 	};
 	/// (46f) RTAO modes (Settings::AOMode); with RTAO off the AO is SSGI's, exactly as before.
 	enum class AOModeKind : int
@@ -850,8 +856,22 @@ private:
 	bool pointDenoised = false;       // FinishPointLights ran this frame (the history is next frame's)
 	bool pointBound = false;          // t40 / t41 of the pixel shaders hold pointVis / pointIdx
 	std::uint64_t pointD3D11Bytes = 0;
+	// (48a) Lights per pixel 5 - 6: the denoised slots 4 - 5 (xy source + 1, zw visibility; also next frame's history, ping-pong with
+	// pointWrite). Created on the first frame whose K > 4 (with the backend's wide texture), released after kPointWideIdleFrames point
+	// frames at K <= 4 (or with the point textures).
+	DenoiseTexture pointWide[2];
+	bool pointWideThisFrame = false;     // this frame's trace / denoiser use slots 4 - 5 (also: the light tags carry kTagWide)
+	bool pointWideTraced = false;        // last frame's trace wrote slots 4 - 5 (the trace's sticky selection may read them)
+	bool pointWideHistoryValid = false;  // pointWide[read] holds last frame's denoised slots 4 - 5
+	std::uint32_t pointWideIdleFrames = 0;
+	std::uint64_t pointWideD3D11Bytes = 0;
+	bool EnsurePointWide(std::uint32_t a_width, std::uint32_t a_height);
+	void ReleasePointWide();
 	std::unique_ptr<ConstantBuffer> pointDenoiseCB;
 	winrt::com_ptr<ID3D11ComputeShader> pointDenoiseCS;
+	// (48a) Variants: Window Beams: Smooth Edges (PL_BEAM; only on frames with soft beam slots), slots 4 - 5 (PL_WIDE; K > 4), both.
+	winrt::com_ptr<ID3D11ComputeShader> pointDenoiseBeamCS, pointDenoiseWideCS, pointDenoiseWideBeamCS;
+	ID3D11ComputeShader* PointDenoiseShader(bool a_wide, bool a_beam);
 	/// Turns the point lights off (not the rest of Ray Tracing) with a reason for the page.
 	void SwitchOffPointLights(std::string a_reason);
 	void UpdatePointLights();

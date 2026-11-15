@@ -74,6 +74,10 @@ RWByteAddressBuffer RayCounter : register(u2);  // rays traced (monotonic, read 
 Texture2D<float> WaterDist : register(t7);
 RWTexture2D<unorm float4> PLWaterVis : register(u3);
 Texture2D<unorm float4> PLIdxPrev : register(t8);  // (47z) last frame's PLIdx (kFlagStickyReproject)
+// (48a) Lights per pixel above 4 (kFlagWide, K 5 - 6): slots 4 and 5 in a second texture, x / y = source + 1 of slot 4 / 5 (plain
+// bytes, no count or caster bits), z / w = their PLVis values. Not touched (and not allocated: null views) while K <= 4.
+RWTexture2D<unorm float4> PLWide : register(u4);
+Texture2D<unorm float4> PLWidePrev : register(t9);  // (48a) last frame's PLWide (kFlagStickyReproject with kFlagWidePrev)
 
 static const uint kFlagCharacters = 1u;   // characters are in the TLAS: the character ray
 static const uint kFlagFirstPerson = 2u;  // no character ray for pixels near the camera
@@ -106,6 +110,16 @@ static const uint kFlagBeamRange = 4096u;
 // reprojection: Sources[kReprojectRecord] holds the matrix, rows in PosRadius / Atten / Spot / Info), read from a copy of last frame's
 // PLIdx (PLIdxPrev, made before this dispatch: PLIdx itself may already hold this frame's value at another pixel). 47y: the same pixel.
 static const uint kFlagStickyReproject = 8192u;
+// (48a) Lights per pixel 5 - 6: slots 4 and 5 go to PLWide (u4); kFlagWidePrev: PLWide (and its copy PLWidePrev) holds last frame's slots
+// 4 - 5 (last frame's trace was wide too), else they count as empty for the sticky bonus and the churn.
+static const uint kFlagWide = 16384u;
+static const uint kFlagWidePrev = 32768u;
+// (48a) Window Beams: Smooth Edges: a window beam's disc sample is a static per-pixel pattern (IGN on swapped axes, offsets the denoiser's
+// rotation never takes) stepped per frame along the R2 sequence (47z: IGN slid diagonally every frame, the same IGN that rotates the
+// denoiser's taps: the lit / blocked pattern along an edge travelled across the screen); a beam ray from a surface facing away from it
+// (depth normal) counts as blocked at once (it enters the surface it starts on: beam rays cull front faces, the character ray skips its
+// first 6 units, so thin parts and back faces came out lit).
+static const uint kFlagBeamSmooth = 65536u;
 static const uint kReprojectRecord = 64u;  // Backend kPointReprojectRecord
 static const uint kSunOutProbed = 64u, kSunOutRtSurfaceRaw = 128u;  // TraceShadowsCS kOutProbed / kOutRtSurfaceRaw
 static const float kStickyBonus = 1.5;
@@ -209,6 +223,17 @@ float InterleavedGradientNoise(float2 p, uint frame)
 {
 	p += float(frame % 64u) * 5.588238;
 	return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715))));
+}
+
+// (48a, kFlagBeamSmooth) The window beams' disc sample: a static spatial pattern (IGN with swapped axes plus an offset whose x / y differ, so
+// it never equals the denoiser's IGN(p, frame), which slides both axes equally) plus the frame times the 2D R2 step; slot k a further
+// fixed offset. u.x: radius (sqrt), u.y: angle.
+float2 BeamSample(float2 p, uint frame, uint k)
+{
+	const float a = frac(52.9829189 * frac(dot(p + float2(17.0, 41.0), float2(0.00583715, 0.06711056))));
+	const float b = frac(52.9829189 * frac(dot(p + float2(83.0, 29.0), float2(0.06711056, 0.00583715))));
+	const float f = float(frame);
+	return frac(float2(a, b) + f * float2(0.7548776662, 0.5698402910) + float(k) * float2(0.4142135624, 0.7320508076));
 }
 
 // Lighting.hlsl's attenuation (InverseSquareLighting::GetAttenuation, or 1 - (d / r)^2).
@@ -466,7 +491,8 @@ groupshared uint gsMask[2];
 	const int2 p = int2(dtid.xy);
 	const uint flags = asuint(C.Params.z);
 	const uint scan = min(uint(C.Params.x), 64u);
-	const uint K = clamp(uint(C.Params.w), 1u, 4u);
+	const bool wide = (flags & kFlagWide) != 0u;  // (48a) K 5 - 6: slots 4 - 5 in PLWide
+	const uint K = clamp(uint(C.Params.w), 1u, wide ? 6u : 4u);
 	const bool inside = all(float2(p) < C.RenderSize.xy);
 	const float depth = inside ? abs(DepthMask[p]) : 0.0;
 	bool valid = inside && depth < 0.999999 && depth > 0.0;
@@ -504,7 +530,10 @@ groupshared uint gsMask[2];
 	// (46g) Last frame's sources of this pixel (read before it is overwritten): stickiness and the churn count.
 	// (47z, kFlagStickyReproject) For a traced surface: at the pixel it had last frame (camera only; nothing there = no sticky source).
 	const bool beamRange = (flags & kFlagBeamRange) != 0u;
+	// (48a) Last frame's slots 4 - 5 only when last frame's trace wrote them (else 0: no sticky bonus, nothing churned).
+	const bool widePrev = wide && (flags & kFlagWidePrev) != 0u;
 	uint4 prevIdx = 0u;
+	uint2 prevIdx2 = 0u;
 	[branch] if ((flags & kFlagStickyReproject) && valid)
 	{
 		const PLSource m = Sources[kReprojectRecord];
@@ -512,20 +541,28 @@ groupshared uint gsMask[2];
 		const float4 prevClip = float4(dot(m.PosRadius, P1), dot(m.Atten, P1), dot(m.Spot, P1), dot(asfloat(m.Info), P1));
 		if (prevClip.w > 1e-6) {
 			const float2 prevUv = float2(prevClip.x / prevClip.w * 0.5 + 0.5, 0.5 - prevClip.y / prevClip.w * 0.5);
-			if (all(prevUv >= 0.0) && all(prevUv < 1.0))  // (false for NaN)
-				prevIdx = uint4(PLIdxPrev[min(int2(prevUv * C.RenderSize.xy), int2(C.RenderSize.xy) - 1)] * 255.0 + 0.5) & 0x7Fu;
+			if (all(prevUv >= 0.0) && all(prevUv < 1.0)) {  // (false for NaN)
+				const int2 prevP = min(int2(prevUv * C.RenderSize.xy), int2(C.RenderSize.xy) - 1);
+				prevIdx = uint4(PLIdxPrev[prevP] * 255.0 + 0.5) & 0x7Fu;
+				[branch] if (widePrev)
+					prevIdx2 = uint2(PLWidePrev[prevP].xy * 255.0 + 0.5) & 0x7Fu;
+			}
 		}
 	}
 	else
 	{
 		prevIdx = uint4(PLIdx[p] * 255.0 + 0.5) & 0x7Fu;
+		[branch] if (widePrev)
+			prevIdx2 = uint2(PLWide[p].xy * 255.0 + 0.5) & 0x7Fu;
 	}
 	const bool sticky = (flags & kFlagSticky) != 0u;
 	const uint2 mask = uint2(gsMask[0], gsMask[1]);
 	if (!valid || all(mask == 0u)) {
 		PLVis[p] = 1.0;
 		PLIdx[p] = 0.0;
-		const uint emptied = WaveActiveCountBits(any(prevIdx != 0u));
+		[branch] if (wide)
+			PLWide[p] = float4(0.0, 0.0, 1.0, 1.0);
+		const uint emptied = WaveActiveCountBits(any(prevIdx != 0u) || any(prevIdx2 != 0u));
 		if (WaveIsFirstLane() && emptied > 0u) {
 			uint previousChurn;
 			RayCounter.InterlockedAdd(kChurnWord * 4u, emptied, previousChurn);
@@ -583,10 +620,10 @@ groupshared uint gsMask[2];
 		rtSurface = probeShared ? (sunFlags & kSunOutRtSurfaceRaw) != 0u : SurfaceProbe(P, V, N, dist);
 	}
 
-	// Top K by contribution.
-	float best[4] = { 0.0, 0.0, 0.0, 0.0 };      // ranking value (x kStickyBonus for last frame's sources)
-	float bestC[4] = { 0.0, 0.0, 0.0, 0.0 };     // (46g) the contribution itself
-	uint bestIdx[4] = { 0u, 0u, 0u, 0u };
+	// Top K by contribution. (48a) Up to 6 (K <= 4 leaves entries 4 - 5 empty: their insertion steps are behind a uniform branch).
+	float best[6] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };   // ranking value (x kStickyBonus for last frame's sources)
+	float bestC[6] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };  // (46g) the contribution itself
+	uint bestIdx[6] = { 0u, 0u, 0u, 0u, 0u, 0u };
 	float total = 0.0;
 	uint count = 0u;
 	[loop] for (uint word = 0u; word < 2u; ++word)
@@ -606,7 +643,7 @@ groupshared uint gsMask[2];
 				total += contribution;
 			count += 1u;
 			// Insert into the sorted top K. (46g) Last frame's sources of the pixel rank higher (stable selection).
-			const bool wasThere = sticky && any(prevIdx == (i + 1u));
+			const bool wasThere = sticky && (any(prevIdx == (i + 1u)) || any(prevIdx2 == (i + 1u)));
 			float v = contribution * (wasThere ? kStickyBonus : 1.0);
 			float vc = contribution;
 			uint vi = i + 1u;
@@ -622,6 +659,23 @@ groupshared uint gsMask[2];
 					v = tv;
 					vc = tc;
 					vi = ti;
+				}
+			}
+			[branch] if (wide)  // (48a) entries 4 - 5
+			{
+				[unroll] for (uint k2 = 4u; k2 < 6u; ++k2)
+				{
+					if (k2 < K && v > best[k2]) {
+						const float tv = best[k2];
+						const float tc = bestC[k2];
+						const uint ti = bestIdx[k2];
+						best[k2] = v;
+						bestC[k2] = vc;
+						bestIdx[k2] = vi;
+						v = tv;
+						vc = tc;
+						vi = ti;
+					}
 				}
 			}
 		}
@@ -642,12 +696,14 @@ groupshared uint gsMask[2];
 		stickyThreshold = max(stickyThreshold, sunTerm * C.Extra.z);
 	}
 	const bool beamSample = ((p.x & 3) | (p.y & 3)) == 0;  // (46g) 1 of 16 pixels feeds the beam counters
-	float4 vis = 1.0;
 	uint rays = ((flags & kFlagRtSurface) && !probeShared) ? 1u : 0u;  // (46y) the surface probe above
-	uint4 idx = 0u;
-	[unroll] for (uint k = 0u; k < 4u; ++k)
+	const bool beamSmooth = (flags & kFlagBeamSmooth) != 0u;  // (48a)
+	// (48a) Six slots (4 - 5 only with K > 4: otherwise bestIdx is 0 there and the slot is skipped at once).
+	float visA[6] = { 1.0, 1.0, 1.0, 1.0, 1.0, 1.0 };
+	uint idxA[6] = { 0u, 0u, 0u, 0u, 0u, 0u };
+	[unroll] for (uint k = 0u; k < 6u; ++k)
 	{
-		if (bestIdx[k] == 0u || bestC[k] < ((sticky && any(prevIdx == bestIdx[k])) ? stickyThreshold : threshold))
+		if (bestIdx[k] == 0u || bestC[k] < ((sticky && (any(prevIdx == bestIdx[k]) || any(prevIdx2 == bestIdx[k]))) ? stickyThreshold : threshold))
 			continue;
 		const PLSource src = Sources[bestIdx[k] - 1u];
 		const bool isBeam = (src.Info.x & kSourceBeam) != 0u;
@@ -664,8 +720,15 @@ groupshared uint gsMask[2];
 		const float3 helper = abs(Ln.z) < 0.999 ? float3(0, 0, 1) : float3(1, 0, 0);
 		const float3 T = normalize(cross(helper, Ln));
 		const float3 B = cross(Ln, T);
-		const float u1 = frac(n0 + float(k) * 0.7548776662);
-		const float u2 = frac(n1 + float(k) * 0.5698402910);
+		float u1 = frac(n0 + float(k) * 0.7548776662);
+		float u2 = frac(n1 + float(k) * 0.5698402910);
+		// (48a) Window Beams: Smooth Edges: the beam's disc sample from its own static pattern stepped along R2 per frame.
+		[branch] if (beamSmooth && softBeam)
+		{
+			const float2 u = BeamSample(float2(p), uint(C.Params.y), k);
+			u1 = u.x;
+			u2 = u.y;
+		}
 		float sn, cs;
 		sincos(6.2831853 * u2, sn, cs);
 		// (46x) A direct fill without a window spot: its own (larger) emitter.
@@ -678,13 +741,20 @@ groupshared uint gsMask[2];
 		// (46c) A window beam's light is far outside: the ray ends where it leaves the captured interior. (46x) So does an aimed fill's.
 		if (beamLike)
 			tMax = min(tMax, ExitDistance(origin, dir));
-		idx[k] = bestIdx[k];
-		if (tMax <= 1.0)
+		idxA[k] = bestIdx[k];
+		// (48a) Window Beams: Smooth Edges: a beam ray into the surface it starts from (depth normal facing away from it) is blocked there,
+		// with no ray (47z traced it: front faces culled for beams, the character ray's first units skipped, so it often came out lit).
+		const bool intoSurface = beamSmooth && beamLike && dot(N, dir) <= 0.0;
+		if (tMax <= 1.0 && !intoSurface)
 			continue;  // the surface is inside the clearance: lit
-		float tHit;
+		float tHit = 0.0;
 		const float footprint = dist * 2.0 * C.RenderSize.w;  // about a pixel's size there (alpha mip choice)
-		bool blocked = Blocked(origin, dir, tMax, kSceneMask, 0.0, footprint, beamLike ? kBeamCull : RAY_FLAG_NONE, tHit);
-		rays += 1u;
+		bool blocked = true;
+		[branch] if (!intoSurface)
+		{
+			blocked = Blocked(origin, dir, tMax, kSceneMask, 0.0, footprint, beamLike ? kBeamCull : RAY_FLAG_NONE, tHit);
+			rays += 1u;
+		}
 		if (!blocked && characters) {
 			// (46d) The player's own light: the player's body (torch, arm, torso) is not tested, only the other actors.
 			const bool ownLight = (src.Info.x & kSourceNoPlayer) != 0u;
@@ -712,7 +782,7 @@ groupshared uint gsMask[2];
 			}
 		}
 		if (blocked)
-			vis[k] = min(sqrt(saturate(tHit / (softBeam ? kBeamBlockerRange : max(len, 1.0)))), 1.0) * (254.0 / 255.0);
+			visA[k] = min(sqrt(saturate(tHit / (softBeam ? kBeamBlockerRange : max(len, 1.0)))), 1.0) * (254.0 / 255.0);
 		if (isBeam && beamSample) {
 			const uint word = kBeamWordBase + (bestIdx[k] - 1u) * 2u;
 			uint previousBeam;
@@ -721,11 +791,20 @@ groupshared uint gsMask[2];
 				RayCounter.InterlockedAdd((word + 1u) * 4u, 1u, previousBeam);
 		}
 	}
-	// (46g) Churn: the pixel's source set (order aside) differs from last frame's.
+	uint4 idx = uint4(idxA[0], idxA[1], idxA[2], idxA[3]);
+	const float4 vis = float4(visA[0], visA[1], visA[2], visA[3]);
+	const uint2 idx2 = uint2(idxA[4], idxA[5]);  // (48a) 0 unless K > 4
+	// (46g) Churn: the pixel's source set (order aside) differs from last frame's. (48a) Slots 4 - 5 too.
 	bool changed = false;
 	[unroll] for (uint a = 0u; a < 4u; ++a)
 	{
-		changed = changed || (idx[a] != 0u && !any(prevIdx == idx[a])) || (prevIdx[a] != 0u && !any(idx == prevIdx[a]));
+		changed = changed || (idx[a] != 0u && !any(prevIdx == idx[a]) && !any(prevIdx2 == idx[a])) ||
+		          (prevIdx[a] != 0u && !any(idx == prevIdx[a]) && !any(idx2 == prevIdx[a]));
+	}
+	[unroll] for (uint a2 = 0u; a2 < 2u; ++a2)
+	{
+		changed = changed || (idx2[a2] != 0u && !any(prevIdx == idx2[a2]) && !any(prevIdx2 == idx2[a2])) ||
+		          (prevIdx2[a2] != 0u && !any(idx == prevIdx2[a2]) && !any(idx2 == prevIdx2[a2]));
 	}
 	const uint churned = WaveActiveCountBits(changed);
 	if (WaveIsFirstLane() && churned > 0u) {
@@ -749,7 +828,7 @@ groupshared uint gsMask[2];
 				if (!(csrc.Info.x & kSourceNative))
 					continue;
 				const float cc = Contribution(csrc, P, NRank, rankWrap);  // (47x) as the ranking
-				const bool covered = any(idx == (ci + 1u).xxxx);
+				const bool covered = any(idx == (ci + 1u).xxxx) || any(idx2 == (ci + 1u).xx);
 				const bool lit = cc > 0.0 && (covered || cc >= threshold);
 				const uint litCount = WaveActiveCountBits(lit);
 				const uint uncoveredCount = WaveActiveCountBits(lit && !covered);
@@ -769,6 +848,8 @@ groupshared uint gsMask[2];
 		idx[3] |= 0x80u;
 	PLVis[p] = vis;
 	PLIdx[p] = float4(idx) / 255.0;
+	[branch] if (wide)  // (48a) slots 4 - 5
+		PLWide[p] = float4(float2(idx2) / 255.0, visA[4], visA[5]);
 	// (47i) Point Light Shadows on Water: a water surface in front of this pixel's opaque surface last frame.
 	uint waterRays = 0u;  // (47j) counted on their own too (F7 rt_pl_water_rays)
 	[branch] if (flags & kFlagWater)

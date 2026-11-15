@@ -2,6 +2,8 @@
 //
 // Input: this frame's trace (TracePointLightsCS): per pixel up to four slots, each a source slot id and
 // one ray's result (1 = lit, < 1 = blocked, the value encoding sqrt(blocker / light distance)).
+// (48a) Lights per pixel 5 - 6 (kPLFlagWide): slots 4 - 5 in PLWide (xy source + 1, zw values); the same filter runs a second
+// time for them (DenoiseSet) and writes OutWide; neighbours / history are matched over all six slots.
 // Per slot of the pixel, only samples of the SAME source count (its id in any slot of the neighbour):
 //   1. 3x3 neighbourhood: where every matching sample agrees (fully lit, fully shadowed) nothing is
 //      filtered (contact shadows stay sharp, lit areas stay lit);
@@ -12,7 +14,8 @@
 //      the distance it should have, its slot found by the source id), clamped to this frame's 3x3 range,
 //      blended in (Params.y = this frame's weight); (47y, kPLFlagMotion) where the camera's taps fail, last frame's motion vectors at
 //      constant velocity; (kPLFlagNoHistorySmooth) slots still without history are filtered at least 2.5 px with a fixed pattern.
-// Output: Lighting reads OutVis / OutIdx (t40 / t41 of the pixel shaders, RayTracing/PointLightShadows.hlsli);
+// (48a, kPLFlagBeamSmooth) Window Beams: Smooth Edges: soft window-beam slots take their own path (BeamRadius / the beam pass below).
+// Output: Lighting reads OutVis / OutIdx (t40 / t41 of the pixel shaders, RayTracing/PointLightShadows.hlsli; (48a) OutWide t46);
 // they are also next frame's history (ping-pong), with OutDist.
 // The debug views of the point lights are written here (after CombineCS cleared DebugColor).
 
@@ -62,6 +65,51 @@ static const float kMotionTryBelow = 0.5;
 static const float kMotionTolerance = 8.0;
 static const float kNoHistoryRadiusPx = 2.5;
 Texture2D<float2> PrevMotion : register(t6);
+
+// (48a) Lights per pixel 5 - 6: this frame's slots 4 - 5 (t7, TracePointLightsCS PLWide: xy source + 1, zw raw), last frame's denoised ones
+// (t8, OutWide of last frame) and this frame's (u4: xy source + 1 as read, zw denoised). kPLFlagWideHistory: t8 holds last frame (its
+// trace was wide too); without it last frame's slots 4 - 5 count as empty.
+static const uint kPLFlagWide = 32u;
+static const uint kPLFlagWideHistory = 64u;
+Texture2D<unorm float4> PLWide : register(t7);
+Texture2D<unorm float4> HistWide : register(t8);
+RWTexture2D<unorm float4> OutWide : register(u4);
+
+// (48a) "Window Beams: Smooth Edges" (soft window-beam slots only; the other slots exactly as before):
+//   - the wide pass runs wherever the beam's penumbra can be: the 3x3 disagrees (at least kBeamMinRadiusPx: hard 0.05-degree edges too) or
+//     the history is partial (kBeamHistLo .. kBeamHistHi: a penumbra pixel whose 3x3 happened to agree). Converged lit / umbra pixels skip
+//     it (the cost stays on the penumbra). Without a blocked sample in the 3x3 the blocker distance comes from a probe of kPoissonTaps taps
+//     at kBeamProbeRadiusPx; none found there = no wide pass (well outside any wide penumbra);
+//   - radius up to kBeamMaxRadiusPx; above kPoissonTaps px a second ring (the disc turned by the golden angle): 24 taps;
+//   - the taps' plane test kBeamPlaneScale times tighter (a character's lowest rows lie in the floor's plane: they no longer bleed across
+//     its shadow on the floor);
+//   - history clamp: the filtered mean +- kBeamClampK sigma of that mean (sigma of the binary samples / sqrt(effective tap count)), at
+//     least kBeamClampMin (47z: the 1-sample 3x3 min / max +- 0.1, which snapped chance-agreeing penumbra pixels to 1: crawling specks);
+//   - a static beam (HistoryDrop 0) keeps more history: this frame weighs kBeamStaticWeight instead of Params.y.
+static const uint kPLFlagBeamSmooth = 128u;
+static const float kBeamMaxRadiusPx = 24.0;
+static const float kBeamMinRadiusPx = 2.0;
+static const float kBeamProbeRadiusPx = 12.0;
+static const float kBeamHistLo = 0.02;
+static const float kBeamHistHi = 0.98;
+static const float kBeamPlaneScale = 0.5;
+static const float kBeamClampK = 2.0;
+static const float kBeamClampMin = 0.05;
+static const float kBeamStaticWeight = 0.1;
+static const float2 kGoldenTurn = float2(-0.7373688, 0.6754903);  // cos / sin of the golden angle (2.3999632 rad)
+
+// (48a) Variants (RayTracing.cpp picks one per frame): PL_WIDE = slots 4 - 5 (K > 4 this frame), PL_BEAM = Window Beams: Smooth Edges on. Without
+// them their code folds away at compile time: the plain variant is the 47z shader (K <= 4 with the switch off costs what it did).
+#if defined(PL_WIDE)
+static const bool kVariantWide = true;
+#else
+static const bool kVariantWide = false;
+#endif
+#if defined(PL_BEAM)
+static const bool kVariantBeam = true;
+#else
+static const bool kVariantBeam = false;
+#endif
 
 float InterleavedGradientNoise(float2 a_p, uint a_frame)
 {
@@ -115,6 +163,32 @@ bool Match(uint4 a_ids, float4 a_vis, uint a_id, out float o_raw)
 	return false;
 }
 
+// (48a) Match over all six slots of a sample: a_wide = its slots 4 - 5 (xy source + 1 as stored, zw values; (0, 0, 1, 1) without them).
+bool MatchWide(uint4 a_ids, float4 a_vis, float4 a_wide, uint a_id, out float o_raw)
+{
+	bool found = Match(a_ids, a_vis, a_id, o_raw);
+	if (kVariantWide && !found && a_id != 0u) {
+		const uint2 wideIds = uint2(a_wide.xy * 255.0 + 0.5) & 0x7Fu;
+		if (wideIds.x == a_id) {
+			o_raw = a_wide.z;
+			found = true;
+		} else if (wideIds.y == a_id) {
+			o_raw = a_wide.w;
+			found = true;
+		}
+	}
+	return found;
+}
+
+// (48a) A sample's slots 4 - 5 when this frame is wide (else none: no read).
+float4 WideAt(int2 a_q, uint a_flags)
+{
+	float4 w = float4(0.0, 0.0, 1.0, 1.0);
+	[branch] if (kVariantWide && (a_flags & kPLFlagWide))
+		w = PLWide[a_q];
+	return w;
+}
+
 // (46d) How much of a source's history is dropped this frame (0 keep .. 1 none): a new or moving source.
 float HistoryDrop(uint a_id)
 {
@@ -150,8 +224,8 @@ bool SoftBeam(uint a_id)
 
 // The history taps at prevPos (last frame's pixel, centre at +0.5): bilinear, each tap checked against the distance it should have, its
 // slot found by the source id ((47y) split out: the camera and the motion candidate share it). Returns the bilinear weight of the taps
-// that passed the distance test (whatever their sources).
-float HistoryTaps(float2 prevPos, float expected, float tolerance, uint4 ids, int2 maxP, out float4 hv, out float4 hw)
+// that passed the distance test (whatever their sources). (48a) a_wideHistory: last frame's slots 4 - 5 (HistWide) are searched too.
+float HistoryTaps(float2 prevPos, float expected, float tolerance, uint4 ids, bool a_wideHistory, int2 maxP, out float4 hv, out float4 hw)
 {
 	hv = 0.0;
 	hw = 0.0;
@@ -169,10 +243,13 @@ float HistoryTaps(float2 prevPos, float expected, float tolerance, uint4 ids, in
 			valid += bw;
 			const uint4 hid = Ids(HistIdx[q]);
 			const float4 hvis = HistVis[q];
+			float4 hwide = float4(0.0, 0.0, 1.0, 1.0);
+			[branch] if (kVariantWide && a_wideHistory)
+				hwide = HistWide[q];
 			[unroll] for (uint s = 0u; s < 4u; ++s)
 			{
 				float h;
-				if (Match(hid, hvis, ids[s], h)) {
+				if (MatchWide(hid, hvis, hwide, ids[s], h)) {
 					hv[s] += h * bw;
 					hw[s] += bw;
 				}
@@ -182,47 +259,175 @@ float HistoryTaps(float2 prevPos, float expected, float tolerance, uint4 ids, in
 	return valid;
 }
 
-[numthreads(8, 8, 1)] void main(uint3 dtid : SV_DispatchThreadID) {
-	const int2 p = int2(dtid.xy);
-	if (any(dtid.xy >= Size.xy))
-		return;
-	const uint flags = asuint(PLParams.z);
-	const float4 idxRaw = PLIdx[p];
-	const uint4 ids = Ids(idxRaw);
-	const float depth = abs(DepthMask[p]);
-	const float4 raw = PLVis[p];
-	float4 result = 1.0;
-	float dist = -1.0;
+// The pixel's geometry, shared by both slot sets.
+struct PixelFrame
+{
+	int2 p;
+	int2 maxP;
+	float3 P;
+	float3 N;
+	float footprint;
+	float planeTolerance;
+	uint flags;
+};
 
-	[branch] if (!RTIsSky(depth) && any(ids != 0u))
+// Steps 1, 2 and 3b for four slots (ids, raw: this frame's; hv / hw: their history taps). (48a) Called for slots 0 - 3 and, with K > 4,
+// for slots 4 - 5 (ids.zw = 0). With kPLFlagBeamSmooth off this is the 47z code, step for step.
+float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw)
+{
+	const int2 p = a_px.p;
+	const int2 maxP = a_px.maxP;
+	const float3 P = a_px.P;
+	const float3 N = a_px.N;
+	const float footprint = a_px.footprint;
+	const float planeTolerance = a_px.planeTolerance;
+	const uint flags = a_px.flags;
+	// (48a) Soft window-beam slots on the Smooth Edges path, and their tighter plane tolerance.
+	const bool beamSmooth = kVariantBeam && (flags & kPLFlagBeamSmooth) != 0u;
+	bool4 beamSlot = false;
+	[unroll] for (uint b = 0u; b < 4u; ++b)
+		beamSlot[b] = beamSmooth && SoftBeam(ids[b]);
+	const float beamPlaneTolerance = planeTolerance * kBeamPlaneScale;
+
+	// 1. 3x3: matching samples, their range and the blocked ones' distance ratio. (48a) + the sum of squared weights (beam slots' clamp).
+	float4 sum = 0.0, weights = 0.0, lo = 2.0, hi = -1.0, qSum = 0.0, qCount = 0.0, weights2 = 0.0;
+	[unroll] for (int k = 0; k < 9; ++k)
 	{
-		const float3 P = RTPosition(p, depth);
-		dist = length(P);
-		const int2 maxP = int2(Size.xy) - 1;
-
-		// Plane of this pixel (depth normal, smaller step per axis).
-		float3 N;
-		float footprint;
-		{
-			const int2 pl = int2(max(p.x - 1, 0), p.y), pr = int2(min(p.x + 1, maxP.x), p.y);
-			const int2 pu = int2(p.x, max(p.y - 1, 0)), pd = int2(p.x, min(p.y + 1, maxP.y));
-			const float dl = abs(DepthMask[pl]), dr = abs(DepthMask[pr]), du = abs(DepthMask[pu]), dd = abs(DepthMask[pd]);
-			const float3 dx = abs(dl - depth) < abs(dr - depth) ? P - RTPosition(pl, dl) : RTPosition(pr, dr) - P;
-			const float3 dy = abs(du - depth) < abs(dd - depth) ? P - RTPosition(pu, du) : RTPosition(pd, dd) - P;
-			N = cross(dy, dx);
-			const float len = length(N);
-			N = len > 1e-12 ? N / len : (dist > 0.0 ? -P / dist : float3(0, 0, 1));
-			// World size of one pixel across the view ray (not the slanted surface: the penumbra is measured on it).
-			footprint = max(length(RTPosition(pr, depth) - P), 1e-3);
+		const int2 o = int2(k % 3 - 1, k / 3 - 1);
+		const int2 q = clamp(p + o, int2(0, 0), maxP);
+		const float dq = abs(DepthMask[q]);
+		float wPlane = 0.0, wPlaneBeam = 0.0;
+		if (!RTIsSky(dq)) {
+			const float planeDist = abs(dot(N, RTPosition(q, dq) - P));
+			wPlane = exp(-planeDist / planeTolerance);
+			wPlaneBeam = exp(-planeDist / beamPlaneTolerance);
 		}
-		const float planeTolerance = dist * 0.01 + 2.0;
-
-		// 1. 3x3: matching samples, their range and the blocked ones' distance ratio.
-		float4 sum = 0.0, weights = 0.0, lo = 2.0, hi = -1.0, qSum = 0.0, qCount = 0.0;
-		[unroll] for (int k = 0; k < 9; ++k)
+		[branch] if (wPlane >= 0.05)
 		{
-			const int2 o = int2(k % 3 - 1, k / 3 - 1);
-			const int2 q = clamp(p + o, int2(0, 0), maxP);
+			const uint4 idq = Ids(PLIdx[q]);
+			const float4 vq = PLVis[q];
+			const float4 wq = WideAt(q, flags);
+			[unroll] for (uint s = 0u; s < 4u; ++s)
+			{
+				const float wp = beamSlot[s] ? wPlaneBeam : wPlane;
+				const float w = wp / (1.0 + float(o.x * o.x + o.y * o.y));
+				float r;
+				if ((!beamSlot[s] || wp >= 0.05) && MatchWide(idq, vq, wq, ids[s], r)) {
+					const float v = Lit(r);
+					sum[s] += v * w;
+					weights[s] += w;
+					weights2[s] += w * w;
+					lo[s] = min(lo[s], v);
+					hi[s] = max(hi[s], v);
+					if (v < 0.5) {
+						const float t = r * (255.0 / 254.0);
+						qSum[s] += t * t;
+						qCount[s] += 1.0;
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Penumbra-wide pass for the slots whose neighbourhood disagrees.
+	float4 radiusPx = 0.0;
+	float4 beamRadius = 0.0;  // (48a) Smooth Edges beam slots: their wide pass radius (0 = none)
+	bool4 beamProbe = false;  // (48a) ... the radius still to be found by the probe
+	float4 spatial = 1.0;
+	[unroll] for (uint s = 0u; s < 4u; ++s)
+	{
+		[branch] if (beamSlot[s])
+		{
+			// (48a) Window Beams: Smooth Edges.
+			const bool disagree = hi[s] > lo[s];
+			const float hMean = hw[s] >= 0.05 ? hv[s] / hw[s] : -1.0;
+			const bool partial = hMean > kBeamHistLo && hMean < kBeamHistHi;
+			if (disagree || partial) {
+				if (qCount[s] > 0.0) {
+					const float qb = saturate(qSum[s] / qCount[s]);
+					beamRadius[s] = clamp(qb * kBeamBlockerRange * PLExtra.w / footprint, 1.0, kBeamMaxRadiusPx);
+					if (disagree) {
+						beamRadius[s] = max(beamRadius[s], kBeamMinRadiusPx);
+						if (hw[s] < 0.05)
+							beamRadius[s] = max(beamRadius[s], kBeamNoHistoryRadiusPx);
+					}
+				} else {
+					beamProbe[s] = true;  // 3x3 all lit, partial history: the blocker distance from a wider look
+				}
+			}
+		}
+		else if (ids[s] != 0u && hi[s] > lo[s])
+		{
+			[branch] if (SoftBeam(ids[s]))
+			{
+				// (46o) A window beam: the light is far away, the penumbra is blocker distance x 2 tan(half angle).
+				const float qb = qCount[s] > 0.0 ? saturate(qSum[s] / qCount[s]) : 0.25;
+				radiusPx[s] = clamp(qb * kBeamBlockerRange * PLExtra.w / footprint, 1.0, PLParams.w);
+				if (hw[s] < 0.05)
+					radiusPx[s] = max(radiusPx[s], min(kBeamNoHistoryRadiusPx, PLParams.w));
+			}
+			else
+			{
+				const float q = qCount[s] > 0.0 ? clamp(qSum[s] / qCount[s], 0.0, 0.95) : 0.25;
+				const float emitter = BigEmitter(ids[s]) ? asfloat(PLEmitter.z) : PLParams.x;  // (46x)
+				const float width = 2.0 * emitter * q / (1.0 - q);
+				radiusPx[s] = clamp(0.5 * width / footprint, 1.0, PLParams.w);
+			}
+			// (47y) Smooth When No History: every slot (the beams keep their 4 px) at least kNoHistoryRadiusPx where no history came.
+			if ((flags & kPLFlagNoHistorySmooth) && hw[s] < 0.05)
+				radiusPx[s] = max(radiusPx[s], min(kNoHistoryRadiusPx, PLParams.w));
+		}
+		spatial[s] = weights[s] > 0.0 ? sum[s] / max(weights[s], 1e-6) : Lit(raw[s]);
+	}
+	// The per-pixel rotation of the taps (per frame), and the fixed one (47y Smooth When No History).
+	float sn, cs;
+	sincos(6.2831853 * InterleavedGradientNoise(float2(p), PLEmitter.w), sn, cs);
+	float snStill = sn, csStill = cs;
+	[branch] if (flags & kPLFlagNoHistorySmooth)
+		sincos(6.2831853 * InterleavedGradientNoise(float2(p), 0u), snStill, csStill);
+	const float maxRadius = max(max(radiusPx.x, radiusPx.y), max(radiusPx.z, radiusPx.w));
+	[branch] if ((flags & kPLFlagSmooth) && maxRadius > 1.5)
+	{
+		// (47x) Per slot at its own radius: the pixel itself plus kPoissonTaps rotated disc taps (plane x Gaussian weights as before).
+		[unroll] for (uint s = 0u; s < 4u; ++s)
+		{
+			[branch] if (radiusPx[s] > 1.5)
+			{
+				const float radius = radiusPx[s];
+				const bool still = (flags & kPLFlagNoHistorySmooth) && hw[s] < 0.05;
+				const float sns = still ? snStill : sn, css = still ? csStill : cs;
+				const float invR2 = 1.0 / (radius * radius);
+				float wsum = Lit(raw[s]), wwt = 1.0;
+				[loop] for (uint k = 0u; k < kPoissonTaps; ++k)
+				{
+					const float2 d = kPoisson[k];
+					const float2 r = float2(d.x * css - d.y * sns, d.x * sns + d.y * css) * radius;
+					const int2 o = int2(round(r));
+					const int2 q = clamp(p + o, int2(0, 0), maxP);
+					const float dq = abs(DepthMask[q]);
+					[branch] if (any(o != 0) && !RTIsSky(dq))
+					{
+						const float wPlane = exp(-abs(dot(N, RTPosition(q, dq) - P)) / planeTolerance);
+						float rq;
+						if (wPlane >= 0.05 && MatchWide(Ids(PLIdx[q]), PLVis[q], WideAt(q, flags), ids[s], rq)) {
+							const float w = wPlane * exp(-1.5 * dot(r, r) * invR2);
+							wsum += Lit(rq) * w;
+							wwt += w;
+						}
+					}
+				}
+				spatial[s] = wsum / wwt;
+			}
+		}
+	}
+	else if (maxRadius > 1.5)
+	{
+		const int stepPx = max(int(round(maxRadius * 0.5)), 1);
+		float4 wsum = 0.0, wwt = 0.0;
+		[loop] for (uint k = 0u; k < 25u; ++k)
+		{
+			const int2 o = int2(int(k % 5u) - 2, int(k / 5u) - 2);
+			const int2 q = clamp(p + o * stepPx, int2(0, 0), maxP);
 			const float dq = abs(DepthMask[q]);
 			float wPlane = 0.0;
 			if (!RTIsSky(dq))
@@ -231,38 +436,191 @@ float HistoryTaps(float2 prevPos, float expected, float tolerance, uint4 ids, in
 			{
 				const uint4 idq = Ids(PLIdx[q]);
 				const float4 vq = PLVis[q];
-				const float w = wPlane / (1.0 + float(o.x * o.x + o.y * o.y));
+				const float4 wq = WideAt(q, flags);
+				const float r2 = float(o.x * o.x + o.y * o.y) * float(stepPx * stepPx);
 				[unroll] for (uint s = 0u; s < 4u; ++s)
 				{
 					float r;
-					if (Match(idq, vq, ids[s], r)) {
-						const float v = Lit(r);
-						sum[s] += v * w;
-						weights[s] += w;
-						lo[s] = min(lo[s], v);
-						hi[s] = max(hi[s], v);
-						if (v < 0.5) {
-							const float t = r * (255.0 / 254.0);
-							qSum[s] += t * t;
-							qCount[s] += 1.0;
-						}
+					if (radiusPx[s] > 1.5 && MatchWide(idq, vq, wq, ids[s], r)) {
+						const float w = wPlane * exp(-2.0 * r2 / (radiusPx[s] * radiusPx[s]));
+						wsum[s] += Lit(r) * w;
+						wwt[s] += w;
 					}
 				}
 			}
 		}
+		[unroll] for (uint s = 0u; s < 4u; ++s)
+			if (radiusPx[s] > 1.5 && wwt[s] > 0.0)
+				spatial[s] = wsum[s] / wwt[s];
+	}
+
+	// (48a) Window Beams: Smooth Edges: the beam slots' own pass (independent of Smoother Shadow Edges).
+	float4 beamNeff = weights2 > 0.0 ? weights * weights / max(weights2, 1e-6) : 1.0;  // effective sample count of the mean in spatial
+	[branch] if (any(beamSlot))
+	{
+		[unroll] for (uint s = 0u; s < 4u; ++s)
+		{
+			// The probe: kPoissonTaps taps at kBeamProbeRadiusPx; the blocked ones' distance ratio gives the radius (none: no wide pass).
+			[branch] if (beamProbe[s])
+			{
+				float pqSum = 0.0, pqCount = 0.0;
+				[loop] for (uint k = 0u; k < kPoissonTaps; ++k)
+				{
+					const float2 d = kPoisson[k];
+					const float2 r = float2(d.x * cs - d.y * sn, d.x * sn + d.y * cs) * kBeamProbeRadiusPx;
+					const int2 o = int2(round(r));
+					const int2 q = clamp(p + o, int2(0, 0), maxP);
+					const float dq = abs(DepthMask[q]);
+					[branch] if (!RTIsSky(dq))
+					{
+						const float wPlane = exp(-abs(dot(N, RTPosition(q, dq) - P)) / beamPlaneTolerance);
+						float rq;
+						if (wPlane >= 0.05 && MatchWide(Ids(PLIdx[q]), PLVis[q], WideAt(q, flags), ids[s], rq)) {
+							if (rq < 0.999) {
+								const float t = rq * (255.0 / 254.0);
+								pqSum += t * t;
+								pqCount += 1.0;
+							}
+						}
+					}
+				}
+				if (pqCount > 0.0)
+					beamRadius[s] = clamp(saturate(pqSum / pqCount) * kBeamBlockerRange * PLExtra.w / footprint, 1.0, kBeamMaxRadiusPx);
+			}
+			[branch] if (beamRadius[s] >= 1.5)
+			{
+				const float radius = beamRadius[s];
+				const bool still = (flags & kPLFlagNoHistorySmooth) && hw[s] < 0.05;
+				const float sns = still ? snStill : sn, css = still ? csStill : cs;
+				const float invR2 = 1.0 / (radius * radius);
+				const uint taps = radius > float(kPoissonTaps) ? 2u * kPoissonTaps : kPoissonTaps;
+				float wsum = Lit(raw[s]), wwt = 1.0, wwt2 = 1.0;
+				[loop] for (uint k = 0u; k < taps; ++k)
+				{
+					const float2 d0 = kPoisson[k % kPoissonTaps];
+					// The second ring: the same disc turned by the golden angle.
+					const float2 d = k < kPoissonTaps ? d0 : float2(d0.x * kGoldenTurn.x - d0.y * kGoldenTurn.y, d0.x * kGoldenTurn.y + d0.y * kGoldenTurn.x);
+					const float2 r = float2(d.x * css - d.y * sns, d.x * sns + d.y * css) * radius;
+					const int2 o = int2(round(r));
+					const int2 q = clamp(p + o, int2(0, 0), maxP);
+					const float dq = abs(DepthMask[q]);
+					[branch] if (any(o != 0) && !RTIsSky(dq))
+					{
+						const float wPlane = exp(-abs(dot(N, RTPosition(q, dq) - P)) / beamPlaneTolerance);
+						float rq;
+						if (wPlane >= 0.05 && MatchWide(Ids(PLIdx[q]), PLVis[q], WideAt(q, flags), ids[s], rq)) {
+							const float w = wPlane * exp(-1.5 * dot(r, r) * invR2);
+							wsum += Lit(rq) * w;
+							wwt += w;
+							wwt2 += w * w;
+						}
+					}
+				}
+				spatial[s] = wsum / wwt;
+				beamNeff[s] = wwt * wwt / wwt2;
+			}
+		}
+	}
+
+	// 3b. History blend (taps read by the caller; hw = 0 without usable history).
+	float4 result = spatial;
+	[unroll] for (uint sh = 0u; sh < 4u; ++sh)
+	{
+		if (ids[sh] != 0u && hw[sh] >= 0.05) {
+			const float drop = HistoryDrop(ids[sh]);
+			float lo3, hi3, current;
+			if (beamSlot[sh]) {
+				// (48a) The filtered mean +- k sigma of that mean (binary samples: sigma^2 = m (1 - m)); static beams keep more history,
+				// but only while it lies inside that band (a history that had to be clamped, e.g. a character's shadow moving over the
+				// floor, is replaced at the normal rate: no longer trails).
+				const float m = spatial[sh];
+				const float band = max(kBeamClampK * sqrt(saturate(m * (1.0 - m)) / max(beamNeff[sh], 1.0)), kBeamClampMin);
+				lo3 = m - band;
+				hi3 = m + band;
+				const float hRaw = hv[sh] / hw[sh];
+				const bool inBand = hRaw >= lo3 && hRaw <= hi3;
+				current = lerp(drop > 0.0 || !inBand ? PLParams.y : kBeamStaticWeight, 1.0, drop);
+			} else {
+				lo3 = (lo[sh] <= 1.0 ? lo[sh] : spatial[sh]) - 0.1;
+				hi3 = (hi[sh] >= 0.0 ? hi[sh] : spatial[sh]) + 0.1;
+				// (46d) A moving source (a carried torch) keeps less history: its shadows move with it, nothing smears.
+				current = lerp(PLParams.y, 1.0, drop);
+			}
+			result[sh] = lerp(clamp(hv[sh] / hw[sh], lo3, hi3), spatial[sh], current);
+		}
+	}
+	[unroll] for (uint e = 0u; e < 4u; ++e)
+		if (ids[e] == 0u)
+			result[e] = 1.0;
+	return result;
+}
+
+[numthreads(8, 8, 1)] void main(uint3 dtid : SV_DispatchThreadID) {
+	const int2 p = int2(dtid.xy);
+	if (any(dtid.xy >= Size.xy))
+		return;
+	const uint flags = asuint(PLParams.z);
+	const bool wide = kVariantWide && (flags & kPLFlagWide) != 0u;
+	const bool wideHistory = wide && (flags & kPLFlagWideHistory) != 0u;
+	const float4 idxRaw = PLIdx[p];
+	const uint4 ids = Ids(idxRaw);
+	const float4 wideRaw = WideAt(p, flags);  // (48a) (0, 0, 1, 1) unless K > 4
+	const uint4 wideIds = uint4(Ids(float4(wideRaw.xy, 0.0, 0.0)).xy, 0u, 0u);
+	const float depth = abs(DepthMask[p]);
+	const float4 raw = PLVis[p];
+	float4 result = 1.0;
+	float2 wideResult = 1.0;
+	float dist = -1.0;
+
+	[branch] if (!RTIsSky(depth) && (any(ids != 0u) || any(wideIds != 0u)))
+	{
+		PixelFrame px;
+		px.p = p;
+		px.flags = flags;
+		px.P = RTPosition(p, depth);
+		dist = length(px.P);
+		px.maxP = int2(Size.xy) - 1;
+		const float3 P = px.P;
+		const int2 maxP = px.maxP;
+
+		// Plane of this pixel (depth normal, smaller step per axis).
+		{
+			const int2 pl = int2(max(p.x - 1, 0), p.y), pr = int2(min(p.x + 1, maxP.x), p.y);
+			const int2 pu = int2(p.x, max(p.y - 1, 0)), pd = int2(p.x, min(p.y + 1, maxP.y));
+			const float dl = abs(DepthMask[pl]), dr = abs(DepthMask[pr]), du = abs(DepthMask[pu]), dd = abs(DepthMask[pd]);
+			const float3 dx = abs(dl - depth) < abs(dr - depth) ? P - RTPosition(pl, dl) : RTPosition(pr, dr) - P;
+			const float3 dy = abs(du - depth) < abs(dd - depth) ? P - RTPosition(pu, du) : RTPosition(pd, dd) - P;
+			float3 N = cross(dy, dx);
+			const float len = length(N);
+			N = len > 1e-12 ? N / len : (dist > 0.0 ? -P / dist : float3(0, 0, 1));
+			px.N = N;
+			// World size of one pixel across the view ray (not the slanted surface: the penumbra is measured on it).
+			px.footprint = max(length(RTPosition(pr, depth) - P), 1e-3);
+		}
+		px.planeTolerance = dist * 0.01 + 2.0;
 
 		// 3a. (46o) The history taps first (read only; blended in after the spatial pass as before), so that a soft beam slot
 		// without usable history (a moving character: rejected by distance) gets a wide spatial filter instead of 1 spp grain.
+		// (48a) The chosen candidate (position, tolerance) is kept for slots 4 - 5.
 		float4 hv = 0.0, hw = 0.0;
+		float2 histPos = 0.0;
+		float histExpected = 0.0, histTolerance = 0.0;
+		bool histTaken = false;
 		[branch] if (flags & kPLFlagHistory)
 		{
 			const float4 prevClip = mul(PrevViewProj, float4(P + CameraDelta.xyz, 1.0));
 			const float2 prevUv = prevClip.w > 1e-4 ? float2(prevClip.x / prevClip.w * 0.5 + 0.5, 0.5 - prevClip.y / prevClip.w * 0.5) : float2(-1.0, -1.0);
 			const float expected = length(P + CameraDelta.xyz);
 			const float tolerance = expected * 0.02 + 8.0;
+			histExpected = expected;
 			float tapWeight = 0.0;
 			[branch] if (all(prevUv >= 0.0) && all(prevUv < 1.0))
-				tapWeight = HistoryTaps(prevUv * float2(Size.xy) - 0.5, expected, tolerance, ids, maxP, hv, hw);
+			{
+				histPos = prevUv * float2(Size.xy) - 0.5;
+				histTolerance = tolerance;
+				histTaken = true;
+				tapWeight = HistoryTaps(histPos, expected, tolerance, ids, wideHistory, maxP, hv, hw);
+			}
 			// (47y) Moving Characters: Keep Shadow History: the camera found (almost) no valid taps -> last frame's motion vectors at
 			// constant velocity (two fixed-point steps from the camera guess); the candidate with more valid taps wins.
 			[branch] if ((flags & kPLFlagMotion) && tapWeight < kMotionTryBelow)
@@ -277,134 +635,36 @@ float HistoryTaps(float2 prevPos, float expected, float tolerance, uint4 ids, in
 				[branch] if (all(m >= 0.0) && all(m < 1.0))
 				{
 					float4 mv, mw;
-					const float motionWeight = HistoryTaps(m * float2(Size.xy) - 0.5, expected, tolerance + kMotionTolerance, ids, maxP, mv, mw);
+					const float2 motionPos = m * float2(Size.xy) - 0.5;
+					const float motionWeight = HistoryTaps(motionPos, expected, tolerance + kMotionTolerance, ids, wideHistory, maxP, mv, mw);
 					if (motionWeight > tapWeight) {
 						hv = mv;
 						hw = mw;
+						histPos = motionPos;
+						histTolerance = tolerance + kMotionTolerance;
+						histTaken = true;
 					}
 				}
 			}
 		}
 
-		// 2. Penumbra-wide pass for the slots whose neighbourhood disagrees.
-		float4 radiusPx = 0.0;
-		float4 spatial = 1.0;
-		[unroll] for (uint s = 0u; s < 4u; ++s)
-		{
-			if (ids[s] != 0u && hi[s] > lo[s]) {
-				[branch] if (SoftBeam(ids[s]))
-				{
-					// (46o) A window beam: the light is far away, the penumbra is blocker distance x 2 tan(half angle).
-					const float qb = qCount[s] > 0.0 ? saturate(qSum[s] / qCount[s]) : 0.25;
-					radiusPx[s] = clamp(qb * kBeamBlockerRange * PLExtra.w / footprint, 1.0, PLParams.w);
-					if (hw[s] < 0.05)
-						radiusPx[s] = max(radiusPx[s], min(kBeamNoHistoryRadiusPx, PLParams.w));
-				}
-				else
-				{
-					const float q = qCount[s] > 0.0 ? clamp(qSum[s] / qCount[s], 0.0, 0.95) : 0.25;
-					const float emitter = BigEmitter(ids[s]) ? asfloat(PLEmitter.z) : PLParams.x;  // (46x)
-					const float width = 2.0 * emitter * q / (1.0 - q);
-					radiusPx[s] = clamp(0.5 * width / footprint, 1.0, PLParams.w);
-				}
-				// (47y) Smooth When No History: every slot (the beams keep their 4 px) at least kNoHistoryRadiusPx where no history came.
-				if ((flags & kPLFlagNoHistorySmooth) && hw[s] < 0.05)
-					radiusPx[s] = max(radiusPx[s], min(kNoHistoryRadiusPx, PLParams.w));
-			}
-			spatial[s] = weights[s] > 0.0 ? sum[s] / weights[s] : Lit(raw[s]);
-		}
-		const float maxRadius = max(max(radiusPx.x, radiusPx.y), max(radiusPx.z, radiusPx.w));
-		[branch] if ((flags & kPLFlagSmooth) && maxRadius > 1.5)
-		{
-			// (47x) Per slot at its own radius: the pixel itself plus kPoissonTaps rotated disc taps (plane x Gaussian weights as before).
-			float sn, cs;
-			sincos(6.2831853 * InterleavedGradientNoise(float2(p), PLEmitter.w), sn, cs);
-			// (47y) Smooth When No History: slots without history use a rotation per pixel only (no per-frame shimmer).
-			float snStill = sn, csStill = cs;
-			[branch] if (flags & kPLFlagNoHistorySmooth)
-				sincos(6.2831853 * InterleavedGradientNoise(float2(p), 0u), snStill, csStill);
-			[unroll] for (uint s = 0u; s < 4u; ++s)
-			{
-				[branch] if (radiusPx[s] > 1.5)
-				{
-					const float radius = radiusPx[s];
-					const bool still = (flags & kPLFlagNoHistorySmooth) && hw[s] < 0.05;
-					const float sns = still ? snStill : sn, css = still ? csStill : cs;
-					const float invR2 = 1.0 / (radius * radius);
-					float wsum = Lit(raw[s]), wwt = 1.0;
-					[loop] for (uint k = 0u; k < kPoissonTaps; ++k)
-					{
-						const float2 d = kPoisson[k];
-						const float2 r = float2(d.x * css - d.y * sns, d.x * sns + d.y * css) * radius;
-						const int2 o = int2(round(r));
-						const int2 q = clamp(p + o, int2(0, 0), maxP);
-						const float dq = abs(DepthMask[q]);
-						[branch] if (any(o != 0) && !RTIsSky(dq))
-						{
-							const float wPlane = exp(-abs(dot(N, RTPosition(q, dq) - P)) / planeTolerance);
-							float rq;
-							if (wPlane >= 0.05 && Match(Ids(PLIdx[q]), PLVis[q], ids[s], rq)) {
-								const float w = wPlane * exp(-1.5 * dot(r, r) * invR2);
-								wsum += Lit(rq) * w;
-								wwt += w;
-							}
-						}
-					}
-					spatial[s] = wsum / wwt;
-				}
-			}
-		}
-		else if (maxRadius > 1.5)
-		{
-			const int stepPx = max(int(round(maxRadius * 0.5)), 1);
-			float4 wsum = 0.0, wwt = 0.0;
-			[loop] for (uint k = 0u; k < 25u; ++k)
-			{
-				const int2 o = int2(int(k % 5u) - 2, int(k / 5u) - 2);
-				const int2 q = clamp(p + o * stepPx, int2(0, 0), maxP);
-				const float dq = abs(DepthMask[q]);
-				float wPlane = 0.0;
-				if (!RTIsSky(dq))
-					wPlane = exp(-abs(dot(N, RTPosition(q, dq) - P)) / planeTolerance);
-				[branch] if (wPlane >= 0.05)
-				{
-					const uint4 idq = Ids(PLIdx[q]);
-					const float4 vq = PLVis[q];
-					const float r2 = float(o.x * o.x + o.y * o.y) * float(stepPx * stepPx);
-					[unroll] for (uint s = 0u; s < 4u; ++s)
-					{
-						float r;
-						if (radiusPx[s] > 1.5 && Match(idq, vq, ids[s], r)) {
-							const float w = wPlane * exp(-2.0 * r2 / (radiusPx[s] * radiusPx[s]));
-							wsum[s] += Lit(r) * w;
-							wwt[s] += w;
-						}
-					}
-				}
-			}
-			[unroll] for (uint s = 0u; s < 4u; ++s)
-				if (radiusPx[s] > 1.5 && wwt[s] > 0.0)
-					spatial[s] = wsum[s] / wwt[s];
-		}
+		result = DenoiseSet(px, ids, raw, hv, hw);
 
-		// 3b. History blend (taps read in 3a; hw = 0 without usable history).
-		result = spatial;
-		[unroll] for (uint sh = 0u; sh < 4u; ++sh)
+		// (48a) Slots 4 - 5 (K > 4): the same steps, history at the candidate chosen above.
+		[branch] if (wide && any(wideIds != 0u))
 		{
-			if (ids[sh] != 0u && hw[sh] >= 0.05) {
-				const float lo3 = (lo[sh] <= 1.0 ? lo[sh] : spatial[sh]) - 0.1, hi3 = (hi[sh] >= 0.0 ? hi[sh] : spatial[sh]) + 0.1;
-				// (46d) A moving source (a carried torch) keeps less history: its shadows move with it, nothing smears.
-				result[sh] = lerp(clamp(hv[sh] / hw[sh], lo3, hi3), spatial[sh], lerp(PLParams.y, 1.0, HistoryDrop(ids[sh])));
-			}
+			float4 hv2 = 0.0, hw2 = 0.0;
+			[branch] if (histTaken)
+				HistoryTaps(histPos, histExpected, histTolerance, wideIds, wideHistory, maxP, hv2, hw2);
+			wideResult = DenoiseSet(px, wideIds, float4(wideRaw.zw, 1.0, 1.0), hv2, hw2).xy;
 		}
-		[unroll] for (uint e = 0u; e < 4u; ++e)
-			if (ids[e] == 0u)
-				result[e] = 1.0;
 	}
 
 	OutVis[p] = saturate(result);
 	OutIdx[p] = idxRaw;
 	OutDist[p] = dist;
+	[branch] if (wide)
+		OutWide[p] = float4(wideRaw.xy, saturate(wideResult));
 
 	[branch] if (flags & kPLFlagDebug)
 	{
@@ -424,7 +684,7 @@ float HistoryTaps(float2 prevPos, float expected, float tolerance, uint4 ids, in
 			else if (n > 4u)
 				debug = float4(1.0, 0.1, 0.05, 0.6);
 		} else if (view == kViewPLSources) {
-			// Colour of the source in slot 0; diagonal stripes in the colour of slot 1 (slots 2-3: thinner stripes).
+			// Colour of the source in slot 0; diagonal stripes in the colour of slot 1 (slots 2-3: thinner stripes; (48a) 4-5 likewise).
 			if (ids.x != 0u) {
 				debug = float4(Hue(ids.x), 0.55);
 				const uint d = (uint(p.x) + uint(p.y)) % 12u;
@@ -434,21 +694,31 @@ float HistoryTaps(float2 prevPos, float expected, float tolerance, uint4 ids, in
 					debug = float4(Hue(ids.z), 0.6);
 				else if (ids.w != 0u && d == 9u)
 					debug = float4(Hue(ids.w), 0.6);
+				else if (wideIds.x != 0u && d == 4u)
+					debug = float4(Hue(wideIds.x), 0.6);
+				else if (wideIds.y != 0u && d == 11u)
+					debug = float4(Hue(wideIds.y), 0.6);
 			}
 		} else if (view == kViewPLRaw) {
-			if (any(ids != 0u)) {
+			if (any(ids != 0u) || any(wideIds != 0u)) {
 				float v = 1.0;
 				[unroll] for (uint s = 0u; s < 4u; ++s)
 					if (ids[s] != 0u)
 						v *= raw[s] >= 0.999 ? 1.0 : 0.0;
+				[unroll] for (uint s2 = 0u; s2 < 2u; ++s2)
+					if (wideIds[s2] != 0u)
+						v *= wideRaw[2u + s2] >= 0.999 ? 1.0 : 0.0;
 				debug = float4(v.xxx, 1.0);
 			}
 		} else if (view == kViewPLDenoised) {
-			if (any(ids != 0u)) {
+			if (any(ids != 0u) || any(wideIds != 0u)) {
 				float v = 1.0;
 				[unroll] for (uint s = 0u; s < 4u; ++s)
 					if (ids[s] != 0u)
 						v *= saturate(result[s]);
+				[unroll] for (uint s2 = 0u; s2 < 2u; ++s2)
+					if (wideIds[s2] != 0u)
+						v *= saturate(wideResult[s2]);
 				debug = float4(v.xxx, 1.0);
 			}
 		}

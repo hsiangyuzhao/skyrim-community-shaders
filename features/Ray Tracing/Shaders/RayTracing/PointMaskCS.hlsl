@@ -30,6 +30,10 @@ Texture2D<float> Depth : register(t1);          // the depth the engine's mask w
 Texture2D<unorm float4> PLVis : register(t2);   // denoised point-light visibility per slot (PointDenoiseCS)
 Texture2D<unorm float4> PLIdx : register(t3);   // per slot: source + 1 (low 7 bits)
 RWTexture2D<unorm float4> OutMask : register(u0);
+// (48a) Lights per pixel 5 - 6: slots 4 - 5 (PointDenoiseCS OutWide: xy source + 1, zw denoised visibility); read only when Channels[0].Flags.y
+// is kWide (null otherwise).
+Texture2D<unorm float4> PLWide : register(t4);
+static const uint kWide = 1u;
 
 static const uint kWrite = 1u;
 static const uint kSpot = 2u;
@@ -50,7 +54,7 @@ float Cone(Channel a_channel, float3 a_position)
 }
 
 // The channel's new value (a_engine: the engine's).
-float ChannelValue(Channel a_channel, float a_engine, bool a_surface, float3 a_position, uint4 a_ids, float4 a_vis)
+float ChannelValue(Channel a_channel, float a_engine, bool a_surface, float3 a_position, uint4 a_ids, float4 a_vis, uint2 a_wideIds, float2 a_wideVis)
 {
 	const uint flags = a_channel.Flags.x;
 	float value = a_engine;
@@ -65,6 +69,10 @@ float ChannelValue(Channel a_channel, float a_engine, bool a_surface, float3 a_p
 			const bool4 match = (source != 0u).xxxx && (a_ids == source.xxxx);
 			if (any(match))
 				value = cone * (match.x ? a_vis.x : (match.y ? a_vis.y : (match.z ? a_vis.z : a_vis.w)));
+			else if (source != 0u && a_wideIds.x == source)  // (48a)
+				value = cone * a_wideVis.x;
+			else if (source != 0u && a_wideIds.y == source)
+				value = cone * a_wideVis.y;
 			else if (flags & kSkipped)
 				value = cone;
 		}
@@ -82,15 +90,23 @@ float ChannelValue(Channel a_channel, float a_engine, bool a_surface, float3 a_p
 	const float3 P = surface ? RTPosition(p, depth) : float3(0.0, 0.0, 0.0);
 	uint4 ids = 0u;
 	float4 vis = 1.0;
+	uint2 wideIds = 0u;  // (48a)
+	float2 wideVis = 1.0;
 	[branch] if (surface && (Channels[0].Pos.w + Channels[1].Pos.w + Channels[2].Pos.w + Channels[3].Pos.w) > 0.0)
 	{
 		ids = uint4(PLIdx[p] * 255.0 + 0.5) & 0x7Fu;
 		vis = PLVis[p];
+		[branch] if (Channels[0].Flags.y == kWide)
+		{
+			const float4 w = PLWide[p];
+			wideIds = uint2(w.xy * 255.0 + 0.5) & 0x7Fu;
+			wideVis = w.zw;
+		}
 	}
 	float4 result;
-	result.x = ChannelValue(Channels[0], mask.x, surface, P, ids, vis);
-	result.y = ChannelValue(Channels[1], mask.y, surface, P, ids, vis);
-	result.z = ChannelValue(Channels[2], mask.z, surface, P, ids, vis);
-	result.w = ChannelValue(Channels[3], mask.w, surface, P, ids, vis);
+	result.x = ChannelValue(Channels[0], mask.x, surface, P, ids, vis, wideIds, wideVis);
+	result.y = ChannelValue(Channels[1], mask.y, surface, P, ids, vis, wideIds, wideVis);
+	result.z = ChannelValue(Channels[2], mask.z, surface, P, ids, vis, wideIds, wideVis);
+	result.w = ChannelValue(Channels[3], mask.w, surface, P, ids, vis, wideIds, wideVis);
 	OutMask[p] = result;
 }

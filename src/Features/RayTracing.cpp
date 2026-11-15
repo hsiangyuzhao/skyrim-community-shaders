@@ -122,16 +122,16 @@ namespace
 		const char* tooltip;
 	};
 	// (47q) Low 1/1/16/20 m, Medium 1/2/24/35 m, High 2/3/48/50 m (plants block), Ultra as 47n. The player's own lights are ray traced from
-	// Medium up, spell / effect lights in High and Ultra.
+	// Medium up, spell / effect lights in High and Ultra. (48a) Indoors Medium 3, High 4, Ultra 6 (outdoors unchanged).
 	constexpr PointTier kPointTiers[4] = {
 		{ 1, 1, 16, 1400.0f, false, false, false,
 			"1 light per pixel (indoors too), at most 16 lights, up to about 20 m; plants and cut-outs do not block point lights outdoors; "
 			"your own lights and spell / effect lights keep their old shadows." },
-		{ 1, 2, 24, 2450.0f, false, true, false,
-			"1 light per pixel (2 indoors), at most 24 lights, up to about 35 m; plants and cut-outs do not block point lights outdoors; "
+		{ 1, 3, 24, 2450.0f, false, true, false,
+			"1 light per pixel (3 indoors), at most 24 lights, up to about 35 m; plants and cut-outs do not block point lights outdoors; "
 			"spell / effect lights keep their old shadows." },
-		{ 2, 3, 48, 3500.0f, true, true, true, "2 lights per pixel (3 indoors), at most 48 lights, up to about 50 m; plants and cut-outs block point lights." },
-		{ 4, 4, 64, 6000.0f, true, true, true, "4 lights per pixel (indoors too), at most 64 lights, up to about 86 m." },
+		{ 2, 4, 48, 3500.0f, true, true, true, "2 lights per pixel (4 indoors), at most 48 lights, up to about 50 m; plants and cut-outs block point lights." },
+		{ 4, 6, 64, 6000.0f, true, true, true, "4 lights per pixel (6 indoors), at most 64 lights, up to about 86 m." },
 	};
 	struct AOTier
 	{
@@ -259,7 +259,9 @@ namespace
 	};
 
 	// (46b) Point-light shadows.
-	int ValidPointK(int a_value) { return std::clamp(a_value, 1, 4); }  // (47q) 3 too (High indoors); the trace takes 1 - 4 slots
+	// (47q) 3 too (High indoors); (48a) up to 6: slots 4 - 5 in a second texture set, allocated only while K > 4.
+	int ValidPointK(int a_value) { return std::clamp(a_value, 1, 6); }
+	constexpr std::uint32_t kPointWideIdleFrames = 600;  // (48a) point frames at K <= 4 before the slot 4 - 5 textures are freed
 	constexpr float kPointMinShare = 0.02f;          // a light under 2 % of the pixel's point light is not traced
 	constexpr float kPointMinContribution = 1e-3f;   // nor one that hardly lights it at all
 	constexpr float kPointHistoryWeight = 0.25f;     // this frame's weight in the denoiser's history blend
@@ -277,6 +279,10 @@ namespace
 	constexpr std::uint32_t kPointFlagStickyReproject = 8192u;  // (47z) TracePointLightsCS: sticky sources read where the surface was last frame
 	constexpr std::uint32_t kPointDenoiseSmooth = 4u;          // (47x) PointDenoiseCS: per-slot rotated Poisson taps (Smoother Shadow Edges)
 	constexpr std::uint32_t kPointDenoiseMotion = 8u, kPointDenoiseNoHistorySmooth = 16u;  // (47y) PointDenoiseCS: motion-vector history (t6), no-history smoothing
+	// (48a) TracePointLightsCS: slots 4 - 5 (u4), last frame's slots 4 - 5 valid, Window Beams: Smooth Edges. PointDenoiseCS: slots 4 - 5
+	// (t7 / u4), their history (t8) valid, Window Beams: Smooth Edges.
+	constexpr std::uint32_t kPointFlagWide = 16384u, kPointFlagWidePrev = 32768u, kPointFlagBeamSmooth = 65536u;
+	constexpr std::uint32_t kPointDenoiseWide = 32u, kPointDenoiseWideHistory = 64u, kPointDenoiseBeamSmooth = 128u;
 	// (47w) Adaptive skip thresholds (per frame, read back). Bad: more than 1 % of its lit pixels uncovered (and at least 32 pixels, so a
 	// light lighting a handful of pixels does not flip on noise), or 4096 uncovered pixels whatever the share. Good: under 0.25 % and
 	// under 1024 pixels. Skip again after kCoverageEnterFrames good frames (first time) or kCoverageRestoreFrames (after a bad frame);
@@ -1513,6 +1519,7 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.KeepBuildingsInSunMap = read("KeepBuildingsInSunMap", defaults.KeepBuildingsInSunMap);  // (47z)
 		settings.PointBeamRange = read("PointBeamRange", defaults.PointBeamRange);
 		settings.PointStickyReproject = read("PointStickyReproject", defaults.PointStickyReproject);
+		settings.PointBeamSmooth = read("PointBeamSmooth", defaults.PointBeamSmooth);  // (48a)
 		const float sunSize = read("SunSize", -1.0f);
 		if (sunSize >= 0.0f) {
 			settings.SunSize = sunSize;
@@ -1585,7 +1592,10 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.PointQuality = kTierCustom;
 		for (int t = 0; t < kTierCustom; ++t) {
 			const auto& tier = kPointTiers[t];
-			if (settings.PointLightsPerPixel == tier.k && settings.PointLightsPerPixelInterior == tier.kInterior && settings.PointLightsMaxSources == tier.maxSources &&
+			// (48a) The tiers' indoor K before 48a (1 / 2 / 3 / 4) still identify a tier saved without the key; it then takes the new table.
+			constexpr int kLegacyInterior[4] = { 1, 2, 3, 4 };
+			const bool interiorMatches = settings.PointLightsPerPixelInterior == tier.kInterior || settings.PointLightsPerPixelInterior == kLegacyInterior[t];
+			if (settings.PointLightsPerPixel == tier.k && interiorMatches && settings.PointLightsMaxSources == tier.maxSources &&
 				std::abs(settings.PointLightsDistance - tier.distance) < 0.5f && settings.PointLightsAlphaOutdoors == tier.alphaOutdoors) {
 				settings.PointQuality = t;
 				break;
@@ -1642,6 +1652,7 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["KeepBuildingsInSunMap"] = settings.KeepBuildingsInSunMap;  // (47z)
 	o_json["PointBeamRange"] = settings.PointBeamRange;
 	o_json["PointStickyReproject"] = settings.PointStickyReproject;
+	o_json["PointBeamSmooth"] = settings.PointBeamSmooth;  // (48a)
 	o_json["AOSmoothNormals"] = settings.AOSmoothNormals;  // (47j)
 	o_json["AOTemporalV2"] = settings.AOTemporalV2;  // (47l)
 	o_json["FoliageSway"] = settings.FoliageSway;  // (47l)
@@ -1796,6 +1807,9 @@ void RayTracing::ClearShaderCache()
 	denoiseHalfVCS = nullptr;
 	sigmaPrepCS = nullptr;
 	pointDenoiseCS = nullptr;  // (46b)
+	pointDenoiseBeamCS = nullptr;  // (48a)
+	pointDenoiseWideCS = nullptr;
+	pointDenoiseWideBeamCS = nullptr;
 	pointMaskCS = nullptr;     // (46c)
 	forwardMergeCS = nullptr;  // (47z)
 	// (46f)
@@ -1829,6 +1843,14 @@ void RayTracing::PrecompileShaders()
 	if (settings.PointLights) {
 		GetShader(pointDenoiseCS, L"Data\\Shaders\\RayTracing\\PointDenoiseCS.hlsl", "PointDenoiseCS");
 		GetShader(pointMaskCS, L"Data\\Shaders\\RayTracing\\PointMaskCS.hlsl", "PointMaskCS");
+		// (48a) The variants the current settings can use (window beams are indoor-only; K > 4 per the tier).
+		const PointTierParams pt = ResolvePointTier();
+		const bool wideK = pt.k > 4 || (settings.PointLightsInteriors && pt.kInterior > 4);
+		const bool beam = settings.PointBeamSmooth && settings.PointLightsInteriors && settings.PointLightsWindowBeams;
+		if (beam)
+			PointDenoiseShader(false, true);
+		if (wideK)
+			PointDenoiseShader(true, beam);
 	}
 	if (settings.AO) {
 		// (46t) The RTAO filter of the current switches (the others compile when first switched on).
@@ -1857,6 +1879,19 @@ void RayTracing::PrecompileShaders()
 				GetShaderDefined(aoTemporalV2WideCS, L"Data\\Shaders\\RayTracing\\RTAOTemporalCS.hlsl", "RTAOTemporalCS (v2, 16x16)", "RTAO_TEMPORAL_V2,RTAO_WIDE");
 		}
 	}
+}
+
+ID3D11ComputeShader* RayTracing::PointDenoiseShader(bool a_wide, bool a_beam)
+{
+	// (48a) The plain variant is the 47z shader; the others compile their extra code in only when it can run this frame.
+	const wchar_t* kPath = L"Data\\Shaders\\RayTracing\\PointDenoiseCS.hlsl";
+	if (a_wide && a_beam)
+		return GetShaderDefined(pointDenoiseWideBeamCS, kPath, "PointDenoiseCS (slots 4-5, beam edges)", "PL_WIDE,PL_BEAM");
+	if (a_wide)
+		return GetShaderDefined(pointDenoiseWideCS, kPath, "PointDenoiseCS (slots 4-5)", "PL_WIDE");
+	if (a_beam)
+		return GetShaderDefined(pointDenoiseBeamCS, kPath, "PointDenoiseCS (beam edges)", "PL_BEAM");
+	return GetShader(pointDenoiseCS, kPath, "PointDenoiseCS");
 }
 
 ID3D11ComputeShader* RayTracing::GetShader(winrt::com_ptr<ID3D11ComputeShader>& a_shader, const wchar_t* a_path, const char* a_name)
@@ -2473,6 +2508,7 @@ void RayTracing::Prepass()
 	pointSelector.Publish(false);
 	pointThisFrame = false;
 	pointK = 0;
+	pointWideThisFrame = false;  // (48a)
 	waterTraced = false;  // (47i)
 	waterLodSkip = false;  // (47l) set again by this frame's point-light preparation
 	pointCpuMs = 0.0f;
@@ -3611,8 +3647,10 @@ void RayTracing::RunFrame()
 	// (46b) The point lights went out with it: Light Limit Fix (next in the prepass list) may tag its lights.
 	pointThisFrame = input.pointLights != nullptr && backend.GetStats().pointTracedLastFrame;
 	pointSelector.Publish(pointThisFrame);
-	if (!pointThisFrame)
+	if (!pointThisFrame) {
 		pointK = 0;
+		pointWideThisFrame = false;  // (48a)
+	}
 
 	// (45l) The D3D11 side of this frame: FinishFrame (now, or after the other prepasses with Late Sync).
 	pending.active = true;
@@ -3831,8 +3869,10 @@ void RayTracing::RunNoSunFrame(ID3D11ShaderResourceView* a_depth, ID3D11ShaderRe
 	}
 	pointThisFrame = input.pointLights != nullptr && backend.GetStats().pointTracedLastFrame;
 	pointSelector.Publish(pointThisFrame);
-	if (!pointThisFrame)
+	if (!pointThisFrame) {
 		pointK = 0;
+		pointWideThisFrame = false;  // (48a)
+	}
 	aoThisFrame = input.ao != nullptr && backend.GetStats().aoTracedLastFrame;
 	aoModeThisFrame = aoThisFrame ? std::clamp(settings.AOMode, 0, static_cast<int>(AOModeKind::Count) - 1) : -1;
 	if (!aoThisFrame)
@@ -4192,6 +4232,7 @@ void RayTracing::UnbindPointLights()
 		return;
 	ID3D11ShaderResourceView* nulls[4]{};
 	globals::d3d::context->PSSetShaderResources(40, 4, nulls);  // (47i) + the water's t42 / t43
+	globals::d3d::context->PSSetShaderResources(46, 1, nulls);  // (48a) slots 4 - 5
 	pointBound = false;
 }
 
@@ -4628,6 +4669,59 @@ void RayTracing::ReleasePointDenoiser()
 	pointHistoryValid = false;
 	d3d11Bytes -= std::min(d3d11Bytes, pointD3D11Bytes);
 	pointD3D11Bytes = 0;
+	ReleasePointWide();  // (48a)
+}
+
+void RayTracing::ReleasePointWide()
+{
+	// (48a) Both sides: the denoised slots 4 - 5 here, the trace's texture in the backend. The pixel shaders' t46 is unbound first.
+	if (pointBound) {
+		ID3D11ShaderResourceView* nullSrv = nullptr;
+		globals::d3d::context->PSSetShaderResources(46, 1, &nullSrv);
+	}
+	pointWide[0] = {};
+	pointWide[1] = {};
+	d3d11Bytes -= std::min(d3d11Bytes, pointWideD3D11Bytes);
+	pointWideD3D11Bytes = 0;
+	if (backend.IsReady() && backend.PointWideReady())
+		backend.ReleasePointWideTextures();
+	pointWideThisFrame = false;
+	pointWideTraced = false;
+	pointWideHistoryValid = false;
+	pointWideIdleFrames = 0;
+}
+
+bool RayTracing::EnsurePointWide(std::uint32_t a_width, std::uint32_t a_height)
+{
+	// (48a) Lights per pixel 5 - 6: created on first use; a fresh texture holds no last frame (no sticky / history from it).
+	const bool backendWasReady = backend.PointWideReady();
+	if (!backend.EnsurePointWideTextures())
+		return false;
+	if (!backendWasReady)
+		pointWideTraced = false;
+	if (pointWide[0].texture && pointWide[1].texture) {
+		D3D11_TEXTURE2D_DESC d{};
+		pointWide[0].texture->GetDesc(&d);
+		if (d.Width == a_width && d.Height == a_height)
+			return true;
+	}
+	pointWide[0] = {};
+	pointWide[1] = {};
+	d3d11Bytes -= std::min(d3d11Bytes, pointWideD3D11Bytes);
+	pointWideD3D11Bytes = 0;
+	pointWideHistoryValid = false;
+	bool ok = true;
+	for (int i = 0; i < 2 && ok; ++i)
+		ok = CreateDenoiseTexture(this, pointWide[i].texture, pointWide[i].srv, pointWide[i].uav, a_width, a_height, DXGI_FORMAT_R8G8B8A8_UNORM, "RayTracing PointWide");
+	if (!ok) {
+		pointWide[0] = {};
+		pointWide[1] = {};
+		logger::warn("[RayTracing] Lights per pixel above 4: could not create the denoiser's slot 4 - 5 textures; 4 lights per pixel are traced");
+		return false;
+	}
+	pointWideD3D11Bytes = static_cast<std::uint64_t>(a_width) * a_height * 2 * 4;
+	d3d11Bytes += pointWideD3D11Bytes;
+	return true;
 }
 
 bool RayTracing::EnsurePointDenoiser(std::uint32_t a_width, std::uint32_t a_height)
@@ -4661,6 +4755,7 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	bool a_interior)
 {
 	pointK = 0;
+	pointWideThisFrame = false;  // (48a)
 	waterTraced = false;  // (47i)
 	waterGateLights.clear();  // (47p)
 	if (!PointLightsOn() || !backend.PointAvailable())  // (47n) no MaskTemp needed (the sun may be "Off")
@@ -4738,7 +4833,24 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	if (scan == 0)
 		return false;
 
-	const std::uint32_t K = static_cast<std::uint32_t>(ValidPointK(a_interior ? tier.kInterior : tier.k));
+	std::uint32_t K = static_cast<std::uint32_t>(ValidPointK(a_interior ? tier.kInterior : tier.k));
+	// (48a) Lights per pixel 5 - 6: slots 4 - 5 in their own textures, made on the first such frame (failing that: 4 slots). Freed again
+	// after kPointWideIdleFrames point frames at K <= 4 (outdoors, a lower tier), so K <= 4 costs nothing once they are gone.
+	const bool wide = K > 4 && EnsurePointWide(width, height);
+	if (K > 4 && !wide)
+		K = 4;
+	if (wide) {
+		pointWideIdleFrames = 0;
+	} else if (backend.PointWideReady() || pointWide[0].texture) {
+		if (++pointWideIdleFrames >= kPointWideIdleFrames) {
+			logger::info("[RayTracing] Lights per pixel above 4: unused for {} frames, slot 4 - 5 textures freed", kPointWideIdleFrames);
+			ReleasePointWide();
+		}
+	}
+	const bool widePrev = wide && pointWideTraced;
+	pointWideTraced = wide;
+	pointWideThisFrame = wide;
+	pointInput.wide = wide;
 	auto& c = pointInput.constants;
 	std::memcpy(c.invViewProj, a_input.constants.invViewProj, sizeof(c.invViewProj));
 	std::copy_n(a_input.constants.renderSize, 4, c.renderSize);
@@ -4805,6 +4917,10 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 		flags |= kPointFlagCloseContact;
 	if (settings.PointBeamRange)  // (47z)
 		flags |= kPointFlagBeamRange;
+	if (wide)  // (48a)
+		flags |= kPointFlagWide | (widePrev ? kPointFlagWidePrev : 0u);
+	if (settings.PointBeamSmooth)
+		flags |= kPointFlagBeamSmooth;
 	// (47z) Stable Light Choice When the Camera Moves: last trace's camera -> this frame's camera-relative positions to last trace's clip
 	// space, one matrix (last view-projection x the translation by the camera's move), appended to the sources (Backend). The trace
 	// reads its copy of last frame's PLIdx there. Without a last camera: 47y (the same pixel).
@@ -4873,7 +4989,16 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 
 void RayTracing::FinishPointLights()
 {
-	auto* shader = GetShader(pointDenoiseCS, L"Data\\Shaders\\RayTracing\\PointDenoiseCS.hlsl", "PointDenoiseCS");
+	// (48a) The shader variant this frame needs: slots 4 - 5 (K > 4) and / or Window Beams: Smooth Edges (only with soft beam slots; outdoors
+	// and without beams the plain 47z shader runs). A variant that fails to compile falls back to the plain one (its extras off).
+	bool wide = pointWideThisFrame && backend.PointWideSRV() && pointWide[0].texture && pointWide[1].texture;
+	bool beamSmooth = settings.PointBeamSmooth && pointBeamMask != 0 && pointBeamTan > 0.0f;
+	ID3D11ComputeShader* shader = (wide || beamSmooth) ? PointDenoiseShader(wide, beamSmooth) : nullptr;
+	if (!shader) {
+		wide = false;
+		beamSmooth = false;
+		shader = PointDenoiseShader(false, false);
+	}
 	if (!shader) {
 		SwitchOffPointLights("the point-light denoiser (PointDenoiseCS) did not compile");
 		return;
@@ -4890,9 +5015,13 @@ void RayTracing::FinishPointLights()
 	PointDenoiseCB cb{};
 	cb.Params[0] = settings.PointLightsSize;
 	cb.Params[1] = kPointHistoryWeight;
-	const std::uint32_t flags = (pointHistoryValid && prevCameraValid ? kPointDenoiseHistory : 0u) | (plDebug ? kPointDenoiseDebug : 0u) |
+	std::uint32_t flags = (pointHistoryValid && prevCameraValid ? kPointDenoiseHistory : 0u) | (plDebug ? kPointDenoiseDebug : 0u) |
 	                            (settings.PointSmoothEdges ? kPointDenoiseSmooth : 0u) |  // (47x)
-	                            (motionSRV ? kPointDenoiseMotion : 0u) | (settings.MovingSmoothNoHistory ? kPointDenoiseNoHistorySmooth : 0u);  // (47y)
+	                            (motionSRV ? kPointDenoiseMotion : 0u) | (settings.MovingSmoothNoHistory ? kPointDenoiseNoHistorySmooth : 0u) |  // (47y)
+	                            (beamSmooth ? kPointDenoiseBeamSmooth : 0u);  // (48a)
+	// (48a) Lights per pixel 5 - 6: their history only when last frame denoised them too and the main history is valid.
+	const bool wideHistory = wide && pointWideHistoryValid && (flags & kPointDenoiseHistory);
+	flags |= (wide ? kPointDenoiseWide : 0u) | (wideHistory ? kPointDenoiseWideHistory : 0u);
 	std::memcpy(&cb.Params[2], &flags, sizeof(float));
 	cb.Params[3] = kPointMaxFilterRadius;
 	cb.Extra[0] = static_cast<float>(pointK);
@@ -4920,19 +5049,21 @@ void RayTracing::FinishPointLights()
 
 	timers->Begin(Util::GpuBucket::RayTracingPointDenoise);
 	ID3D11Buffer* cbs[2] = { combineCB->CB(), pointDenoiseCB->CB() };
-	ID3D11ShaderResourceView* srvs[7] = { backend.PointVisibilitySRV(), backend.PointSourcesSRV(), backend.DepthMaskSRV(), pointVis[read].srv.get(),
-		pointIdx[read].srv.get(), pointDist[read].srv.get(), motionSRV };
-	ID3D11UnorderedAccessView* uavs[4] = { pointVis[write].uav.get(), pointIdx[write].uav.get(), pointDist[write].uav.get(), plDebug ? debugColorUAV.get() : nullptr };
+	// (48a) t7 / t8 / u4: slots 4 - 5 (null without them: the shader does not read or write them then).
+	ID3D11ShaderResourceView* srvs[9] = { backend.PointVisibilitySRV(), backend.PointSourcesSRV(), backend.DepthMaskSRV(), pointVis[read].srv.get(),
+		pointIdx[read].srv.get(), pointDist[read].srv.get(), motionSRV, wide ? backend.PointWideSRV() : nullptr, wideHistory ? pointWide[read].srv.get() : nullptr };
+	ID3D11UnorderedAccessView* uavs[5] = { pointVis[write].uav.get(), pointIdx[write].uav.get(), pointDist[write].uav.get(), plDebug ? debugColorUAV.get() : nullptr,
+		wide ? pointWide[write].uav.get() : nullptr };
 	context->CSSetConstantBuffers(0, 2, cbs);
-	context->CSSetShaderResources(0, 7, srvs);
-	context->CSSetUnorderedAccessViews(0, 4, uavs, nullptr);
+	context->CSSetShaderResources(0, 9, srvs);
+	context->CSSetUnorderedAccessViews(0, 5, uavs, nullptr);
 	context->CSSetShader(shader, nullptr, 0);
 	context->Dispatch((pending.width + 7) / 8, (pending.height + 7) / 8, 1);
-	ID3D11ShaderResourceView* nullSrvs[7]{};
-	ID3D11UnorderedAccessView* nullUavs[4]{};
+	ID3D11ShaderResourceView* nullSrvs[9]{};
+	ID3D11UnorderedAccessView* nullUavs[5]{};
 	ID3D11Buffer* nullCbs[2]{};
-	context->CSSetShaderResources(0, 7, nullSrvs);
-	context->CSSetUnorderedAccessViews(0, 4, nullUavs, nullptr);
+	context->CSSetShaderResources(0, 9, nullSrvs);
+	context->CSSetUnorderedAccessViews(0, 5, nullUavs, nullptr);
 	context->CSSetConstantBuffers(0, 2, nullCbs);
 	context->CSSetShader(nullptr, nullptr, 0);
 	timers->End(Util::GpuBucket::RayTracingPointDenoise);
@@ -4943,6 +5074,10 @@ void RayTracing::FinishPointLights()
 	ID3D11ShaderResourceView* views[4] = { pointVis[write].srv.get(), pointIdx[write].srv.get(), water ? backend.PointWaterVisSRV() : nullptr,
 		water ? backend.PointWaterDistSRV() : nullptr };
 	context->PSSetShaderResources(40, 4, views);
+	// (48a) t46: slots 4 - 5 (null with K <= 4; the light tags carry kTagWide only on wide frames).
+	ID3D11ShaderResourceView* wideView = wide ? pointWide[write].srv.get() : nullptr;
+	context->PSSetShaderResources(46, 1, &wideView);
+	pointWideHistoryValid = wide;
 	pointBound = true;
 	pointWrite ^= 1u;
 	pointHistoryValid = true;
@@ -6026,8 +6161,10 @@ void RayTracing::RunInteriorFrame()
 	}
 	pointThisFrame = input.pointLights != nullptr && backend.GetStats().pointTracedLastFrame;
 	pointSelector.Publish(pointThisFrame);
-	if (!pointThisFrame)
+	if (!pointThisFrame) {
 		pointK = 0;
+		pointWideThisFrame = false;  // (48a)
+	}
 	// (46h) RTAO went out right behind it (second fence): DrawAmbientOcclusion uses it after Screen Space GI.
 	aoThisFrame = input.ao != nullptr && backend.GetStats().aoTracedLastFrame;
 	aoInteriorThisFrame = aoThisFrame;
@@ -6173,6 +6310,10 @@ void RayTracing::WritePointMask(bool a_traced)
 		SwitchOffInteriors("the shadow mask shader (PointMaskCS) did not compile");
 		return;
 	}
+	// (48a) Slots 4 - 5 (t4) when this frame denoised them (Channels[0].Flags.y = PointMaskCS kWide).
+	const std::uint32_t latest = pointWrite ^ 1u;  // FinishPointLights flipped it after writing
+	const bool wideMask = rt && pointWideThisFrame && pointWideHistoryValid && pointWide[latest].srv;
+	cb.Channels[0].Flags[1] = wideMask ? 1u : 0u;
 	pointMaskCB->Update(cb);
 
 	// This frame's camera and render size (also when nothing was traced).
@@ -6191,19 +6332,19 @@ void RayTracing::WritePointMask(bool a_traced)
 		combineCB->Update(c);
 	}
 	auto* context = globals::d3d::context;
-	const std::uint32_t latest = pointWrite ^ 1u;  // FinishPointLights flipped it after writing
 	ID3D11Buffer* cbs[2] = { combineCB->CB(), pointMaskCB->CB() };
-	ID3D11ShaderResourceView* srvs[4] = { mask.SRV, depth.depthSRV, rt ? pointVis[latest].srv.get() : nullptr, rt ? pointIdx[latest].srv.get() : nullptr };
+	ID3D11ShaderResourceView* srvs[5] = { mask.SRV, depth.depthSRV, rt ? pointVis[latest].srv.get() : nullptr, rt ? pointIdx[latest].srv.get() : nullptr,
+		wideMask ? pointWide[latest].srv.get() : nullptr };
 	ID3D11UnorderedAccessView* uavs[1] = { maskTempUAV.get() };
 	context->CSSetConstantBuffers(0, 2, cbs);
-	context->CSSetShaderResources(0, 4, srvs);
+	context->CSSetShaderResources(0, 5, srvs);
 	context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
 	context->CSSetShader(shader, nullptr, 0);
 	context->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
-	ID3D11ShaderResourceView* nullSrvs[4]{};
+	ID3D11ShaderResourceView* nullSrvs[5]{};
 	ID3D11UnorderedAccessView* nullUavs[1]{};
 	ID3D11Buffer* nullCbs[2]{};
-	context->CSSetShaderResources(0, 4, nullSrvs);
+	context->CSSetShaderResources(0, 5, nullSrvs);
 	context->CSSetUnorderedAccessViews(0, 1, nullUavs, nullptr);
 	context->CSSetConstantBuffers(0, 2, nullCbs);
 	context->CSSetShader(nullptr, nullptr, 0);
@@ -6715,6 +6856,14 @@ void RayTracing::DrawPointLightPage()
 			ImGui::Text("How wide the sun looks through the window (degrees, like the sun's own size): soft edges on the beam's window pattern,");
 			ImGui::Text("  growing with the distance to the window frame. 0 = hard, grainy pattern.");
 		}
+		// (48a)
+		ImGui::Checkbox("Window Beams: Smooth Edges", &settings.PointBeamSmooth);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): the edges of window beam shadows (the window pattern, people's shadows in the beam) are cleaned up");
+			ImGui::Text("  with a filter made for them: smooth, still edges instead of crawling specks and \"flowing\" edges, also at small");
+			ImGui::Text("  Window Beam Softness. Surfaces facing away from the beam no longer show bright rims at their edges.");
+			ImGui::Text("Off: as 47z.");
+		}
 		ImGui::EndDisabled();
 		if (!interiorOffReason.empty()) {
 			RtErrorLine("Indoors was switched off automatically", interiorOffReason);
@@ -6775,25 +6924,28 @@ void RayTracing::DrawPointLightPage()
 				// (47n) The tier's values in effect; an edit switches to Custom, seeded from the tier shown, then the edited value.
 				const PointTierParams cur = ResolvePointTier();
 				PointTierParams v = cur;
-				const char* kNames[4] = { "1", "2", "3", "4" };
+				const char* kNames[6] = { "1", "2", "3", "4", "5", "6" };  // (48a) up to 6
 				bool changed = false;
-				int index = std::clamp(v.k, 1, 4) - 1;
-				if (ImGui::Combo("Lights per Pixel", &index, kNames, 4)) {
-					v.k = std::clamp(index, 0, 3) + 1;
+				int index = std::clamp(v.k, 1, 6) - 1;
+				if (ImGui::Combo("Lights per Pixel", &index, kNames, 6)) {
+					v.k = std::clamp(index, 0, 5) + 1;
 					changed = true;
 				}
 				if (auto _tt = Util::HoverTooltipWrapper()) {
 					ImGui::Text("How many of the lights that light a pixel most are traced there (one ray each). High: 2.");
-					ImGui::Text("  Weaker lights at that pixel keep their old shadows. More = slower.");
+					ImGui::Text("  Weaker lights at that pixel keep their old shadows. More = slower. 5 or 6 take extra video memory (about 16 bytes");
+					ImGui::Text("  per pixel at the render resolution, freed again after a while at 4 or less).");
 				}
 				ImGui::BeginDisabled(!settings.PointLightsInteriors);
-				int indexInterior = std::clamp(v.kInterior, 1, 4) - 1;
-				if (ImGui::Combo("Lights per Pixel Indoors", &indexInterior, kNames, 4)) {
-					v.kInterior = std::clamp(indexInterior, 0, 3) + 1;
+				int indexInterior = std::clamp(v.kInterior, 1, 6) - 1;
+				if (ImGui::Combo("Lights per Pixel Indoors", &indexInterior, kNames, 6)) {
+					v.kInterior = std::clamp(indexInterior, 0, 5) + 1;
 					changed = true;
 				}
-				if (auto _tt = Util::HoverTooltipWrapper())
-					ImGui::Text("Indoors many lights overlap; 3 (High) or 4 (Ultra) catch nearly all of the light. 2 or 1 = cheaper.");
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("Indoors many lights overlap: Medium 3, High 4, Ultra 6 catch nearly all of the light (crowded halls such as the Blue Palace");
+					ImGui::Text("  gain most from 4 and up). 5 or 6 trace up to 50 %% more rays than 4 and take extra video memory. 2 or 1 = cheaper.");
+				}
 				ImGui::EndDisabled();
 				changed |= ImGui::SliderInt("Max Lights", &v.maxSources, 8, static_cast<int>(RayTracingPointLights::kMaxSources));
 				if (auto _tt = Util::HoverTooltipWrapper())
@@ -7623,6 +7775,9 @@ std::string RayTracing::DescribeForProfile() const
 	text += std::format(", keep buildings in the sun shadow map {} ({} draws kept), window beams respect their range {}, stable light choice when the camera moves {}",
 		settings.KeepBuildingsInSunMap ? "on" : "off", RayTracingCasterFilter::KeptLastFrame(), settings.PointBeamRange ? "on" : "off",
 		settings.PointStickyReproject ? "on" : "off");
+	// (48a)
+	text += std::format(", window beams: smooth edges {}, lights per pixel this frame {}{}", settings.PointBeamSmooth ? "on" : "off",
+		pointThisFrame ? pointK : 0u, pointWideThisFrame ? " (slots 4-5 in use)" : "");
 	// (46f)
 	static constexpr const char* kAOModes[] = { "RTAO (keeps SSGI contact AO)", "darker of RTAO and SSGI AO" };
 	static constexpr const char* kAOViews[] = { "off", "raw", "filtered", "split", "raw detail", "filtered detail", "final", "normal confidence", "normal Ns", "normal Ng",
@@ -7723,6 +7878,10 @@ nlohmann::json RayTracing::DescribeJson() const
 	j["kept_sun_caster_lost"] = RayTracingCasterFilter::RedirectLostLastFrame();
 	j["point_beam_range"] = settings.PointBeamRange;
 	j["point_sticky_reproject"] = settings.PointStickyReproject;
+	j["point_beam_smooth"] = settings.PointBeamSmooth;  // (48a)
+	j["point_k_this_frame"] = pointThisFrame ? pointK : 0u;
+	j["point_wide_slots"] = { { "in_use", pointWideThisFrame }, { "allocated", backend.PointWideReady() },
+		{ "mb", static_cast<double>(backend.PointWideBytes() + pointWideD3D11Bytes) / (1024.0 * 1024.0) } };
 	j["denoiser_effective"] = static_cast<int>(EffectiveDenoiser());
 	j["upscaling_rr_active"] = UpscalingRRActive();
 	j["sigma_stabilized_frames"] = settings.SigmaStabilizedFrames;
@@ -7834,6 +7993,9 @@ std::uint32_t RayTracing::PointLightTag(const RE::BSLight* a_light) const
 	// that view reads the bit (Lighting.hlsl); no shading depends on it.
 	if (a_light && !skippedLights.empty() && std::binary_search(skippedLights.begin(), skippedLights.end(), a_light))
 		tag |= RayTracingPointLights::kTagMapSkipped;
+	// (48a) Lights per pixel 5 - 6 this frame: Lighting also looks in slots 4 - 5 (t46, bound by FinishPointLights).
+	if (pointWideThisFrame && (tag & RayTracingPointLights::kTagSourceMask))
+		tag |= RayTracingPointLights::kTagWide;
 	return tag;
 }
 
