@@ -290,6 +290,18 @@ public:
 		// PointCloseContact "Close-Contact Shadows on Characters": the point lights' character ray starts 2 units out instead of 6 (6 kept
 		// where the light grazes or faces away from the depth normal: the terminator). The sun's character ray is unchanged.
 		bool PointCloseContact = true;
+		// (47y) Outside the settings macro. Grainy RT shadows on moving characters; each on by default, off = 47x exactly.
+		// MovingKeepHistory "Moving Characters: Keep Shadow History" (sun and point lights): where the camera-only reprojection finds no
+		// valid history (a moving surface), the denoisers also try last frame's motion vectors at constant velocity (the trace runs
+		// before this frame's G-buffer), accepted only where the stored history distance matches. Clamp and character cap kept.
+		bool MovingKeepHistory = true;
+		// MovingSmoothNoHistory "Moving Characters: Smooth When No History" (sun and point lights): pixels still without history are
+		// smoothed a little instead of showing one frame's raw rays (point: every slot at least 2.5 px, the Poisson taps not rotated per
+		// frame there; sun: a 5x5 plane-weighted mean of this frame's spatial result blended in).
+		bool MovingSmoothNoHistory = true;
+		// SunSmoothTileRadius "Smooth Blur Width Between Tiles" (Penumbra denoiser): the per-8x8-tile penumbra radius is interpolated per
+		// pixel between the neighbouring tile centres (never below half its own tile's), so the blur width has no tile blocks.
+		bool SunSmoothTileRadius = true;
 	};
 	/// (46f) RTAO modes (Settings::AOMode); with RTAO off the AO is SSGI's, exactly as before.
 	enum class AOModeKind : int

@@ -118,6 +118,45 @@ bool Traced(int2 q, out float3 Pq)
 	const float radius = radius0;
 #else
 	// Penumbra radius (in filter pixels) from the 3x3 tiles' blocker distance.
+	// (47y) "Smooth Blur Width Between Tiles" (kFlagSmoothTileRadius): that 3x3-tile blocker distance is known per tile, so the radius
+	// steps at every 8x8 tile edge. Interpolated per pixel instead: bilinear between the 4 nearest tile centres' own 3x3-tile values
+	// (a centre whose 3x3 tiles have no blocker is left out), never below kOwnTileGuard x this pixel's own tile value (a penumbra at a
+	// shadow edge is not shrunk much by a neighbouring contact shadow; along tile edges the bilinear value already stays above it).
+	[branch] if (flags & kFlagSmoothTileRadius)
+	{
+		static const float kOwnTileGuard = 0.5;
+		const int2 maxTile = int2((Size.xy + 7u) / 8u) - 1;
+		const float2 tf = (float2(FullPixel(p)) + 0.5 * float(kScale)) / 8.0 - 0.5;
+		const int2 t0 = int2(floor(tf));
+		const float2 ft = tf - float2(t0);
+		// The 4x4 tiles around the 4 centres t0 .. t0 + 1: blocker sum and count each.
+		float tSum[16], tCount[16];
+		[unroll] for (int k = 0; k < 16; ++k)
+		{
+			const float4 t = Tiles[clamp(t0 + int2(k % 4 - 1, k / 4 - 1), int2(0, 0), maxTile)];
+			tSum[k] = t.x * t.y;
+			tCount[k] = t.y;
+		}
+		float bSum = 0.0, bWeight = 0.0;
+		[unroll] for (int c = 0; c < 4; ++c)
+		{
+			const int cx = c & 1, cy = c >> 1;
+			float s = 0.0, n = 0.0;
+			[unroll] for (int j = 0; j < 9; ++j)
+			{
+				const int idx = (cy + j / 3) * 4 + (cx + j % 3);
+				s += tSum[idx];
+				n += tCount[idx];
+			}
+			const float bw = (cx ? ft.x : 1.0 - ft.x) * (cy ? ft.y : 1.0 - ft.y);
+			if (n > 0.0) {
+				bSum += bw * s / n;
+				bWeight += bw;
+			}
+		}
+		const float interpolated = bWeight > 1e-4 ? bSum / bWeight : tileBlocker;
+		tileBlocker = max(interpolated, kOwnTileGuard * tileBlocker);
+	}
 	float radius;
 	{
 		const float width = 2.0 * tileBlocker * Denoise.x;

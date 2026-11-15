@@ -4,5 +4,5 @@
 /// place to change when a new test package is made.
 namespace BuildLabel
 {
-	inline constexpr const char* kBuild = "47x";
+	inline constexpr const char* kBuild = "47y";
 }

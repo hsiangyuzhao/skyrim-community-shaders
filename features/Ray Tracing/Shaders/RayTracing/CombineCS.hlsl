@@ -157,32 +157,15 @@ void TemporalStats(int2 p, uint flags, out float mean, out float sigma, out floa
 	}
 }
 
-// (45k) The clamped history: reprojected with the camera (bilinear, each tap checked against the
-// expected distance), clamped to this frame's 3x3 mean +- k sigma, blended with 1 / length; the
-// length grows to Denoise.z frames, less while the camera moves fast and where a character casts
-// the shadow.
-// (47r) With this frame's 3x3 statistics given (ClampedHistory computes them; the uniform-tile fast path knows them).
-float ClampedHistoryWith(int2 p, float3 P, float rt, uint flags, uint anyFlags, float mean, float sigma, float n, out float historyLength)
+// (45k) The bilinear history taps at prevPos (last frame's pixel, centre at +0.5), each checked against the expected distance
+// ((47y) split out: the camera and the motion candidate share it). Returns the bilinear weight of the valid taps.
+float HistoryTaps(float2 prevPos, float expected, float tolerance, out float hv, out float hl)
 {
-	historyLength = 1.0;
-	if (!(flags & kFlagHistoryValid))
-		return rt;
-	if (n <= 0.0)
-		return rt;
-	const float lo = mean - Denoise.w * sigma - 0.02, hi = mean + Denoise.w * sigma + 0.02;
-
-	const float4 prevClip = mul(PrevViewProj, float4(P + CameraDelta.xyz, 1.0));
-	if (prevClip.w <= 1e-4)
-		return rt;
-	const float2 prevUv = float2(prevClip.x / prevClip.w * 0.5 + 0.5, 0.5 - prevClip.y / prevClip.w * 0.5);
-	if (any(prevUv < 0.0) || any(prevUv >= 1.0))
-		return rt;
-	const float2 prevPos = prevUv * float2(Size.xy) - 0.5;
 	const int2 base = int2(floor(prevPos));
 	const float2 f = prevPos - float2(base);
-	const float expected = length(P + CameraDelta.xyz);
-	const float tolerance = expected * 0.02 + 8.0;
-	float hv = 0.0, hl = 0.0, hw = 0.0;
+	hv = 0.0;
+	hl = 0.0;
+	float hw = 0.0;
 	[unroll] for (int t = 0; t < 4; ++t)
 	{
 		const int2 o = int2(t & 1, t >> 1);
@@ -195,8 +178,141 @@ float ClampedHistoryWith(int2 p, float3 P, float rt, uint flags, uint anyFlags, 
 			hw += bw;
 		}
 	}
+	return hw;
+}
+
+// (47y) "Moving Characters: Keep Shadow History" (kFlagMotionHistory). This pass runs before this frame's G-buffer, so the motion
+// vectors at t7 are LAST frame's (StartDeferred clears the target later; as RTAO's AONormalPrepCS candidate B). At constant velocity
+// this pixel's point was last frame at prevUv = uv + Motion[prevUv]: two fixed-point steps from the camera guess. A wrong guess
+// (stale / cleared vectors) only fails the distance test below.
+Texture2D<float2> PrevMotion : register(t7);
+static const float kMotionTryBelow = 0.5;     // the camera candidate's valid tap weight under which the motion candidate is tried
+static const float kMotionTolerance = 8.0;    // extra distance allowed (units): the surface itself moved (a walking character)
+
+float2 MotionPrevUv(int2 p, float2 a_startUv)
+{
+	const float2 uv = (float2(p) + 0.5) / float2(Size.xy);
+	float2 m = a_startUv;
+	[unroll] for (int i = 0; i < 2; ++i)
+	{
+		const int2 q = int2(clamp(m, 0.0, 0.999999) * float2(Size.xy));
+		m = uv + PrevMotion[q];
+	}
+	return m;
+}
+
+// (47y) "Moving Characters: Smooth When No History" (kFlagNoHistorySmooth): a pixel without usable history takes, instead of this
+// frame's value alone, a blend toward a small plane-weighted mean of this frame's spatial result (5x5 full / 3x3 half samples,
+// Gaussian sigma 1.5 px). Where this frame's 3x3 agrees (sigma 0: contact shadows, plain light) nothing changes.
+static const float kNoHistoryBlend = 0.75;
+
+float NoHistorySmooth(int2 p, float3 P, float rt, uint flags, float sigma)
+{
+	if (sigma <= 0.0)
+		return rt;
+	const float dist = length(P);
+	const int2 maxP = int2(Size.xy) - 1;
+	float3 N;
+	{
+		const int2 pl = int2(max(p.x - 1, 0), p.y), pr = int2(min(p.x + 1, maxP.x), p.y);
+		const int2 pu = int2(p.x, max(p.y - 1, 0)), pd = int2(p.x, min(p.y + 1, maxP.y));
+		const float d0 = abs(DepthMask[p]);
+		const float dl = abs(DepthMask[pl]), dr = abs(DepthMask[pr]), du = abs(DepthMask[pu]), dd = abs(DepthMask[pd]);
+		const float3 dx = abs(dl - d0) < abs(dr - d0) ? P - RTPosition(pl, dl) : RTPosition(pr, dr) - P;
+		const float3 dy = abs(du - d0) < abs(dd - d0) ? P - RTPosition(pu, du) : RTPosition(pd, dd) - P;
+		N = cross(dy, dx);
+		const float len = length(N);
+		N = len > 1e-12 ? N / len : (dist > 0.0 ? -P / dist : float3(0, 0, 1));
+	}
+	const float planeTolerance = dist * 0.01 + 2.0;
+	float sum = rt, weights = 1.0;
+	[branch] if ((flags & kFlagSpatial) && (flags & kFlagDenoiseHalf))
+	{
+		const int2 h = int2(uint2(p) / 2u);
+		const int2 maxH = HalfSize() - 1;
+		[loop] for (uint k = 0u; k < 9u; ++k)
+		{
+			const int2 q = clamp(h + int2(int(k % 3u) - 1, int(k / 3u) - 1), int2(0, 0), maxH);
+			const float v = Denoised[q].x;
+			const int2 fq = q * 2;
+			const float dq = abs(DepthMask[fq]);
+			[branch] if (v >= 0.0 && !RTIsSky(dq))
+			{
+				const float2 r = float2(fq) + 0.5 - (float2(p) + 0.5);
+				const float w = exp(-abs(dot(N, RTPosition(fq, dq) - P)) / planeTolerance) * exp(-dot(r, r) / 4.5);
+				sum += v * w;
+				weights += w;
+			}
+		}
+	}
+	else
+	{
+		[loop] for (uint k = 0u; k < 25u; ++k)
+		{
+			const int2 o = int2(int(k % 5u) - 2, int(k / 5u) - 2);
+			const int2 q = clamp(p + o, int2(0, 0), maxP);
+			[branch] if (any(o != 0) && TracedPixel(q, flags))
+			{
+				const float v = (flags & kFlagSpatial) ? Denoised[q].x : Visibility[q].x;
+				const float w = exp(-abs(dot(N, RTPosition(q, abs(DepthMask[q])) - P)) / planeTolerance) * exp(-float(o.x * o.x + o.y * o.y) / 4.5);
+				sum += v * w;
+				weights += w;
+			}
+		}
+	}
+	return lerp(rt, sum / weights, kNoHistoryBlend);
+}
+
+// (45k) The clamped history: reprojected with the camera (bilinear, each tap checked against the
+// expected distance), clamped to this frame's 3x3 mean +- k sigma, blended with 1 / length; the
+// length grows to Denoise.z frames, less while the camera moves fast and where a character casts
+// the shadow.
+// (47r) With this frame's 3x3 statistics given (ClampedHistory computes them; the uniform-tile fast path knows them).
+// (47y) Where the camera candidate is (partly) invalid: the motion candidate (kFlagMotionHistory), the one with more valid taps wins;
+// still none: NoHistorySmooth (kFlagNoHistorySmooth) instead of this frame alone. Clamp and the character cap apply to either.
+float ClampedHistoryWith(int2 p, float3 P, float rt, uint flags, uint anyFlags, float mean, float sigma, float n, out float historyLength)
+{
+	historyLength = 1.0;
+	if (!(flags & kFlagHistoryValid))
+		return rt;
+	if (n <= 0.0)
+		return rt;
+	const float lo = mean - Denoise.w * sigma - 0.02, hi = mean + Denoise.w * sigma + 0.02;
+
+	const float4 prevClip = mul(PrevViewProj, float4(P + CameraDelta.xyz, 1.0));
+	const float expected = length(P + CameraDelta.xyz);
+	const float tolerance = expected * 0.02 + 8.0;
+	float hv = 0.0, hl = 0.0, hw = 0.0;
+	float2 prevPos = float2(p);
+	float2 startUv = (float2(p) + 0.5) / float2(Size.xy);
+	[branch] if (prevClip.w > 1e-4)
+	{
+		const float2 prevUv = float2(prevClip.x / prevClip.w * 0.5 + 0.5, 0.5 - prevClip.y / prevClip.w * 0.5);
+		[branch] if (all(prevUv >= 0.0) && all(prevUv < 1.0))
+		{
+			startUv = prevUv;
+			prevPos = prevUv * float2(Size.xy) - 0.5;
+			hw = HistoryTaps(prevPos, expected, tolerance, hv, hl);
+		}
+	}
+	[branch] if ((flags & kFlagMotionHistory) && hw < kMotionTryBelow)
+	{
+		const float2 motionUv = MotionPrevUv(p, startUv);
+		[branch] if (all(motionUv >= 0.0) && all(motionUv < 1.0))
+		{
+			float mv, ml;
+			const float2 motionPos = motionUv * float2(Size.xy) - 0.5;
+			const float mw = HistoryTaps(motionPos, expected, tolerance + kMotionTolerance, mv, ml);
+			if (mw > hw) {
+				hv = mv;
+				hl = ml;
+				hw = mw;
+				prevPos = motionPos;
+			}
+		}
+	}
 	if (hw < 0.05)
-		return rt;  // disoccluded: this frame alone
+		return (flags & kFlagNoHistorySmooth) ? NoHistorySmooth(p, P, rt, flags, sigma) : rt;  // disoccluded: this frame alone
 	hv = clamp(hv / hw, lo, hi);
 	hl /= hw;
 	const float motion = length(prevPos + 0.5 - (float2(p) + 0.5));

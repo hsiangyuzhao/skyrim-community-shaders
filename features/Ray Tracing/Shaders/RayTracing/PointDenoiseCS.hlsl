@@ -10,7 +10,8 @@
 //      Poisson-disc taps per slot at that slot's own width, rotated per pixel and per frame;
 //   3. the history: last frame's result reprojected with the camera (bilinear, each tap checked against
 //      the distance it should have, its slot found by the source id), clamped to this frame's 3x3 range,
-//      blended in (Params.y = this frame's weight).
+//      blended in (Params.y = this frame's weight); (47y, kPLFlagMotion) where the camera's taps fail, last frame's motion vectors at
+//      constant velocity; (kPLFlagNoHistorySmooth) slots still without history are filtered at least 2.5 px with a fixed pattern.
 // Output: Lighting reads OutVis / OutIdx (t40 / t41 of the pixel shaders, RayTracing/PointLightShadows.hlsli);
 // they are also next frame's history (ping-pong), with OutDist.
 // The debug views of the point lights are written here (after CombineCS cleared DebugColor).
@@ -49,6 +50,18 @@ static const float2 kPoisson[12] = {
 	float2(0.962340, -0.194983), float2(0.473434, -0.480026), float2(0.519456, 0.767022), float2(0.185461, -0.893124),
 	float2(0.507431, 0.064425), float2(0.896420, 0.412458), float2(-0.321940, -0.932615), float2(-0.791559, -0.597710)
 };
+
+// (47y) "Moving Characters: Keep Shadow History": where the camera-only reprojection has (almost) no valid taps, last frame's motion vectors
+// (t6; this pass runs before this frame's G-buffer, as RTAO's AONormalPrepCS candidate B) at constant velocity; validated by the stored
+// history distance like the camera taps (plus kMotionTolerance: the surface itself moved).
+// "Moving Characters: Smooth When No History": a slot still without history is filtered at least kNoHistoryRadiusPx wide (where its 3x3
+// disagrees) and its Poisson taps are rotated per pixel only (a fixed pattern: no per-frame shimmer that no history would average).
+static const uint kPLFlagMotion = 8u;
+static const uint kPLFlagNoHistorySmooth = 16u;
+static const float kMotionTryBelow = 0.5;
+static const float kMotionTolerance = 8.0;
+static const float kNoHistoryRadiusPx = 2.5;
+Texture2D<float2> PrevMotion : register(t6);
 
 float InterleavedGradientNoise(float2 a_p, uint a_frame)
 {
@@ -135,6 +148,40 @@ bool SoftBeam(uint a_id)
 	return ((word >> (s & 31u)) & 1u) != 0u;
 }
 
+// The history taps at prevPos (last frame's pixel, centre at +0.5): bilinear, each tap checked against the distance it should have, its
+// slot found by the source id ((47y) split out: the camera and the motion candidate share it). Returns the bilinear weight of the taps
+// that passed the distance test (whatever their sources).
+float HistoryTaps(float2 prevPos, float expected, float tolerance, uint4 ids, int2 maxP, out float4 hv, out float4 hw)
+{
+	hv = 0.0;
+	hw = 0.0;
+	float valid = 0.0;
+	const int2 base = int2(floor(prevPos));
+	const float2 f = prevPos - float2(base);
+	[unroll] for (int t = 0; t < 4; ++t)
+	{
+		const int2 o = int2(t & 1, t >> 1);
+		const int2 q = clamp(base + o, int2(0, 0), maxP);
+		const float hd = HistDist[q];
+		const float bw = (o.x ? f.x : 1.0 - f.x) * (o.y ? f.y : 1.0 - f.y);
+		[branch] if (hd > 0.0 && abs(hd - expected) <= tolerance && bw > 0.0)
+		{
+			valid += bw;
+			const uint4 hid = Ids(HistIdx[q]);
+			const float4 hvis = HistVis[q];
+			[unroll] for (uint s = 0u; s < 4u; ++s)
+			{
+				float h;
+				if (Match(hid, hvis, ids[s], h)) {
+					hv[s] += h * bw;
+					hw[s] += bw;
+				}
+			}
+		}
+	}
+	return valid;
+}
+
 [numthreads(8, 8, 1)] void main(uint3 dtid : SV_DispatchThreadID) {
 	const int2 p = int2(dtid.xy);
 	if (any(dtid.xy >= Size.xy))
@@ -211,31 +258,29 @@ bool SoftBeam(uint a_id)
 		{
 			const float4 prevClip = mul(PrevViewProj, float4(P + CameraDelta.xyz, 1.0));
 			const float2 prevUv = prevClip.w > 1e-4 ? float2(prevClip.x / prevClip.w * 0.5 + 0.5, 0.5 - prevClip.y / prevClip.w * 0.5) : float2(-1.0, -1.0);
+			const float expected = length(P + CameraDelta.xyz);
+			const float tolerance = expected * 0.02 + 8.0;
+			float tapWeight = 0.0;
 			[branch] if (all(prevUv >= 0.0) && all(prevUv < 1.0))
+				tapWeight = HistoryTaps(prevUv * float2(Size.xy) - 0.5, expected, tolerance, ids, maxP, hv, hw);
+			// (47y) Moving Characters: Keep Shadow History: the camera found (almost) no valid taps -> last frame's motion vectors at
+			// constant velocity (two fixed-point steps from the camera guess); the candidate with more valid taps wins.
+			[branch] if ((flags & kPLFlagMotion) && tapWeight < kMotionTryBelow)
 			{
-				const float2 prevPos = prevUv * float2(Size.xy) - 0.5;
-				const int2 base = int2(floor(prevPos));
-				const float2 f = prevPos - float2(base);
-				const float expected = length(P + CameraDelta.xyz);
-				const float tolerance = expected * 0.02 + 8.0;
-				[unroll] for (int t = 0; t < 4; ++t)
+				const float2 uv = (float2(p) + 0.5) / float2(Size.xy);
+				float2 m = (all(prevUv >= 0.0) && all(prevUv < 1.0)) ? prevUv : uv;
+				[unroll] for (int i = 0; i < 2; ++i)
 				{
-					const int2 o = int2(t & 1, t >> 1);
-					const int2 q = clamp(base + o, int2(0, 0), maxP);
-					const float hd = HistDist[q];
-					const float bw = (o.x ? f.x : 1.0 - f.x) * (o.y ? f.y : 1.0 - f.y);
-					[branch] if (hd > 0.0 && abs(hd - expected) <= tolerance && bw > 0.0)
-					{
-						const uint4 hid = Ids(HistIdx[q]);
-						const float4 hvis = HistVis[q];
-						[unroll] for (uint s = 0u; s < 4u; ++s)
-						{
-							float h;
-							if (Match(hid, hvis, ids[s], h)) {
-								hv[s] += h * bw;
-								hw[s] += bw;
-							}
-						}
+					const int2 q = int2(clamp(m, 0.0, 0.999999) * float2(Size.xy));
+					m = uv + PrevMotion[q];
+				}
+				[branch] if (all(m >= 0.0) && all(m < 1.0))
+				{
+					float4 mv, mw;
+					const float motionWeight = HistoryTaps(m * float2(Size.xy) - 0.5, expected, tolerance + kMotionTolerance, ids, maxP, mv, mw);
+					if (motionWeight > tapWeight) {
+						hv = mv;
+						hw = mw;
 					}
 				}
 			}
@@ -262,6 +307,9 @@ bool SoftBeam(uint a_id)
 					const float width = 2.0 * emitter * q / (1.0 - q);
 					radiusPx[s] = clamp(0.5 * width / footprint, 1.0, PLParams.w);
 				}
+				// (47y) Smooth When No History: every slot (the beams keep their 4 px) at least kNoHistoryRadiusPx where no history came.
+				if ((flags & kPLFlagNoHistorySmooth) && hw[s] < 0.05)
+					radiusPx[s] = max(radiusPx[s], min(kNoHistoryRadiusPx, PLParams.w));
 			}
 			spatial[s] = weights[s] > 0.0 ? sum[s] / weights[s] : Lit(raw[s]);
 		}
@@ -271,17 +319,23 @@ bool SoftBeam(uint a_id)
 			// (47x) Per slot at its own radius: the pixel itself plus kPoissonTaps rotated disc taps (plane x Gaussian weights as before).
 			float sn, cs;
 			sincos(6.2831853 * InterleavedGradientNoise(float2(p), PLEmitter.w), sn, cs);
+			// (47y) Smooth When No History: slots without history use a rotation per pixel only (no per-frame shimmer).
+			float snStill = sn, csStill = cs;
+			[branch] if (flags & kPLFlagNoHistorySmooth)
+				sincos(6.2831853 * InterleavedGradientNoise(float2(p), 0u), snStill, csStill);
 			[unroll] for (uint s = 0u; s < 4u; ++s)
 			{
 				[branch] if (radiusPx[s] > 1.5)
 				{
 					const float radius = radiusPx[s];
+					const bool still = (flags & kPLFlagNoHistorySmooth) && hw[s] < 0.05;
+					const float sns = still ? snStill : sn, css = still ? csStill : cs;
 					const float invR2 = 1.0 / (radius * radius);
 					float wsum = Lit(raw[s]), wwt = 1.0;
 					[loop] for (uint k = 0u; k < kPoissonTaps; ++k)
 					{
 						const float2 d = kPoisson[k];
-						const float2 r = float2(d.x * cs - d.y * sn, d.x * sn + d.y * cs) * radius;
+						const float2 r = float2(d.x * css - d.y * sns, d.x * sns + d.y * css) * radius;
 						const int2 o = int2(round(r));
 						const int2 q = clamp(p + o, int2(0, 0), maxP);
 						const float dq = abs(DepthMask[q]);

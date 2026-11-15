@@ -30,6 +30,9 @@ static const uint kFlagDenoiseHalf = 1024u;      // (45l) the penumbra filter ra
 static const uint kFlagSigma = 2048u;            // (45l) Denoiser NRD SIGMA: rt from its output
 static const uint kFlagFalloffDenoise = 4096u;   // (45l) the filter radius shrinks with distance (Falloff)
 static const uint kFlagUniformTiles = 8192u;     // (47r) CombineCS: the fast path for uniform tiles (t6 = the denoiser's tiles)
+static const uint kFlagMotionHistory = 16384u;   // (47y) CombineCS: a motion-vector history candidate where the camera's fails (t7 = last frame's motion vectors)
+static const uint kFlagNoHistorySmooth = 32768u; // (47y) CombineCS: pixels without history take a small plane-weighted mean instead of this frame alone
+static const uint kFlagSmoothTileRadius = 65536u;  // (47y) DenoiseSpatialCS: the penumbra radius interpolated between tile centres per pixel
 
 static const uint kViewOff = 0u;
 static const uint kViewShadowSource = 1u;

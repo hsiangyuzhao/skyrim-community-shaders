@@ -167,6 +167,9 @@ namespace
 	constexpr std::uint32_t kPatternNpcReduced = 16u;                                                  // TraceShadowsCS Extra.w
 	constexpr std::uint32_t kFlagSpatial = 512u, kFlagDenoiseHalf = 1024u, kFlagSigma = 2048u, kFlagFalloffDenoise = 4096u;  // Common.hlsli
 	constexpr std::uint32_t kCombineFlagUniformTiles = 8192u;  // (47r) Common.hlsli kFlagUniformTiles: CombineCS fast path (t6 = the denoiser's tiles)
+	// (47y) Common.hlsli: CombineCS motion-vector history candidate (t7 = the motion vectors), CombineCS no-history smoothing, DenoiseSpatialCS
+	// per-pixel penumbra radius between tile centres.
+	constexpr std::uint32_t kCombineFlagMotionHistory = 16384u, kCombineFlagNoHistorySmooth = 32768u, kCombineFlagSmoothTileRadius = 65536u;
 	constexpr float kBlockerRange = 4096.0f;    // TraceShadowsCS kBlockerRange
 	// (45k) Loading screens: build budgets (frame time does not matter there), warm-up after them.
 	constexpr std::uint32_t kLoadingBuildTriangles = 1u << 20;  // per submission (TDR-safe: about 8 frames' worth of normal builds)
@@ -271,6 +274,7 @@ namespace
 	constexpr std::uint32_t kPointFlagCurvedRanking = 1024u;  // (47x) TracePointLightsCS: wider-fit normal + wrapped facing in the ranking
 	constexpr std::uint32_t kPointFlagCloseContact = 2048u;   // (47x) TracePointLightsCS: character ray TMin 2 units (its kCloseContactTMin)
 	constexpr std::uint32_t kPointDenoiseSmooth = 4u;          // (47x) PointDenoiseCS: per-slot rotated Poisson taps (Smoother Shadow Edges)
+	constexpr std::uint32_t kPointDenoiseMotion = 8u, kPointDenoiseNoHistorySmooth = 16u;  // (47y) PointDenoiseCS: motion-vector history (t6), no-history smoothing
 	// (47w) Adaptive skip thresholds (per frame, read back). Bad: more than 1 % of its lit pixels uncovered (and at least 32 pixels, so a
 	// light lighting a handful of pixels does not flip on noise), or 4096 uncovered pixels whatever the share. Good: under 0.25 % and
 	// under 1024 pixels. Skip again after kCoverageEnterFrames good frames (first time) or kCoverageRestoreFrames (after a bad frame);
@@ -1501,6 +1505,9 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.PointSmoothEdges = read("PointSmoothEdges", defaults.PointSmoothEdges);  // (47x)
 		settings.PointCurvedRanking = read("PointCurvedRanking", defaults.PointCurvedRanking);
 		settings.PointCloseContact = read("PointCloseContact", defaults.PointCloseContact);
+		settings.MovingKeepHistory = read("MovingKeepHistory", defaults.MovingKeepHistory);  // (47y)
+		settings.MovingSmoothNoHistory = read("MovingSmoothNoHistory", defaults.MovingSmoothNoHistory);
+		settings.SunSmoothTileRadius = read("SunSmoothTileRadius", defaults.SunSmoothTileRadius);
 		const float sunSize = read("SunSize", -1.0f);
 		if (sunSize >= 0.0f) {
 			settings.SunSize = sunSize;
@@ -1624,6 +1631,9 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["PointSmoothEdges"] = settings.PointSmoothEdges;  // (47x)
 	o_json["PointCurvedRanking"] = settings.PointCurvedRanking;
 	o_json["PointCloseContact"] = settings.PointCloseContact;
+	o_json["MovingKeepHistory"] = settings.MovingKeepHistory;  // (47y)
+	o_json["MovingSmoothNoHistory"] = settings.MovingSmoothNoHistory;
+	o_json["SunSmoothTileRadius"] = settings.SunSmoothTileRadius;
 	o_json["AOSmoothNormals"] = settings.AOSmoothNormals;  // (47j)
 	o_json["AOTemporalV2"] = settings.AOTemporalV2;  // (47l)
 	o_json["FoliageSway"] = settings.FoliageSway;  // (47l)
@@ -3462,7 +3472,9 @@ void RayTracing::RunFrame()
 	                             (blockerDist ? kFlagCombineBlockerDist : 0u);
 	if (historyStage)
 		combineFlags |= kFlagPenumbra | (history4Valid && prevCameraValid ? kFlagHistoryValid : 0u) | kFlagSpatial |
-		                (quality.denoiseHalf ? kFlagDenoiseHalf : 0u) | (falloff ? kFlagFalloffDenoise : 0u);
+		                (quality.denoiseHalf ? kFlagDenoiseHalf : 0u) | (falloff ? kFlagFalloffDenoise : 0u) |
+		                (settings.MovingKeepHistory ? kCombineFlagMotionHistory : 0u) | (settings.MovingSmoothNoHistory ? kCombineFlagNoHistorySmooth : 0u) |
+		                (settings.SunSmoothTileRadius ? kCombineFlagSmoothTileRadius : 0u);  // (47y)
 	if (sigmaMode)
 		combineFlags |= kFlagSigma;
 	const auto& viewProjUnjittered = fb.GetCameraViewProjUnjittered(0);
@@ -4003,9 +4015,17 @@ void RayTracing::FinishFrame()
 			combineFlags |= kCombineFlagUniformTiles;
 			setFlags();
 		}
-		ID3D11ShaderResourceView* srvs[7] = { mask.SRV, backend.VisibilitySRV(), backend.DepthMaskSRV(), sigmaActive ? sigmaOut.srv.get() : nullptr,
+		// (47y) Moving Characters: Keep Shadow History: last frame's motion vectors at t7 (this frame's G-buffer is not drawn yet).
+		ID3D11ShaderResourceView* motionSRV = (penumbraActive && (combineFlags & kCombineFlagMotionHistory)) ?
+		                                          renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGET::kMOTION_VECTOR].SRV :
+		                                          nullptr;
+		if ((combineFlags & kCombineFlagMotionHistory) && !motionSRV) {
+			combineFlags &= ~kCombineFlagMotionHistory;
+			setFlags();
+		}
+		ID3D11ShaderResourceView* srvs[8] = { mask.SRV, backend.VisibilitySRV(), backend.DepthMaskSRV(), sigmaActive ? sigmaOut.srv.get() : nullptr,
 			(combineFlags & kFlagSpatial) ? denoiseOut.srv.get() : nullptr, penumbraActive ? history4[read4].srv.get() : nullptr,
-			uniformTiles ? denoiseTiles.srv.get() : nullptr };
+			uniformTiles ? denoiseTiles.srv.get() : nullptr, motionSRV };
 		ID3D11UnorderedAccessView* uavs[5] = {
 			maskTempUAV.get(),
 			writeSSS ? screenSpaceShadows->screenSpaceShadowsTexture->uav.get() : nullptr,
@@ -4018,13 +4038,13 @@ void RayTracing::FinishFrame()
 		if (writeSSS)
 			context->PSSetShaderResources(45, 1, nullPs);
 		context->CSSetConstantBuffers(0, 1, cbs);
-		context->CSSetShaderResources(0, 7, srvs);
+		context->CSSetShaderResources(0, 8, srvs);
 		context->CSSetUnorderedAccessViews(0, 5, uavs, nullptr);
 		context->CSSetShader(combine, nullptr, 0);
 		context->Dispatch(groupsX, groupsY, 1);
-		ID3D11ShaderResourceView* nullSrvs[7]{};
+		ID3D11ShaderResourceView* nullSrvs[8]{};
 		ID3D11UnorderedAccessView* nullUavs[5]{};
-		context->CSSetShaderResources(0, 7, nullSrvs);
+		context->CSSetShaderResources(0, 8, nullSrvs);
 		context->CSSetUnorderedAccessViews(0, 5, nullUavs, nullptr);
 		if (penumbraActive) {
 			history4Index = write4;
@@ -4827,11 +4847,15 @@ void RayTracing::FinishPointLights()
 	auto* timers = Util::GpuPassTimers::GetSingleton();
 	const std::uint32_t write = pointWrite, read = pointWrite ^ 1u;
 	const bool plDebug = debugView >= DebugView::PLCandidates && debugView <= DebugView::PLDenoised && debugColorUAV;
+	// (47y) Moving Characters: Keep Shadow History: last frame's motion vectors (the G-buffer of this frame is not drawn yet; StartDeferred
+	// clears the target later), as RTAO's normal prep reads them. The shader validates its guess against the stored history distance.
+	ID3D11ShaderResourceView* motionSRV = settings.MovingKeepHistory ? globals::game::renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGET::kMOTION_VECTOR].SRV : nullptr;
 	PointDenoiseCB cb{};
 	cb.Params[0] = settings.PointLightsSize;
 	cb.Params[1] = kPointHistoryWeight;
 	const std::uint32_t flags = (pointHistoryValid && prevCameraValid ? kPointDenoiseHistory : 0u) | (plDebug ? kPointDenoiseDebug : 0u) |
-	                            (settings.PointSmoothEdges ? kPointDenoiseSmooth : 0u);  // (47x)
+	                            (settings.PointSmoothEdges ? kPointDenoiseSmooth : 0u) |  // (47x)
+	                            (motionSRV ? kPointDenoiseMotion : 0u) | (settings.MovingSmoothNoHistory ? kPointDenoiseNoHistorySmooth : 0u);  // (47y)
 	std::memcpy(&cb.Params[2], &flags, sizeof(float));
 	cb.Params[3] = kPointMaxFilterRadius;
 	cb.Extra[0] = static_cast<float>(pointK);
@@ -4859,18 +4883,18 @@ void RayTracing::FinishPointLights()
 
 	timers->Begin(Util::GpuBucket::RayTracingPointDenoise);
 	ID3D11Buffer* cbs[2] = { combineCB->CB(), pointDenoiseCB->CB() };
-	ID3D11ShaderResourceView* srvs[6] = { backend.PointVisibilitySRV(), backend.PointSourcesSRV(), backend.DepthMaskSRV(), pointVis[read].srv.get(),
-		pointIdx[read].srv.get(), pointDist[read].srv.get() };
+	ID3D11ShaderResourceView* srvs[7] = { backend.PointVisibilitySRV(), backend.PointSourcesSRV(), backend.DepthMaskSRV(), pointVis[read].srv.get(),
+		pointIdx[read].srv.get(), pointDist[read].srv.get(), motionSRV };
 	ID3D11UnorderedAccessView* uavs[4] = { pointVis[write].uav.get(), pointIdx[write].uav.get(), pointDist[write].uav.get(), plDebug ? debugColorUAV.get() : nullptr };
 	context->CSSetConstantBuffers(0, 2, cbs);
-	context->CSSetShaderResources(0, 6, srvs);
+	context->CSSetShaderResources(0, 7, srvs);
 	context->CSSetUnorderedAccessViews(0, 4, uavs, nullptr);
 	context->CSSetShader(shader, nullptr, 0);
 	context->Dispatch((pending.width + 7) / 8, (pending.height + 7) / 8, 1);
-	ID3D11ShaderResourceView* nullSrvs[6]{};
+	ID3D11ShaderResourceView* nullSrvs[7]{};
 	ID3D11UnorderedAccessView* nullUavs[4]{};
 	ID3D11Buffer* nullCbs[2]{};
-	context->CSSetShaderResources(0, 6, nullSrvs);
+	context->CSSetShaderResources(0, 7, nullSrvs);
 	context->CSSetUnorderedAccessViews(0, 4, nullUavs, nullptr);
 	context->CSSetConstantBuffers(0, 2, nullCbs);
 	context->CSSetShader(nullptr, nullptr, 0);
@@ -6173,6 +6197,21 @@ void RayTracing::DrawSettings()
 	// Ray Tracing category (each shows the switch and the status on top).
 	ImGui::PushID("rtMainPage");  // tree-node open states of its own (other pages also have Advanced / Diagnostics)
 	DrawMasterHeader();
+	// (47y) Grainy RT shadows on moving characters (sun and point lights alike).
+	ImGui::SeparatorText("Moving Characters");
+	ImGui::Checkbox("Moving Characters: Keep Shadow History", &settings.MovingKeepHistory);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("On (default): the shadow denoisers (sun and point lights) follow a moving surface with the game's motion vectors, so a");
+		ImGui::Text("  walking character keeps the shadow's smoothing from earlier frames instead of starting from one grainy frame.");
+		ImGui::Text("  Only taken where last frame's stored distance matches; the anti-ghosting clamp and the short history where a");
+		ImGui::Text("  character casts the sun shadow stay. Off: as 47x (the camera alone decides).");
+	}
+	ImGui::Checkbox("Moving Characters: Smooth When No History", &settings.MovingSmoothNoHistory);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("On (default): pixels that still have no usable history (just uncovered, fast motion) are blurred a little instead of");
+		ImGui::Text("  showing one frame of raw rays (point lights: at least 2.5 px with a fixed pattern; sun: a small mean of the");
+		ImGui::Text("  neighbours on the same surface). Where the neighbourhood agrees (crisp contact shadows) nothing changes. Off: as 47x.");
+	}
 	DrawObjectRows();  // (47n) one per-kind choice for the sun, the point lights and RTAO
 	DrawDiagnostics();
 	ImGui::PopID();
@@ -6426,6 +6465,12 @@ void RayTracing::DrawSunPage()
 					settings.CustomDenoiseClamp = std::clamp(clampSigma, 0.5f, 4.0f);
 			}
 			ImGui::Separator();
+			ImGui::Checkbox("Smooth Blur Width Between Tiles", &settings.SunSmoothTileRadius);  // (47y)
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): the denoiser's blur width is worked out per 8x8-pixel tile, then blended smoothly from pixel to pixel");
+				ImGui::Text("  between neighbouring tiles (never below half of what its own tile wants), so soft shadow edges have no square blocks");
+				ImGui::Text("  (the Penumbra Radius debug view shows it per pixel). Off: one width per tile, as in 47x.");
+			}
 			ImGui::SliderFloat("RT Caster Contact Length", &settings.RtContactScale, 0.0f, 32.0f, "%.1f x ray offset");
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::Text("How far (along the sun ray) a ray-traced object may still cast a small screen-space contact shadow at its base,");
@@ -7504,6 +7549,9 @@ std::string RayTracing::DescribeForProfile() const
 	// (47x)
 	text += std::format(", smoother shadow edges {}, curved-surface ranking {}, close-contact on characters {}", settings.PointSmoothEdges ? "on" : "off",
 		settings.PointCurvedRanking ? "on" : "off", settings.PointCloseContact ? "on" : "off");
+	// (47y)
+	text += std::format(", moving characters: keep shadow history {}, smooth when no history {}, sun smooth blur width between tiles {}",
+		settings.MovingKeepHistory ? "on" : "off", settings.MovingSmoothNoHistory ? "on" : "off", settings.SunSmoothTileRadius ? "on" : "off");
 	// (46f)
 	static constexpr const char* kAOModes[] = { "RTAO (keeps SSGI contact AO)", "darker of RTAO and SSGI AO" };
 	static constexpr const char* kAOViews[] = { "off", "raw", "filtered", "split", "raw detail", "filtered detail", "final", "normal confidence", "normal Ns", "normal Ng",
@@ -7595,6 +7643,9 @@ nlohmann::json RayTracing::DescribeJson() const
 	j["first_person_player_rt"] = settings.FirstPersonPlayer;
 	j["denoiser"] = settings.Denoiser;
 	j["rt_contact_scale"] = settings.RtContactScale;
+	j["moving_keep_history"] = settings.MovingKeepHistory;  // (47y) sun and point lights
+	j["moving_smooth_no_history"] = settings.MovingSmoothNoHistory;
+	j["sun_smooth_tile_radius"] = settings.SunSmoothTileRadius;
 	j["denoiser_effective"] = static_cast<int>(EffectiveDenoiser());
 	j["upscaling_rr_active"] = UpscalingRRActive();
 	j["sigma_stabilized_frames"] = settings.SigmaStabilizedFrames;
