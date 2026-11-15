@@ -4364,7 +4364,10 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		[branch] if (ssplsCoverageView)
 		{
 			const float coverageWeight = Color::RGBToLuminance(max(lightColor, 0.0)) * saturate(lightAngle);
-			const bool shadowMap = (Permutation::PixelShaderDescriptor & Permutation::LightingFlags::DefShadow) && (light.lightFlags & LightLimitFix::LightFlags::Shadow) && !rtApplied;
+			// (47z) Not when its game shadow map was left out this frame (Skip the Game's Shadow Maps; tag bit 13, RayTracing PointLights.h
+			// kTagMapSkipped): Ray Tracing wrote its mask channel unshadowed where the pixel did not trace it, so that is no shadow (red).
+			const bool shadowMap = (Permutation::PixelShaderDescriptor & Permutation::LightingFlags::DefShadow) && (light.lightFlags & LightLimitFix::LightFlags::Shadow) && !rtApplied &&
+			                       !(light.rtShadow & (1u << 13));
 			if (rtShadow)
 				ssplsCoverage += ssplsRun ? float4(0.0, coverageWeight, 0.0, 0.0) : float4(coverageWeight, 0.0, 0.0, 0.0);
 			else

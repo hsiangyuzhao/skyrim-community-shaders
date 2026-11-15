@@ -1573,7 +1573,8 @@ namespace RayTracingScene
 					shape.shown = true;  // (46g) else at HandOff
 				// (45j) Foliage "Both": traced, and still drawn into the cascades (the darker of both wins).
 				if (shape.shown && !shape.registered && !(shape.foliage && config_.foliage == FoliageMode::Both)) {
-					RayTracingCasterFilter::Add(shape.geometry.get());
+					// (47z) Keepable (Keep Buildings in the Game's Sun Shadow Map): not foliage, not trees and plants.
+					RayTracingCasterFilter::Add(shape.geometry.get(), !shape.foliage && object->kind != ObjectKind::Tree);
 					shape.registered = true;
 				}
 				if (shape.registered)
@@ -1955,7 +1956,7 @@ namespace RayTracingScene
 				cell->shown = true;  // (46g) else at HandOff
 			if (built && cell->shown && !cell->filterRegistered) {
 				for (const auto& geometry : cell->geometries)
-					RayTracingCasterFilter::Add(geometry.get());
+					RayTracingCasterFilter::Add(geometry.get(), true);  // (47z) statics and landscape: keepable
 				cell->filterRegistered = true;
 			}
 			if (built && cell->replaces) {
@@ -1969,7 +1970,7 @@ namespace RayTracingScene
 				if (shape.ready && !shape.shown && !hold_)
 					shape.shown = true;  // (46g) else at HandOff
 				if (shape.shown && !shape.registered && !(shape.foliage && config_.foliage == FoliageMode::Both)) {
-					RayTracingCasterFilter::Add(shape.geometry.get());
+					RayTracingCasterFilter::Add(shape.geometry.get(), !shape.foliage);  // (47z) a non-foliage cut-out: keepable
 					shape.registered = true;
 				}
 			}

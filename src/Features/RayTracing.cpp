@@ -273,6 +273,8 @@ namespace
 	constexpr std::uint32_t kPointFlagCoverage = 512u;  // (47w) TracePointLightsCS: count the engine shadow-map lights' uncovered pixels
 	constexpr std::uint32_t kPointFlagCurvedRanking = 1024u;  // (47x) TracePointLightsCS: wider-fit normal + wrapped facing in the ranking
 	constexpr std::uint32_t kPointFlagCloseContact = 2048u;   // (47x) TracePointLightsCS: character ray TMin 2 units (its kCloseContactTMin)
+	constexpr std::uint32_t kPointFlagBeamRange = 4096u;        // (47z) TracePointLightsCS: beams rank 0 past their radius, not in the share total
+	constexpr std::uint32_t kPointFlagStickyReproject = 8192u;  // (47z) TracePointLightsCS: sticky sources read where the surface was last frame
 	constexpr std::uint32_t kPointDenoiseSmooth = 4u;          // (47x) PointDenoiseCS: per-slot rotated Poisson taps (Smoother Shadow Edges)
 	constexpr std::uint32_t kPointDenoiseMotion = 8u, kPointDenoiseNoHistorySmooth = 16u;  // (47y) PointDenoiseCS: motion-vector history (t6), no-history smoothing
 	// (47w) Adaptive skip thresholds (per frame, read back). Bad: more than 1 % of its lit pixels uncovered (and at least 32 pixels, so a
@@ -1508,6 +1510,9 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.MovingKeepHistory = read("MovingKeepHistory", defaults.MovingKeepHistory);  // (47y)
 		settings.MovingSmoothNoHistory = read("MovingSmoothNoHistory", defaults.MovingSmoothNoHistory);
 		settings.SunSmoothTileRadius = read("SunSmoothTileRadius", defaults.SunSmoothTileRadius);
+		settings.KeepBuildingsInSunMap = read("KeepBuildingsInSunMap", defaults.KeepBuildingsInSunMap);  // (47z)
+		settings.PointBeamRange = read("PointBeamRange", defaults.PointBeamRange);
+		settings.PointStickyReproject = read("PointStickyReproject", defaults.PointStickyReproject);
 		const float sunSize = read("SunSize", -1.0f);
 		if (sunSize >= 0.0f) {
 			settings.SunSize = sunSize;
@@ -1634,6 +1639,9 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["MovingKeepHistory"] = settings.MovingKeepHistory;  // (47y)
 	o_json["MovingSmoothNoHistory"] = settings.MovingSmoothNoHistory;
 	o_json["SunSmoothTileRadius"] = settings.SunSmoothTileRadius;
+	o_json["KeepBuildingsInSunMap"] = settings.KeepBuildingsInSunMap;  // (47z)
+	o_json["PointBeamRange"] = settings.PointBeamRange;
+	o_json["PointStickyReproject"] = settings.PointStickyReproject;
 	o_json["AOSmoothNormals"] = settings.AOSmoothNormals;  // (47j)
 	o_json["AOTemporalV2"] = settings.AOTemporalV2;  // (47l)
 	o_json["FoliageSway"] = settings.FoliageSway;  // (47l)
@@ -1789,6 +1797,7 @@ void RayTracing::ClearShaderCache()
 	sigmaPrepCS = nullptr;
 	pointDenoiseCS = nullptr;  // (46b)
 	pointMaskCS = nullptr;     // (46c)
+	forwardMergeCS = nullptr;  // (47z)
 	// (46f)
 	aoTemporalCS = nullptr;
 	aoCompositeCS = nullptr;
@@ -1808,6 +1817,8 @@ void RayTracing::PrecompileShaders()
 	GetShader(prepareCS, L"Data\\Shaders\\RayTracing\\PrepareCS.hlsl", "PrepareCS");
 	if (SunOn())
 		GetShader(combineCS, L"Data\\Shaders\\RayTracing\\CombineCS.hlsl", "CombineCS");
+	if (SunOn() && settings.KeepBuildingsInSunMap)  // (47z)
+		GetShader(forwardMergeCS, L"Data\\Shaders\\RayTracing\\ForwardShadowMergeCS.hlsl", "ForwardShadowMergeCS");
 	if (SunOn() && ValidDenoiser(settings.Denoiser) == static_cast<int>(DenoiserMode::Penumbra)) {
 		GetShader(denoiseTileCS, L"Data\\Shaders\\RayTracing\\DenoiseTileCS.hlsl", "DenoiseTileCS");
 		GetShaderDefined(denoiseHalfHCS, L"Data\\Shaders\\RayTracing\\DenoiseSpatialCS.hlsl", "DenoiseSpatialCS (half)", "DENOISE_HALF");
@@ -1937,6 +1948,9 @@ void RayTracing::ReleaseD3D11Resources()
 	ReleaseSigma();
 	ReleasePointDenoiser();  // (46b)
 	ReleaseAOFilter();       // (46f)
+	ReleaseForwardShadowMap();             // (47z)
+	RayTracingCasterFilter::ReleaseKept();
+	pointPrevValid = false;
 	prevCameraValid = false;
 	maskDesc = {};
 	maskDescValid = false;  // (47n)
@@ -2349,7 +2363,7 @@ void RayTracing::LatchFrame()
 	                    backend.HasFreeContext() && scene.HasCoverage();
 	// (45f) Watch for big casters the scene lacks while Ray Tracing runs (also when nothing is left out).
 	const bool watch = RtWanted() && SunOn() && status == Status::Active;
-	RayTracingCasterFilter::Latch(active, filterRect, watch);
+	RayTracingCasterFilter::Latch(active, filterRect, watch, settings.KeepBuildingsInSunMap);  // (47z) keep: Keep Buildings in the Game's Sun Shadow Map
 	filterLatched = RayTracingCasterFilter::IsLatched();
 	RunEarlyPrep();
 }
@@ -4789,6 +4803,29 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 		flags |= kPointFlagCurvedRanking;
 	if (settings.PointCloseContact)
 		flags |= kPointFlagCloseContact;
+	if (settings.PointBeamRange)  // (47z)
+		flags |= kPointFlagBeamRange;
+	// (47z) Stable Light Choice When the Camera Moves: last trace's camera -> this frame's camera-relative positions to last trace's clip
+	// space, one matrix (last view-projection x the translation by the camera's move), appended to the sources (Backend). The trace
+	// reads its copy of last frame's PLIdx there. Without a last camera: 47y (the same pixel).
+	pointInput.reproject = false;
+	if (settings.PointStickyReproject && pointPrevValid) {
+		const double delta[3] = { a_camX - pointPrevCamera[0], a_camY - pointPrevCamera[1], a_camZ - pointPrevCamera[2] };
+		for (int r = 0; r < 4; ++r) {
+			const float* row = pointPrevViewProj + r * 4;
+			pointInput.reprojectMatrix[r * 4 + 0] = row[0];
+			pointInput.reprojectMatrix[r * 4 + 1] = row[1];
+			pointInput.reprojectMatrix[r * 4 + 2] = row[2];
+			pointInput.reprojectMatrix[r * 4 + 3] = static_cast<float>(static_cast<double>(row[3]) + row[0] * delta[0] + row[1] * delta[1] + row[2] * delta[2]);
+		}
+		pointInput.reproject = true;
+		flags |= kPointFlagStickyReproject;
+	}
+	std::copy_n(viewProjF, 16, pointPrevViewProj);
+	pointPrevCamera[0] = a_camX;
+	pointPrevCamera[1] = a_camY;
+	pointPrevCamera[2] = a_camZ;
+	pointPrevValid = true;
 	c.params[0] = static_cast<float>(scan);
 	c.params[1] = static_cast<float>(frameIndex % 1024);
 	std::memcpy(&c.params[2], &flags, sizeof(float));
@@ -6471,6 +6508,16 @@ void RayTracing::DrawSunPage()
 				ImGui::Text("  between neighbouring tiles (never below half of what its own tile wants), so soft shadow edges have no square blocks");
 				ImGui::Text("  (the Penumbra Radius debug view shows it per pixel). Off: one width per tile, as in 47x.");
 			}
+			ImGui::Checkbox("Keep Buildings in the Game's Sun Shadow Map", &settings.KeepBuildingsInSunMap);  // (47z)
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): see-through things drawn after the solid pass (glass, blended arches such as the Blue Palace garden");
+				ImGui::Text("  trellis, banners, particles, water, fog) take their sunlight from the game's own shadow map, which left out everything");
+				ImGui::Text("  ray tracing handles, so they looked sunlit inside a building's shadow. Now large buildings and objects (not plants,");
+				ImGui::Text("  trees or characters) are also drawn into a separate copy of the two near shadow-map layers, and only those see-through");
+				ImGui::Text("  things read it. Solid surfaces keep exactly the ray-traced shadows as before (no double darkening).");
+				ImGui::Text("  Costs the shadow-map drawing of those objects again (see Diagnostics for the count) and about 64-80 MB of video memory");
+				ImGui::Text("  at a 2048 shadow resolution. Off: as 47y.");
+			}
 			ImGui::SliderFloat("RT Caster Contact Length", &settings.RtContactScale, 0.0f, 32.0f, "%.1f x ray offset");
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::Text("How far (along the sun ray) a ray-traced object may still cast a small screen-space contact shadow at its base,");
@@ -6820,6 +6867,20 @@ void RayTracing::DrawPointLightPage()
 				ImGui::Text("On (default): things 2-6 units from a character (a chain on the chest, an arm against the body) cast lamp shadows on it.");
 				ImGui::Text("  The ray against characters starts 2 units out instead of 6 (still 6 where the light only grazes the surface).");
 				ImGui::Text("  Risk: small dark speckles of a character shadowing itself. Off: as 47w. The sun is not affected.");
+			}
+			// (47z) Light choice: two switches, each on by default, off = 47y.
+			ImGui::Checkbox("Window Beams: Respect Their Range", &settings.PointBeamRange);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): a window beam (Window Shadows Ultimate) only competes for the few lights a pixel traces within its own");
+				ImGui::Text("  reach (the game's light ends there too), and its full strength no longer pushes the other lamps of the pixel under");
+				ImGui::Text("  the minimum share. Fixes block-shaped steps in which lights get traced (Candidates / Traced Lights views).");
+				ImGui::Text("Off: as 47y.");
+			}
+			ImGui::Checkbox("Stable Light Choice When the Camera Moves", &settings.PointStickyReproject);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): a pixel keeps preferring the lights it traced last frame where that surface was last frame (follows");
+				ImGui::Text("  the camera), not at the same spot of the screen, so turning or walking no longer reshuffles which lights cast");
+				ImGui::Text("  ray-traced shadows. Off: as 47y.");
 			}
 			// (46c, 47m: default on; 47x: default off again)
 			ImGui::BeginDisabled(!settings.PointLightsInteriors);
@@ -7301,8 +7362,9 @@ void RayTracing::DrawDiagnostics()
 			ImGui::Text("Point Lights: Raw Rays / Denoised: the point-light shadows before / after the clean-up (white = lit).");
 			ImGui::Text("Point Lights: SSPLS Coverage (needs Screen Space Point Light Shadows on): what shadows the point lights at each pixel get,");
 			ImGui::Text("  mixed by how bright each light is there: green = ray traced only, cyan = ray traced + screen-space for the non-RT casters,");
-			ImGui::Text("  orange = screen-space only (the light is not traced here: not a source, more lights than traced per pixel, outside the");
-			ImGui::Text("  traced area), red = no shadow at all. Dark grey = no point light.");
+			ImGui::Text("  orange = screen-space and / or the game's shadow map only (the light is not traced here: not a source, more lights than");
+			ImGui::Text("  traced per pixel, outside the traced area), red = no shadow at all (also a light whose game shadow map Skip the Game's");
+			ImGui::Text("  Shadow Maps left out, where the pixel did not trace it: it shines unshadowed there). Dark grey = no point light.");
 			// (47h)
 			ImGui::Text("Note: see-through surfaces drawn after the solid pass (glass, blended arches and banners, water, particles) are drawn");
 			ImGui::Text("  over these views: the colours there describe what lies behind them, not the see-through surface itself.");
@@ -7464,6 +7526,11 @@ void RayTracing::DrawDiagnostics()
 			}
 			ImGui::Text("Shadow map: %u casters handed to RT, %u draws left out last frame%s", RayTracingCasterFilter::RegisteredCount(),
 				RayTracingCasterFilter::SkippedLastFrame(), filterLatched ? "" : " (not active)");
+			// (47z) Keep Buildings in the Game's Sun Shadow Map.
+			ImGui::Text("Kept for see-through surfaces: %u draws last frame (%u could not be kept: left out; %u self-check misses), %.1f MB%s",
+				RayTracingCasterFilter::KeptLastFrame(), RayTracingCasterFilter::RedirectFailedLastFrame(), RayTracingCasterFilter::RedirectLostLastFrame(),
+				static_cast<double>(RayTracingCasterFilter::KeptBytes() + (forwardMerged ? static_cast<std::uint64_t>(forwardMergedDesc.Width) * forwardMergedDesc.Height * forwardMergedDesc.ArraySize * 4u : 0u)) / (1024.0 * 1024.0),
+				!settings.KeepBuildingsInSunMap ? " (switch off)" : (globals::state && forwardMergedFrame != UINT32_MAX && globals::state->frameCount - forwardMergedFrame <= 1u ? "" : " (not merged this frame)"));
 			ImGui::Text("TLAS: %u cell chunks, %u doors/activators, %u items, %u trees, %u alpha-tested, %u character parts (%u not built yet)",
 				check.written[RayTracingRT::kCategoryCell], check.written[RayTracingRT::kCategoryMovable], check.written[RayTracingRT::kCategoryItem],
 				check.written[RayTracingRT::kCategoryTree], check.written[RayTracingRT::kCategoryAlpha], check.written[RayTracingRT::kCategoryCharacter], notBuilt);
@@ -7552,6 +7619,10 @@ std::string RayTracing::DescribeForProfile() const
 	// (47y)
 	text += std::format(", moving characters: keep shadow history {}, smooth when no history {}, sun smooth blur width between tiles {}",
 		settings.MovingKeepHistory ? "on" : "off", settings.MovingSmoothNoHistory ? "on" : "off", settings.SunSmoothTileRadius ? "on" : "off");
+	// (47z)
+	text += std::format(", keep buildings in the sun shadow map {} ({} draws kept), window beams respect their range {}, stable light choice when the camera moves {}",
+		settings.KeepBuildingsInSunMap ? "on" : "off", RayTracingCasterFilter::KeptLastFrame(), settings.PointBeamRange ? "on" : "off",
+		settings.PointStickyReproject ? "on" : "off");
 	// (46f)
 	static constexpr const char* kAOModes[] = { "RTAO (keeps SSGI contact AO)", "darker of RTAO and SSGI AO" };
 	static constexpr const char* kAOViews[] = { "off", "raw", "filtered", "split", "raw detail", "filtered detail", "final", "normal confidence", "normal Ns", "normal Ng",
@@ -7646,6 +7717,12 @@ nlohmann::json RayTracing::DescribeJson() const
 	j["moving_keep_history"] = settings.MovingKeepHistory;  // (47y) sun and point lights
 	j["moving_smooth_no_history"] = settings.MovingSmoothNoHistory;
 	j["sun_smooth_tile_radius"] = settings.SunSmoothTileRadius;
+	j["keep_buildings_in_sun_map"] = settings.KeepBuildingsInSunMap;  // (47z)
+	j["kept_sun_caster_draws"] = RayTracingCasterFilter::KeptLastFrame();
+	j["kept_sun_caster_failed"] = RayTracingCasterFilter::RedirectFailedLastFrame();
+	j["kept_sun_caster_lost"] = RayTracingCasterFilter::RedirectLostLastFrame();
+	j["point_beam_range"] = settings.PointBeamRange;
+	j["point_sticky_reproject"] = settings.PointStickyReproject;
 	j["denoiser_effective"] = static_cast<int>(EffectiveDenoiser());
 	j["upscaling_rr_active"] = UpscalingRRActive();
 	j["sigma_stabilized_frames"] = settings.SigmaStabilizedFrames;
@@ -7747,4 +7824,107 @@ bool RayTracing::SunMaskDepthCheckActive() const
 {
 	// (47h) Only within the frame the mask was written (a stale flag after Ray Tracing stopped running never applies).
 	return RtWanted() && SunOn() && sunMaskWrittenThisFrame && globals::state && sunMaskFrame == globals::state->frameCount;
+}
+
+std::uint32_t RayTracing::PointLightTag(const RE::BSLight* a_light) const
+{
+	std::uint32_t tag = pointSelector.TagFor(a_light);
+	// (47z) Its engine shadow map was left out this frame (Skip the Game's Shadow Maps): where a pixel did not trace it, PointMaskCS
+	// wrote its mask channel unshadowed, so the SSPLS Coverage view counts it as no shadow (red), not as a shadow map (orange). Only
+	// that view reads the bit (Lighting.hlsl); no shading depends on it.
+	if (a_light && !skippedLights.empty() && std::binary_search(skippedLights.begin(), skippedLights.end(), a_light))
+		tag |= RayTracingPointLights::kTagMapSkipped;
+	return tag;
+}
+
+ID3D11ShaderResourceView* RayTracing::ForwardShadowMap(ID3D11ShaderResourceView* a_cascades)
+{
+	// (47z) Keep Buildings in the Game's Sun Shadow Map. No redirected draw this frame (switch off, Ray Tracing not latched, interior,
+	// nothing kept): the engine's cascades, exactly as 47y.
+	forwardMergedLastFrame = false;
+	if (!a_cascades || !loaded || !globals::state)
+		return a_cascades;
+	auto* kept = RayTracingCasterFilter::KeptCascades(a_cascades);
+	if (!kept)
+		return a_cascades;
+	const std::uint32_t frame = globals::state->frameCount;
+	if (forwardMergedFrame == frame && forwardMergedFrom == a_cascades && forwardMergedSRV) {
+		forwardMergedLastFrame = true;
+		return forwardMergedSRV.get();  // a second mask draw this frame: already merged
+	}
+	winrt::com_ptr<ID3D11Resource> resource;
+	a_cascades->GetResource(resource.put());
+	winrt::com_ptr<ID3D11Texture2D> texture;
+	if (!resource || FAILED(resource->QueryInterface(IID_PPV_ARGS(texture.put()))))
+		return a_cascades;
+	D3D11_TEXTURE2D_DESC desc{};
+	texture->GetDesc(&desc);
+	if (!forwardMerged || forwardMergedDesc.Width != desc.Width || forwardMergedDesc.Height != desc.Height || forwardMergedDesc.ArraySize != desc.ArraySize) {
+		ReleaseForwardShadowMap();
+		D3D11_TEXTURE2D_DESC mergedDesc{};
+		mergedDesc.Width = desc.Width;
+		mergedDesc.Height = desc.Height;
+		mergedDesc.MipLevels = 1;
+		mergedDesc.ArraySize = desc.ArraySize;
+		mergedDesc.Format = DXGI_FORMAT_R32_FLOAT;
+		mergedDesc.SampleDesc = { 1, 0 };
+		mergedDesc.Usage = D3D11_USAGE_DEFAULT;
+		mergedDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+		auto* device = globals::d3d::device;
+		HRESULT hr = device->CreateTexture2D(&mergedDesc, nullptr, forwardMerged.put());
+		if (SUCCEEDED(hr)) {
+			D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+			srvDesc.Format = DXGI_FORMAT_R32_FLOAT;
+			srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+			srvDesc.Texture2DArray.MipLevels = 1;
+			srvDesc.Texture2DArray.ArraySize = desc.ArraySize;
+			hr = device->CreateShaderResourceView(forwardMerged.get(), &srvDesc, forwardMergedSRV.put());
+		}
+		if (SUCCEEDED(hr)) {
+			D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+			uavDesc.Format = DXGI_FORMAT_R32_FLOAT;
+			uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2DARRAY;
+			uavDesc.Texture2DArray.ArraySize = desc.ArraySize;
+			hr = device->CreateUnorderedAccessView(forwardMerged.get(), &uavDesc, forwardMergedUAV.put());
+		}
+		if (FAILED(hr)) {
+			logger::warn("[RayTracing] Keep Buildings in the Game's Sun Shadow Map: could not create the merged cascades ({}x{} x {}, hr {:08X})", desc.Width,
+				desc.Height, desc.ArraySize, static_cast<std::uint32_t>(hr));
+			ReleaseForwardShadowMap();
+			return a_cascades;
+		}
+		Util::SetResourceName(forwardMerged.get(), "RayTracing Forward Sun Cascades");
+		forwardMergedDesc = mergedDesc;
+	}
+	auto* shader = GetShader(forwardMergeCS, L"Data\\Shaders\\RayTracing\\ForwardShadowMergeCS.hlsl", "ForwardShadowMergeCS");
+	if (!shader)
+		return a_cascades;
+	auto* context = globals::d3d::context;
+	// The merged array may still be bound for the pixel shaders (last frame's t18): not as SRV while it is written.
+	ID3D11ShaderResourceView* nullSrv[2]{};
+	context->PSSetShaderResources(18, 1, nullSrv);
+	ID3D11ShaderResourceView* srvs[2]{ a_cascades, kept };
+	ID3D11UnorderedAccessView* uav = forwardMergedUAV.get();
+	context->CSSetShader(shader, nullptr, 0);
+	context->CSSetShaderResources(0, 2, srvs);
+	context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+	context->Dispatch((desc.Width + 7) / 8, (desc.Height + 7) / 8, desc.ArraySize);
+	uav = nullptr;
+	context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+	context->CSSetShaderResources(0, 2, nullSrv);
+	context->CSSetShader(nullptr, nullptr, 0);
+	forwardMergedFrame = frame;
+	forwardMergedFrom = a_cascades;
+	forwardMergedLastFrame = true;
+	return forwardMergedSRV.get();
+}
+
+void RayTracing::ReleaseForwardShadowMap()
+{
+	forwardMerged = nullptr;
+	forwardMergedSRV = nullptr;
+	forwardMergedUAV = nullptr;
+	forwardMergedDesc = {};
+	forwardMergedFrame = UINT32_MAX;
+	forwardMergedFrom = nullptr;
 }

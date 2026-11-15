@@ -1813,7 +1813,9 @@ void PhysicalSky::AccumShadow()
 		auto sampler = sampTr.get();
 		auto srvs = std::array{
 			globals::game::renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY].depthSRV,
-			deferred->shadowView,
+			// (47z) The shared capture: with Ray Tracing's Keep Buildings in the Game's Sun Shadow Map the merged cascades (else the
+			// same array as shadowView).
+			deferred->HasFreshShadowCapture() ? deferred->capturedShadowMap.get() : deferred->shadowView,
 			deferred->perShadow->srv.get(),
 			terrainShadows.IsHeightMapReady() ? terrainShadows.texShadowHeight->srv.get() : nullptr,
 			cloudShadows.loaded ? cloudShadows.texCubemapCloudOcc->srv.get() : nullptr,

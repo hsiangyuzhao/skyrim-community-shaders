@@ -50,6 +50,9 @@ namespace RayTracingPointLights
 	inline constexpr std::uint32_t kTagContactShift = 16u;
 	// (47h) "Point Light Shadows on Water": the water above a shallow bed takes the bed's traced visibility (PointLightShadows.hlsli GetWater).
 	inline constexpr std::uint32_t kTagWaterBed = 1u << 12;
+	// (47z) The light's engine shadow map was left out this frame (Skip the Game's Shadow Maps): set by RayTracing::PointLightTag, also
+	// without a source; read only by Lighting.hlsl's SSPLS Coverage debug view (where the pixel did not trace it: red, not orange).
+	inline constexpr std::uint32_t kTagMapSkipped = 1u << 13;
 
 	// GpuSource::info[0] bits (TracePointLightsCS).
 	inline constexpr std::uint32_t kSourceISL = 1u;     // inverse-square attenuation (InverseSquareLighting)

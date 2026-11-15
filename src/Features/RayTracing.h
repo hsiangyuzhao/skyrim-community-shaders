@@ -302,6 +302,20 @@ public:
 		// SunSmoothTileRadius "Smooth Blur Width Between Tiles" (Penumbra denoiser): the per-8x8-tile penumbra radius is interpolated per
 		// pixel between the neighbouring tile centres (never below half its own tile's), so the blur width has no tile blocks.
 		bool SunSmoothTileRadius = true;
+		// (47z) Outside the settings macro. Each on by default, off = 47y exactly.
+		// KeepBuildingsInSunMap "Keep Buildings in the Game's Sun Shadow Map" (Sun Shadows > Advanced): the large casters the ray tracer
+		// covers (statics, landscape, doors, movable statics, non-foliage cut-outs; bound radius >= 128) are drawn into a second copy of
+		// the two near sun cascades instead of being left out; the forward readers (glass, blended arches and banners, particles, water,
+		// fog) sample the merge of both, the engine's shadow mask (every opaque surface) keeps the cascades without them (CasterFilter.h).
+		bool KeepBuildingsInSunMap = true;
+		// PointBeamRange "Window Beams: Respect Their Range" (Point Light Shadows > Advanced): a window beam ranks 0 past its radius (the
+		// engine's spot lights nothing there; the per-tile sphere test already used that radius) and does not count in the share cut's
+		// total (a full-strength beam no longer pushes the other lights of the pixel under the minimum share).
+		bool PointBeamRange = true;
+		// PointStickyReproject "Stable Light Choice When the Camera Moves" (Point Light Shadows > Advanced): the sticky selection reads
+		// last frame's traced lights where this surface was last frame (camera reprojection into a copy of last frame's PLIdx), not at
+		// the same screen pixel.
+		bool PointStickyReproject = true;
 	};
 	/// (46f) RTAO modes (Settings::AOMode); with RTAO off the AO is SSGI's, exactly as before.
 	enum class AOModeKind : int
@@ -393,7 +407,8 @@ public:
 
 	/// (46b) Light Limit Fix, for each light it uploads: the ray-traced shadow tag (LightData::rtShadow), 0 unless
 	/// this frame's trace has a shadow source for the light.
-	[[nodiscard]] std::uint32_t PointLightTag(const RE::BSLight* a_light) const { return pointSelector.TagFor(a_light); }
+	/// (47z) Plus kTagMapSkipped when the light's engine shadow map was left out this frame (SSPLS Coverage view: red, not orange).
+	[[nodiscard]] std::uint32_t PointLightTag(const RE::BSLight* a_light) const;
 	/// (46y) Debug view SSPLS Coverage: Screen Space Point Light Shadows asks Lighting.hlsl to draw it (SSPLS.hlsli CoverageView).
 	[[nodiscard]] bool SSPLSCoverageView() const { return debugView == DebugView::PLSsplsCoverage; }
 	/// (46x) Light Census: this frame's 46x class of a light (RayTracingPointLights::Decision | why << 8; 0 = none). Render thread.
@@ -408,6 +423,10 @@ public:
 	/// (47h) This frame's sun shadow mask was written by the trace (outdoors) and "Sun Shadow: Depth Check for Translucent Surfaces" is
 	/// on: forward Lighting surfaces that are not the depth buffer's take the cascades at their own position (LightLimitFix strict flags).
 	[[nodiscard]] bool SunMaskDepthCheckActive() const;
+	/// (47z) Keep Buildings in the Game's Sun Shadow Map: Deferred::CopyShadowData (the engine's sun shadow-mask draw), with the engine's
+	/// cascade array: the array for the forward readers (t18, the shared capture) -- the merge with the kept casters when draws were
+	/// redirected this frame, else a_cascades itself.
+	ID3D11ShaderResourceView* ForwardShadowMap(ID3D11ShaderResourceView* a_cascades);
 	[[nodiscard]] Status GetStatus() const { return status; }
 
 	/// For the F7 frame trace: D3D12 GPU ms (last completed), CPU ms this frame, BLAS builds this frame.
@@ -879,6 +898,20 @@ private:
 	winrt::com_ptr<ID3D11ShaderResourceView> waterDepthCopySRV;
 	D3D11_TEXTURE2D_DESC waterDepthCopyDesc{};
 	winrt::com_ptr<ID3D11ComputeShader> waterPrepCS;
+	// (47z) Keep Buildings in the Game's Sun Shadow Map: the merged cascades (an R32_FLOAT array like the engine's) and their merge.
+	winrt::com_ptr<ID3D11ComputeShader> forwardMergeCS;
+	winrt::com_ptr<ID3D11Texture2D> forwardMerged;
+	winrt::com_ptr<ID3D11ShaderResourceView> forwardMergedSRV;
+	winrt::com_ptr<ID3D11UnorderedAccessView> forwardMergedUAV;
+	D3D11_TEXTURE2D_DESC forwardMergedDesc{};
+	uint32_t forwardMergedFrame = UINT32_MAX;               // State::frameCount of the last merge
+	ID3D11ShaderResourceView* forwardMergedFrom = nullptr;  // ... and the cascade SRV it merged (identity only)
+	bool forwardMergedLastFrame = false;                    // diagnostic: the forward readers got the merge on the last mask draw
+	void ReleaseForwardShadowMap();
+	// (47z) Stable Light Choice When the Camera Moves: the camera of the last point trace (its jittered view-projection, position).
+	float pointPrevViewProj[16]{};
+	double pointPrevCamera[3]{};
+	bool pointPrevValid = false;
 	std::unique_ptr<ConstantBuffer> waterPrepCB;
 	// (47j) RTAO: Smooth Normals. Last frame's camera and size (DepthMask still holds its depth until PrepareCS overwrites it).
 	winrt::com_ptr<ID3D11ComputeShader> aoNormalCS;

@@ -73,6 +73,7 @@ RWByteAddressBuffer RayCounter : register(u2);  // rays traced (monotonic, read 
 // (RTPointShadows::GetWater), so the point traced is the fragment itself.
 Texture2D<float> WaterDist : register(t7);
 RWTexture2D<unorm float4> PLWaterVis : register(u3);
+Texture2D<unorm float4> PLIdxPrev : register(t8);  // (47z) last frame's PLIdx (kFlagStickyReproject)
 
 static const uint kFlagCharacters = 1u;   // characters are in the TLAS: the character ray
 static const uint kFlagFirstPerson = 2u;  // no character ray for pixels near the camera
@@ -97,6 +98,15 @@ static const float kRankWrap = 0.4;
 static const uint kFlagCloseContact = 2048u;
 static const float kCloseContactTMin = 2.0;
 static const float kCloseContactGraze = 0.3;
+// (47z) Window Beams: Respect Their Range: a window beam ranks 0 past its radius (PosRadius.w; the per-group sphere test already used it, so
+// whole 8x8 tiles gained / lost a full-strength beam: stair steps in the candidate / traced-light regions) and stays out of the share
+// cut's total (its full strength pushed the pixel's other lights under the minimum share). The coverage count takes the same Contribution.
+static const uint kFlagBeamRange = 4096u;
+// (47z) Stable Light Choice When the Camera Moves: the sticky sources are last frame's at the pixel this surface had last frame (camera
+// reprojection: Sources[kReprojectRecord] holds the matrix, rows in PosRadius / Atten / Spot / Info), read from a copy of last frame's
+// PLIdx (PLIdxPrev, made before this dispatch: PLIdx itself may already hold this frame's value at another pixel). 47y: the same pixel.
+static const uint kFlagStickyReproject = 8192u;
+static const uint kReprojectRecord = 64u;  // Backend kPointReprojectRecord
 static const uint kSunOutProbed = 64u, kSunOutRtSurfaceRaw = 128u;  // TraceShadowsCS kOutProbed / kOutRtSurfaceRaw
 static const float kStickyBonus = 1.5;
 static const uint kChurnWord = 1u;           // (46g) RayCounter words: [1] pixels whose source set changed
@@ -253,7 +263,11 @@ float Contribution(PLSource src, float3 P, float3 N, float a_wrap)
 		return 0.0;
 	const float facing = a_wrap > 0.0 ? (ndl + a_wrap) / (1.0 + a_wrap) : ndl;
 	// (46c) Window beams: the sun through a window, no fall-off with distance; spots: inside their cone only.
-	const float atten = (src.Info.x & kSourceBeam) ? 1.0 : Attenuation(src, d);
+	// (47z, kFlagBeamRange) ... but nothing past the beam's radius (the engine's spot does not light there either).
+	const bool beam = (src.Info.x & kSourceBeam) != 0u;
+	if (beam && (asuint(C.Params.z) & kFlagBeamRange) && d >= src.PosRadius.w)
+		return 0.0;
+	const float atten = beam ? 1.0 : Attenuation(src, d);
 	return src.Atten.w * atten * facing * SpotFactor(src, P);
 }
 
@@ -488,7 +502,24 @@ groupshared uint gsMask[2];
 	if (!inside)
 		return;
 	// (46g) Last frame's sources of this pixel (read before it is overwritten): stickiness and the churn count.
-	const uint4 prevIdx = uint4(PLIdx[p] * 255.0 + 0.5) & 0x7Fu;
+	// (47z, kFlagStickyReproject) For a traced surface: at the pixel it had last frame (camera only; nothing there = no sticky source).
+	const bool beamRange = (flags & kFlagBeamRange) != 0u;
+	uint4 prevIdx = 0u;
+	[branch] if ((flags & kFlagStickyReproject) && valid)
+	{
+		const PLSource m = Sources[kReprojectRecord];
+		const float4 P1 = float4(P, 1.0);
+		const float4 prevClip = float4(dot(m.PosRadius, P1), dot(m.Atten, P1), dot(m.Spot, P1), dot(asfloat(m.Info), P1));
+		if (prevClip.w > 1e-6) {
+			const float2 prevUv = float2(prevClip.x / prevClip.w * 0.5 + 0.5, 0.5 - prevClip.y / prevClip.w * 0.5);
+			if (all(prevUv >= 0.0) && all(prevUv < 1.0))  // (false for NaN)
+				prevIdx = uint4(PLIdxPrev[min(int2(prevUv * C.RenderSize.xy), int2(C.RenderSize.xy) - 1)] * 255.0 + 0.5) & 0x7Fu;
+		}
+	}
+	else
+	{
+		prevIdx = uint4(PLIdx[p] * 255.0 + 0.5) & 0x7Fu;
+	}
 	const bool sticky = (flags & kFlagSticky) != 0u;
 	const uint2 mask = uint2(gsMask[0], gsMask[1]);
 	if (!valid || all(mask == 0u)) {
@@ -570,7 +601,9 @@ groupshared uint gsMask[2];
 			const float contribution = Contribution(src, P, NRank, rankWrap);  // (47w) the same terms as before, in a function; (47x) NRank / wrap
 			if (contribution <= 0.0)
 				continue;
-			total += contribution;
+			// (47z, kFlagBeamRange) A window beam does not raise the share cut of the pixel's other lights.
+			if (!(beamRange && (src.Info.x & kSourceBeam)))
+				total += contribution;
 			count += 1u;
 			// Insert into the sorted top K. (46g) Last frame's sources of the pixel rank higher (stable selection).
 			const bool wasThere = sticky && any(prevIdx == (i + 1u));

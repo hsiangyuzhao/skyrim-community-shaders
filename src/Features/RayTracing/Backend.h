@@ -317,7 +317,13 @@ namespace RayTracingRT
 		// coverage flag); read back with the timestamps (Stats::coverage). coverageCount = 0: nothing counted.
 		std::array<PointCoverageKey, kPointCoverageLights> coverage{};
 		std::uint32_t coverageCount = 0;
+		// (47z) Stable Light Choice When the Camera Moves (the caller sets the shader's flag): last frame's PLIdx is copied before the
+		// trace (t8) and this matrix (row-major: this frame's camera-relative position -> last trace's clip space) is appended to the
+		// sources at record kPointReprojectRecord.
+		bool reproject = false;
+		float reprojectMatrix[16]{};
 	};
+	inline constexpr std::uint32_t kPointReprojectRecord = 64;  // (47z) TracePointLightsCS kReprojectRecord (after the 64 sources)
 
 	/// (45f) What a TLAS instance holds, for the per-category counts and the self-check.
 	enum InstanceCategory : std::uint8_t
@@ -1485,6 +1491,9 @@ namespace RayTracingRT
 		ComPtr<ID3D12PipelineState> pointAlphaPipeline_;  // (46c) TracePointLightsCS with RT_ALPHA
 		bool pointAlphaLastFrame_ = false;
 		SharedTexture pointVis_, pointIdx_;
+		// (47z) Stable Light Choice When the Camera Moves: last frame's PLIdx, copied in the point list right before the trace (D3D12 only;
+		// COMMON between frames). Null = not available (the trace then reads zeros there: no sticky bonus, no harm).
+		ComPtr<ID3D12Resource> pointIdxPrev_;
 		SharedTexture pointWaterDist_, pointWaterVis_;  // (47i) Point Light Shadows on Water
 		std::uint64_t pointWaterBytes_ = 0;
 		static constexpr DXGI_FORMAT kPointWaterDistFormat = DXGI_FORMAT_R32_FLOAT;
@@ -1518,7 +1527,8 @@ namespace RayTracingRT
 		// PLIdx UAV), RTAO table (depth SRV, AO UAV).
 		// (47i) + the point table's water views (water distance SRV, water visibility UAV) after the RTAO table (offsets 6, 7 of the point table).
 		// (47n) The 47l RTAO blue noise SRV (slot 11) is gone.
-		static constexpr std::uint32_t kDynSun = 0, kDynPoint = 2, kDynAO = 6, kDynWater = 8, kDynAONormal = 10, kDynamicDescriptors = 11;  // (47j) + the RTAO smooth normals SRV (RTAO table offset 4)
+		// (47z) + last frame's PLIdx SRV (point table offset 9, t8).
+		static constexpr std::uint32_t kDynSun = 0, kDynPoint = 2, kDynAO = 6, kDynWater = 8, kDynAONormal = 10, kDynPointPrev = 11, kDynamicDescriptors = 12;  // (47j) + the RTAO smooth normals SRV (RTAO table offset 4)
 		static constexpr std::uint32_t kDynamicBase = kPointDescriptorBase + kPointDescriptors;  // after the (unused) 46b point slots
 		ComPtr<ID3D12DescriptorHeap> stagingHeap_;
 		[[nodiscard]] D3D12_CPU_DESCRIPTOR_HANDLE StagingCpu(std::uint32_t a_slot) const;

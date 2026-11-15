@@ -307,15 +307,21 @@ void Deferred::CopyShadowData()
 	{
 		context->PSGetShaderResources(4, 1, &shadowView);
 
+		// (47z) Ray Tracing's Keep Buildings in the Game's Sun Shadow Map: the forward readers (t18, the shared capture) get the engine's
+		// cascades merged with the large ray-traced casters it keeps for them; the engine's own mask draw keeps reading PS t4 (unchanged).
+		ID3D11ShaderResourceView* forwardView = shadowView;
+		if (globals::features::rayTracing.loaded)
+			forwardView = globals::features::rayTracing.ForwardShadowMap(shadowView);
+
 		ID3D11ShaderResourceView* srvs[2]{
-			shadowView,
+			forwardView,
 			perShadow->srv.get(),
 		};
 
 		context->PSSetShaderResources(18, ARRAYSIZE(srvs), srvs);
 
 		// (batch 38) Shared capture for Volumetric Fog / Volumetric Shadows (see Deferred.h).
-		capturedShadowMap.copy_from(shadowView);
+		capturedShadowMap.copy_from(forwardView);
 		capturedShadowFrame = globals::state->frameCount;
 
 		// Release COM object to prevent memory leak

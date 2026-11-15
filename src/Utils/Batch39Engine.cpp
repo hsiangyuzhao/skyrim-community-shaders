@@ -144,15 +144,23 @@ namespace Batch39Engine
 			{
 				// (45) Ray Tracing: a caster the ray tracer covers is not drawn into the sun cascades.
 				// One branch unless Ray Tracing latched this frame (CasterFilter.h).
-				if (RayTracingCasterFilter::ShouldSkip(a_pass))
+				const auto decision = RayTracingCasterFilter::Decide(a_pass);
+				if (decision == RayTracingCasterFilter::Decision::kSkip)
 					return;
 				// (47p, A) Small far objects cast no sun shadow in the far cascade (one branch while off).
 				if (g_smallCullOn && CullSmallCaster(a_pass))
+					return;
+				// (47z) Keep Buildings in the Game's Sun Shadow Map: drawn into the forward cascades instead (skipped as in 47y when
+				// that is not possible).
+				const bool redirect = decision == RayTracingCasterFilter::Decision::kRedirect;
+				if (redirect && !RayTracingCasterFilter::BeginRedirect())
 					return;
 				RE::BSRenderPass* previous = g_currentPass;
 				g_currentPass = a_pass;
 				func(a_pass, a_technique, a_alphaTest, a_renderFlags);
 				g_currentPass = previous;
+				if (redirect)
+					RayTracingCasterFilter::EndRedirect();
 			}
 			static inline REL::Relocation<decltype(thunk)> func;
 		};

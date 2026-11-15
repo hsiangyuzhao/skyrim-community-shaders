@@ -386,6 +386,9 @@ namespace RayTracingRT
 			// (47j) RTAO: Smooth Normals (filled when its texture exists).
 			nullSrv.Format = kDepthMaskFormat;
 			device_->CreateShaderResourceView(nullptr, &nullSrv, StagingCpu(kDynAONormal));
+			// (47z) Last frame's PLIdx (filled with the point textures).
+			nullSrv.Format = kPointFormat;
+			device_->CreateShaderResourceView(nullptr, &nullSrv, StagingCpu(kDynPointPrev));
 		}
 
 		// (45h) Null views in every alpha slot (the copy layers and the bindless table are filled on use).
@@ -452,7 +455,12 @@ namespace RayTracingRT
 		// (46c) the alpha-tested variant also: records t4, texcoords t5, table (copy layers t6, bindless game textures t0 space1), s0.
 		// 52 + 2 + 1 + 2 + 2 + 2 + 2 + 1 = 64 DWORDs (the limit).
 		// (47i) + the water views in the same table (water distance t7, water visibility u3; past the RTAO table in the block).
-		D3D12_DESCRIPTOR_RANGE ranges[4]{};
+		// (47z) + last frame's PLIdx (t8) in the same table (past the RTAO normals SRV in the block).
+		D3D12_DESCRIPTOR_RANGE ranges[5]{};
+		ranges[4].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+		ranges[4].NumDescriptors = 1;
+		ranges[4].BaseShaderRegister = 8;
+		ranges[4].OffsetInDescriptorsFromTableStart = kDynPointPrev - kDynPoint;
 		ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
 		ranges[0].NumDescriptors = 2;
 		ranges[0].BaseShaderRegister = 1;
@@ -488,7 +496,7 @@ namespace RayTracingRT
 		params[1].Descriptor.ShaderRegister = 0;
 		params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-		params[2].DescriptorTable.NumDescriptorRanges = 4;
+		params[2].DescriptorTable.NumDescriptorRanges = 5;
 		params[2].DescriptorTable.pDescriptorRanges = ranges;
 		params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
@@ -581,9 +589,32 @@ namespace RayTracingRT
 		}
 		pointCounterMapped_ = static_cast<const std::uint32_t*>(mapped);
 		pointCounterValid_ = false;
+		{
+			// (47z) Stable Light Choice When the Camera Moves: last frame's PLIdx (D3D12 only). Not fatal: without it the trace reads zeros.
+			D3D12_HEAP_PROPERTIES heap{};
+			heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+			D3D12_RESOURCE_DESC desc{};
+			desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+			desc.Width = a_width;
+			desc.Height = a_height;
+			desc.DepthOrArraySize = 1;
+			desc.MipLevels = 1;
+			desc.Format = kPointFormat;
+			desc.SampleDesc.Count = 1;
+			desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+			const HRESULT hrPrev = device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&pointIdxPrev_));
+			if (FAILED(hrPrev)) {
+				pointIdxPrev_.Reset();
+				logger::warn("[RayTracing] Point-light previous sources texture failed ({}); Stable Light Choice When the Camera Moves reads nothing", HrString(hrPrev));
+			} else {
+				pointIdxPrev_->SetName(L"RayTracing PointSourcesPrev");
+				if (ResidencyHigh())
+					ApplyResidency(pointIdxPrev_.Get());
+			}
+		}
 		pointWidth_ = a_width;
 		pointHeight_ = a_height;
-		pointBytes_ = static_cast<std::uint64_t>(a_width) * a_height * 8;
+		pointBytes_ = static_cast<std::uint64_t>(a_width) * a_height * (pointIdxPrev_ ? 12 : 8);  // (47z) + last frame's PLIdx
 		WritePointDescriptors();
 		logger::info("[RayTracing] Point-light textures {}x{}", a_width, a_height);
 		return true;
@@ -661,6 +692,9 @@ namespace RayTracingRT
 			Retire(pointVis_.resource12, 0, nullptr);
 		if (pointIdx_.resource12)
 			Retire(pointIdx_.resource12, 0, nullptr);
+		if (pointIdxPrev_)  // (47z)
+			Retire(pointIdxPrev_, 0, nullptr);
+		pointIdxPrev_.Reset();
 		if (pointCounterReadback_ && pointCounterMapped_)
 			pointCounterReadback_->Unmap(0, nullptr);
 		pointCounterMapped_ = nullptr;
@@ -687,6 +721,12 @@ namespace RayTracingRT
 			nullUav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
 			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynPoint + 2));
 			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynPoint + 3));
+			D3D12_SHADER_RESOURCE_VIEW_DESC nullSrv{};  // (47z)
+			nullSrv.Format = kPointFormat;
+			nullSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+			nullSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			nullSrv.Texture2D.MipLevels = 1;
+			device_->CreateShaderResourceView(nullptr, &nullSrv, StagingCpu(kDynPointPrev));
 		}
 	}
 
@@ -707,6 +747,9 @@ namespace RayTracingRT
 		uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
 		device_->CreateUnorderedAccessView(pointVis_.resource12.Get(), nullptr, &uavDesc, StagingCpu(kDynPoint + 2));
 		device_->CreateUnorderedAccessView(pointIdx_.resource12.Get(), nullptr, &uavDesc, StagingCpu(kDynPoint + 3));
+		// (47z) Last frame's PLIdx (t8; null view without the copy texture).
+		srvDesc.Format = kPointFormat;
+		device_->CreateShaderResourceView(pointIdxPrev_.Get(), &srvDesc, StagingCpu(kDynPointPrev));
 	}
 
 	bool Backend::EnsurePointBuffer(CommandContext& a_context, std::uint32_t a_bytes)
@@ -767,7 +810,27 @@ namespace RayTracingRT
 			};
 			a_list->ResourceBarrier(2, waterPre);
 		}
+		// (47z) Stable Light Choice When the Camera Moves: last frame's PLIdx copied before this trace overwrites it (the trace reads it at
+		// the reprojected pixel, which another lane of this dispatch may already have written in PLIdx itself).
+		const bool prevCopy = pl.reproject && pointIdxPrev_;
+		if (prevCopy) {
+			D3D12_RESOURCE_BARRIER copyPre[2] = {
+				Transition(pointIdx_.resource12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+				Transition(pointIdxPrev_.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST),
+			};
+			a_list->ResourceBarrier(2, copyPre);
+			a_list->CopyResource(pointIdxPrev_.Get(), pointIdx_.resource12.Get());
+			D3D12_RESOURCE_BARRIER copyPost[2] = {
+				Transition(pointIdx_.resource12.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+				Transition(pointIdxPrev_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+			};
+			a_list->ResourceBarrier(2, copyPost);
+		}
 		a_list->Dispatch((a_input.renderWidth + 7) / 8, (a_input.renderHeight + 7) / 8, 1);
+		if (prevCopy) {
+			D3D12_RESOURCE_BARRIER prevPost = Transition(pointIdxPrev_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+			a_list->ResourceBarrier(1, &prevPost);
+		}
 		if (water) {
 			D3D12_RESOURCE_BARRIER waterPost[2] = {
 				Transition(pointWaterDist_.resource12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
@@ -2694,9 +2757,14 @@ namespace RayTracingRT
 
 		// (46b) Point lights this frame: textures, counter and this context's copy of the sources.
 		const bool pointFrame = a_input.pointLights && a_input.pointLights->scan > 0 && a_input.pointLights->sources && PointAvailable() && pointVis_.resource12 &&
-		                        pointIdx_.resource12 && pointCounter_ && pointCounterMapped_ && EnsurePointBuffer(context, a_input.pointLights->sourceBytes);
-		if (pointFrame)
+		                        pointIdx_.resource12 && pointCounter_ && pointCounterMapped_ &&
+		                        EnsurePointBuffer(context, std::max<std::uint32_t>(a_input.pointLights->sourceBytes, (kPointReprojectRecord + 1) * 64));
+		if (pointFrame) {
 			std::memcpy(context.pointMapped, a_input.pointLights->sources, a_input.pointLights->sourceBytes);
+			// (47z) Stable Light Choice When the Camera Moves: the reprojection matrix after the sources (TracePointLightsCS kReprojectRecord).
+			if (a_input.pointLights->reproject && a_input.pointLights->sourceBytes <= kPointReprojectRecord * 64)
+				std::memcpy(static_cast<std::byte*>(context.pointMapped) + kPointReprojectRecord * 64, a_input.pointLights->reprojectMatrix, 64);
+		}
 		stats_.pointTracedLastFrame = pointFrame;
 		// (46m) Split Trace Sync: the sun alone in this list (the sun fence is signalled behind it), the point lights in
 		// their own list after it; the D3D11 queue can start on the sun's result while the point lights still run. (47m) Always
