@@ -268,6 +268,9 @@ namespace
 	constexpr std::uint32_t kPointFlagWater = 128u;     // (47i) TracePointLightsCS: trace the sources from last frame's water too
 	constexpr std::uint32_t kPointFlagSunProbe = 256u;  // (47q) TracePointLightsCS: reuse the sun pass's surface probe (its alpha variant)
 	constexpr std::uint32_t kPointFlagCoverage = 512u;  // (47w) TracePointLightsCS: count the engine shadow-map lights' uncovered pixels
+	constexpr std::uint32_t kPointFlagCurvedRanking = 1024u;  // (47x) TracePointLightsCS: wider-fit normal + wrapped facing in the ranking
+	constexpr std::uint32_t kPointFlagCloseContact = 2048u;   // (47x) TracePointLightsCS: character ray TMin 2 units (its kCloseContactTMin)
+	constexpr std::uint32_t kPointDenoiseSmooth = 4u;          // (47x) PointDenoiseCS: per-slot rotated Poisson taps (Smoother Shadow Edges)
 	// (47w) Adaptive skip thresholds (per frame, read back). Bad: more than 1 % of its lit pixels uncovered (and at least 32 pixels, so a
 	// light lighting a handful of pixels does not flip on noise), or 4096 uncovered pixels whatever the share. Good: under 0.25 % and
 	// under 1024 pixels. Skip again after kCoverageEnterFrames good frames (first time) or kCoverageRestoreFrames (after a bad frame);
@@ -1495,6 +1498,9 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.SunTraceEarly = read("SunTraceEarly", defaults.SunTraceEarly);  // (47u)
 		settings.SkipIrrelevantUpdates = read("SkipIrrelevantUpdates", defaults.SkipIrrelevantUpdates);
 		settings.SpatialStaticChunks = read("SpatialStaticChunks", defaults.SpatialStaticChunks);
+		settings.PointSmoothEdges = read("PointSmoothEdges", defaults.PointSmoothEdges);  // (47x)
+		settings.PointCurvedRanking = read("PointCurvedRanking", defaults.PointCurvedRanking);
+		settings.PointCloseContact = read("PointCloseContact", defaults.PointCloseContact);
 		const float sunSize = read("SunSize", -1.0f);
 		if (sunSize >= 0.0f) {
 			settings.SunSize = sunSize;
@@ -1507,11 +1513,12 @@ void RayTracing::LoadSettings(json& o_json)
 			logger::info("[RayTracing] Shadow Edge Softness (sun size, 47q): {:.2f} degrees (the sun quality's cone until 47p)", settings.SunSize);
 		}
 	}
-	// (47m) Skip the Game's Shadow Maps for RT-Shadowed Lights: on once for settings saved before 47m (its new default).
-	if (loadedVersion < 7) {
-		if (!settings.PointLightsSkipShadowMaps)
-			logger::info("[RayTracing] Skip the Game's Shadow Maps for RT-Shadowed Lights switched on (47m default; untick it in Point Light Shadows > Advanced if wanted)");
-		settings.PointLightsSkipShadowMaps = true;
+	// (47m) Skip the Game's Shadow Maps for RT-Shadowed Lights was switched on once for settings saved before 47m (version 7).
+	// (47x) Off once for settings saved before 47x (version 8; the engine's shadow maps are kept again, its new default).
+	if (loadedVersion < 8) {
+		if (settings.PointLightsSkipShadowMaps)
+			logger::info("[RayTracing] Skip the Game's Shadow Maps for RT-Shadowed Lights switched off (47x default; tick it in Point Light Shadows > Advanced if wanted)");
+		settings.PointLightsSkipShadowMaps = false;
 	}
 	if (settings.Denoiser == 1)
 		logger::info("[RayTracing] Denoiser Temporal was removed: Penumbra");
@@ -1614,6 +1621,9 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["SunTraceEarly"] = settings.SunTraceEarly;  // (47u)
 	o_json["SkipIrrelevantUpdates"] = settings.SkipIrrelevantUpdates;
 	o_json["SpatialStaticChunks"] = settings.SpatialStaticChunks;
+	o_json["PointSmoothEdges"] = settings.PointSmoothEdges;  // (47x)
+	o_json["PointCurvedRanking"] = settings.PointCurvedRanking;
+	o_json["PointCloseContact"] = settings.PointCloseContact;
 	o_json["AOSmoothNormals"] = settings.AOSmoothNormals;  // (47j)
 	o_json["AOTemporalV2"] = settings.AOTemporalV2;  // (47l)
 	o_json["FoliageSway"] = settings.FoliageSway;  // (47l)
@@ -4755,6 +4765,10 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 		if (pointInput.coverageCount > 0)
 			flags |= kPointFlagCoverage;
 	}
+	if (settings.PointCurvedRanking)  // (47x)
+		flags |= kPointFlagCurvedRanking;
+	if (settings.PointCloseContact)
+		flags |= kPointFlagCloseContact;
 	c.params[0] = static_cast<float>(scan);
 	c.params[1] = static_cast<float>(frameIndex % 1024);
 	std::memcpy(&c.params[2], &flags, sizeof(float));
@@ -4816,7 +4830,8 @@ void RayTracing::FinishPointLights()
 	PointDenoiseCB cb{};
 	cb.Params[0] = settings.PointLightsSize;
 	cb.Params[1] = kPointHistoryWeight;
-	const std::uint32_t flags = (pointHistoryValid && prevCameraValid ? kPointDenoiseHistory : 0u) | (plDebug ? kPointDenoiseDebug : 0u);
+	const std::uint32_t flags = (pointHistoryValid && prevCameraValid ? kPointDenoiseHistory : 0u) | (plDebug ? kPointDenoiseDebug : 0u) |
+	                            (settings.PointSmoothEdges ? kPointDenoiseSmooth : 0u);  // (47x)
 	std::memcpy(&cb.Params[2], &flags, sizeof(float));
 	cb.Params[3] = kPointMaxFilterRadius;
 	cb.Extra[0] = static_cast<float>(pointK);
@@ -4832,6 +4847,7 @@ void RayTracing::FinishPointLights()
 		cb.Emitter[0] = static_cast<std::uint32_t>(pointEmitterMask);
 		cb.Emitter[1] = static_cast<std::uint32_t>(pointEmitterMask >> 32);
 		std::memcpy(&cb.Emitter[2], &pointEmitterRadius, sizeof(float));
+		cb.Emitter[3] = frameIndex;  // (47x) Smoother Shadow Edges: the taps' rotation changes every frame
 	}
 	{
 		// (46d) Moving / new sources: their history is dropped in proportion (slot s in byte s % 4 of Motion[s / 4]).
@@ -6740,29 +6756,48 @@ void RayTracing::DrawPointLightPage()
 				ImGui::Text("On (default): outdoors in Low and Medium too, the point lights take the sun's check of which surfaces are ray traced");
 				ImGui::Text("  instead of shooting their own ray per pixel (High and Ultra did so since 47q). Same result. Off: as 47q.");
 			}
-			// (46c, 47m: default on)
+			// (47x) Jagged point-light shadows on characters: three switches, each on by default, off = 47w.
+			ImGui::Checkbox("Smoother Shadow Edges", &settings.PointSmoothEdges);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): the clean-up of soft point-light shadow edges samples a rotating scatter of points sized for each light");
+				ImGui::Text("  on its own, so large Light Size values give smooth edges instead of stair steps, and small ones no longer speckle.");
+				ImGui::Text("Off: as 47w (one fixed grid shared by all lights of the pixel).");
+			}
+			ImGui::Checkbox("Trace Lights on Curved Surfaces Reliably", &settings.PointCurvedRanking);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): when picking the few lights each pixel traces, the surface direction is measured over a wider patch and");
+				ImGui::Text("  lights just past the edge of the lit side still count, so skin, hair and other round shapes get their ray-traced");
+				ImGui::Text("  shadows everywhere instead of in patches (the rest of the pixels fell back to other shadows or none).");
+				ImGui::Text("Off: as 47w.");
+			}
+			ImGui::Checkbox("Close-Contact Shadows on Characters", &settings.PointCloseContact);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): things 2-6 units from a character (a chain on the chest, an arm against the body) cast lamp shadows on it.");
+				ImGui::Text("  The ray against characters starts 2 units out instead of 6 (still 6 where the light only grazes the surface).");
+				ImGui::Text("  Risk: small dark speckles of a character shadowing itself. Off: as 47w. The sun is not affected.");
+			}
+			// (46c, 47m: default on; 47x: default off again)
 			ImGui::BeginDisabled(!settings.PointLightsInteriors);
 			ImGui::Checkbox("Skip the Game's Shadow Maps for RT-Shadowed Lights", &settings.PointLightsSkipShadowMaps);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On (default): indoors, the game no longer draws its own shadow maps for the lights whose shadows ray tracing already");
+				ImGui::Text("On: indoors, the game no longer draws its own shadow maps for the lights whose shadows ray tracing already");
 				ImGui::Text("  draws (saves about 0.7-1.2 ms). Only on frames where the ray-traced result is sure to come.");
-				ImGui::Text("  If it still goes missing for a frame, those lights shine without a shadow for that frame (inside their cone for");
-				ImGui::Text("  spot lights); the Diagnostics line \"with the fallback only\" counts such frames.");
-				ImGui::Text("Off: the game keeps drawing those shadow maps too (wasted work).");
+				ImGui::Text("  Pixels that do not trace such a light (each traces only its brightest few) then get no shadow from it.");
+				ImGui::Text("Off (default): the game keeps drawing those shadow maps; pixels that did not trace a light use its shadow map.");
 			}
-			// (47w)
-			ImGui::BeginDisabled(!settings.PointLightsSkipShadowMaps);
-			ImGui::Indent();
-			ImGui::Checkbox("Adaptive: keep maps for lights RT can't fully cover", &settings.PointLightsAdaptiveSkip);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On (default): a light's own shadow map is left out only while ray tracing gives it a shadow on (nearly) every pixel");
-				ImGui::Text("  it lights. Where a pixel traces other, stronger lights instead (each pixel traces only its brightest few), the");
-				ImGui::Text("  game's shadow map of that light is kept and used there, so no light ever ends up with no shadow at all.");
-				ImGui::Text("  Lights switch back to skipped only after about a second of full coverage (no flipping back and forth).");
-				ImGui::Text("Off: as 47v (every RT-shadowed light skipped; where a pixel did not trace it, that light shines unshadowed).");
+			// (47w) Only while Skip is on (47x).
+			if (settings.PointLightsSkipShadowMaps) {
+				ImGui::Indent();
+				ImGui::Checkbox("Adaptive: keep maps for lights RT can't fully cover", &settings.PointLightsAdaptiveSkip);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("On (default): a light's own shadow map is left out only while ray tracing gives it a shadow on (nearly) every pixel");
+					ImGui::Text("  it lights. Where a pixel traces other, stronger lights instead (each pixel traces only its brightest few), the");
+					ImGui::Text("  game's shadow map of that light is kept and used there, so no light ever ends up with no shadow at all.");
+					ImGui::Text("  Lights switch back to skipped only after about a second of full coverage (no flipping back and forth).");
+					ImGui::Text("Off: as 47v (every RT-shadowed light skipped; where a pixel did not trace it, that light shines unshadowed).");
+				}
+				ImGui::Unindent();
 			}
-			ImGui::Unindent();
-			ImGui::EndDisabled();
 			ImGui::EndDisabled();
 			ImGui::EndDisabled();
 			ImGui::TreePop();
@@ -7466,6 +7501,9 @@ std::string RayTracing::DescribeForProfile() const
 		pt.effects ? "on" : "off", pt.alphaOutdoors ? "on" : "off");
 	// (46o)
 	text += std::format(", window beam softness {:.2f} deg", settings.PointLightsBeamSoftness);
+	// (47x)
+	text += std::format(", smoother shadow edges {}, curved-surface ranking {}, close-contact on characters {}", settings.PointSmoothEdges ? "on" : "off",
+		settings.PointCurvedRanking ? "on" : "off", settings.PointCloseContact ? "on" : "off");
 	// (46f)
 	static constexpr const char* kAOModes[] = { "RTAO (keeps SSGI contact AO)", "darker of RTAO and SSGI AO" };
 	static constexpr const char* kAOViews[] = { "off", "raw", "filtered", "split", "raw detail", "filtered detail", "final", "normal confidence", "normal Ns", "normal Ng",
@@ -7612,7 +7650,8 @@ nlohmann::json RayTracing::DescribeJson() const
 			 { "denoise_gpu_ms", Util::GpuPassTimers::GetSingleton()->SmoothedMs(Util::GpuBucket::RayTracingPointDenoise) },
 			{ "cpu_ms", pointCpuMs }, { "off_reason", pointOffReason }, { "player", pt.player }, { "effects", pt.effects },
 			{ "alpha_outdoors", pt.alphaOutdoors }, { "player_sources", ps.player }, { "effect_sources", ps.effects },
-			{ "alpha_last_frame", backend.PointAlphaLastFrame() } };
+			{ "alpha_last_frame", backend.PointAlphaLastFrame() }, { "smooth_edges", settings.PointSmoothEdges },  // (47x)
+			{ "curved_ranking", settings.PointCurvedRanking }, { "close_contact", settings.PointCloseContact } };
 		// (46c)
 		const auto& sc = scene.GetStats();
 		j["interior"] = { { "enabled", settings.PointLightsInteriors }, { "k", pt.kInterior },

@@ -105,8 +105,9 @@ public:
 		bool Characters = true;
 		bool PhysicsParts = true;  // HDT-SMP / HDT-PE parts other than hair (capes, skirts)
 		// 5 = 45o (debug switches hard-wired; no migrations before it); 6 = 46o (Window Beam Guard off once; the guard is gone since
-		// 47m); 7 = 47m (Skip the Game's Shadow Maps for RT-Shadowed Lights on once)
-		int SettingsVersion = 7;
+		// 47m); 7 = 47m (Skip the Game's Shadow Maps for RT-Shadowed Lights on once); 8 = 47x (... off once: the engine shadow maps are
+		// kept again, user decision after 47w)
+		int SettingsVersion = 8;
 		bool Buildings = true;
 		bool Objects = true;
 		bool Trees = false;
@@ -144,7 +145,8 @@ public:
 		bool PointLightsInteriors = true;
 		int PointLightsPerPixelInterior = 4;    // K indoors: 1, 2 or 4
 		bool PointLightsWindowBeams = true;     // Window Shadows Ultimate's window beams traced (their shadow mask channel written)
-		bool PointLightsSkipShadowMaps = true;  // the engine does not draw shadow maps for lights fully handled by RT (interiors); (47m) default on
+		// The engine does not draw shadow maps for lights fully handled by RT (interiors); (47m) default on; (47x) default off again.
+		bool PointLightsSkipShadowMaps = false;
 		// (47w) Adaptive: a light's shadow map is skipped only while its traced shadow covers (nearly) every pixel it lights; off = 47v.
 		bool PointLightsAdaptiveSkip = true;
 		// (46d)
@@ -277,6 +279,17 @@ public:
 		// (Morton) order instead of reference order, and outdoors one- and two-sided shapes share chunks (no ray there culls faces).
 		// A change re-captures the scene. Default from the offline traversal test (47u as built).
 		bool SpatialStaticChunks = false;
+		// (47x) Outside the settings macro. Jagged point-light shadows on characters; each on by default, off = 47w exactly.
+		// PointSmoothEdges "Smoother Shadow Edges": PointDenoiseCS's wide pass takes 12 Poisson-disc taps per slot at that slot's own
+		// penumbra radius, rotated per pixel and per frame (47w: one fixed 5x5 grid whose step came from the largest radius of the 4 slots).
+		bool PointSmoothEdges = true;
+		// PointCurvedRanking "Trace Lights on Curved Surfaces Reliably": TracePointLightsCS ranks the lights with a normal fitted over 1-
+		// and 2-pixel neighbours and a wrapped facing term (N.L > -0.4), so faceted skin / hair pixels whose depth normal turns just away
+		// still trace the lights their shading normal is lit by. The 47w coverage count takes the same contribution.
+		bool PointCurvedRanking = true;
+		// PointCloseContact "Close-Contact Shadows on Characters": the point lights' character ray starts 2 units out instead of 6 (6 kept
+		// where the light grazes or faces away from the depth normal: the terminator). The sun's character ray is unchanged.
+		bool PointCloseContact = true;
 	};
 	/// (46f) RTAO modes (Settings::AOMode); with RTAO off the AO is SSGI's, exactly as before.
 	enum class AOModeKind : int
@@ -780,7 +793,8 @@ private:
 		float Params[4];  // emitter radius, this frame's weight in the history, flags (bits), max filter radius (px)
 		float Extra[4];   // K, (46o) window-beam source slots (bits 0-31, 32-63 as uint bits), tan of the beam softness (0 = 46n)
 		std::uint32_t Motion[16];  // (46d) per source slot one byte: history dropped this frame (0 keep .. 255 none), 4 slots per uint
-		// (46x) Source slots with their own emitter radius (bits 0-31, 32-63; direct fills without a window spot), that radius, unused.
+		// (46x) Source slots with their own emitter radius (bits 0-31, 32-63; direct fills without a window spot), that radius,
+		// (47x) the frame index (Smoother Shadow Edges' tap rotation).
 		std::uint32_t Emitter[4];
 	};
 	STATIC_ASSERT_ALIGNAS_16(PointDenoiseCB);

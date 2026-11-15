@@ -6,7 +6,8 @@
 //   1. 3x3 neighbourhood: where every matching sample agrees (fully lit, fully shadowed) nothing is
 //      filtered (contact shadows stay sharp, lit areas stay lit);
 //   2. otherwise a 5x5 pattern whose step follows the penumbra width (emitter size x blocker distance /
-//      (light distance - blocker distance), in pixels), Gaussian x plane distance weights;
+//      (light distance - blocker distance), in pixels), Gaussian x plane distance weights; (47x, kPLFlagSmooth) instead 12
+//      Poisson-disc taps per slot at that slot's own width, rotated per pixel and per frame;
 //   3. the history: last frame's result reprojected with the camera (bilinear, each tap checked against
 //      the distance it should have, its slot found by the source id), clamped to this frame's 3x3 range,
 //      blended in (Params.y = this frame's weight).
@@ -38,6 +39,22 @@ RWTexture2D<unorm float4> DebugColor : register(u3);
 
 static const uint kPLFlagHistory = 1u;  // the history textures hold last frame
 static const uint kPLFlagDebug = 2u;
+// (47x) Smoother Shadow Edges: the wide pass takes, per slot, kPoissonTaps Poisson-disc taps scaled by that slot's own radius and
+// rotated per pixel and per frame (the history averages the rotations). Without it (47w): one 5x5 grid, step = half the largest
+// radius of the pixel's slots, shared by all slots (stair steps every step pixels; small-radius slots weighed ~only the pixel itself).
+static const uint kPLFlagSmooth = 4u;
+static const uint kPoissonTaps = 12u;
+static const float2 kPoisson[12] = {
+	float2(-0.326212, -0.405810), float2(-0.840144, -0.073580), float2(-0.695914, 0.457137), float2(-0.203345, 0.620716),
+	float2(0.962340, -0.194983), float2(0.473434, -0.480026), float2(0.519456, 0.767022), float2(0.185461, -0.893124),
+	float2(0.507431, 0.064425), float2(0.896420, 0.412458), float2(-0.321940, -0.932615), float2(-0.791559, -0.597710)
+};
+
+float InterleavedGradientNoise(float2 a_p, uint a_frame)
+{
+	a_p += float(a_frame % 64u) * 5.588238;
+	return frac(52.9829189 * frac(dot(a_p, float2(0.06711056, 0.00583715))));
+}
 // (46o) Soft window beams (TracePointLightsCS, same constant): a blocked sample is sqrt(blocker distance / kBeamBlockerRange).
 static const float kBeamBlockerRange = 2048.0;
 static const float kBeamNoHistoryRadiusPx = 4.0;  // a beam slot without usable history (moving character) is filtered at least this wide
@@ -249,7 +266,41 @@ bool SoftBeam(uint a_id)
 			spatial[s] = weights[s] > 0.0 ? sum[s] / weights[s] : Lit(raw[s]);
 		}
 		const float maxRadius = max(max(radiusPx.x, radiusPx.y), max(radiusPx.z, radiusPx.w));
-		[branch] if (maxRadius > 1.5)
+		[branch] if ((flags & kPLFlagSmooth) && maxRadius > 1.5)
+		{
+			// (47x) Per slot at its own radius: the pixel itself plus kPoissonTaps rotated disc taps (plane x Gaussian weights as before).
+			float sn, cs;
+			sincos(6.2831853 * InterleavedGradientNoise(float2(p), PLEmitter.w), sn, cs);
+			[unroll] for (uint s = 0u; s < 4u; ++s)
+			{
+				[branch] if (radiusPx[s] > 1.5)
+				{
+					const float radius = radiusPx[s];
+					const float invR2 = 1.0 / (radius * radius);
+					float wsum = Lit(raw[s]), wwt = 1.0;
+					[loop] for (uint k = 0u; k < kPoissonTaps; ++k)
+					{
+						const float2 d = kPoisson[k];
+						const float2 r = float2(d.x * cs - d.y * sn, d.x * sn + d.y * cs) * radius;
+						const int2 o = int2(round(r));
+						const int2 q = clamp(p + o, int2(0, 0), maxP);
+						const float dq = abs(DepthMask[q]);
+						[branch] if (any(o != 0) && !RTIsSky(dq))
+						{
+							const float wPlane = exp(-abs(dot(N, RTPosition(q, dq) - P)) / planeTolerance);
+							float rq;
+							if (wPlane >= 0.05 && Match(Ids(PLIdx[q]), PLVis[q], ids[s], rq)) {
+								const float w = wPlane * exp(-1.5 * dot(r, r) * invR2);
+								wsum += Lit(rq) * w;
+								wwt += w;
+							}
+						}
+					}
+					spatial[s] = wsum / wwt;
+				}
+			}
+		}
+		else if (maxRadius > 1.5)
 		{
 			const int stepPx = max(int(round(maxRadius * 0.5)), 1);
 			float4 wsum = 0.0, wwt = 0.0;

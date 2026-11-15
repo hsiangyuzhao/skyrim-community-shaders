@@ -87,6 +87,16 @@ static const uint kFlagSunProbe = 256u;      // (47q) with kFlagRtSurface: the s
 // (47w) Adaptive skip: per slot of an engine shadow-map light (kSourceNative), the pixels it lights (contribution above the pixel's cut,
 // or traced there) and of those the pixels whose top K do not hold it (they get no traced shadow), into RayCounter from kCoverageWordBase.
 static const uint kFlagCoverage = 512u;
+// (47x) Trace Lights on Curved Surfaces Reliably: the ranking (and the coverage count) take a normal fitted over the 1- and 2-pixel
+// neighbours and a wrapped facing term (N.L > -kRankWrap, weight (N.L + w) / (1 + w)): faceted skin and hair, whose depth normal turns
+// away from a light the smooth shading normal is still lit by, rank that light (47w: the 1-pixel depth normal, N.L > 0).
+static const uint kFlagCurvedRanking = 1024u;
+static const float kRankWrap = 0.4;
+// (47x) Close-Contact Shadows on Characters: the character ray's TMin is kCloseContactTMin instead of Bias.z (6), rising back to Bias.z
+// where the light grazes the ranking normal (N.L 0.3 -> 0: the terminator, where facets of the body itself would shadow it).
+static const uint kFlagCloseContact = 2048u;
+static const float kCloseContactTMin = 2.0;
+static const float kCloseContactGraze = 0.3;
 static const uint kSunOutProbed = 64u, kSunOutRtSurfaceRaw = 128u;  // TraceShadowsCS kOutProbed / kOutRtSurfaceRaw
 static const float kStickyBonus = 1.5;
 static const uint kChurnWord = 1u;           // (46g) RayCounter words: [1] pixels whose source set changed
@@ -224,7 +234,8 @@ float SpotFactor(PLSource s, float3 P)
 
 // The ranking's contribution of a source at P (normal N): attenuation x N.L x intensity x the spot's cone; 0 = it does not light P
 // (outside its rooms' box, facing away, out of range or outside the cone). (47w) Shared by the ranking and the coverage count.
-float Contribution(PLSource src, float3 P, float3 N)
+// (47x) a_wrap > 0 (Curved Surfaces): facing away only below N.L = -a_wrap, the N.L term wrapped; a_wrap = 0: exactly 47w.
+float Contribution(PLSource src, float3 P, float3 N, float a_wrap)
 {
 	// (46x) A room-bound light (Light Limit Fix lights only the geometry of its rooms): not ranked outside its rooms' box.
 	[branch] if (src.Info.x & kSourceRoomBox)
@@ -238,11 +249,12 @@ float Contribution(PLSource src, float3 P, float3 N)
 	const float3 toLight = src.PosRadius.xyz - P;
 	const float d = length(toLight);
 	const float ndl = d > 1e-3 ? dot(N, toLight / d) : 0.0;
-	if (ndl <= 0.0)
+	if (ndl <= -a_wrap)
 		return 0.0;
+	const float facing = a_wrap > 0.0 ? (ndl + a_wrap) / (1.0 + a_wrap) : ndl;
 	// (46c) Window beams: the sun through a window, no fall-off with distance; spots: inside their cone only.
 	const float atten = (src.Info.x & kSourceBeam) ? 1.0 : Attenuation(src, d);
-	return src.Atten.w * atten * ndl * SpotFactor(src, P);
+	return src.Atten.w * atten * facing * SpotFactor(src, P);
 }
 
 // (46c) Distance along dir from origin to where the ray leaves the interior box (Rect xy, Bounds xy as z).
@@ -504,6 +516,29 @@ groupshared uint gsMask[2];
 	N = nLen > 1e-12 ? N / nLen : V;
 	if (dot(N, V) < 0.0)
 		N = -N;
+	// (47x, kFlagCurvedRanking) The ranking's normal: the 1-pixel normal averaged with one fitted over the 2-pixel neighbours (per axis
+	// the side with the smaller depth step, as above), unless the wider one straddles an edge (more than 60 degrees apart); the ray
+	// origin, the surface probe and the sun gate keep the 1-pixel normal.
+	const bool curved = (flags & kFlagCurvedRanking) != 0u;
+	const float rankWrap = curved ? kRankWrap : 0.0;
+	float3 NRank = N;
+	[branch] if (curved)
+	{
+		const int2 pl2 = int2(max(p.x - 2, 0), p.y), pr2 = int2(min(p.x + 2, maxP.x), p.y);
+		const int2 pu2 = int2(p.x, max(p.y - 2, 0)), pd2 = int2(p.x, min(p.y + 2, maxP.y));
+		const float dl2 = abs(DepthMask[pl2]), dr2 = abs(DepthMask[pr2]), du2 = abs(DepthMask[pu2]), dd2 = abs(DepthMask[pd2]);
+		const float3 dx2 = abs(dl2 - depth) < abs(dr2 - depth) ? P - PositionAt(pl2, dl2) : PositionAt(pr2, dr2) - P;
+		const float3 dy2 = abs(du2 - depth) < abs(dd2 - depth) ? P - PositionAt(pu2, du2) : PositionAt(pd2, dd2) - P;
+		float3 N2 = cross(dy2, dx2);
+		const float n2Len = length(N2);
+		if (n2Len > 1e-12) {
+			N2 /= n2Len;
+			if (dot(N2, V) < 0.0)
+				N2 = -N2;
+			if (dot(N2, N) > 0.5)
+				NRank = normalize(N + N2);
+		}
+	}
 	// (46y) Is this surface a traced caster (an occluder for other pixels' Screen Space Point Light Shadows)?
 	bool rtSurface = false;
 	bool probeShared = false;
@@ -532,7 +567,7 @@ groupshared uint gsMask[2];
 			bits &= bits - 1u;
 			const uint i = word * 32u + bit;
 			const PLSource src = Sources[i];
-			const float contribution = Contribution(src, P, N);  // (47w) the same terms as before, in a function
+			const float contribution = Contribution(src, P, NRank, rankWrap);  // (47w) the same terms as before, in a function; (47x) NRank / wrap
 			if (contribution <= 0.0)
 				continue;
 			total += contribution;
@@ -628,10 +663,18 @@ groupshared uint gsMask[2];
 				const uint owner = src.Info.w & 0xFFFFFFu;
 				// (46q) Carrier Casts Shadows (Extra.w >= 0): its body blocks except within the carrier clearance of the light.
 				const float ownerTMax = max(len - max(C.Extra.w, 0.0), 0.0);
+				// (47x) Close-Contact Shadows on Characters: TMin 2 units, back to Bias.z (6) where the light grazes the surface.
+				float charTMin = C.Bias.z;
+				[branch] if (flags & kFlagCloseContact)
+				{
+					const float3 toTarget = rayTarget - P;
+					const float ndlRay = dot(NRank, toTarget) * rsqrt(max(dot(toTarget, toTarget), 1e-6));
+					charTMin = lerp(C.Bias.z, min(kCloseContactTMin, C.Bias.z), saturate(ndlRay / kCloseContactGraze));
+				}
 				if (owner != 0u)
-					blocked = BlockedExcept(origin, dir, tMax, ownLight ? kNpcMask : kCharacterMasks, C.Bias.z, footprint, owner, ownerTMax, tHit);
+					blocked = BlockedExcept(origin, dir, tMax, ownLight ? kNpcMask : kCharacterMasks, charTMin, footprint, owner, ownerTMax, tHit);
 				else
-					blocked = Blocked(origin, dir, tMax, ownLight ? kNpcMask : kCharacterMasks, C.Bias.z, footprint, RAY_FLAG_NONE, tHit);
+					blocked = Blocked(origin, dir, tMax, ownLight ? kNpcMask : kCharacterMasks, charTMin, footprint, RAY_FLAG_NONE, tHit);
 				rays += 1u;
 			}
 		}
@@ -672,7 +715,7 @@ groupshared uint gsMask[2];
 				const PLSource csrc = Sources[ci];
 				if (!(csrc.Info.x & kSourceNative))
 					continue;
-				const float cc = Contribution(csrc, P, N);
+				const float cc = Contribution(csrc, P, NRank, rankWrap);  // (47x) as the ranking
 				const bool covered = any(idx == (ci + 1u).xxxx);
 				const bool lit = cc > 0.0 && (covered || cc >= threshold);
 				const uint litCount = WaveActiveCountBits(lit);
