@@ -138,6 +138,14 @@ namespace RayTracingCharacters
 		void SetBodyOnlyDistance(float a_distance) { bodyOnlyDistance_ = std::isfinite(a_distance) ? std::max(a_distance, 0.0f) : 0.0f; }
 		/// Drops everything on the next Update (loading screens, from any thread).
 		void RequestFlush() { flushRequested_.store(true); }
+		/// (48g) Capture Materials for characters (texcoords per triangle corner + the shape's material). A change re-captures them.
+		void SetMaterials(bool a_on)
+		{
+			if (a_on != materials_) {
+				materials_ = a_on;
+				RequestFlush();
+			}
+		}
 		/// (46m) An actor equipped / unequipped something (any thread): its 3D is scanned in full for the next frames.
 		static void NoteEquip(const void* a_reference);
 		/// a_rect: world xy min / max of the traced area (actors outside are not taken).
@@ -194,6 +202,7 @@ namespace RayTracingCharacters
 			bool alpha = false;
 			RayTracingRT::AlphaTexture texture = RayTracingRT::kInvalidAlphaTexture;
 			std::uint32_t info = RayTracingRT::kInvalidAlphaInfo;
+			std::uint16_t material = RayTracingRT::kNoMaterial;  // (48g) Capture Materials: its diffuse texture (per NPC for faces)
 			bool registered = false;
 			bool drawable = false;          // in the TLAS (an alpha part only once its texture is ready)
 			bool reuse = false;             // this frame: last frame's skinned BLAS (still pose)
@@ -264,6 +273,7 @@ namespace RayTracingCharacters
 		bool dropTiny_ = false;  // (47p)
 		bool bonesTolerant_ = false;  // (47p) "Ray tracing: ignore bone noise"
 		float bodyOnlyDistance_ = 0.0f;  // (47q) 0 = no limit
+		bool materials_ = false;         // (48g)
 		std::uint32_t stillReused_ = 0;  // (45n)
 		std::uint64_t frame_ = 0;
 		std::uint32_t actorSerial_ = 0;

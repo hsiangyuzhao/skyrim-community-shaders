@@ -4,6 +4,8 @@
 #include "Features/RayTracing/CasterFilter.h"
 #include "Features/RayTracing/Wind.h"
 #include "Features/DynamicCubemaps.h"
+#include "Features/LightLimitFix.h"  // (48g) the hit shading reads its light list
+#include "Features/Skylighting.h"    // (48g) and its probes
 #include "Features/ScreenSpaceGI.h"
 #include "Features/ScreenSpacePointLightShadows.h"
 #include "Features/ScreenSpaceRayTracing.h"
@@ -189,6 +191,10 @@ namespace
 	// screen, each with a render-thread CPU cap (the first copy of a frame always goes).
 	constexpr std::uint32_t kMaterialCopiesPerFrame = 12, kMaterialCopiesTransition = 256;
 	constexpr float kMaterialCopyCpuMs = 0.3f, kMaterialCopyCpuMsTransition = 4.0f;
+	// (48g) The shading half: the Off-screen Hit Color switch fades over this long; a material fades in over this many frames once its copy
+	// is ready (no pop when the copies arrive after entering an area).
+	constexpr double kShadeFadeMs = 400.0;
+	constexpr float kShadeFadeInFrames = 30.0f;
 	constexpr float kCharacterSelfShadowOffset = 6.0f;  // hits on characters nearer than this along the sun ray are ignored (units)
 	constexpr float kRayBiasConstant = 2.0f, kRayBiasPerUnit = 0.0015f;  // the ray start offset: 2 units + 0.15 % of the distance
 
@@ -1111,6 +1117,7 @@ void RayTracing::UpdateAlphaCasters()
 		backend.SetMaterialsEnabled(MaterialsWanted());
 	if (backend.IsReady() && backend.MaterialsEnabled())
 		backend.PrepareMaterialResources(globals::state->frameCount);  // (48g) attribute buffer + first page at enable time, render thread
+	characters.SetMaterials(MaterialsWanted() && settings.ReflectionsCharacterMaterials);  // (48g) a change re-captures the characters
 	scene.Configure(SceneConfigFromSettings());  // a change re-captures the scene
 	const bool alphaInUse = scene.AlphaWanted() || (settings.Characters && backend.SkinAlphaAvailable());
 	if (!alphaInUse && backend.IsReady() && backend.AlphaIdle())
@@ -1146,6 +1153,8 @@ void RayTracing::UpdateAlphaCasters()
 		backend.ReleaseReflectResources();
 	// (48f) Capture Materials off (or RT Reflections Off): no surface record; the rest goes once the re-captured scene no longer uses it.
 	if (backend.IsReady()) {
+		if (!ShadeWanted() && shadeTexture)
+			ReleaseShadeResources();  // (48g)
 		if (!MaterialsWanted() && backend.ReflectSurfaceBytes())
 			backend.ReleaseReflectSurfaceTextures();
 		backend.MaterialHousekeeping(globals::state->frameCount);
@@ -1586,6 +1595,11 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.ReflectionsLoadingPrep = read("ReflectionsLoadingPrep", defaults.ReflectionsLoadingPrep);  // (48e)
 		settings.ReflectionsCubemapWarmUp = read("ReflectionsCubemapWarmUp", defaults.ReflectionsCubemapWarmUp);
 		settings.ReflectionsMaterials = read("ReflectionsMaterials", defaults.ReflectionsMaterials);  // (48f)
+		settings.ReflectionsOffscreenColor = std::clamp(read("ReflectionsOffscreenColor", defaults.ReflectionsOffscreenColor), 0, 1);  // (48g)
+		settings.ReflectionsOffscreenBrightness = std::clamp(read("ReflectionsOffscreenBrightness", defaults.ReflectionsOffscreenBrightness), 0.25f, 4.0f);
+		settings.ReflectionsSunRay = read("ReflectionsSunRay", defaults.ReflectionsSunRay);
+		settings.ReflectionsShadeLights = read("ReflectionsShadeLights", defaults.ReflectionsShadeLights);
+		settings.ReflectionsCharacterMaterials = read("ReflectionsCharacterMaterials", defaults.ReflectionsCharacterMaterials);
 		const float sunSize = read("SunSize", -1.0f);
 		if (sunSize >= 0.0f) {
 			settings.SunSize = sunSize;
@@ -1735,6 +1749,11 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["ReflectionsLoadingPrep"] = settings.ReflectionsLoadingPrep;  // (48e)
 	o_json["ReflectionsCubemapWarmUp"] = settings.ReflectionsCubemapWarmUp;
 	o_json["ReflectionsMaterials"] = settings.ReflectionsMaterials;  // (48f)
+	o_json["ReflectionsOffscreenColor"] = settings.ReflectionsOffscreenColor;  // (48g)
+	o_json["ReflectionsOffscreenBrightness"] = settings.ReflectionsOffscreenBrightness;
+	o_json["ReflectionsSunRay"] = settings.ReflectionsSunRay;
+	o_json["ReflectionsShadeLights"] = settings.ReflectionsShadeLights;
+	o_json["ReflectionsCharacterMaterials"] = settings.ReflectionsCharacterMaterials;
 	o_json["AOSmoothNormals"] = settings.AOSmoothNormals;  // (47j)
 	o_json["AOTemporalV2"] = settings.AOTemporalV2;  // (47l)
 	o_json["FoliageSway"] = settings.FoliageSway;  // (47l)
@@ -2623,6 +2642,8 @@ void RayTracing::Prepass()
 	reflectThisFrame = false;   // (48d)
 	reflectGapFillUsedLastFrame = reflectGapFillUsed;
 	reflectGapFillUsed = false;
+	shadeLastFrame = shadeThisFrame;  // (48g)
+	shadeThisFrame = false;
 	aoCpuMs = 0.0f;
 	// (45n) Whatever path this Prepass takes: an Early Prep context that the trace did not use is released
 	// (D3D12 signal only), and the frame-start flags end with this frame.
@@ -2751,6 +2772,7 @@ void RayTracing::SwitchedOffFrame()
 			if (backend.AlphaIdle())
 				backend.ReleaseAlphaResources();  // (45h) once the GPU is done with the released scene
 			backend.SetMaterialsEnabled(false);  // (48f) the released scene's materials and attributes go
+			ReleaseShadeResources();  // (48g)
 			backend.MaterialHousekeeping(globals::state->frameCount);
 			if (backend.SkinIdle())
 				backend.ReleaseSkinResources();  // (45i)
@@ -3179,6 +3201,12 @@ void RayTracing::PublishCpuSplit()
 			detail.matPending = static_cast<int>(ms.texturesPending);
 			detail.matTextures = static_cast<int>(ms.texturesReady);
 			detail.matAttrMb = static_cast<float>(static_cast<double>(ms.attrBytesUsed) / (1024.0 * 1024.0));
+		}
+		// (48g) The shading half (last frame's; -1 = not run).
+		if (shadeLastFrame) {
+			detail.shadeGpuMs = timers->LastSampleMs(Util::GpuBucket::RayTracingReflectShade);
+			detail.shadeMaterialPct = shadeMaterialShare >= 0.0f ? shadeMaterialShare * 100.0f : -1.0f;
+			detail.shadeRatio = shadeRatio;
 		}
 		// (46h) Where this frame's RTAO was traced and its mode (-1 = not traced this frame).
 		detail.rtaoIndoors = aoTraced && aoThisFrame ? (aoInteriorThisFrame ? 1 : 0) : -1;
@@ -5813,6 +5841,7 @@ void RayTracing::PrepareReflections(RayTracingRT::FrameInput& a_input)
 	reflectWantedThisFrame = false;
 	a_input.reflectTags = false;
 	a_input.materials = false;  // (48f)
+	reflectSunRayThisFrame = false;  // (48g)
 	try {
 		PrepareReflectionsImpl(a_input);
 	} catch (const std::exception& e) {
@@ -5862,6 +5891,17 @@ void RayTracing::PrepareReflectionsImpl(RayTracingRT::FrameInput& a_input)
 	a_input.reflectTags = true;
 	// (48f) Capture Materials: the surface record (sized like the hit record) and the per-instance table with this frame's TLAS.
 	a_input.materials = MaterialsWanted() && backend.MaterialsEnabled() && backend.EnsureReflectSurfaceTextures(width, height);
+	// (48g) The sun visibility ray of the material variant (sun path only: interiors and the sun-off path have no sun trace), and the shading
+	// pass's output, made with the surface record (enable time / a resize).
+	const float* toSun = a_input.constants.toSun;
+	const float sunLength = std::sqrt(toSun[0] * toSun[0] + toSun[1] * toSun[1] + toSun[2] * toSun[2]);
+	const bool sunRay = a_input.materials && a_input.sun && settings.ReflectionsSunRay && sunLength > 0.5f;
+	for (int a = 0; a < 3; ++a)
+		c.sun[a] = sunLength > 1e-6f ? toSun[a] / sunLength : 0.0f;
+	c.sun[3] = sunRay ? 1.0f : 0.0f;
+	reflectSunRayThisFrame = sunRay;
+	if (a_input.materials && ShadeWanted())
+		EnsureShadeResources(width, height);
 	reflectWantedThisFrame = true;
 }
 
@@ -5896,13 +5936,20 @@ void RayTracing::PrewarmReflectionShaders()
 	}
 	if (settings.ReflectionsMode == 2)
 		globals::features::screenSpaceRayTracing.PrewarmRTGapFill();
+	// (48g) The shading pass (Gap Fill + Capture Materials + Off-screen Hit Color: Material), in the background as well.
+	if (settings.ReflectionsMode == 2 && settings.ReflectionsMaterials && settings.ReflectionsOffscreenColor == 1 && !reflectShadeCS && !reflectShadeFailed) {
+		bool failed = false;
+		PollAsyncShader(reflectShadeAsync, reflectShadeCS, L"Data\\Shaders\\RayTracing\\ReflectShadeCS.hlsl", {}, "Ray Tracing ReflectShadeCS", failed);
+		if (failed)
+			reflectShadeFailed = true;
+	}
 }
 
 void RayTracing::DrawReflectionDebugViews()
 {
 	// (48d) Right before the SSRT specular pass: the reflection list's wait (third fence), then the hit type / distance / confidence view.
 	// The "RT Reflection Use" view is written by the ray march itself (AcquireReflectionGapFill).
-	if (!reflectThisFrame || reflectDebugView == ReflectDebugView::Off || reflectDebugView == ReflectDebugView::Use)
+	if (!reflectThisFrame || reflectDebugView == ReflectDebugView::Off || reflectDebugView == ReflectDebugView::Use || reflectDebugView == ReflectDebugView::ShadeVsScreen)
 		return;
 	try {
 		auto* timers = Util::GpuPassTimers::GetSingleton();
@@ -5916,7 +5963,8 @@ void RayTracing::DrawReflectionDebugViews()
 	}
 }
 
-bool RayTracing::AcquireReflectionGapFill(std::uint32_t a_width, std::uint32_t a_height, ReflectionGapFill& o_fill)
+bool RayTracing::AcquireReflectionGapFill(std::uint32_t a_width, std::uint32_t a_height, ReflectionGapFill& o_fill, ID3D11ShaderResourceView* a_screenColor,
+	ID3D11ShaderResourceView* a_depth)
 {
 	// (48d) Only this frame's record, at the ray march's size; anything else (not traced, first frame after a resize / load, Trace Only,
 	// Off, a failure) leaves the ray march on its old path.
@@ -5950,14 +5998,240 @@ bool RayTracing::AcquireReflectionGapFill(std::uint32_t a_width, std::uint32_t a
 		o_fill.flags |= kGapFillHitDistance;
 	if (settings.ReflectionsCubemapWarmUp)
 		o_fill.flags |= kGapFillWarmUp;  // (48e)
+	// (48g) Off-screen Hit Color: the switch fades over ~0.4 s (no pop either way); the shading pass runs while it is above 0 (or for the
+	// "RT Shading vs Screen" view) and the ray march blends the shaded colours in by their availability x this fade.
+	{
+		const std::int64_t now = Qpc();
+		const double dtMs = shadeFadeQpc != 0 ? std::clamp(static_cast<double>(now - shadeFadeQpc) * QpcMs(), 0.0, 100.0) : 0.0;
+		shadeFadeQpc = now;
+		const float target = settings.ReflectionsOffscreenColor == 1 && MaterialsWanted() ? 1.0f : 0.0f;
+		const float step = static_cast<float>(dtMs / kShadeFadeMs);
+		shadeFade = target > shadeFade ? std::min(target, shadeFade + step) : std::max(target, shadeFade - step);
+	}
+	if (ShadeWanted() && backend.ReflectMaterialLastFrame() && ShadeReflections(a_width, a_height, a_screenColor, a_depth)) {
+		o_fill.shade = shadeSRV.get();
+		o_fill.shadeScale = std::clamp(settings.ReflectionsOffscreenBrightness, 0.25f, 4.0f);
+		if (shadeFade > 0.0f)
+			o_fill.flags |= kGapFillMaterial;
+	}
 	reflectGapFillUsed = true;
 	return true;
+}
+
+bool RayTracing::ShadeWanted() const
+{
+	// (48g) Gap Fill with materials, and the Material colour selected (or still fading out), or the comparison view.
+	if (settings.ReflectionsMode != 2 || !MaterialsWanted() || reflectShadeFailed)
+		return false;
+	return settings.ReflectionsOffscreenColor == 1 || shadeFade > 0.0f || reflectDebugView == ReflectDebugView::ShadeVsScreen;
+}
+
+bool RayTracing::EnsureShadeResources(std::uint32_t a_width, std::uint32_t a_height)
+{
+	// (48g) RGBA16F at render size (1440p 28 MB) + a 32-byte stats buffer and its staging ring: made with the surface record (enable time / a
+	// resize), on the render thread; never per frame.
+	if (shadeTexture && shadeWidth == a_width && shadeHeight == a_height)
+		return true;
+	ReleaseShadeResources();
+	auto* device = globals::d3d::device;
+	if (!device || a_width == 0 || a_height == 0)
+		return false;
+	D3D11_TEXTURE2D_DESC desc{};
+	desc.Width = a_width;
+	desc.Height = a_height;
+	desc.MipLevels = 1;
+	desc.ArraySize = 1;
+	desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+	desc.SampleDesc.Count = 1;
+	desc.Usage = D3D11_USAGE_DEFAULT;
+	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+	HRESULT hr = device->CreateTexture2D(&desc, nullptr, shadeTexture.put());
+	if (SUCCEEDED(hr))
+		hr = device->CreateShaderResourceView(shadeTexture.get(), nullptr, shadeSRV.put());
+	if (SUCCEEDED(hr))
+		hr = device->CreateUnorderedAccessView(shadeTexture.get(), nullptr, shadeUAV.put());
+	if (SUCCEEDED(hr)) {
+		D3D11_BUFFER_DESC statsDesc{};
+		statsDesc.ByteWidth = 32;
+		statsDesc.Usage = D3D11_USAGE_DEFAULT;
+		statsDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+		statsDesc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+		hr = device->CreateBuffer(&statsDesc, nullptr, shadeStats.put());
+		if (SUCCEEDED(hr)) {
+			D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+			uavDesc.Format = DXGI_FORMAT_R32_TYPELESS;
+			uavDesc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+			uavDesc.Buffer.NumElements = 8;
+			uavDesc.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+			hr = device->CreateUnorderedAccessView(shadeStats.get(), &uavDesc, shadeStatsUAV.put());
+		}
+		D3D11_BUFFER_DESC stagingDesc{};
+		stagingDesc.ByteWidth = 32;
+		stagingDesc.Usage = D3D11_USAGE_STAGING;
+		stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		for (auto& staging : shadeStatsStaging)
+			if (SUCCEEDED(hr))
+				hr = device->CreateBuffer(&stagingDesc, nullptr, staging.put());
+	}
+	if (FAILED(hr)) {
+		ReleaseShadeResources();
+		reflectShadeFailed = true;
+		logger::warn("[RayTracing] Reflection shading: could not create its textures (0x{:08X}); off-screen hits keep the cubemap colour",
+			static_cast<std::uint32_t>(hr));
+		return false;
+	}
+	Util::SetResourceName(shadeTexture.get(), "RayTracing ReflectShade");
+	shadeWidth = a_width;
+	shadeHeight = a_height;
+	shadeStatsFrame.fill(0);
+	logger::info("[RayTracing] Reflection shading: output {}x{} ({:.1f} MB)", a_width, a_height, static_cast<double>(a_width) * a_height * 8.0 / (1024.0 * 1024.0));
+	return true;
+}
+
+void RayTracing::ReleaseShadeResources()
+{
+	shadeUAV = nullptr;
+	shadeSRV = nullptr;
+	shadeTexture = nullptr;
+	shadeStatsUAV = nullptr;
+	shadeStats = nullptr;
+	for (auto& staging : shadeStatsStaging)
+		staging = nullptr;
+	shadeStatsFrame.fill(0);
+	shadeWidth = shadeHeight = 0;
+	shadeThisFrame = false;
+}
+
+bool RayTracing::ShadeReflections(std::uint32_t a_width, std::uint32_t a_height, ID3D11ShaderResourceView* a_screenColor, ID3D11ShaderResourceView* a_depth)
+{
+	// (48g) After the reflection list's wait (AcquireReflectionGapFill), right before the SSRT specular ray march. Never blocks: the shader
+	// compiles in the background (until then the ray march keeps the cubemap path); the stats are read back a few frames late.
+	shadeThisFrame = false;
+	if (!a_depth || !backend.ReflectSurf0SRV() || !backend.ReflectSurf1SRV() || !backend.MaterialTableSRV() || !EnsureShadeResources(a_width, a_height))
+		return false;
+	if (!reflectShadeCS) {
+		bool failed = false;
+		if (!PollAsyncShader(reflectShadeAsync, reflectShadeCS, L"Data\\Shaders\\RayTracing\\ReflectShadeCS.hlsl", {}, "Ray Tracing ReflectShadeCS", failed)) {
+			if (failed) {
+				reflectShadeFailed = true;
+				logger::error("[RayTracing] Reflection shading: ReflectShadeCS did not compile; off-screen hits keep the cubemap colour");
+			}
+			return false;
+		}
+	}
+	ReadShadeStats();
+	struct alignas(16) ReflectShadeConstants
+	{
+		std::uint32_t Size[4];
+		float Params[4];
+	};
+	if (!reflectShadeCB)
+		reflectShadeCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<ReflectShadeConstants>());
+	if (!reflectDebugSampler) {
+		D3D11_SAMPLER_DESC samplerDesc{};
+		samplerDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+		samplerDesc.AddressU = samplerDesc.AddressV = samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+		samplerDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+		samplerDesc.MaxLOD = D3D11_FLOAT32_MAX;
+		globals::d3d::device->CreateSamplerState(&samplerDesc, reflectDebugSampler.put());
+	}
+	auto& skylighting = globals::features::skylighting;
+	auto& llf = globals::features::lightLimitFix;
+	const bool sky = skylighting.loaded && skylighting.texProbeArray && skylighting.texProbeArray->srv && skylighting.stbn_vec3_2Dx1D_128x128x64;
+	const bool lamps = settings.ReflectionsShadeLights && llf.loaded && llf.lights && llf.lights->srv && llf.lightCount > 0;
+	const bool debug = reflectDebugView == ReflectDebugView::ShadeVsScreen && EnsureDebugColor() && debugColorUAV;
+	const bool stats = shadeStats && shadeStatsUAV;
+	ReflectShadeConstants cb{};
+	cb.Size[0] = a_width;
+	cb.Size[1] = a_height;
+	cb.Size[2] = globals::state->frameCount;
+	cb.Size[3] = (sky ? 1u : 0u) | (lamps ? 2u : 0u) | (debug && a_screenColor ? 4u : 0u) | (stats && a_screenColor ? 8u : 0u) | (reflectSunRayThisFrame ? 16u : 0u);
+	cb.Params[0] = kShadeFadeInFrames;
+	cb.Params[1] = std::clamp(shadeFade, 0.0f, 1.0f);
+	cb.Params[2] = lamps ? static_cast<float>(llf.lightCount) : 0.0f;
+	reflectShadeCB->Update(cb);
+	auto* context = globals::d3d::context;
+	auto* timers = Util::GpuPassTimers::GetSingleton();
+	timers->Begin(Util::GpuBucket::RayTracingReflectShade);
+	if (stats) {
+		const UINT zero[4] = { 0, 0, 0, 0 };
+		context->ClearUnorderedAccessViewUint(shadeStatsUAV.get(), zero);
+	}
+	ID3D11ShaderResourceView* srvs[16] = { backend.ReflectOutSRV(), backend.ReflectDirSRV(), backend.ReflectSurf0SRV(), backend.ReflectSurf1SRV(),
+		backend.MaterialTableSRV() };
+	for (std::uint32_t page = 0; page < RayTracingRT::kMaterialMaxPages; ++page)
+		srvs[5 + page] = backend.MaterialPageSRV(page);
+	srvs[11] = sky ? skylighting.texProbeArray->srv.get() : nullptr;
+	srvs[12] = sky ? skylighting.stbn_vec3_2Dx1D_128x128x64.get() : nullptr;
+	srvs[13] = lamps ? llf.lights->srv.get() : nullptr;
+	srvs[14] = a_depth;
+	srvs[15] = a_screenColor;
+	ID3D11UnorderedAccessView* uavs[3] = { shadeUAV.get(), stats ? shadeStatsUAV.get() : nullptr, debug ? debugColorUAV.get() : nullptr };
+	// The ray march's constant buffers (SharedData b5 / b6, FrameBuffer b12) stay; b0 and s0 are put back afterwards.
+	winrt::com_ptr<ID3D11Buffer> previousCb;
+	winrt::com_ptr<ID3D11SamplerState> previousSampler;
+	context->CSGetConstantBuffers(0, 1, previousCb.put());
+	context->CSGetSamplers(0, 1, previousSampler.put());
+	ID3D11Buffer* cbs[1] = { reflectShadeCB->CB() };
+	ID3D11SamplerState* sampler = reflectDebugSampler.get();
+	context->CSSetConstantBuffers(0, 1, cbs);
+	context->CSSetSamplers(0, 1, &sampler);
+	context->CSSetShaderResources(0, 16, srvs);
+	context->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
+	context->CSSetShader(reflectShadeCS.get(), nullptr, 0);
+	context->Dispatch((a_width + 7) / 8, (a_height + 7) / 8, 1);
+	ID3D11ShaderResourceView* nullSrvs[16]{};
+	ID3D11UnorderedAccessView* nullUavs[3]{};
+	context->CSSetShaderResources(0, 16, nullSrvs);
+	context->CSSetUnorderedAccessViews(0, 3, nullUavs, nullptr);
+	ID3D11Buffer* restoreCb = previousCb.get();
+	ID3D11SamplerState* restoreSampler = previousSampler.get();
+	context->CSSetConstantBuffers(0, 1, &restoreCb);
+	context->CSSetSamplers(0, 1, &restoreSampler);
+	context->CSSetShader(nullptr, nullptr, 0);
+	if (stats) {
+		const std::uint32_t slot = shadeStatsCursor % kShadeStatsRing;
+		context->CopyResource(shadeStatsStaging[slot].get(), shadeStats.get());
+		shadeStatsFrame[slot] = std::max(globals::state->frameCount, 1u);
+		shadeStatsCursor = (shadeStatsCursor + 1) % kShadeStatsRing;
+	}
+	timers->End(Util::GpuBucket::RayTracingReflectShade);
+	if (debug)
+		reflectDebugDrawn = true;
+	shadeThisFrame = true;
+	return true;
+}
+
+void RayTracing::ReadShadeStats()
+{
+	// (48g) The oldest written staging copy that is at least two frames old, without waiting (DO_NOT_WAIT): the material share and the
+	// brightness ratio for the panel / F7 / F12.
+	auto* context = globals::d3d::context;
+	const std::uint32_t frame = globals::state->frameCount;
+	for (std::uint32_t i = 0; i < kShadeStatsRing; ++i) {
+		const std::uint32_t slot = (shadeStatsCursor + i) % kShadeStatsRing;
+		if (shadeStatsFrame[slot] == 0 || frame - shadeStatsFrame[slot] < 2 || !shadeStatsStaging[slot])
+			continue;
+		D3D11_MAPPED_SUBRESOURCE mapped{};
+		if (context->Map(shadeStatsStaging[slot].get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped) != S_OK || !mapped.pData)
+			continue;
+		std::uint32_t values[8]{};
+		std::memcpy(values, mapped.pData, sizeof(values));
+		context->Unmap(shadeStatsStaging[slot].get(), 0);
+		shadeStatsFrame[slot] = 0;
+		const double hits = static_cast<double>(values[0]) + static_cast<double>(values[1]);
+		shadeMaterialShare = hits > 0.0 ? static_cast<float>(static_cast<double>(values[0]) / hits) : -1.0f;
+		shadeRatioGroups = values[4];
+		shadeRatio = values[4] > 0 && values[3] > 0 ? static_cast<float>(static_cast<double>(values[2]) / static_cast<double>(values[3])) : -1.0f;
+		break;
+	}
 }
 
 void RayTracing::DrawReflectionDebug()
 {
 	// (48d) After the reflection list's own wait: the hit type / distance / normal confidence view into debugColor.
-	if (reflectDebugView == ReflectDebugView::Off || reflectDebugView == ReflectDebugView::Use || !debugColorUAV || !backend.ReflectOutSRV())
+	if (reflectDebugView == ReflectDebugView::Off || reflectDebugView == ReflectDebugView::Use || reflectDebugView == ReflectDebugView::ShadeVsScreen || !debugColorUAV ||
+		!backend.ReflectOutSRV())
 		return;
 	if (!reflectDebugCS) {
 		// (48e) In the background: the view simply stays undrawn until the shader is ready.
@@ -7014,12 +7288,54 @@ void RayTracing::DrawSettings()
 		// (48f) The data half of the material step.
 		ImGui::Checkbox("Reflections: Capture Materials", &settings.ReflectionsMaterials);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): prepares what the reflection rays will need to colour what they hit (the next package uses it; the picture does");
-			ImGui::Text("  not change yet). Every captured surface keeps its texture coordinates and direction (16 bytes per triangle), every distinct");
-			ImGui::Text("  texture gets a small 128x128 copy (a few per frame while playing, many in the black screen after a loading screen), and the");
-			ImGui::Text("  rays note the texture and spot they hit. Check it with Reflection Debug View > RT Albedo. Changing it captures the scene again.");
-			ImGui::Text("Off: nothing of it (as 48e). Characters are not covered yet (they show purple in RT Albedo).");
+			ImGui::Text("On (default): what the reflection rays need to colour what they hit. Every captured surface keeps its texture coordinates and");
+			ImGui::Text("  direction (16 bytes per triangle), every distinct texture gets a small 128x128 copy (a few per frame while playing, many in");
+			ImGui::Text("  the black screen after a loading screen), and the rays note the texture and spot they hit. Check it with Reflection Debug");
+			ImGui::Text("  View > RT Albedo. Changing it captures the scene again. (48g) Used by 'Off-screen Hit Color: Material' below.");
+			ImGui::Text("Off: nothing of it (as 48e); off-screen hits keep the cubemap colour.");
 		}
+		// (48g) The shading half.
+		ImGui::BeginDisabled(!settings.ReflectionsMaterials);
+		ImGui::Checkbox("Capture Materials: Characters", &settings.ReflectionsCharacterMaterials);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): characters also keep their texture coordinates and their own texture (faces per person), so reflected people");
+			ImGui::Text("  get their real colours (RT Albedo no longer shows them purple). Changing it captures the characters again (a moment of");
+			ImGui::Text("  shadow-map shadows on them). Off: as 48f (purple in RT Albedo, the cubemap colour in the picture).");
+		}
+		ImGui::EndDisabled();
+		ImGui::BeginDisabled(settings.ReflectionsMode != 2 || !settings.ReflectionsMaterials);
+		{
+			const char* kOffscreen[2] = { "Cubemap Approx", "Material" };
+			settings.ReflectionsOffscreenColor = std::clamp(settings.ReflectionsOffscreenColor, 0, 1);
+			ImGui::Combo("Off-screen Hit Color", &settings.ReflectionsOffscreenColor, kOffscreen, 2);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Gap Fill + Capture Materials. What a reflection ray that hits something OFF screen shows (hits on screen always take the");
+				ImGui::Text("  screen's own colour):");
+				ImGui::Text("  Material (default): the hit's own texture, lit by the sun (with a shadow ray), the sky light, the lamps and its own glow.");
+				ImGui::Text("    Where its data is missing (texture copy still pending, no material, captured before) it fades to the cubemap guess;");
+				ImGui::Text("    new copies fade in over about half a second, so nothing pops.");
+				ImGui::Text("  Cubemap Approx: as 48f (the dynamic cubemap where its stored point matches, else the cubemap without sky).");
+				ImGui::Text("  Switching fades over about 0.4 s.");
+			}
+			ImGui::SliderFloat("Off-screen Hit Brightness", &settings.ReflectionsOffscreenBrightness, 0.25f, 4.0f, "%.2f");
+			settings.ReflectionsOffscreenBrightness = std::clamp(settings.ReflectionsOffscreenBrightness, 0.25f, 4.0f);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Default 1.00. Scales the Material colour of off-screen hits, to match it by eye to what the screen shows (the shading is");
+				ImGui::Text("  simplified: no fog, no shine of the hit surface). Reflection Debug View > RT Shading vs Screen and the status line below show");
+				ImGui::Text("  how much brighter (> 1) or darker (< 1) it measures where a hit is also on screen.");
+			}
+			ImGui::Checkbox("Material Hits: Sun Shadow Ray", &settings.ReflectionsSunRay);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): each hit that faces the sun sends one more ray to the sun (leaves count as solid), so reflected shadows are");
+				ImGui::Text("  dark. A small extra cost on the ray-tracing GPU queue. Off: every hit facing the sun is lit (no shadows in the reflection).");
+			}
+			ImGui::Checkbox("Material Hits: Lamps", &settings.ReflectionsShadeLights);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): lamps, torches and fires (Light Limit Fix's lights) light the hits too (no lamp shadows). Off: only the sun");
+				ImGui::Text("  and the sky light (cheaper in towns at night).");
+			}
+		}
+		ImGui::EndDisabled();
 		// (48e) Background compiles of the reflection shaders (no first-use freeze).
 		if (settings.ReflectionsMode != 0) {
 			auto& ssrtFeature = globals::features::screenSpaceRayTracing;
@@ -7029,9 +7345,9 @@ void RayTracing::DrawSettings()
 				ImGui::TextDisabled("Preparing the reflection shaders in the background (the picture uses the old path until they are ready)...");
 		}
 		{
-			const char* kViews[6] = { "Off", "Hit Type", "Hit Distance", "Normal Confidence", "RT Reflection Use", "RT Albedo" };
+			const char* kViews[7] = { "Off", "Hit Type", "Hit Distance", "Normal Confidence", "RT Reflection Use", "RT Albedo", "RT Shading vs Screen" };
 			int view = static_cast<int>(reflectDebugView);
-			if (ImGui::Combo("Reflection Debug View", &view, kViews, 6))
+			if (ImGui::Combo("Reflection Debug View", &view, kViews, 7))
 				reflectDebugView = static_cast<ReflectDebugView>(std::clamp(view, 0, static_cast<int>(ReflectDebugView::Count) - 1));
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::Text("Not saved. Hit Type: green building / static, orange object, cyan leaves / cut-out, purple character, brown terrain,");
@@ -7043,7 +7359,11 @@ void RayTracing::DrawSettings()
 				ImGui::Text("  Transparent = not used (SSR found it, not traced, or the direction check faded it out).");
 				ImGui::Text("RT Albedo (Capture Materials): the texture colour of what each traced ray hit (ground: its layers' average colours). Magenta =");
 				ImGui::Text("  captured without material data, red-orange = no readable texture, yellow / black checks = its copy is still pending,");
-				ImGui::Text("  purple = a character (not covered yet), dim blue / grey = nothing hit. Dark magenta everywhere = no material data this frame.");
+				ImGui::Text("  purple = a character without material data, dim blue / grey = nothing hit. Dark magenta everywhere = no material data this frame.");
+				ImGui::Text("RT Reflection Use also shows pale yellow = the hit's own Material colour (Off-screen Hit Color: Material).");
+				ImGui::Text("RT Shading vs Screen (Gap Fill + Capture Materials): where a ray's hit is also visible on screen, the shaded colour against");
+				ImGui::Text("  the screen's: green = within about 20 %%, red = shading brighter, blue = shading darker (stronger = up to 4x). Elsewhere the");
+				ImGui::Text("  shaded colour itself (hits off screen). The mean ratio is on the status line below (Off-screen Hit Brightness).");
 			}
 		}
 		ImGui::EndDisabled();
@@ -7074,15 +7394,47 @@ void RayTracing::DrawSettings()
 						Megabytes(ms.attrBytes).c_str(), backend.ReflectMaterialLastFrame() ? "written" : "not written");
 					if (auto _tt = Util::HoverTooltipWrapper()) {
 						ImGui::Text("Registered materials (one per shape / ground quadrant, shared where texture and transform match), the 128x128 texture copies");
-						ImGui::Text("  made and still waiting (the backlog after entering a new area), the copy pages (256 textures each, made on a worker");
-						ImGui::Text("  thread), the per-triangle data in use of its buffer, and whether last frame's rays wrote the surface record.");
+						ImGui::Text("  made and still waiting (the backlog after entering a new area), the copy pages (256 textures each; (48g) made on the");
+						ImGui::Text("  render thread, last one in %.2f ms), the per-triangle data in use of its buffer, and whether last frame's rays wrote", ms.pageCreateMs);
+						ImGui::Text("  the surface record. Pages made while playing (not at the switch-on / after a load): %u.", ms.pagesMadeInPlay);
 						ImGui::Text("  Render-thread CPU of the copies last frame: %.2f ms. Surface record: %s. Material table: %s. Refused textures: %llu.",
 							ms.copyCpuMs, Megabytes(backend.ReflectSurfaceBytes()).c_str(), Megabytes(ms.tableBytes).c_str(),
 							static_cast<unsigned long long>(ms.texturesRefused));
 					}
-					if (ms.attrFull > 0 || ms.texturesFull > 0)
-						ImGui::TextColored({ 1.0f, 0.85f, 0.3f, 1.0f }, "Material buffers full: %llu shapes without data, %u textures without a copy layer",
+					if (ms.attrFull > 0 || ms.texturesFull > 0) {
+						ImGui::TextColored({ 1.0f, 0.85f, 0.3f, 1.0f }, "Material buffers full: %llu shapes without data since switched on, %u textures without a copy layer",
 							static_cast<unsigned long long>(ms.attrFull), ms.texturesFull);
+						if (auto _tt = Util::HoverTooltipWrapper()) {
+							ImGui::Text("(48g) Of the refused shapes, %llu found free memory only in pieces (no single range large enough). The last refused",
+								static_cast<unsigned long long>(ms.attrRefusedFragmented));
+							ImGui::Text("  range was %s with the largest free range %s. The buffer grows (64 -> 96 -> 128 MB) behind the next loading screen,",
+								Megabytes(ms.attrLastRefusedBytes).c_str(), Megabytes(ms.attrLargestFreeBytes).c_str());
+							ImGui::Text("  never while playing; those shapes get their data when their cell is captured again. Growths so far: %u.", ms.attrGrowths);
+						}
+					}
+					// (48g) The shading half.
+					if (settings.ReflectionsMode == 2) {
+						if (!ShadeWanted()) {
+							ImGui::TextDisabled("Off-screen shading: off (Off-screen Hit Color: Cubemap Approx)");
+						} else if (reflectShadeFailed) {
+							ImGui::TextColored({ 1.0f, 0.4f, 0.3f, 1.0f }, "Off-screen shading: unavailable (its shader did not compile or its textures could not be made)");
+						} else if (!reflectShadeCS) {
+							ImGui::TextDisabled("Off-screen shading: preparing its shader in the background...");
+						} else {
+							const float gpu = Util::GpuPassTimers::GetSingleton()->LastSampleMs(Util::GpuBucket::RayTracingReflectShade);
+							const std::string gpuText = gpu >= 0.0f && shadeLastFrame ? std::format("{:.2f} ms", gpu) : std::string("- ms");
+							const std::string shareText = shadeMaterialShare >= 0.0f ? std::format("{:.0f} %", shadeMaterialShare * 100.0f) : std::string("-");
+							const std::string ratioText = shadeRatio >= 0.0f ? std::format("{:.2f} ({} samples)", shadeRatio, shadeRatioGroups) : std::string("- (no hit also on screen)");
+							ImGui::Text("Off-screen shading: %s GPU, %s of the hits with material data (rest: cubemap), brightness shading / screen %s", gpuText.c_str(),
+								shareText.c_str(), ratioText.c_str());
+							if (auto _tt = Util::HoverTooltipWrapper()) {
+								ImGui::Text("GPU time of the hit shading pass (shown while the Performance Overlay or an F7 recording runs), the share of the traced");
+								ImGui::Text("  hits that had material data (texture copied, attributes captured) and so used their own colour, and the measured");
+								ImGui::Text("  brightness of the shading against the screen where a hit is also on screen (1.00 = equal; read a few frames late).");
+								ImGui::Text("  It is measured before Off-screen Hit Brightness: to match, set the slider to about 1 / this ratio.");
+							}
+						}
+					}
 				}
 			}
 			if (!reflectOffReason.empty())
@@ -8519,6 +8871,11 @@ std::string RayTracing::DescribeForProfile() const
 			settings.ReflectionsMaterials ? "on" : "off", settings.ReflectionsMaterials && !MaterialsWanted() ? " (not available)" : "", ms.materials, ms.texturesReady,
 			ms.texturesPending, static_cast<double>(ms.attrBytesUsed) / (1024.0 * 1024.0), static_cast<double>(ms.attrBytes) / (1024.0 * 1024.0),
 			static_cast<double>(ms.textureBytes) / (1024.0 * 1024.0));
+		// (48g)
+		text += std::format(", characters {}, off-screen hit color {} (brightness {:.2f}, sun shadow ray {}, lamps {}{})",
+			settings.ReflectionsCharacterMaterials ? "on" : "off", settings.ReflectionsOffscreenColor == 1 ? "material" : "cubemap approx",
+			settings.ReflectionsOffscreenBrightness, settings.ReflectionsSunRay ? "on" : "off", settings.ReflectionsShadeLights ? "on" : "off",
+			shadeRatio >= 0.0f ? std::format("; measured shading / screen {:.2f}", shadeRatio) : std::string());
 	}
 	// (46f)
 	static constexpr const char* kAOModes[] = { "RTAO (keeps SSGI contact AO)", "darker of RTAO and SSGI AO" };
@@ -8658,7 +9015,17 @@ nlohmann::json RayTracing::DescribeJson() const
 			{ "texture_mb", static_cast<double>(ms.textureBytes) / (1024.0 * 1024.0) }, { "attr_mb", static_cast<double>(ms.attrBytes) / (1024.0 * 1024.0) },
 			{ "attr_used_mb", static_cast<double>(ms.attrBytesUsed) / (1024.0 * 1024.0) }, { "attr_full", ms.attrFull }, { "copies_total", ms.copiesTotal },
 			{ "copy_cpu_ms", ms.copyCpuMs }, { "surface_mb", static_cast<double>(backend.ReflectSurfaceBytes()) / (1024.0 * 1024.0) },
-			{ "table_kb", static_cast<double>(ms.tableBytes) / 1024.0 }, { "copy_shader_ms", materialCopyAsync.CompileMs() } };
+			{ "table_kb", static_cast<double>(ms.tableBytes) / 1024.0 }, { "copy_shader_ms", materialCopyAsync.CompileMs() },
+			{ "attr_full_fragmented", ms.attrRefusedFragmented }, { "attr_growths", ms.attrGrowths }, { "page_create_ms", ms.pageCreateMs },
+			{ "pages_made_in_play", ms.pagesMadeInPlay }, { "character_materials", settings.ReflectionsCharacterMaterials } };
+		// (48g) The shading half.
+		j["reflections"]["shading"] = { { "offscreen_color", settings.ReflectionsOffscreenColor == 1 ? "material" : "cubemap" },
+			{ "brightness", settings.ReflectionsOffscreenBrightness }, { "sun_ray", settings.ReflectionsSunRay }, { "lamps", settings.ReflectionsShadeLights },
+			{ "wanted", ShadeWanted() }, { "ran_last_frame", shadeLastFrame }, { "fade", shadeFade }, { "failed", reflectShadeFailed },
+			{ "gpu_ms", Util::GpuPassTimers::GetSingleton()->LastSampleMs(Util::GpuBucket::RayTracingReflectShade) },
+			{ "material_share", shadeMaterialShare }, { "ratio_shaded_over_screen", shadeRatio }, { "ratio_samples", shadeRatioGroups },
+			{ "shader_ms", reflectShadeAsync.CompileMs() }, { "output_mb", static_cast<double>(shadeWidth) * shadeHeight * 8.0 / (1024.0 * 1024.0) },
+			{ "late_eviction_priorities", Util::FrameTrace::DeferredEvictionPriorities() } };
 	}
 	j["denoiser_effective"] = static_cast<int>(EffectiveDenoiser());
 	j["upscaling_rr_active"] = UpscalingRRActive();

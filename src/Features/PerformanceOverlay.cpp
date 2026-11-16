@@ -349,6 +349,8 @@ namespace
 			return "Ray-traced lamp shadows: water prep";
 		case B::RayTracingReflectSync:  // (48d)
 			return "Ray-traced reflections: wait for the trace";
+		case B::RayTracingReflectShade:  // (48g)
+			return "Ray-traced reflections: hit shading";
 		case B::RayTracingAONormalPrep:  // (47l)
 			return "Ray-traced AO: normal prep";
 		default:
@@ -371,6 +373,7 @@ namespace
 		Util::GpuBucket::RayTracingWaterPrep,  // (47j)
 		Util::GpuBucket::RayTracingAONormalPrep,  // (47l)
 		Util::GpuBucket::RayTracingReflectSync,   // (48d)
+		Util::GpuBucket::RayTracingReflectShade,  // (48g)
 	};
 
 	/// A table label without the ':' the tables append.

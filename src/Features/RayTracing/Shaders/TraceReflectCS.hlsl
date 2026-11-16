@@ -33,6 +33,11 @@
 // The instance's entry in InstanceAttrs (t6, TLAS order = CommittedInstanceIndex) gives its attribute base and triangle count, its own
 // material (objects, cut-outs) and its type; Attributes (t7) holds 16 bytes per triangle (MaterialAttributes.h): three corner texcoords
 // (terrain: corner layer weights) and the material | face normal word.
+//
+// (48g) RT_MATERIAL also: characters get their record (corner texcoords + the shape's material from the instance table; merged character
+// BLASes through one entry per member geometry; the normal faces the ray, no skinned positions are readable here), and a sun visibility ray
+// from every hit whose face turns towards the sun (Sun.w = 1): any-hit, cut-outs solid, scene + terrain as occluders; ReflectOut bit 9 =
+// tested, bit 8 = lit. ReflectShadeCS (D3D11) shades the hits from this record.
 
 struct RFConstants
 {
@@ -41,6 +46,9 @@ struct RFConstants
 	float4 Params;                   // x frame, y flags (asuint), z max ray length (units), w unused
 	float4 Bias;                     // x constant ray offset, y per unit of distance, z character ray TMin, w unused
 	float4 Spheres[2];               // character bounds (camera-relative xyz, radius; 0 = none): [0] the player, [1] the others
+#if defined(RT_MATERIAL)
+	float4 Sun;                      // (48g) xyz the direction to the sun (world), w 1 = trace the sun visibility ray
+#endif
 };
 
 ConstantBuffer<RFConstants> C : register(b0);
@@ -54,6 +62,8 @@ RWTexture2D<uint> ReflectDir : register(u2);  // (48d)
 #if defined(RT_MATERIAL)
 static const uint kMatNone = 0xFFFFu, kMatNoAttr = 0xFFFEu, kMatCharacter = 0xFFFDu;  // Backend: kNoMaterial, markers past kMaterialMaxIds
 static const uint kInstTerrain = 1u;                                                   // Backend.cpp kInstanceAttrTerrain
+static const uint kInstCharacterGroup = 3u;                                            // (48g) Backend.cpp kInstanceAttrCharacterGroup
+static const uint kSunLit = 0x100u, kSunTested = 0x200u;                               // (48g) ReflectOut bits 8 / 9
 StructuredBuffer<uint4> InstanceAttrs : register(t6);  // attribute base (UINT_MAX none), triangles, material | type << 16, unused
 StructuredBuffer<uint4> Attributes : register(t7);
 RWTexture2D<uint> ReflectSurf0 : register(u3);
@@ -219,6 +229,45 @@ void SurfaceRecord(uint instanceIndex, uint primitive, float2 bary, float3x3 obj
 		o_surf0 = f32tof16(uv.x) | (f32tof16(uv.y) << 16);
 	}
 	o_surf1 = material | (OctEncode8(n) << 16);
+}
+
+// (48g) The hit surface record of a committed character hit: the shape's corner texcoords and material (a merged character BLAS: the entry
+// of the instance points at one entry per member geometry). No face normal is stored for characters (their skinned positions are not
+// readable here): the record's normal faces the ray (-R). No attributes: kMatCharacter as in 48f.
+void CharacterSurfaceRecord(uint instanceIndex, uint geometryIndex, uint primitive, float2 bary, float3 R, out uint o_surf0, out uint o_surf1)
+{
+	o_surf0 = 0u;
+	o_surf1 = kMatCharacter | (OctEncode8(-R) << 16);
+	uint4 inst = InstanceAttrs[instanceIndex];
+	if ((inst.z >> 16) == kInstCharacterGroup) {
+		if (geometryIndex >= inst.y)
+			return;
+		inst = InstanceAttrs[inst.x + geometryIndex];
+	}
+	if (inst.x == 0xFFFFFFFFu || primitive >= inst.y || (inst.z & 0xFFFFu) == kMatNone)
+		return;
+	const uint4 a = Attributes[inst.x + primitive];
+	const float w0 = 1.0 - bary.x - bary.y;
+	float2 uv = UnpackHalf2(a.x) * w0 + UnpackHalf2(a.y) * bary.x + UnpackHalf2(a.z) * bary.y;
+	if (!all(isfinite(uv)))
+		uv = 0.0;
+	o_surf0 = f32tof16(uv.x) | (f32tof16(uv.y) << 16);
+	o_surf1 = (inst.z & 0xFFFFu) | (OctEncode8(-R) << 16);
+}
+
+// (48g) Is the sun visible from a hit point? One any-hit ray (accept the first hit, end the search), cut-outs solid (force opaque), the
+// scene and (when traced) the terrain as occluders; characters are not occluders here.
+bool SunVisible(float3 hitPos, float3 n, float3 L, float dist, uint sceneMask)
+{
+	RayDesc ray;
+	ray.Origin = hitPos + n * (C.Bias.x + C.Bias.y * dist);
+	ray.Direction = L;
+	ray.TMin = 0.0;
+	ray.TMax = C.Params.z * 4.0;
+	RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+	q.TraceRayInline(Scene, RAY_FLAG_NONE, sceneMask, ray);
+	q.Proceed();
+	return q.CommittedStatus() != COMMITTED_TRIANGLE_HIT;
 }
 #endif
 
@@ -386,8 +435,9 @@ bool SphereOnSegment(float3 origin, float3 dir, float tMax, float4 sphere)
 					type = kHitCharacter;
 					tHit = q.CommittedRayT();
 #if defined(RT_MATERIAL)
-					surf0 = 0u;
-					surf1 = kMatCharacter | (OctEncode8(-R) << 16);  // (48f) characters: no attributes yet (48g)
+					// (48g) The shape's texcoords and material (no attributes: kMatCharacter as in 48f).
+					CharacterSurfaceRecord(q.CommittedInstanceIndex(), q.CommittedGeometryIndex(), q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics(), R,
+						surf0, surf1);
 #endif
 				}
 			}
@@ -395,6 +445,21 @@ bool SphereOnSegment(float3 origin, float3 dir, float tMax, float4 sphere)
 				type = kHitRangeEnd;  // (48d) nothing within the shortened range: unknown, not the sky
 			const float distance = (type == kHitMiss || type == kHitRangeEnd) ? 0.0 : min(tHit, 65000.0);
 			result = kTraced | type | (min(confidence, 7u) << 3) | (f32tof16(distance) << 16);
+#if defined(RT_MATERIAL)
+			// (48g) Sun visibility at the hit (the shading pass's direct sun): only where the hit's face turns towards the sun; bit 9 = tested,
+			// bit 8 = lit (facing and nothing in the way). Characters: their record's normal faces the ray.
+			[branch] if (C.Sun.w > 0.5 && type != kHitMiss && type != kHitRangeEnd)
+			{
+				const float3 n = OctDecode8(surf1 >> 16);
+				const float3 L = C.Sun.xyz;
+				result |= kSunTested;
+				[branch] if (dot(n, L) > 0.0)
+				{
+					if (SunVisible(origin + R * tHit, n, L, dist + tHit, sceneMask))
+						result |= kSunLit;
+				}
+			}
+#endif
 			traced = 1u;
 			// (48d) The direction word: what the gap fill reads (its hit point, the lobe check, the miss lookup).
 			const uint2 o = uint2(round(saturate(OctEncode(R) * 0.5 + 0.5) * 65535.0));

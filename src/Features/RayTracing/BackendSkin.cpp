@@ -178,6 +178,13 @@ namespace RayTracingRT
 			if (!AllocateAlphaUv(shape.uvCount, shape.uvOffset))
 				return refuse();
 		}
+		// (48g) Capture Materials: the shape's per-triangle texcoords get an attribute range for its life (none: the hits show no material).
+		if (materialsEnabled_ && a_geometry->attributes.size() == static_cast<std::size_t>(triangles) * kAttributeWords && AllocateAttributes(triangles, shape.attrOffset))
+			shape.attrCount = triangles;
+		else {
+			shape.attrOffset = UINT32_MAX;
+			a_geometry->attributes = {};
+		}
 		shape.geometry = std::move(a_geometry);
 
 		SkinHandle handle;
@@ -215,6 +222,8 @@ namespace RayTracingRT
 		asPool_.Free(shape.blas, RetireValue());
 		if (shape.uvOffset != UINT32_MAX)
 			FreeAlphaUv(shape.uvOffset, shape.uvCount);
+		if (shape.attrOffset != UINT32_MAX)
+			FreeAttributes(shape.attrOffset, shape.attrCount);  // (48g)
 		skinStats_.bytes -= std::min(skinStats_.bytes, shape.Bytes());
 		skinStats_.vertices -= std::min<std::uint64_t>(skinStats_.vertices, shape.vertices);
 		skinStats_.triangles -= std::min<std::uint64_t>(skinStats_.triangles, shape.triangles);
@@ -270,6 +279,7 @@ namespace RayTracingRT
 	{
 		if (skinUploadQueue_.empty())
 			return;
+		RecordAttributeGrowth(a_list);  // (48g) a grown attribute buffer takes over before any attribute upload into it
 		// (46g) Each shape takes four pool ranges (rest + index, skinned vertices, BLAS) and one upload range: no
 		// resource creation on the render thread (four committed resources per shape were the 40-125 ms frames after
 		// a transition, with the old "at least one shape" rule). A CPU budget bounds the copies; a shape whose ranges
@@ -282,7 +292,7 @@ namespace RayTracingRT
 		{
 			SkinHandle handle;
 			ArenaAlloc upload;
-			std::uint64_t indexOffset, uvOffset;  // inside the upload range
+			std::uint64_t indexOffset, uvOffset, attrOffset;  // inside the upload range ((48g) attributes)
 		};
 		std::vector<Pending> batch;
 		std::uint32_t batchVertices = 0;
@@ -300,12 +310,16 @@ namespace RayTracingRT
 			}
 			auto& shape = skins_[handle];
 			const auto& geometry = *shape.geometry;
-			Pending entry{ handle, {}, 0, 0 };
+			Pending entry{ handle, {}, 0, 0, 0 };
 			entry.indexOffset = AlignUp(geometry.vertices.size() * sizeof(SkinVertex), 256);
 			std::uint64_t uploadBytes = entry.indexOffset + geometry.indices.size() * sizeof(std::uint32_t);
 			if (!geometry.Opaque()) {
 				entry.uvOffset = AlignUp(uploadBytes, 256);
 				uploadBytes = entry.uvOffset + geometry.alphaUV.size() * sizeof(std::uint32_t);
+			}
+			if (shape.attrOffset != UINT32_MAX && !geometry.attributes.empty()) {
+				entry.attrOffset = AlignUp(uploadBytes, 256);  // (48g)
+				uploadBytes = entry.attrOffset + geometry.attributes.size() * sizeof(std::uint32_t);
 			}
 			ArenaAlloc rest, index, output, blas;
 			// (46m) A merged shape has no BLAS of its own (its character's merged BLAS holds it).
@@ -334,6 +348,8 @@ namespace RayTracingRT
 			std::memcpy(mapped + entry.indexOffset, geometry.indices.data(), geometry.indices.size() * sizeof(std::uint32_t));
 			if (!geometry.Opaque())
 				std::memcpy(mapped + entry.uvOffset, geometry.alphaUV.data(), geometry.alphaUV.size() * sizeof(std::uint32_t));
+			if (shape.attrOffset != UINT32_MAX && !geometry.attributes.empty())
+				std::memcpy(mapped + entry.attrOffset, geometry.attributes.data(), geometry.attributes.size() * sizeof(std::uint32_t));  // (48g)
 			shape.rest = rest;
 			shape.index = index;
 			shape.output = output;
@@ -379,6 +395,25 @@ namespace RayTracingRT
 			}
 			auto back = SkinTransition(alphaUv_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 			a_list->ResourceBarrier(1, &back);
+		}
+		// (48g) Capture Materials: the shapes' attributes into their ranges (inside this upload's budget, like the alpha texcoords).
+		if (attr_) {
+			bool anyAttr = false;
+			for (const auto& entry : batch)
+				anyAttr = anyAttr || (skins_[entry.handle].attrOffset != UINT32_MAX && !skins_[entry.handle].geometry->attributes.empty());
+			if (anyAttr) {
+				auto toCopy = SkinTransition(attr_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+				a_list->ResourceBarrier(1, &toCopy);
+				for (const auto& entry : batch) {
+					const auto& shape = skins_[entry.handle];
+					if (shape.attrOffset == UINT32_MAX || shape.geometry->attributes.empty())
+						continue;
+					a_list->CopyBufferRegion(attr_.Get(), static_cast<std::uint64_t>(shape.attrOffset) * 16, uploadPool_.Resource(entry.upload),
+						entry.upload.offset + entry.attrOffset, static_cast<std::uint64_t>(shape.attrCount) * 16);
+				}
+				auto back = SkinTransition(attr_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+				a_list->ResourceBarrier(1, &back);
+			}
 		}
 		skinRecorded_ = true;
 		for (const auto& entry : batch) {
@@ -884,6 +919,7 @@ namespace RayTracingRT
 			instance.npc = lead.npc;
 			instance.owner = lead.owner;
 			instance.members = static_cast<std::uint32_t>(op.memberCount);
+			instance.firstMember = static_cast<std::uint32_t>(op.firstMember);  // (48g)
 			skinGroupFrame_.push_back(instance);
 			++skinStats_.groupsLastFrame;
 			skinStats_.groupShapesLastFrame += instance.members;

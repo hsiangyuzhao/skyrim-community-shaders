@@ -1081,6 +1081,9 @@ namespace Util::FrameTrace
 				out << "#   the game queue standing still at the wait for the reflection rays right before that ray march (-1 = not used).\n";
 				out << "# (48f) rt_refl_mat_copies / rt_refl_mat_pending / rt_refl_mat_textures / rt_refl_attr_mb = Reflections: Capture Materials (-1 = off):\n";
 				out << "#   128x128 texture copies made this frame, copies still waiting, textures copied so far, per-triangle attribute MB in use.\n";
+				out << "# (48g) rt_refl_shade_gpu_ms / rt_refl_shade_mat_pct / rt_refl_shade_ratio = the hit shading pass (Off-screen Hit Color: Material;\n";
+				out << "#   -1 = not run): its GPU ms, the share of the traced hits with material data (percent), the mean shaded / screen brightness where\n";
+				out << "#   a hit is also on screen (before Off-screen Hit Brightness; read back a few frames late).\n";
 				out << "# (48c) rt_pl_extra_pct = Extra Lights Where Crowded: percent of the pixels with a ray-traced point light that also traced a light past\n";
 				out << "#   the lights-per-pixel count (read back a few frames late; -1 = switch off, 6 lights per pixel, or not known).\n";
 				out << "#   rt_pw_* = the work of the RT D3D12 prep submission whose GPU time is rt_prep_gpu_ms on the same row (1 = valid; early =\n";
@@ -1193,7 +1196,8 @@ namespace Util::FrameTrace
 					   "rt_refl_gpu_ms,rt_refl_traced_pct,"  // (48a)
 					   "rt_pl_extra_pct,"  // (48c)
 					   "rt_refl_fill,rt_refl_sync_gpu_ms,"  // (48d)
-					   "rt_refl_mat_copies,rt_refl_mat_pending,rt_refl_mat_textures,rt_refl_attr_mb\n";  // (48f) the last ones
+					   "rt_refl_mat_copies,rt_refl_mat_pending,rt_refl_mat_textures,rt_refl_attr_mb,"  // (48f)
+					   "rt_refl_shade_gpu_ms,rt_refl_shade_mat_pct,rt_refl_shade_ratio\n";  // (48g) the last ones
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
 					std::string s = std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{},{}", t.scene,
@@ -1405,6 +1409,9 @@ namespace Util::FrameTrace
 					// (48f) Capture Materials, after rt_refl_sync_gpu_ms (the old last column).
 					extra.pop_back();
 					extra += std::format(",{},{},{},{:.2f}\n", r.rt.matCopies, r.rt.matPending, r.rt.matTextures, r.rt.matAttrMb);
+					// (48g) The shading half, after rt_refl_attr_mb (the old last column).
+					extra.pop_back();
+					extra += std::format(",{:.3f},{:.1f},{:.3f}\n", r.rt.shadeGpuMs, r.rt.shadeMaterialPct, r.rt.shadeRatio);
 					if (it == a_reflex.end()) {
 						out << (r.reflexFrame == UINT32_MAX ? std::string("-1") : std::to_string(r.reflexFrame)) << ",-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" << engineColumns(r) << extra;
 						continue;

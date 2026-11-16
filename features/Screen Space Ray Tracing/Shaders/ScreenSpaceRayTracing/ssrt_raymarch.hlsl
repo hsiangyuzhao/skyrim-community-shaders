@@ -208,7 +208,7 @@ cbuffer SSRTCB : register(b1)
     uint RTFlags;             // kRTFill* bits
     float RTMatchRelative;    // cubemap position check: tolerance share of the hit's camera distance
     float RTMatchMin;         // ... plus this many units
-    float RTPad0;
+    float RTShadeScale;       // (48g) "Off-screen Hit Brightness" (the material colour of off-screen hits, kRTFillMaterial)
     // --- row 6 ---
     float4 RTCaptureOffset;   // xyz: this frame's camera minus the camera of the last plain cubemap capture (units); w 1 = known
 #endif
@@ -231,6 +231,8 @@ TextureCube<float4> RTCubemapPosition : register(t15);  // Dynamic Cubemaps: the
 TextureCube<float4> RTCubemapRaw : register(t16);       // ... and its raw colours
 RWTexture2D<unorm float4> RTUseDebug : register(u2);    // "RT Reflection Use" (Ray Tracing's debug colour; written only with kRTFillDebug)
 static const uint kRTFillDebug = 1u, kRTFillBeyond = 2u, kRTFillLobe = 4u, kRTFillMatch = 8u, kRTFillHitDistance = 16u, kRTFillWarmUp = 32u;
+static const uint kRTFillMaterial = 64u;  // (48g) "Off-screen Hit Color: Material": RTShade holds the hit's own shaded colour
+Texture2D<float4> RTShade : register(t18);  // (48g) ReflectShadeCS: rgb linear colour, a = how much of it to use (0 = no material data)
 #else
 #   define SSRT_RT_FILL 0
 #endif
@@ -924,7 +926,7 @@ float3 SSRT_RTEnvColor(float3 a_dir, bool a_sky)
 }
 
 // (48d) The gap fill of one pixel: its weight (0 = the old path), colour (linear, as the fallback's envColor after IrradianceToLinear),
-// what it used (1 screen, 2 cubemap matched, 3 cubemap without sky, 4 sky) and the hit distance (-1 = a miss / nothing).
+// what it used (1 screen, 2 cubemap matched, 3 cubemap without sky, 4 sky, (48g) 5 the material colour) and the hit distance (-1 = a miss / nothing).
 float SSRT_RTFill(uint2 a_pixel, float3 a_positionWS, float3 a_normalWS, float a_roughness, uint2 a_screenSize, uint a_eye, out float3 o_color, out uint o_use,
     out float o_hitDistance)
 {
@@ -1018,6 +1020,19 @@ float SSRT_RTFill(uint2 a_pixel, float3 a_positionWS, float3 a_normalWS, float a
                 const float3 matched = filterInf(filterNaN(Color::IrradianceToLinear(max(raw.rgb, 0.0)))) * SharedData::ssrtSettings.SpecularMult;
                 offColor = lerp(offColor, matched, match);
                 offUse = match >= 0.5 ? 2u : 3u;
+            }
+        }
+        // (48g) "Off-screen Hit Color: Material": the hit's own shaded colour (ReflectShadeCS), faded against the cubemap path above by its
+        // availability (no material data / copy pending -> the cubemap path, fading in once the copy is ready; never a pop).
+        [branch] if (RTFlags & kRTFillMaterial)
+        {
+            const float4 shade = RTShade[a_pixel];
+            [branch] if (shade.a > 0.0)
+            {
+                const float3 material = filterInf(filterNaN(max(shade.rgb, 0.0))) * SharedData::ssrtSettings.SpecularMult * RTShadeScale;
+                offColor = lerp(offColor, material, saturate(shade.a));
+                if (shade.a >= 0.5)
+                    offUse = 5u;
             }
         }
     }
@@ -1630,7 +1645,7 @@ float SSRT_RTFill(uint2 a_pixel, float3 a_positionWS, float3 a_normalWS, float a
                     // REBLUR's hit distance: the ray's real one where it carries the pixel (SSR found nothing, the ray hit something).
                     if ((RTFlags & kRTFillHitDistance) && confidence <= 0.0 && rtHitDistance > 0.0 && rtWeight >= 0.5)
                         hit_distance = rtHitDistance;
-                    const float3 useColor = rtUse == 1u ? float3(0.1, 0.95, 0.2) : (rtUse == 2u ? float3(0.1, 0.9, 0.95) : (rtUse == 3u ? float3(1.0, 0.55, 0.1) : float3(0.2, 0.4, 1.0)));
+                    const float3 useColor = rtUse == 1u ? float3(0.1, 0.95, 0.2) : (rtUse == 2u ? float3(0.1, 0.9, 0.95) : (rtUse == 3u ? float3(1.0, 0.55, 0.1) : (rtUse == 5u ? float3(1.0, 0.95, 0.35) : float3(0.2, 0.4, 1.0))));  // (48g) 5 = material: pale yellow
                     rtDebug = float4(useColor, 0.2 + 0.6 * rtWeight * (1.0 - confidence));
                 }
             }

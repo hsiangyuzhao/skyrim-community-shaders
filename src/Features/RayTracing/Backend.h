@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <bit>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -110,6 +111,9 @@ namespace RayTracingRT
 		std::vector<SkinVertex> vertices;
 		std::vector<std::uint32_t> indices;
 		std::vector<std::uint32_t> alphaUV;  // as ChunkGeometry::alphaUV (alpha-tested parts: hair)
+		// (48g) Capture Materials: kAttributeWords per triangle (MaterialAttributes.h: corner texcoords, no face normal: the trace faces the
+		// ray), kept in the attribute buffer for the shape's life. Empty = none.
+		std::vector<std::uint32_t> attributes;
 		std::uint32_t boneCount = 0;
 		// (46m) Merge Character Parts: an opaque shape traced only inside its character's merged BLAS (SkinDraw::group);
 		// it gets no BLAS of its own.
@@ -136,6 +140,7 @@ namespace RayTracingRT
 		// (46m) Merge Character Parts: the character's key (0 = a BLAS of its own). Every draw of one group has the same
 		// x / y / z, npc and owner; the group's opaque shapes are one BLAS (one geometry each), one TLAS instance.
 		std::uint32_t group = 0;
+		std::uint16_t material = kNoMaterial;  // (48g) Capture Materials: the shape's material (its diffuse texture; per NPC for faces)
 	};
 
 	struct SkinStats
@@ -303,8 +308,9 @@ namespace RayTracingRT
 		float params[4];      // frame, flags (bit pattern), max ray length (units), unused
 		float bias[4];        // constant ray offset, per unit of distance, character ray TMin, unused
 		float spheres[8];     // character bounds, as TraceConstants::spheres
+		float sun[4];         // (48g) RT_MATERIAL: xyz the direction to the sun (world), w 1 = trace a sun visibility ray from front-facing hits
 	};
-	static_assert(sizeof(ReflectTraceConstants) == 36 * 4);
+	static_assert(sizeof(ReflectTraceConstants) == 40 * 4);  // (48g) + sun (only the RT_MATERIAL variants declare it)
 	/// (48a) This frame's reflection rays (FrameInput::reflect; null = none). (48d) Their own list and their own (third) fence, submitted
 	/// right behind the RTAO list (or behind the trace without RTAO): the game's queue waits for them only right before the SSRT specular
 	/// ray march (WaitForReflections), so the RTAO wait no longer includes them.
@@ -1002,7 +1008,8 @@ namespace RayTracingRT
 		[[nodiscard]] bool MaterialTraceAvailable() const { return ReflectAvailable() && reflectMatPipeline_ != nullptr; }
 		/// A material for one shape: its diffuse texture (copied once into a 128x128 RGBA8 page layer, shared by every material using it) and
 		/// texcoord transform (offset xy, scale zw). kNoMaterial when not enabled / refused (counted). Counted per user (ReleaseMaterial).
-		std::uint16_t AcquireMaterial(ID3D11Texture2D* a_texture, ID3D11ShaderResourceView* a_view, const float a_uvTransform[4]);
+		/// (48g) a_emissive: the shape's own emissive colour x multiplier (gamma units, as Lighting.hlsl adds it; null = none).
+		std::uint16_t AcquireMaterial(ID3D11Texture2D* a_texture, ID3D11ShaderResourceView* a_view, const float a_uvTransform[4], const float* a_emissive = nullptr);
 		/// A terrain quadrant's material: its six layer textures (their copies' last mip is the layer's average colour) and the quadrant's
 		/// average vertex colour (RGBA8). Never shared.
 		std::uint16_t AcquireTerrainMaterial(const TerrainLayerSource& a_layers, std::uint32_t a_tint);
@@ -1359,10 +1366,12 @@ namespace RayTracingRT
 			std::uint32_t flags;    // 1 terrain, 2 a texture is registered, 4 its copy is still pending
 			std::uint32_t terrain[3];  // terrain: the six layers' page layers, 16 bits each (0xFFFF = none / pending)
 			std::uint32_t tint;     // RGBA8 (terrain: the quadrant's average vertex colour; others white)
-			std::uint32_t pad[2];
+			std::uint32_t readyFrame;  // (48g) frame its copy (terrain: the last of its layers) became ready (ReflectShadeCS fades it in)
+			std::uint32_t pad;
 			float uvTransform[4];   // offset xy, scale zw
+			float emissive[4];      // (48g) rgb the shape's emissive colour x multiplier (gamma units), w unused
 		};
-		static_assert(sizeof(MaterialGpu) == 48);
+		static_assert(sizeof(MaterialGpu) == 64);
 		struct MatTexture
 		{
 			ComPtr<ID3D11Texture2D> texture11;        // held: the key can never be a reused address
@@ -1373,12 +1382,14 @@ namespace RayTracingRT
 			std::uint32_t sourceMips = 1;
 			bool live = false;
 			bool ready = false;
+			std::uint32_t readyFrame = 0;  // (48g)
 		};
 		struct MatEntry
 		{
 			std::array<std::uint32_t, 6> textures{ UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX };
 			float uvTransform[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
 			std::uint32_t tint = 0xFFFFFFFFu;
+			float emissive[3] = { 0.0f, 0.0f, 0.0f };  // (48g)
 			std::uint32_t users = 0;
 			bool terrain = false;
 			bool live = false;      // allocated (also while retired)
@@ -1387,9 +1398,18 @@ namespace RayTracingRT
 		struct MatKey
 		{
 			std::uint32_t texture;
-			std::uint32_t uv[4];
+			std::uint32_t uv[7];  // (48g) uv transform (4) + emissive (3), as bit patterns
 			bool operator==(const MatKey&) const = default;
 		};
+		static MatKey MakeMatKey(std::uint32_t a_texture, const float a_uv[4], const float a_emissive[3])
+		{
+			MatKey key{ a_texture, {} };
+			for (int i = 0; i < 4; ++i)
+				key.uv[i] = std::bit_cast<std::uint32_t>(a_uv[i]);
+			for (int i = 0; i < 3; ++i)
+				key.uv[4 + i] = std::bit_cast<std::uint32_t>(a_emissive[i]);
+			return key;
+		}
 		struct MatKeyHash
 		{
 			std::size_t operator()(const MatKey& a_key) const noexcept
@@ -1460,6 +1480,7 @@ namespace RayTracingRT
 			std::uint64_t buildScratch = 0, updateScratch = 0;
 			std::uint32_t vertices = 0, triangles = 0, boneCount = 0;
 			std::uint32_t uvOffset = UINT32_MAX, uvCount = 0;  // alpha texcoords (hair)
+			std::uint32_t attrOffset = UINT32_MAX, attrCount = 0;  // (48g) its attribute range (Capture Materials)
 			std::uint32_t refits = 0;                          // since the last build
 			std::uint64_t lastSubmission = 0;                  // a shape is skinned once per frame
 			// (46m) Merge Character Parts: no BLAS of its own (built = inside a built merged BLAS); skinned = its skinned
@@ -1493,6 +1514,7 @@ namespace RayTracingRT
 			bool npc = false;
 			std::uint32_t owner = 0;
 			std::uint32_t members = 0;
+			std::uint32_t firstMember = 0;  // (48g) its member draws (geometry order) at skinGroupMembers_[firstMember ..]
 		};
 		static constexpr float kSkinGroupSlack = 1.25f;  // a merged BLAS is allocated this much above its need
 

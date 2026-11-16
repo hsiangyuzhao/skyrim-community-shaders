@@ -326,18 +326,21 @@ namespace RayTracingRT
 		return id;
 	}
 
-	std::uint16_t Backend::AcquireMaterial(ID3D11Texture2D* a_texture, ID3D11ShaderResourceView* a_view, const float a_uvTransform[4])
+	std::uint16_t Backend::AcquireMaterial(ID3D11Texture2D* a_texture, ID3D11ShaderResourceView* a_view, const float a_uvTransform[4], const float* a_emissive)
 	{
 		if (!materialsEnabled_ || !ready_ || failed_ || !a_texture || !a_view)
 			return kNoMaterial;
 		float uv[4];
 		for (int i = 0; i < 4; ++i)
 			uv[i] = std::isfinite(a_uvTransform[i]) ? a_uvTransform[i] : (i < 2 ? 0.0f : 1.0f);
+		float emissive[3] = { 0.0f, 0.0f, 0.0f };  // (48g)
+		if (a_emissive)
+			for (int i = 0; i < 3; ++i)
+				emissive[i] = std::isfinite(a_emissive[i]) ? std::clamp(a_emissive[i], 0.0f, 64.0f) : 0.0f;
 		// Shared by every shape with the same texture and transform (the texture's handle is its key while it lives).
 		const auto known = matTextureIndex_.find(a_texture);
 		if (known != matTextureIndex_.end()) {
-			MatKey key{ known->second, { std::bit_cast<std::uint32_t>(uv[0]), std::bit_cast<std::uint32_t>(uv[1]), std::bit_cast<std::uint32_t>(uv[2]),
-										   std::bit_cast<std::uint32_t>(uv[3]) } };
+			const MatKey key = MakeMatKey(known->second, uv, emissive);
 			if (const auto it = materialIndex_.find(key); it != materialIndex_.end()) {
 				auto& entry = materials_[it->second];
 				if (entry.retired) {
@@ -360,8 +363,8 @@ namespace RayTracingRT
 		auto& entry = materials_[id];
 		entry.textures[0] = texture;
 		std::copy_n(uv, 4, entry.uvTransform);
-		materialIndex_[MatKey{ texture, { std::bit_cast<std::uint32_t>(uv[0]), std::bit_cast<std::uint32_t>(uv[1]), std::bit_cast<std::uint32_t>(uv[2]),
-											 std::bit_cast<std::uint32_t>(uv[3]) } }] = id;
+		std::copy_n(emissive, 3, entry.emissive);
+		materialIndex_[MakeMatKey(texture, uv, emissive)] = id;
 		matTableDirty_ = true;
 		return id;
 	}
@@ -406,8 +409,7 @@ namespace RayTracingRT
 				return true;
 			auto& entry = materials_[id];
 			if (!entry.terrain) {
-				MatKey key{ entry.textures[0], { std::bit_cast<std::uint32_t>(entry.uvTransform[0]), std::bit_cast<std::uint32_t>(entry.uvTransform[1]),
-												   std::bit_cast<std::uint32_t>(entry.uvTransform[2]), std::bit_cast<std::uint32_t>(entry.uvTransform[3]) } };
+				const MatKey key = MakeMatKey(entry.textures[0], entry.uvTransform, entry.emissive);
 				if (const auto it = materialIndex_.find(key); it != materialIndex_.end() && it->second == id)
 					materialIndex_.erase(it);
 			}
@@ -563,6 +565,11 @@ namespace RayTracingRT
 				return 0xFFFFu;
 			return matTextures_[a_texture].layer & 0xFFFFu;
 		};
+		auto readyOf = [&](std::uint32_t a_texture) -> std::uint32_t {
+			if (a_texture >= matTextures_.size() || !matTextures_[a_texture].live || !matTextures_[a_texture].ready)
+				return 0u;
+			return matTextures_[a_texture].readyFrame;
+		};
 		for (std::uint32_t id = 0; id < count; ++id) {
 			const auto& entry = materials_[id];
 			MaterialGpu gpu{};
@@ -576,6 +583,7 @@ namespace RayTracingRT
 			if (entry.live) {
 				std::copy_n(entry.uvTransform, 4, gpu.uvTransform);
 				gpu.tint = entry.tint;
+				std::copy_n(entry.emissive, 3, gpu.emissive);  // (48g)
 				if (entry.terrain) {
 					gpu.flags = 1u;
 					bool pending = false;
@@ -583,11 +591,13 @@ namespace RayTracingRT
 						const std::uint32_t layer = layerOf(entry.textures[i]);
 						pending = pending || (entry.textures[i] != UINT32_MAX && layer == 0xFFFFu);
 						gpu.terrain[i / 2] = (gpu.terrain[i / 2] & ~(0xFFFFu << (16 * (i & 1)))) | (layer << (16 * (i & 1)));
+						gpu.readyFrame = std::max(gpu.readyFrame, readyOf(entry.textures[i]));
 					}
 					gpu.flags |= pending ? 4u : 0u;
 				} else if (entry.textures[0] != UINT32_MAX) {
 					gpu.layer = layerOf(entry.textures[0]);
 					gpu.flags = 2u | (gpu.layer == 0xFFFFu ? 4u : 0u);
+					gpu.readyFrame = readyOf(entry.textures[0]);
 				}
 			}
 			out[id] = gpu;
@@ -713,6 +723,7 @@ namespace RayTracingRT
 					// One dispatch for every mip: z = mip, 16 x 16 groups of 8 x 8 cover the 128 x 128 level (smaller levels exit early).
 					context->Dispatch(kMaterialTextureSize / 8, kMaterialTextureSize / 8, kMaterialTextureMips);
 					entry.ready = true;
+					entry.readyFrame = a_frame;  // (48g) ReflectShadeCS fades the material in from here
 					entry.view11.Reset();
 					it = matCopyQueue_.erase(it);
 					++made;

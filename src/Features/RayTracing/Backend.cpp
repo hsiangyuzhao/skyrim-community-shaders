@@ -60,7 +60,7 @@ namespace RayTracingRT
 
 		// (48f) The per-instance attribute table (TraceReflectCS RT_MATERIAL InstanceAttrs, uint4 per TLAS instance): attribute base (uint4
 		// elements; UINT32_MAX = none), its triangle count, the instance material | type << 16, unused.
-		constexpr std::uint32_t kInstanceAttrTerrain = 1u, kInstanceAttrCharacter = 2u;
+		constexpr std::uint32_t kInstanceAttrTerrain = 1u, kInstanceAttrCharacter = 2u, kInstanceAttrCharacterGroup = 3u;  // (48g) group
 		void WriteInstanceAttr(std::uint32_t* a_table, std::uint32_t a_index, std::uint32_t a_base, std::uint32_t a_triangles, std::uint16_t a_material, std::uint32_t a_type)
 		{
 			std::uint32_t* entry = a_table + static_cast<std::size_t>(a_index) * 4;
@@ -3281,7 +3281,10 @@ namespace RayTracingRT
 		// Without it (not enabled, no attribute buffer, the upload buffer failed) the reflection rays run the 48e variant.
 		context.instanceAttrWritten = false;
 		std::uint32_t* instanceAttrs = nullptr;
-		if (a_input.materials && attr_ && reflectMatPipeline_ && EnsureInstanceAttrBuffer(context, maxInstances))
+		// (48g) + one entry per member geometry of the merged character BLASes, after the instances (at most one per skin draw).
+		const std::uint32_t geometryBase = maxInstances;
+		std::uint32_t geometryEntries = 0;
+		if (a_input.materials && attr_ && reflectMatPipeline_ && EnsureInstanceAttrBuffer(context, maxInstances + static_cast<std::uint32_t>(skinDraws.size())))
 			instanceAttrs = static_cast<std::uint32_t*>(context.instanceAttrMapped);
 		for (const auto& instance : instances) {
 			const auto category = std::min<std::uint32_t>(instance.category, kInstanceCategories - 1);
@@ -3387,7 +3390,7 @@ namespace RayTracingRT
 			desc.AccelerationStructure = asPool_.Address(skin.blas);
 			++check_.written[kCategoryCharacter];
 			if (instanceAttrs)
-				WriteInstanceAttr(instanceAttrs, instanceCount, UINT32_MAX, 0, kNoMaterial, kInstanceAttrCharacter);  // (48f)
+				WriteInstanceAttr(instanceAttrs, instanceCount, skin.attrOffset, skin.attrCount, draw.material, kInstanceAttrCharacter);  // (48g) its texcoords + material
 			descs[instanceCount++] = desc;
 			++characterInstances;
 			++charactersTraced;
@@ -3408,8 +3411,28 @@ namespace RayTracingRT
 			desc.Flags = kInstanceFlags;
 			desc.AccelerationStructure = group.blas;
 			check_.written[kCategoryCharacter] += group.members;
-			if (instanceAttrs)
-				WriteInstanceAttr(instanceAttrs, instanceCount, UINT32_MAX, 0, kNoMaterial, kInstanceAttrCharacter);  // (48f)
+			if (instanceAttrs) {
+				// (48g) The group entry points at one entry per member geometry (CommittedGeometryIndex order = the build's member order).
+				if (group.members > 0 && geometryEntries + group.members <= skinDraws.size() &&
+					static_cast<std::size_t>(group.firstMember) + group.members <= skinGroupMembers_.size()) {
+					WriteInstanceAttr(instanceAttrs, instanceCount, geometryBase + geometryEntries, group.members, kNoMaterial, kInstanceAttrCharacterGroup);
+					for (std::uint32_t m = 0; m < group.members; ++m) {
+						const std::uint32_t d = skinGroupMembers_[group.firstMember + m];
+						std::uint32_t base = UINT32_MAX, triangles = 0;
+						std::uint16_t material = kNoMaterial;
+						if (d < skinDraws.size() && skinDraws[d].shape < skins_.size() && skins_[skinDraws[d].shape].live) {
+							const auto& member = skins_[skinDraws[d].shape];
+							base = member.attrOffset;
+							triangles = member.attrOffset != UINT32_MAX ? member.attrCount : 0u;
+							material = skinDraws[d].material;
+						}
+						WriteInstanceAttr(instanceAttrs, geometryBase + geometryEntries + m, base, triangles, material, kInstanceAttrCharacter);
+					}
+					geometryEntries += group.members;
+				} else {
+					WriteInstanceAttr(instanceAttrs, instanceCount, UINT32_MAX, 0, kNoMaterial, kInstanceAttrCharacter);
+				}
+			}
 			descs[instanceCount++] = desc;
 			++characterInstances;
 			charactersTraced += group.members;

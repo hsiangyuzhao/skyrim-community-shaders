@@ -104,6 +104,8 @@ namespace Util
 		RayTracingAONormalPrep,
 		// (48d) RT reflections: the game queue's wait for the reflection list (third fence) right before the SSRT specular ray march.
 		RayTracingReflectSync,
+		// (48g) RT reflections: ReflectShadeCS (the hits' shaded colours, right before the SSRT specular ray march).
+		RayTracingReflectShade,
 		Count
 	};
 

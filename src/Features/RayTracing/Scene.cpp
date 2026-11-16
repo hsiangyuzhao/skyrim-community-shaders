@@ -1149,6 +1149,21 @@ namespace RayTracingScene
 
 	namespace
 	{
+		/// (48g) The shape's own emissive colour x multiplier (only with the OwnEmit flag, as the Lighting shader; SEH-guarded).
+		void ReadOwnEmissive(RE::BSLightingShaderProperty* a_lighting, float o_emissive[3])
+		{
+			__try {
+				if (!a_lighting->flags.any(RE::BSShaderProperty::EShaderPropertyFlag::kOwnEmit) || !a_lighting->emissiveColor)
+					return;
+				const float mult = a_lighting->emissiveMult;
+				o_emissive[0] = a_lighting->emissiveColor->red * mult;
+				o_emissive[1] = a_lighting->emissiveColor->green * mult;
+				o_emissive[2] = a_lighting->emissiveColor->blue * mult;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				o_emissive[0] = o_emissive[1] = o_emissive[2] = 0.0f;
+			}
+		}
+
 		/// (48f) A landscape quadrant's six layer textures: the material's base diffuse and its blended layers (SEH-guarded).
 		bool ReadLandscapeTextures(RE::BSLightingShaderProperty* a_lighting, RayTracingRT::TerrainLayerSource& o_layers)
 		{
@@ -1186,7 +1201,10 @@ namespace RayTracingScene
 		RawAlphaSource raw{};
 		if (!ReadAlphaSource(lighting, raw))
 			return RayTracingRT::kNoMaterial;
-		return a_backend.AcquireMaterial(raw.texture, raw.view, raw.uv);
+		// (48g) Its own emissive colour x multiplier (OwnEmit shapes: lamps, glowing objects; glow maps are not copied).
+		float emissive[3] = { 0.0f, 0.0f, 0.0f };
+		ReadOwnEmissive(lighting, emissive);
+		return a_backend.AcquireMaterial(raw.texture, raw.view, raw.uv, emissive);
 	}
 
 	std::uint16_t Scene::AcquireTerrainMaterial(RayTracingRT::Backend& a_backend, RE::BSTriShape* a_shape, const RE::TESObjectLAND::LoadedLandData& a_land, int a_quad) const

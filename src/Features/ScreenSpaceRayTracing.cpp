@@ -2608,6 +2608,7 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     // reflection list here (GPU-side, right before the ray march) and the SSRT_RT_REFLECT permutation runs; otherwise the plain one, with
     // exactly the bindings and constants it always had.
     std::array<ID3D11ShaderResourceView*, 4> rtSrvs = { nullptr };
+    ID3D11ShaderResourceView* rtShadeSrv = nullptr;  // (48g) t18: the shaded colours of the hits (t17 stays SharedData's)
     bool gapFill = false;
     {
         RayTracing::ReflectionGapFill fill{};
@@ -2622,14 +2623,17 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
             bool acquired = false;
             if (shaderReady && raymarchSpecularRTCS) {
                 Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTTraceSpecular);
-                acquired = rayTracing.AcquireReflectionGapFill(static_cast<std::uint32_t>(size.x), static_cast<std::uint32_t>(size.y), fill);
+                acquired = rayTracing.AcquireReflectionGapFill(static_cast<std::uint32_t>(size.x), static_cast<std::uint32_t>(size.y), fill, texColor->srv.get(),
+                    depth.depthSRV);  // (48g) the shading pass runs in there (screen colour + depth: the "RT Shading vs Screen" comparison)
                 Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTTraceSpecular);
             }
             if (acquired) {
                 gapFill = true;
                 rtSrvs = { fill.hit, fill.dir, dynamicCubemaps.envCapturePositionTexture->srv.get(), dynamicCubemaps.envCaptureRawTexture->srv.get() };
+                rtShadeSrv = fill.shade;
                 uavs.at(2) = fill.debug;
                 ssrCBData.RTFlags = fill.flags;
+                ssrCBData.RTShadeScale = fill.shadeScale;  // (48g)
                 ssrCBData.RTMatchRelative = 0.04f;  // 4 % of the hit's camera distance ...
                 ssrCBData.RTMatchMin = 32.0f;       // ... plus about half a metre (camera movement since the capture, filtering)
                 const auto eye = Util::GetEyePosition(0);
@@ -2647,6 +2651,8 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
     if (gapFill)
         context->CSSetShaderResources(13, (uint)rtSrvs.size(), rtSrvs.data());
+    if (rtShadeSrv)
+        context->CSSetShaderResources(18, 1, &rtShadeSrv);
     context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
     context->CSSetShader(gapFill ? raymarchSpecularRTCS.get() : raymarchSpecularCS.get(), nullptr, 0);
     context->CSSetConstantBuffers(1, 1, &buffer);
@@ -2659,6 +2665,10 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     if (gapFill) {
         rtSrvs.fill(nullptr);
         context->CSSetShaderResources(13, (uint)rtSrvs.size(), rtSrvs.data());
+        if (rtShadeSrv) {
+            ID3D11ShaderResourceView* nullShade = nullptr;
+            context->CSSetShaderResources(18, 1, &nullShade);
+        }
     }
     resetViews();
 

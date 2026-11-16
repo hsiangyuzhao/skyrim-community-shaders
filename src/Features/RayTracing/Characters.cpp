@@ -517,6 +517,9 @@ namespace RayTracingCharacters
 			a_backend.ReleaseAlphaTexture(a_shape.texture);
 		a_shape.info = RayTracingRT::kInvalidAlphaInfo;
 		a_shape.texture = RayTracingRT::kInvalidAlphaTexture;
+		if (a_shape.material != RayTracingRT::kNoMaterial)
+			a_backend.ReleaseMaterial(a_shape.material);  // (48g)
+		a_shape.material = RayTracingRT::kNoMaterial;
 		if (a_shape.handle != RayTracingRT::kInvalidSkin)
 			a_backend.ReleaseSkinShape(a_shape.handle);
 		a_shape.handle = RayTracingRT::kInvalidSkin;
@@ -1077,6 +1080,31 @@ namespace RayTracingCharacters
 		}
 		geometry->indices = std::move(indices);
 
+		// (48g) Capture Materials: every triangle corner's texcoord (the trace interpolates it at the hit) and the shape's material (its diffuse
+		// texture: faces have their own per NPC). No face normal (the trace faces the ray: the skinned positions are not readable there).
+		std::uint16_t shapeMaterial = RayTracingRT::kNoMaterial;
+		if (materials_ && a_backend.MaterialsEnabled()) {
+			const std::uint32_t uvOffset0 = vertexDesc.GetAttributeOffset(RE::BSGraphics::Vertex::VA_TEXCOORD0);
+			RawAlpha rawMaterial{};
+			if ((flags & RE::BSGraphics::Vertex::VF_UV) && uvOffset0 + 4 <= stride && rawVertices && lighting && ReadAlpha(lighting, rawMaterial)) {
+				shapeMaterial = a_backend.AcquireMaterial(rawMaterial.texture, rawMaterial.view, rawMaterial.uv);
+				if (shapeMaterial != RayTracingRT::kNoMaterial) {
+					const std::size_t triangles = geometry->indices.size() / 3;
+					geometry->attributes.resize(triangles * RayTracingRT::kAttributeWords);
+					for (std::size_t t = 0; t < triangles; ++t) {
+						std::uint32_t* out = geometry->attributes.data() + t * RayTracingRT::kAttributeWords;
+						for (std::size_t c = 0; c < 3; ++c) {
+							std::uint32_t uv;
+							std::memcpy(&uv, bytes.data() + static_cast<std::size_t>(geometry->indices[t * 3 + c]) * stride + uvOffset0, sizeof(uv));
+							out[c] = RayTracingRT::Attributes::SanitizeHalf2(uv);
+						}
+						out[3] = RayTracingRT::kNoMaterial;  // the instance table carries the shape's material; normal bits unused
+					}
+				}
+			}
+		}
+		shape->material = shapeMaterial;  // (48g) released with the shape (ReleaseShape) or on the failures below
+
 		// --- Alpha-tested parts: texcoords per triangle corner, texture and record.
 		RayTracingRT::AlphaMaterial material{};
 		RawAlpha rawAlpha{};
@@ -1087,6 +1115,9 @@ namespace RayTracingCharacters
 			if ((test != RE::NiAlphaProperty::TestFunction::kGreater && test != RE::NiAlphaProperty::TestFunction::kGreaterEqual) ||
 				!(flags & RE::BSGraphics::Vertex::VF_UV) || uvOffset + 4 > stride || !rawVertices || !ReadAlpha(lighting, rawAlpha)) {
 				++stats_.skipAlphaFailed;
+				if (shape->material != RayTracingRT::kNoMaterial)
+					a_backend.ReleaseMaterial(shape->material);  // (48g)
+				shape->material = RayTracingRT::kNoMaterial;
 				return nullptr;
 			}
 			material.threshold = static_cast<float>(alphaProperty->alphaThreshold) / 255.0f;
@@ -1118,6 +1149,9 @@ namespace RayTracingCharacters
 		shape->handle = a_backend.CreateSkinShape(std::move(geometry));
 		if (shape->handle == RayTracingRT::kInvalidSkin) {
 			++stats_.skipBackend;
+			if (shape->material != RayTracingRT::kNoMaterial)
+				a_backend.ReleaseMaterial(shape->material);  // (48g)
+			shape->material = RayTracingRT::kNoMaterial;
 			return nullptr;
 		}
 		if (alphaTested) {
@@ -1496,6 +1530,7 @@ namespace RayTracingCharacters
 			draw.group = grouped ? a_actor.serial : 0u;
 			draw.boneOffset = static_cast<std::uint32_t>(o_bones.size() / 12);
 			draw.alphaInfo = a_shape.alpha ? a_shape.info : RayTracingRT::kInvalidAlphaInfo;
+			draw.material = a_shape.material;  // (48g)
 			draw.npc = a_npc;
 			draw.owner = a_owner;
 			draw.reuse = a_shape.reuse && !rebase;  // (45l) last frame's BLAS: no bones uploaded

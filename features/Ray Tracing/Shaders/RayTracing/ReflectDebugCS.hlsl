@@ -7,7 +7,8 @@
 //   (48f) 5 RT Albedo (Capture Materials): the hit's own texture colour from its material's 128x128 copy at the interpolated texcoord, terrain
 //     as its six layers' average colours blended by the weights at the hit times the quadrant's vertex colour. Missing data has its own
 //     colour: magenta = the hit has no attributes (captured before / without materials), red-orange = no material (no readable texture),
-//     yellow / black checks = the texture copy is still pending, purple = a character (48g), dim blue / grey = miss / range end; dark
+//     yellow / black checks = the texture copy is still pending, purple = a character without material data ((48g) characters now have
+//     their texcoords and material), dim blue / grey = miss / range end; dark
 //     magenta everywhere = this frame has no surface record (materials off or not ready).
 
 cbuffer ReflectDebugCB : register(b0)
@@ -30,9 +31,10 @@ struct MaterialGpu
 	uint Terrain1;
 	uint Terrain2;
 	uint Tint;
-	uint Pad0;
-	uint Pad1;
+	uint ReadyFrame;  // (48g)
+	uint Pad;
 	float4 UvTransform;
+	float4 Emissive;  // (48g) MaterialGpu is 64 bytes
 };
 StructuredBuffer<MaterialGpu> Materials : register(t3);
 Texture2DArray<float4> Page0 : register(t4);

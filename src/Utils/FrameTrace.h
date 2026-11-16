@@ -214,6 +214,9 @@ namespace Util::FrameTrace
 		// (48f) Capture Materials (-1 = off): texture copies made this frame, copies still waiting (backlog), copied textures, attribute MB in use.
 		int matCopies = -1, matPending = -1, matTextures = -1;
 		float matAttrMb = -1.0f;
+		// (48g) The shading half (-1 = not run last frame / not known): ReflectShadeCS GPU ms, share of the traced hits with material data (%),
+		// mean shaded / screen brightness where hits are also on screen (read back a few frames late).
+		float shadeGpuMs = -1.0f, shadeMaterialPct = -1.0f, shadeRatio = -1.0f;
 		// (48c) Extra Lights Where Crowded: the share of the pixels with a traced point light that traced at least one extra rank (percent, read back
 		// a few frames late; -1 = off this frame, K 6, or not known).
 		float plExtraPct = -1.0f;

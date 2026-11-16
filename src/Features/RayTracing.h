@@ -368,6 +368,17 @@ public:
 		// quadrant gets a material and every distinct diffuse texture a 128x128 copy (D3D11, a few per frame), and the reflection rays write a
 		// surface record (the RT Albedo view). A change re-captures the scene. Off (or RT Reflections Off): nothing of it, exactly 48e.
 		bool ReflectionsMaterials = true;
+		// (48g) The shading half. ReflectionsOffscreenColor "Off-screen Hit Color": 0 Cubemap Approx (as 48f), 1 Material (default): Gap Fill's hits
+		// off screen take their own shaded colour (ReflectShadeCS: texture x sun / sky / lamps + emissive), fading to the cubemap path where the
+		// material data is missing. ReflectionsOffscreenBrightness "Off-screen Hit Brightness" (1.0): scale of that colour (calibration by eye).
+		// ReflectionsSunRay "Material Hits: Sun Shadow Ray": the trace casts a sun visibility ray from front-facing hits (off: lit by the sun
+		// wherever they face it). ReflectionsShadeLights "Material Hits: Lamps": Light Limit Fix's lights light the hits. ReflectionsCharacterMaterials
+		// "Capture Materials: Characters": characters keep their texcoords and material (off: purple in RT Albedo, cubemap path, as 48f).
+		int ReflectionsOffscreenColor = 1;
+		float ReflectionsOffscreenBrightness = 1.0f;
+		bool ReflectionsSunRay = true;
+		bool ReflectionsShadeLights = true;
+		bool ReflectionsCharacterMaterials = true;
 	};
 	/// (48d) What the SSRT specular ray march needs for the gap fill this frame (AcquireReflectionGapFill).
 	struct ReflectionGapFill
@@ -376,9 +387,12 @@ public:
 		ID3D11ShaderResourceView* dir = nullptr;   // word 1 (octahedral ray direction)
 		ID3D11UnorderedAccessView* debug = nullptr;  // "RT Reflection Use" view target (null = view off)
 		std::uint32_t flags = 0;                   // kGapFill* bits
+		ID3D11ShaderResourceView* shade = nullptr;   // (48g) ReflectShadeCS output (kGapFillMaterial; t18 of the ray march)
+		float shadeScale = 1.0f;                   // (48g) "Off-screen Hit Brightness"
 	};
 	static constexpr std::uint32_t kGapFillDebug = 1u, kGapFillBeyond = 2u, kGapFillLobe = 4u, kGapFillMatch = 8u, kGapFillHitDistance = 16u,
-	                                 kGapFillWarmUp = 32u;  // (48e)
+	                                 kGapFillWarmUp = 32u,   // (48e)
+	                                 kGapFillMaterial = 64u;  // (48g)
 	/// (46f) RTAO modes (Settings::AOMode); with RTAO off the AO is SSGI's, exactly as before.
 	enum class AOModeKind : int
 	{
@@ -471,7 +485,9 @@ public:
 	void DrawReflectionDebugViews();
 	/// (48d) The SSRT specular pass, right before its ray march: with RT Reflections = Gap Fill and this frame's hit record at this size, the
 	/// D3D11 queue waits for the reflection list (GPU-side) and o_fill gets the record. False (o_fill empty): the ray march runs its old path.
-	bool AcquireReflectionGapFill(std::uint32_t a_width, std::uint32_t a_height, ReflectionGapFill& o_fill);
+	/// (48g) a_screenColor / a_depth: the ray march's colour source and depth (the shading pass's on-screen comparison).
+	bool AcquireReflectionGapFill(std::uint32_t a_width, std::uint32_t a_height, ReflectionGapFill& o_fill, ID3D11ShaderResourceView* a_screenColor = nullptr,
+		ID3D11ShaderResourceView* a_depth = nullptr);
 	/// (48d) Gap Fill has a consumer: SSRT specular on with its cubemap fallback (Dynamic Cubemaps loaded). Without it nothing is traced.
 	[[nodiscard]] static bool GapFillConsumer();
 
@@ -1057,6 +1073,7 @@ private:
 		NormalConfidence,  // the reprojected last-frame normal: green sure .. red fell back
 		Use,               // (48d) what the gap fill used: on-screen hit / cubemap matched / unmatched / miss (written by the SSRT ray march)
 		Albedo,            // (48f) the hit's texture colour from the material copies (Capture Materials); missing data has its own colour
+		ShadeVsScreen,     // (48g) the shaded colour against the screen where a hit is also on screen (written by ReflectShadeCS)
 		Count
 	};
 	ReflectDebugView reflectDebugView = ReflectDebugView::Off;  // not persisted
@@ -1093,6 +1110,37 @@ private:
 	Util::AsyncComputeShader materialCopyAsync;
 	bool materialCopyFailed = false;
 	winrt::com_ptr<ID3D11SamplerState> reflectDebugSampler;
+	// (48g) The shading half: ReflectShadeCS (compiled in the background), its RGBA16F output at render size (made with the surface record, at
+	// enable time / a resize, never per frame), its stats buffer (cleared each frame, read back through a ring of staging copies, never
+	// waited for), the Off-screen Hit Color switch's fade (0..1, about 0.4 s each way: no pop) and the measured readings.
+	[[nodiscard]] bool ShadeWanted() const;
+	bool EnsureShadeResources(std::uint32_t a_width, std::uint32_t a_height);
+	void ReleaseShadeResources();
+	bool ShadeReflections(std::uint32_t a_width, std::uint32_t a_height, ID3D11ShaderResourceView* a_screenColor, ID3D11ShaderResourceView* a_depth);
+	void ReadShadeStats();
+	winrt::com_ptr<ID3D11ComputeShader> reflectShadeCS;
+	Util::AsyncComputeShader reflectShadeAsync;
+	bool reflectShadeFailed = false;
+	std::unique_ptr<ConstantBuffer> reflectShadeCB;
+	winrt::com_ptr<ID3D11Texture2D> shadeTexture;
+	winrt::com_ptr<ID3D11ShaderResourceView> shadeSRV;
+	winrt::com_ptr<ID3D11UnorderedAccessView> shadeUAV;
+	std::uint32_t shadeWidth = 0, shadeHeight = 0;
+	winrt::com_ptr<ID3D11Buffer> shadeStats;
+	winrt::com_ptr<ID3D11UnorderedAccessView> shadeStatsUAV;
+	static constexpr std::uint32_t kShadeStatsRing = 4;
+	std::array<winrt::com_ptr<ID3D11Buffer>, kShadeStatsRing> shadeStatsStaging;
+	std::array<std::uint32_t, kShadeStatsRing> shadeStatsFrame{};  // frame written (0 = empty)
+	std::uint32_t shadeStatsCursor = 0;
+	float shadeFade = 0.0f;          // the Off-screen Hit Color switch's fade (1 = Material fully)
+	std::int64_t shadeFadeQpc = 0;
+	bool shadeThisFrame = false;     // ReflectShadeCS ran this frame (its output is valid for the ray march)
+	bool shadeLastFrame = false;
+	bool reflectSunRayThisFrame = false;  // (48g) this frame's material trace casts sun visibility rays (ReflectOut bits 8 / 9 valid)
+	float shadeGpuMs = -1.0f;        // its GPU time (GpuPassTimers RayTracingReflectShade; -1 = not run / not timed)
+	float shadeMaterialShare = -1.0f;  // share of the traced hits with material data (last read-back; -1 = none)
+	float shadeRatio = -1.0f;        // mean shaded / mean screen brightness where hits are also on screen (-1 = no sample)
+	std::uint32_t shadeRatioGroups = 0;
 	bool inLoadingPump = false;  // (48f) TransitionFrame called from the loading pump (the loading screen owns the D3D11 context)
 	winrt::com_ptr<ID3D11Texture2D> aoPrevDepth;
 	winrt::com_ptr<ID3D11ShaderResourceView> aoPrevDepthSRV;

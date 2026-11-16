@@ -1010,7 +1010,8 @@ struct ScreenSpaceRayTracing : Feature
         /// @brief Cubemap position check: tolerance = RTMatchMin + RTMatchRelative x the hit's camera distance (units).
         float RTMatchRelative = 0.0f;
         float RTMatchMin = 0.0f;
-        float RTPad0 = 0.0f;
+        /// @brief (48g) "Off-screen Hit Brightness": scale of the material colour of off-screen hits (kGapFillMaterial).
+        float RTShadeScale = 0.0f;
         // --- row 6 ---
         /// @brief xyz: this frame's eye minus the eye of the last plain cubemap capture (units); w 1 = that capture is known.
         float RTCaptureOffset[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
