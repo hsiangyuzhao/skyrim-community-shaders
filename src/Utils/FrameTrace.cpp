@@ -142,6 +142,10 @@ namespace Util::FrameTrace
 		std::array<std::atomic<uint64_t>, kVramOwners> g_vramFreed{};
 		// {6E3D0F2A-91B4-4C7D-8E25-3A9F1C64B70D}: our private-data slot on tagged resources.
 		constexpr GUID kVramTagGuid = { 0x6e3d0f2a, 0x91b4, 0x4c7d, { 0x8e, 0x25, 0x3a, 0x9f, 0x1c, 0x64, 0xb7, 0x0d } };
+		// (48g) Our targets created off the main thread, waiting for their eviction priority (set on the main thread).
+		std::mutex g_priorityMutex;
+		std::vector<winrt::com_ptr<IDXGIResource>> g_priorityPending;
+		std::atomic<uint64_t> g_priorityDeferred{ 0 };
 
 		/// Bytes alive per feature of ours (entries never go away: a deque keeps their addresses).
 		struct FeatureVram
@@ -2441,6 +2445,7 @@ namespace Util::FrameTrace
 
 	void OnPresentEnd(int64_t a_presentStart, uint64_t a_gpuFrameIndex)
 	{
+		DrainEvictionPriorities();  // (48g)
 		const int64_t now = Now();
 		const bool wasActive = g_active;
 		// (47p) Our periodic jobs of this frame, by GPU frame index (the spike watch looks them up when the GPU sample arrives).
@@ -3033,11 +3038,42 @@ namespace Util::FrameTrace
 		}
 		TagObject(a_resource, owner, a_bytes, feature);
 		// (46p) Keep Our GPU Memory Resident (always, 47m): our render targets / UAVs (histories, interop, work textures) are evicted last.
+		// (48g) Only on the main (render) thread: a resource created on another thread is held and gets its priority at the next main-thread
+		// present (DrainEvictionPriorities), so no DXGI residency call ever runs beside the render thread's D3D11 work.
 		if (a_target && a_resource && (owner == VramOwner::D3D11Ours || owner == VramOwner::D3D11Shared)) {
 			winrt::com_ptr<IDXGIResource> dxgi;
-			if (SUCCEEDED(a_resource->QueryInterface(IID_PPV_ARGS(dxgi.put()))))
-				dxgi->SetEvictionPriority(DXGI_RESOURCE_PRIORITY_HIGH);
+			if (SUCCEEDED(a_resource->QueryInterface(IID_PPV_ARGS(dxgi.put())))) {
+				if (EngineTiming::IsMainThread()) {
+					dxgi->SetEvictionPriority(DXGI_RESOURCE_PRIORITY_HIGH);
+				} else {
+					std::scoped_lock lock(g_priorityMutex);
+					g_priorityPending.push_back(std::move(dxgi));
+				}
+			}
 		}
+	}
+
+	void DrainEvictionPriorities()
+	{
+		// (48g) Main thread only; the held references are released here too (on the main thread).
+		if (!EngineTiming::IsMainThread())
+			return;
+		std::vector<winrt::com_ptr<IDXGIResource>> pending;
+		{
+			std::scoped_lock lock(g_priorityMutex);
+			if (g_priorityPending.empty())
+				return;
+			pending.swap(g_priorityPending);
+		}
+		for (auto& dxgi : pending)
+			if (dxgi)
+				dxgi->SetEvictionPriority(DXGI_RESOURCE_PRIORITY_HIGH);
+		g_priorityDeferred.fetch_add(static_cast<uint64_t>(pending.size()), std::memory_order_relaxed);
+	}
+
+	uint64_t DeferredEvictionPriorities()
+	{
+		return g_priorityDeferred.load(std::memory_order_relaxed);
 	}
 
 	// ---- (46p) coarse GPU time per engine segment ----

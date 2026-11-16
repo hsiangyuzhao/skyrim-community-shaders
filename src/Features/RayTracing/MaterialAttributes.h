@@ -15,6 +15,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
+#include <map>
 #include <utility>
 #include <vector>
 
@@ -169,4 +171,97 @@ namespace RayTracingRT
 			}
 		}
 	}
+	/// (48g) The attribute buffer's ranges (in uint4 elements): best fit over a coalescing free list, growable at the end. Pure (the offline
+	/// sanity check runs synthetic churn through it). 48f used first fit, which at 80-90 % occupancy leaves the large holes cut up by small
+	/// objects, so a whole static chunk (up to 131072 triangles = 2 MB) found no single range although several MB were free in pieces.
+	class AttrRangeAllocator
+	{
+	public:
+		void Reset(std::uint32_t a_capacity)
+		{
+			free_.clear();
+			capacity_ = a_capacity;
+			used_ = 0;
+			if (a_capacity)
+				free_.emplace(0u, a_capacity);
+		}
+		/// Adds [capacity, a_capacity) as free (merged with a free range ending at the old end).
+		void Grow(std::uint32_t a_capacity)
+		{
+			if (a_capacity <= capacity_)
+				return;
+			Insert(capacity_, a_capacity - capacity_);
+			capacity_ = a_capacity;
+		}
+		/// The smallest free range that fits (lowest offset among equals); false = no single range is large enough.
+		bool Allocate(std::uint32_t a_count, std::uint32_t& o_offset)
+		{
+			if (a_count == 0)
+				return false;
+			auto best = free_.end();
+			for (auto it = free_.begin(); it != free_.end(); ++it) {
+				if (it->second < a_count)
+					continue;
+				if (best == free_.end() || it->second < best->second)
+					best = it;
+				if (best->second == a_count)
+					break;
+			}
+			if (best == free_.end())
+				return false;
+			o_offset = best->first;
+			const std::uint32_t rest = best->second - a_count;
+			free_.erase(best);
+			if (rest)
+				free_.emplace(o_offset + a_count, rest);
+			used_ += a_count;
+			return true;
+		}
+		void Free(std::uint32_t a_offset, std::uint32_t a_count)
+		{
+			if (a_count == 0 || a_offset >= capacity_)
+				return;
+			used_ -= std::min<std::uint64_t>(used_, a_count);
+			Insert(a_offset, a_count);
+		}
+		[[nodiscard]] std::uint32_t Capacity() const { return capacity_; }
+		[[nodiscard]] std::uint64_t Used() const { return used_; }
+		[[nodiscard]] std::uint32_t LargestFree() const
+		{
+			std::uint32_t largest = 0;
+			for (const auto& [offset, count] : free_)
+				largest = std::max(largest, count);
+			return largest;
+		}
+		[[nodiscard]] std::uint64_t FreeTotal() const
+		{
+			std::uint64_t total = 0;
+			for (const auto& [offset, count] : free_)
+				total += count;
+			return total;
+		}
+		[[nodiscard]] std::size_t FreeRanges() const { return free_.size(); }
+
+	private:
+		void Insert(std::uint32_t a_offset, std::uint32_t a_count)
+		{
+			auto [it, inserted] = free_.emplace(a_offset, a_count);
+			if (!inserted)
+				return;
+			if (auto next = std::next(it); next != free_.end() && it->first + it->second == next->first) {
+				it->second += next->second;
+				free_.erase(next);
+			}
+			if (it != free_.begin()) {
+				auto previous = std::prev(it);
+				if (previous->first + previous->second == it->first) {
+					previous->second += it->second;
+					free_.erase(it);
+				}
+			}
+		}
+		std::map<std::uint32_t, std::uint32_t> free_;  // offset -> count
+		std::uint32_t capacity_ = 0;
+		std::uint64_t used_ = 0;
+	};
 }

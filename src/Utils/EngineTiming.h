@@ -76,6 +76,8 @@ namespace Util::EngineTiming
 	// ---- frame structure (Hooks.cpp) ----
 	/// Top of the Main_Update hook, after the Reflex sleep. a_frameToken: Streamline frame timing started this frame.
 	void OnUpdateBegin(bool a_frameToken);
+	/// (48g) True on the thread that runs Main::Update (the render thread in SE); false before the first update.
+	bool IsMainThread();
 	/// Bottom of the Main_Update hook.
 	void OnUpdateEnd();
 

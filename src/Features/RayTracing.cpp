@@ -1109,6 +1109,8 @@ void RayTracing::UpdateAlphaCasters()
 	settings.ReflectionsMode = std::clamp(settings.ReflectionsMode, 0, 2);
 	if (backend.IsReady())
 		backend.SetMaterialsEnabled(MaterialsWanted());
+	if (backend.IsReady() && backend.MaterialsEnabled())
+		backend.PrepareMaterialResources(globals::state->frameCount);  // (48g) attribute buffer + first page at enable time, render thread
 	scene.Configure(SceneConfigFromSettings());  // a change re-captures the scene
 	const bool alphaInUse = scene.AlphaWanted() || (settings.Characters && backend.SkinAlphaAvailable());
 	if (!alphaInUse && backend.IsReady() && backend.AlphaIdle())
@@ -5785,7 +5787,7 @@ void RayTracing::RunMaterialCopies(bool a_transition)
 	}
 	const std::uint32_t copies = a_transition ? kMaterialCopiesTransition : kMaterialCopiesPerFrame;
 	const float cpuMs = a_transition ? kMaterialCopyCpuMsTransition : kMaterialCopyCpuMs;
-	backend.UpdateMaterials(materialCopyCS.get(), copies, cpuMs, globals::state->frameCount);
+	backend.UpdateMaterials(materialCopyCS.get(), copies, cpuMs, globals::state->frameCount, a_transition);
 }
 
 bool RayTracing::GapFillConsumer()

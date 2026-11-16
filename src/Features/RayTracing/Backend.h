@@ -462,6 +462,13 @@ namespace RayTracingRT
 		std::uint64_t copiesTotal = 0;
 		float copyCpuMs = 0.0f;               // render-thread ms of the last UpdateMaterials
 		std::uint64_t instanceTableBytes = 0; // the per-context instance tables (upload heaps)
+		// (48g)
+		std::uint32_t attrGrowths = 0;          // attribute buffer growths (64 -> 96 -> 128 MB) since the switch-on
+		std::uint64_t attrRefusedFragmented = 0;  // refusals with enough free memory in total (no single range large enough)
+		std::uint64_t attrLastRefusedBytes = 0;   // the last refused range
+		std::uint64_t attrLargestFreeBytes = 0;   // the largest free range at that refusal
+		float pageCreateMs = 0.0f;              // render-thread ms of the last texture-copy page creation
+		std::uint32_t pagesMadeInPlay = 0;      // pages made while playing (not at enable / in a transition)
 	};
 	/// (48f) Texture-copy pages: a Texture2DArray of kMaterialPageLayers layers of kMaterialTextureSize^2 RGBA8 with every mip; at most
 	/// kMaterialMaxPages (ReflectDebugCS / 48g's shading bind them as t4 .. t9).
@@ -987,7 +994,9 @@ namespace RayTracingRT
 		// (48f) RT reflections, Capture Materials (BackendMaterial.cpp). Nothing of it exists while it is not enabled.
 		/// On: attribute BLASes keep their attributes, materials can be registered. Off: nothing new is registered; the attribute buffer, the
 		/// texture pages and the table go once nothing uses them any more (MaterialHousekeeping).
-		void SetMaterialsEnabled(bool a_on) { materialsEnabled_ = a_on; }
+		void SetMaterialsEnabled(bool a_on);
+		/// (48g) At enable time, on the render thread: the attribute buffer and the first texture-copy page (no-op once they exist).
+		void PrepareMaterialResources(std::uint32_t a_frame);
 		[[nodiscard]] bool MaterialsEnabled() const { return materialsEnabled_; }
 		/// The RT_MATERIAL variants of the reflection shader exist.
 		[[nodiscard]] bool MaterialTraceAvailable() const { return ReflectAvailable() && reflectMatPipeline_ != nullptr; }
@@ -1002,7 +1011,7 @@ namespace RayTracingRT
 		/// D3D11, render thread, never while the loading screen is presented: takes finished pages (created on a worker thread), starts the
 		/// next page when layers run out (up to kMaterialMaxPages), makes up to a_maxCopies pending texture copies with a_shader
 		/// (MaterialCopyCS) within a_cpuMs, uploads the table when it changed. a_frame: the frame counter (id recycling).
-		void UpdateMaterials(ID3D11ComputeShader* a_shader, std::uint32_t a_maxCopies, float a_cpuMs, std::uint32_t a_frame);
+		void UpdateMaterials(ID3D11ComputeShader* a_shader, std::uint32_t a_maxCopies, float a_cpuMs, std::uint32_t a_frame, bool a_transition);
 		/// Every frame (also while Ray Tracing waits / is off): recycles retired ids and, when not enabled and nothing is used, releases the
 		/// attribute buffer, pages and table.
 		void MaterialHousekeeping(std::uint32_t a_frame);
@@ -1321,7 +1330,20 @@ namespace RayTracingRT
 		static constexpr std::uint32_t kMaterialMaxIds = 0xFFF0;    // ids >= this are markers (TraceReflectCS kMatNone ..)
 		bool materialsEnabled_ = false;
 		ComPtr<ID3D12Resource> attr_;
-		std::map<std::uint32_t, std::uint32_t> attrFree_;  // offset -> count (uint4 elements)
+		AttrRangeAllocator attrAlloc_;                     // (48g) best fit, growable (MaterialAttributes.h)
+		std::uint64_t attrBytes_ = 0;                      // (48g) current capacity
+		ComPtr<ID3D12Resource> attrNext_;                  // (48g) the grown buffer, taking over at the next BuildQueued
+		std::uint64_t attrCopyBytes_ = 0;                  // (48g) bytes of the old buffer to copy into attrNext_
+		bool attrGrowFailed_ = false;
+		std::uint32_t attrRefusedSinceGrow_ = 0;
+		std::int64_t materialsEnabledQpc_ = 0;
+		static constexpr std::uint64_t kAttrGrowStep = 32ull << 20;
+		static constexpr std::uint64_t kAttrMaxBytes = 128ull << 20;
+		static constexpr double kAttrEnableWindowMs = 15000.0;  // growth allowed this long after the switch-on (its re-capture)
+		bool AttrGrowthAllowed() const;
+		bool GrowAttributes(const char* a_why);
+		void RecordAttributeGrowth(ID3D12GraphicsCommandList4* a_list);
+		void LogDeviceRemovedReasons(const char* a_where, HRESULT a_hr);
 		std::vector<DeferredFree> retiredAttr_;
 		std::uint64_t attrUsed_ = 0;                       // uint4 elements
 		bool attrFailed_ = false;                          // could not be created: no attributes until switched off and on
@@ -1384,11 +1406,6 @@ namespace RayTracingRT
 			ComPtr<ID3D11ShaderResourceView> srv;
 			std::array<ComPtr<ID3D11UnorderedAccessView>, kMaterialTextureMips> uavs;
 		};
-		struct MatPageJob
-		{
-			std::atomic<int> state{ 0 };  // 0 creating, 1 done, 2 failed
-			MatPage page;
-		};
 		std::vector<MatTexture> matTextures_;
 		std::vector<std::uint32_t> freeMatTextures_;
 		std::unordered_map<ID3D11Texture2D*, std::uint32_t> matTextureIndex_;
@@ -1400,7 +1417,7 @@ namespace RayTracingRT
 		std::vector<MatPage> matPages_;
 		std::vector<std::uint32_t> freeMatLayers_;
 		std::uint32_t nextMatLayer_ = 0;
-		std::shared_ptr<MatPageJob> matPageJob_;
+
 		bool matPageFailed_ = false;
 		ComPtr<ID3D11Buffer> matTable_;
 		ComPtr<ID3D11ShaderResourceView> matTableSrv_;
@@ -1414,7 +1431,7 @@ namespace RayTracingRT
 		void ReleaseMatTexture(std::uint32_t a_texture);
 		std::uint16_t AllocateMaterial();
 		void RecycleMaterials(std::uint32_t a_frame, bool a_all);
-		void StartMaterialPage();
+		bool CreateMaterialPage(const char* a_when);
 		void UploadMaterialTable();
 		void UpdateMaterialStats();
 		void ReleaseMaterialResources();

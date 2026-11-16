@@ -8,8 +8,8 @@
 // D3D11: a material = a game texture (+ texcoord transform), or a terrain quadrant's six layer textures (+ its average vertex colour). Every
 // distinct game texture gets one 128x128 RGBA8 copy with all mips in a layer of a texture-copy page (Texture2DArray of 256 layers), made by
 // MaterialCopyCS within a per-frame budget (more in the black screen / warm-up after a loading screen; never while the loading screen itself
-// is presented: it owns the immediate context from another thread). Pages are created on a worker thread (the D3D11 device is free-threaded)
-// when the layers run out: never a creation on the render thread, never per frame. The material table (StructuredBuffer, 48 bytes per id) is
+// is presented: it owns the immediate context from another thread). (48g) Pages are created synchronously on the render thread (the first at
+// enable time, the next ones when layers run out, preferably in the black screen / fade-in; never on a worker thread). The material table is
 // rewritten when something changed. Ids are recycled only kMaterialRetireFrames after their last user went (a frame's hit record may name it).
 //
 // Nothing of this exists while RT Reflections is Off or Capture Materials is off; what was made goes once nothing uses it.
@@ -69,15 +69,53 @@ namespace RayTracingRT
 			attrFailed_ = true;
 			logger::warn("[RayTracing] Reflection materials: could not create the {} MB attribute buffer; shapes are captured without attributes",
 				kAttrBytes >> 20);
+			LogDeviceRemovedReasons("attribute buffer creation", E_OUTOFMEMORY);
 			return false;
 		}
 		attr_->SetName(L"CS RayTracing reflection attributes");
-		attrFree_.clear();
-		attrFree_[0] = static_cast<std::uint32_t>(kAttrBytes / 16);
+		attrBytes_ = kAttrBytes;
+		attrAlloc_.Reset(static_cast<std::uint32_t>(kAttrBytes / 16));
 		attrUsed_ = 0;
 		matStats_.attrBytes = kAttrBytes;
 		matStats_.attrBytesUsed = 0;
-		logger::info("[RayTracing] Reflection materials: attribute buffer {} MB", kAttrBytes >> 20);
+		logger::info("[RayTracing] Reflection materials: attribute buffer {} MB (frame {})", kAttrBytes >> 20, matFrame_);
+		return true;
+	}
+
+	bool Backend::AttrGrowthAllowed() const
+	{
+		// (48g) Never mid-play: behind a loading screen / in the black screen and fade-in (transition_), or in the first seconds after Capture
+		// Materials was switched on (its own re-capture runs then).
+		if (!attr_ || attrNext_ || attrBytes_ >= kAttrMaxBytes || attrGrowFailed_)
+			return false;
+		return transition_ || MatQpcToMs(MatQpc() - materialsEnabledQpc_) < kAttrEnableWindowMs;
+	}
+
+	bool Backend::GrowAttributes(const char* a_why)
+	{
+		// (48g) A bigger buffer (64 -> 96 -> 128 MB). The ranges keep their offsets: the old content is copied into it at the start of the next
+		// BuildQueued (before any attribute upload of that batch), then the old buffer is retired behind the fence. The new range at the end is
+		// free right away (its uploads all happen after that copy).
+		const std::uint64_t bytes = std::min<std::uint64_t>(attrBytes_ + kAttrGrowStep, kAttrMaxBytes);
+		const std::int64_t start = MatQpc();
+		auto next = CreateBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, false);
+		if (!next) {
+			attrGrowFailed_ = true;
+			logger::warn("[RayTracing] Reflection materials: could not grow the attribute buffer to {} MB; it stays at {} MB", bytes >> 20, attrBytes_ >> 20);
+			LogDeviceRemovedReasons("attribute buffer growth", E_OUTOFMEMORY);
+			return false;
+		}
+		next->SetName(L"CS RayTracing reflection attributes");
+		attrNext_ = std::move(next);
+		attrCopyBytes_ = attrBytes_;
+		attrBytes_ = bytes;
+		attrAlloc_.Grow(static_cast<std::uint32_t>(bytes / 16));
+		matStats_.attrBytes = bytes;
+		++matStats_.attrGrowths;
+		logger::info("[RayTracing] Reflection materials: attribute buffer grown to {} MB ({}; {:.1f} of {} MB were in use, {} free ranges, largest {:.1f} MB; "
+					 "created in {:.2f} ms, frame {})",
+			bytes >> 20, a_why, static_cast<double>(attrUsed_ * 16) / (1024.0 * 1024.0), attrCopyBytes_ >> 20, attrAlloc_.FreeRanges(),
+			static_cast<double>(attrAlloc_.LargestFree()) * 16.0 / (1024.0 * 1024.0), MatQpcToMs(MatQpc() - start), matFrame_);
 		return true;
 	}
 
@@ -85,20 +123,31 @@ namespace RayTracingRT
 	{
 		if (a_count == 0 || !EnsureAttributes())
 			return false;
-		// First fit (the ranges are whole BLASes: few, large, freed whole).
-		for (auto it = attrFree_.begin(); it != attrFree_.end(); ++it) {
-			if (it->second < a_count)
-				continue;
-			o_offset = it->first;
-			const std::uint32_t rest = it->second - a_count;
-			attrFree_.erase(it);
-			if (rest)
-				attrFree_.emplace(o_offset + a_count, rest);
+		// (48g) Best fit (AttrRangeAllocator); growth in big steps only behind loading / right after the switch-on.
+		if (attrAlloc_.Allocate(a_count, o_offset)) {
+			attrUsed_ += a_count;
+			matStats_.attrBytesUsed = attrUsed_ * 16;
+			if (attrUsed_ * 16 > attrBytes_ * 3 / 4 && AttrGrowthAllowed())
+				GrowAttributes("over 75 % in use");
+			return true;
+		}
+		if (AttrGrowthAllowed() && GrowAttributes("a range did not fit") && attrAlloc_.Allocate(a_count, o_offset)) {
 			attrUsed_ += a_count;
 			matStats_.attrBytesUsed = attrUsed_ * 16;
 			return true;
 		}
 		++matStats_.attrFull;
+		++attrRefusedSinceGrow_;
+		const std::uint64_t freeElements = attrAlloc_.FreeTotal();
+		matStats_.attrLastRefusedBytes = static_cast<std::uint64_t>(a_count) * 16;
+		matStats_.attrLargestFreeBytes = static_cast<std::uint64_t>(attrAlloc_.LargestFree()) * 16;
+		matStats_.attrRefusedFragmented += freeElements >= a_count ? 1u : 0u;
+		if (matStats_.attrFull <= 5 || (matStats_.attrFull % 100) == 0)
+			logger::info("[RayTracing] Reflection materials: {} triangles ({:.2f} MB) got no attribute range ({}): {:.1f} of {} MB in use, {} retired ranges "
+						 "waiting for the GPU, {} free ranges, largest {:.2f} MB (refusals so far {}; the buffer grows only behind a loading screen)",
+				a_count, static_cast<double>(a_count) * 16.0 / (1024.0 * 1024.0), freeElements >= a_count ? "free memory in pieces" : "buffer full",
+				static_cast<double>(attrUsed_ * 16) / (1024.0 * 1024.0), attrBytes_ >> 20, retiredAttr_.size(), attrAlloc_.FreeRanges(),
+				static_cast<double>(matStats_.attrLargestFreeBytes) / (1024.0 * 1024.0), static_cast<unsigned long long>(matStats_.attrFull));
 		return false;
 	}
 
@@ -114,25 +163,16 @@ namespace RayTracingRT
 			if (a_entry.fence > a_completed)
 				return false;
 			attrUsed_ -= std::min<std::uint64_t>(attrUsed_, a_entry.count);
-			if (attr_) {
-				auto [it, inserted] = attrFree_.emplace(a_entry.value, a_entry.count);
-				if (inserted) {
-					if (auto next = std::next(it); next != attrFree_.end() && it->first + it->second == next->first) {
-						it->second += next->second;
-						attrFree_.erase(next);
-					}
-					if (it != attrFree_.begin()) {
-						auto previous = std::prev(it);
-						if (previous->first + previous->second == it->first) {
-							previous->second += it->second;
-							attrFree_.erase(it);
-						}
-					}
-				}
-			}
+			if (attr_)
+				attrAlloc_.Free(static_cast<std::uint32_t>(a_entry.value), a_entry.count);
 			return true;
 		});
 		matStats_.attrBytesUsed = attrUsed_ * 16;
+		// (48g) Behind a loading screen: grow ahead when the last play period refused ranges or the buffer is over 75 % in use.
+		if (transition_ && materialsEnabled_ && (attrRefusedSinceGrow_ > 0 || attrUsed_ * 16 > attrBytes_ * 3 / 4) && AttrGrowthAllowed()) {
+			if (GrowAttributes(attrRefusedSinceGrow_ > 0 ? "refusals while playing" : "over 75 % in use"))
+				attrRefusedSinceGrow_ = 0;
+		}
 	}
 
 	bool Backend::EnsureInstanceAttrBuffer(CommandContext& a_context, std::uint32_t a_instances)
@@ -178,6 +218,7 @@ namespace RayTracingRT
 			reflectSurf0_ = {};
 			reflectSurf1_ = {};
 			logger::warn("[RayTracing] Reflection materials: could not create the surface record textures; the rays run without materials");
+			LogDeviceRemovedReasons("surface record creation", E_FAIL);
 			return false;
 		}
 		reflectSurfBytes_ = static_cast<std::uint64_t>(a_width) * a_height * 8;
@@ -380,46 +421,97 @@ namespace RayTracingRT
 		});
 	}
 
-	void Backend::StartMaterialPage()
+	bool Backend::CreateMaterialPage(const char* a_when)
 	{
-		if (matPageJob_ || matPageFailed_ || matPages_.size() >= kMaterialMaxPages || !device11_)
+		// (48g) Synchronous, on the render thread (48f made pages on a detached worker thread: the suspected cause of the 2026-11-17 driver
+		// crash). Every D3D11 object of the material path is created and finally released on the render thread now.
+		if (matPageFailed_ || matPages_.size() >= kMaterialMaxPages || !device11_)
+			return false;
+		const auto index = static_cast<std::uint32_t>(matPages_.size()) + 1;
+		const std::uint32_t frame = matFrame_;
+		logger::info("[RayTracing] Reflection materials: texture-copy page {} creation started (frame {}, {})", index, frame, a_when);
+		const std::int64_t start = MatQpc();
+		D3D11_TEXTURE2D_DESC desc{};
+		desc.Width = desc.Height = kMaterialTextureSize;
+		desc.MipLevels = kMaterialTextureMips;
+		desc.ArraySize = kMaterialPageLayers;
+		desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		desc.SampleDesc.Count = 1;
+		desc.Usage = D3D11_USAGE_DEFAULT;
+		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+		MatPage page;
+		HRESULT hr = device11_->CreateTexture2D(&desc, nullptr, &page.texture);
+		const char* step = "texture";
+		if (SUCCEEDED(hr)) {
+			Util::SetResourceName(page.texture.Get(), "RayTracing MaterialCopies");
+			D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+			srvDesc.Format = desc.Format;
+			srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+			srvDesc.Texture2DArray.MipLevels = kMaterialTextureMips;
+			srvDesc.Texture2DArray.ArraySize = kMaterialPageLayers;
+			hr = device11_->CreateShaderResourceView(page.texture.Get(), &srvDesc, &page.srv);
+			step = "view";
+		}
+		for (std::uint32_t mip = 0; SUCCEEDED(hr) && mip < kMaterialTextureMips; ++mip) {
+			D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+			uavDesc.Format = desc.Format;
+			uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2DARRAY;
+			uavDesc.Texture2DArray.MipSlice = mip;
+			uavDesc.Texture2DArray.ArraySize = kMaterialPageLayers;
+			hr = device11_->CreateUnorderedAccessView(page.texture.Get(), &uavDesc, &page.uavs[mip]);
+			step = "mip view";
+		}
+		const double ms = MatQpcToMs(MatQpc() - start);
+		if (FAILED(hr)) {
+			matPageFailed_ = true;
+			logger::warn("[RayTracing] Reflection materials: texture-copy page {} could not be created ({} failed, 0x{:08X}, {:.2f} ms); textures past "
+						 "the last page stay uncopied",
+				index, step, static_cast<std::uint32_t>(hr), ms);
+			LogDeviceRemovedReasons("material page creation", hr);
+			return false;  // page released here, on the render thread
+		}
+		const auto base = static_cast<std::uint32_t>(matPages_.size()) * kMaterialPageLayers;
+		matPages_.push_back(std::move(page));
+		for (std::uint32_t i = kMaterialPageLayers; i-- > 0;)
+			freeMatLayers_.push_back(base + i);
+		matStats_.pageCreateMs = static_cast<float>(ms);
+		if (!transition_ && index > 1)
+			++matStats_.pagesMadeInPlay;
+		logger::info("[RayTracing] Reflection materials: texture-copy page {} created in {:.2f} ms (frame {}, {} layers of {}x{} RGBA8, {:.1f} MB)", index,
+			ms, frame, kMaterialPageLayers, kMaterialTextureSize, kMaterialTextureSize, static_cast<double>(PageBytes()) / (1024.0 * 1024.0));
+		return true;
+	}
+
+	void Backend::PrepareMaterialResources(std::uint32_t a_frame)
+	{
+		// (48g) At enable time (the frame Capture Materials turns on, also behind a loading screen), on the render thread: the attribute buffer
+		// and the first texture-copy page together (the surface record follows in the same frame's PrepareReflections). Nothing when they exist.
+		if (!materialsEnabled_ || !ready_ || failed_)
 			return;
-		auto job = std::make_shared<MatPageJob>();
-		matPageJob_ = job;
-		ComPtr<ID3D11Device> device = device11_;
-		std::thread([job, device]() {
-			// Below normal: a page is 22 MB of D3D11 texture plus its views; the device is free-threaded (as the shader cache's compile workers).
-			SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-			D3D11_TEXTURE2D_DESC desc{};
-			desc.Width = desc.Height = kMaterialTextureSize;
-			desc.MipLevels = kMaterialTextureMips;
-			desc.ArraySize = kMaterialPageLayers;
-			desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-			desc.SampleDesc.Count = 1;
-			desc.Usage = D3D11_USAGE_DEFAULT;
-			desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-			bool ok = SUCCEEDED(device->CreateTexture2D(&desc, nullptr, &job->page.texture));
-			if (ok) {
-				Util::SetResourceName(job->page.texture.Get(), "RayTracing MaterialCopies");
-				D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-				srvDesc.Format = desc.Format;
-				srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
-				srvDesc.Texture2DArray.MipLevels = kMaterialTextureMips;
-				srvDesc.Texture2DArray.ArraySize = kMaterialPageLayers;
-				ok = SUCCEEDED(device->CreateShaderResourceView(job->page.texture.Get(), &srvDesc, &job->page.srv));
-			}
-			for (std::uint32_t mip = 0; ok && mip < kMaterialTextureMips; ++mip) {
-				D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
-				uavDesc.Format = desc.Format;
-				uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2DARRAY;
-				uavDesc.Texture2DArray.MipSlice = mip;
-				uavDesc.Texture2DArray.ArraySize = kMaterialPageLayers;
-				ok = SUCCEEDED(device->CreateUnorderedAccessView(job->page.texture.Get(), &uavDesc, &job->page.uavs[mip]));
-			}
-			if (!ok)
-				job->page = {};
-			job->state.store(ok ? 1 : 2, std::memory_order_release);
-		}).detach();
+		matFrame_ = a_frame;
+		EnsureAttributes();
+		if (matPages_.empty() && !matPageFailed_)
+			CreateMaterialPage("enable time");
+	}
+
+	void Backend::SetMaterialsEnabled(bool a_on)
+	{
+		if (a_on && !materialsEnabled_) {
+			materialsEnabledQpc_ = MatQpc();
+			matStats_.attrFull = 0;  // (48g) the panel line counts since this switch-on
+			matStats_.attrRefusedFragmented = 0;
+			attrRefusedSinceGrow_ = 0;
+		}
+		materialsEnabled_ = a_on;
+	}
+
+	void Backend::LogDeviceRemovedReasons(const char* a_where, HRESULT a_hr)
+	{
+		// (48g) Diagnostics: after any D3D11 / D3D12 failure in the material path, both devices' removed reasons (S_OK = not removed).
+		const HRESULT reason11 = device11_ ? device11_->GetDeviceRemovedReason() : E_POINTER;
+		const HRESULT reason12 = device_ ? device_->GetDeviceRemovedReason() : E_POINTER;
+		logger::warn("[RayTracing] {} failed with 0x{:08X}; device removed reason: D3D11 0x{:08X}, D3D12 0x{:08X}", a_where, static_cast<std::uint32_t>(a_hr),
+			static_cast<std::uint32_t>(reason11), static_cast<std::uint32_t>(reason12));
 	}
 
 	void Backend::UploadMaterialTable()
@@ -442,24 +534,29 @@ namespace RayTracingRT
 			desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 			desc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
 			desc.StructureByteStride = sizeof(MaterialGpu);
-			if (FAILED(device11_->CreateBuffer(&desc, nullptr, &matTable_)))
+			if (const HRESULT hr = device11_->CreateBuffer(&desc, nullptr, &matTable_); FAILED(hr)) {
+				LogDeviceRemovedReasons("material table creation", hr);
 				return;
+			}
 			Util::SetResourceName(matTable_.Get(), "RayTracing MaterialTable");
 			D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
 			srvDesc.Format = DXGI_FORMAT_UNKNOWN;
 			srvDesc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
 			srvDesc.Buffer.FirstElement = 0;
 			srvDesc.Buffer.NumElements = capacity;
-			if (FAILED(device11_->CreateShaderResourceView(matTable_.Get(), &srvDesc, &matTableSrv_))) {
+			if (const HRESULT hr = device11_->CreateShaderResourceView(matTable_.Get(), &srvDesc, &matTableSrv_); FAILED(hr)) {
 				matTable_.Reset();
+				LogDeviceRemovedReasons("material table view creation", hr);
 				return;
 			}
 			matTableCapacity_ = capacity;
 			matStats_.tableBytes = static_cast<std::uint64_t>(capacity) * sizeof(MaterialGpu);
 		}
 		D3D11_MAPPED_SUBRESOURCE mapped{};
-		if (FAILED(context11_->Map(matTable_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)) || !mapped.pData)
+		if (const HRESULT hr = context11_->Map(matTable_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped); FAILED(hr) || !mapped.pData) {
+			LogDeviceRemovedReasons("material table Map", hr);
 			return;
+		}
 		auto* out = static_cast<MaterialGpu*>(mapped.pData);
 		auto layerOf = [&](std::uint32_t a_texture) -> std::uint32_t {
 			if (a_texture >= matTextures_.size() || !matTextures_[a_texture].live || !matTextures_[a_texture].ready)
@@ -512,11 +609,11 @@ namespace RayTracingRT
 			++(entry.ready ? matStats_.texturesReady : matStats_.texturesPending);
 		}
 		matStats_.pages = static_cast<std::uint32_t>(matPages_.size());
-		matStats_.pageCreating = matPageJob_ != nullptr;
+		matStats_.pageCreating = false;  // (48g) pages are made synchronously on the render thread
 		matStats_.textureBytes = PageBytes() * matPages_.size();
 	}
 
-	void Backend::UpdateMaterials(ID3D11ComputeShader* a_shader, std::uint32_t a_maxCopies, float a_cpuMs, std::uint32_t a_frame)
+	void Backend::UpdateMaterials(ID3D11ComputeShader* a_shader, std::uint32_t a_maxCopies, float a_cpuMs, std::uint32_t a_frame, bool a_transition)
 	{
 		const std::int64_t start = MatQpc();
 		matFrame_ = a_frame;
@@ -526,41 +623,32 @@ namespace RayTracingRT
 			return;
 		}
 		RecycleMaterials(a_frame, false);
-		// A page made on the worker thread joins the free layers.
-		if (matPageJob_) {
-			const int state = matPageJob_->state.load(std::memory_order_acquire);
-			if (state == 1) {
-				const auto base = static_cast<std::uint32_t>(matPages_.size()) * kMaterialPageLayers;
-				matPages_.push_back(std::move(matPageJob_->page));
-				matPageJob_.reset();
-				for (std::uint32_t i = kMaterialPageLayers; i-- > 0;)
-					freeMatLayers_.push_back(base + i);
-				logger::info("[RayTracing] Reflection materials: texture-copy page {} ready ({} layers of {}x{} RGBA8, {:.1f} MB)", matPages_.size(),
-					kMaterialPageLayers, kMaterialTextureSize, kMaterialTextureSize, static_cast<double>(PageBytes()) / (1024.0 * 1024.0));
-			} else if (state == 2) {
-				matPageJob_.reset();
-				matPageFailed_ = true;
-				logger::warn("[RayTracing] Reflection materials: a texture-copy page could not be created; textures past the last page stay uncopied");
+		// Layers for waiting textures. (48g) A new page is made right here on the render thread when they run out (at most one per frame):
+		// in the black screen / fade-in after a load also a quarter page ahead; while playing only when a texture actually waits (logged).
+		auto assignLayers = [&]() {
+			std::uint32_t waitingNow = 0;
+			for (const auto handle : matCopyQueue_) {
+				if (handle >= matTextures_.size())
+					continue;
+				auto& entry = matTextures_[handle];
+				if (!entry.live || entry.layer != UINT32_MAX)
+					continue;
+				if (!freeMatLayers_.empty()) {
+					entry.layer = freeMatLayers_.back();
+					freeMatLayers_.pop_back();
+				} else {
+					++waitingNow;
+				}
 			}
+			return waitingNow;
+		};
+		std::uint32_t waiting = assignLayers();
+		const bool ahead = a_transition && freeMatLayers_.size() < kMaterialPageLayers / 4 && !matCopyQueue_.empty();
+		if (materialsEnabled_ && !matPageFailed_ && matPages_.size() < kMaterialMaxPages && (waiting > 0 || ahead)) {
+			if (CreateMaterialPage(a_transition ? "black screen / fade-in after a load" : "needed while playing"))
+				waiting = assignLayers();
 		}
-		// Layers for waiting textures; a new page (worker thread) when they run out, ahead by a quarter page.
-		std::uint32_t waiting = 0;
-		for (const auto handle : matCopyQueue_) {
-			if (handle >= matTextures_.size())
-				continue;
-			auto& entry = matTextures_[handle];
-			if (!entry.live || entry.layer != UINT32_MAX)
-				continue;
-			if (!freeMatLayers_.empty()) {
-				entry.layer = freeMatLayers_.back();
-				freeMatLayers_.pop_back();
-			} else {
-				++waiting;
-			}
-		}
-		matStats_.texturesFull = (matPages_.size() >= kMaterialMaxPages && !matPageJob_) ? waiting : 0;  // waiting with no page to come
-		if (materialsEnabled_ && matPages_.size() < kMaterialMaxPages && (waiting > 0 || (freeMatLayers_.size() < kMaterialPageLayers / 4 && !matCopyQueue_.empty())))
-			StartMaterialPage();
+		matStats_.texturesFull = (matPages_.size() >= kMaterialMaxPages || matPageFailed_) ? waiting : 0;  // waiting with no page to come
 		// The copies (layers assigned, source still held).
 		if (a_shader && a_maxCopies > 0 && !matCopyQueue_.empty() && !matPages_.empty()) {
 			if (!matCopyCB_) {
@@ -611,8 +699,10 @@ namespace RayTracingRT
 						boundPage = page;
 					}
 					D3D11_MAPPED_SUBRESOURCE mapped{};
-					if (FAILED(context->Map(cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)) || !mapped.pData)
+					if (const HRESULT hr = context->Map(cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped); FAILED(hr) || !mapped.pData) {
+						LogDeviceRemovedReasons("material copy constants Map", hr);
 						break;
+					}
 					const float lod0 = std::log2(std::max(static_cast<float>(entry.sourceSize) / static_cast<float>(kMaterialTextureSize), 1.0f));
 					const std::uint32_t values[4] = { entry.layer % kMaterialPageLayers, std::bit_cast<std::uint32_t>(lod0),
 						std::bit_cast<std::uint32_t>(static_cast<float>(entry.sourceMips - 1)), 0 };
@@ -656,7 +746,7 @@ namespace RayTracingRT
 			bool used = false;
 			for (const auto& entry : materials_)
 				used = used || entry.live;
-			if (!used && attrUsed_ == 0 && retiredAttr_.empty() && (attr_ || !matPages_.empty() || matTable_ || matPageJob_ || !materials_.empty()))
+			if (!used && attrUsed_ == 0 && retiredAttr_.empty() && (attr_ || !matPages_.empty() || matTable_ || !materials_.empty()))
 				ReleaseMaterialResources();
 			attrFailed_ = false;  // a later switch-on tries again
 			UpdateMaterialStats();
@@ -668,7 +758,12 @@ namespace RayTracingRT
 		if (attr_)
 			Retire(attr_, 0, nullptr);
 		attr_.Reset();
-		attrFree_.clear();
+		attrNext_.Reset();  // (48g) a growth not taken over yet (never submitted: nothing reads it)
+		attrAlloc_.Reset(0);
+		attrBytes_ = 0;
+		attrCopyBytes_ = 0;
+		attrGrowFailed_ = false;
+		attrRefusedSinceGrow_ = 0;
 		retiredAttr_.clear();
 		attrUsed_ = 0;
 		matTextures_.clear();
@@ -682,7 +777,7 @@ namespace RayTracingRT
 		matPages_.clear();  // D3D11 keeps them alive while queued work uses them
 		freeMatLayers_.clear();
 		nextMatLayer_ = 0;
-		matPageJob_.reset();  // a page still being made is dropped when its thread finishes
+		// (48g) No page job any more: pages are made and released on the render thread only.
 		matPageFailed_ = false;
 		matTableSrv_.Reset();
 		matTable_.Reset();
@@ -692,11 +787,10 @@ namespace RayTracingRT
 		matCopySampler_.Reset();
 		const std::uint64_t instanceTables = matStats_.instanceTableBytes;
 		const std::uint64_t copies = matStats_.copiesTotal;
-		const std::uint64_t full = matStats_.attrFull, refused = matStats_.texturesRefused;
+		const std::uint64_t refused = matStats_.texturesRefused;
 		matStats_ = {};
 		matStats_.instanceTableBytes = instanceTables;
 		matStats_.copiesTotal = copies;
-		matStats_.attrFull = full;
 		matStats_.texturesRefused = refused;
 		logger::info("[RayTracing] Reflection materials: buffers released");
 	}

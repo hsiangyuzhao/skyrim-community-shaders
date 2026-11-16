@@ -429,6 +429,10 @@ namespace Util::FrameTrace
 	/// A D3D11 texture / buffer created through the game's device (EngineTiming's Create* hooks): owner from a_caller.
 	/// a_target: default usage, bound as render target / UAV / depth (ours get DXGI_RESOURCE_PRIORITY_HIGH: evicted last, 46p, always since 47m).
 	void OnD3D11Created(ID3D11DeviceChild* a_resource, uint64_t a_bytes, bool a_shared, bool a_staging, bool a_target, const void* a_caller);
+	/// (48g) Applies the eviction priority of our targets created off the main thread (main thread only; OnPresentEnd calls it).
+	void DrainEvictionPriorities();
+	/// (48g) How many priorities were applied late (created off the main thread), for the log / F12.
+	uint64_t DeferredEvictionPriorities();
 	/// (46p) Bytes of D3D11 resources our DLL created and that are alive (tagged), for the overlay / trace.
 	uint64_t OurD3D11LiveBytes();
 	/// (46p) Our creations on this thread are billed to feature a_name until cleared (empty). Without a scope: the pass open on

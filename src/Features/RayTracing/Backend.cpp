@@ -2739,10 +2739,29 @@ namespace RayTracingRT
 		}
 	}
 
+	void Backend::RecordAttributeGrowth(ID3D12GraphicsCommandList4* a_list)
+	{
+		// (48g) The pending bigger buffer takes over: copy the old content (every range keeps its offset), retire the old buffer.
+		if (!attrNext_ || !attr_ || !a_list)
+			return;
+		D3D12_RESOURCE_BARRIER before[2] = { Transition(attr_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
+			Transition(attrNext_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST) };
+		a_list->ResourceBarrier(2, before);
+		a_list->CopyBufferRegion(attrNext_.Get(), 0, attr_.Get(), 0, attrCopyBytes_);
+		D3D12_RESOURCE_BARRIER after[2] = { Transition(attr_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+			Transition(attrNext_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) };
+		a_list->ResourceBarrier(2, after);
+		Retire(attr_, 0, nullptr);
+		attr_ = std::move(attrNext_);
+		attrNext_.Reset();
+		attrCopyBytes_ = 0;
+	}
+
 	std::uint32_t Backend::BuildQueued(ID3D12GraphicsCommandList4* a_list, std::uint32_t a_budget, std::size_t a_maxBuilds, std::int64_t a_deadline)
 	{
 		std::uint32_t built = 0;
 		std::vector<std::uint32_t> slots;
+		RecordAttributeGrowth(a_list);  // (48g) before any attribute upload of this batch (they may use the grown range)
 		if (!buildQueue_.empty() && (asPool_.failed || uploadPool_.failed)) {
 			// Out of video memory for a new block: as when a BLAS buffer could not be created before 46g.
 			Fail(asPool_.failed ? "BLAS pool block" : "upload pool block", E_OUTOFMEMORY);

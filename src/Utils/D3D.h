@@ -6,6 +6,7 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+#include <winrt/base.h>
 
 namespace Util
 {
@@ -24,6 +25,7 @@ namespace Util
 	 * blocks: it returns the shader once the thread has finished, else nullptr (the caller keeps its old path meanwhile). Reset()
 	 * forgets the job; a compile still running finishes into its own shared state and is dropped. One info line per job (wall
 	 * time, disk cache on / off) when Poll() first sees it finished. Main thread only (the worker touches only its job).
+	 * (48g) The worker compiles bytecode only; the shader object is created (and released) on the main thread.
 	 */
 	class AsyncComputeShader
 	{
@@ -54,6 +56,8 @@ namespace Util
 	private:
 		struct Job;
 		std::shared_ptr<Job> job;
+		winrt::com_ptr<ID3D11ComputeShader> shader;  // (48g) created on the main thread from the worker's bytecode
+		bool created = false;
 		std::string key;
 		std::string label;
 		double compileMs = 0.0;

@@ -931,6 +931,11 @@ namespace Util::EngineTiming
 		logger::info("[EngineTiming] Device Create* timers installed");
 	}
 
+	bool IsMainThread()
+	{
+		return OnMainThread();
+	}
+
 	void OnUpdateBegin(bool a_frameToken)
 	{
 		g_mainThread = GetCurrentThreadId();

@@ -234,141 +234,195 @@ namespace Util
 		}
 	}
 
+	namespace
+	{
+		/// (48g) What CompileShader reads from the plugin's state, captured on the calling thread so a background compile never reads
+		/// globals::state (its define list) while the main thread may change it.
+		struct CompileEnv
+		{
+			bool vr = false;
+			bool developer = false;
+			bool diskCache = false;
+			std::vector<std::pair<std::string, std::string>> defines;
+		};
+
+		CompileEnv CaptureCompileEnv()
+		{
+			CompileEnv env;
+			env.vr = REL::Module::IsVR();
+			env.developer = globals::state->IsDeveloperMode();
+			env.diskCache = globals::shaderCache && globals::shaderCache->IsDiskCache();
+			if (const auto shaderDefines = globals::state->GetDefines(); shaderDefines && !shaderDefines->empty())
+				env.defines.assign(shaderDefines->begin(), shaderDefines->end());
+			return env;
+		}
+
+		struct Bytecode
+		{
+			winrt::com_ptr<ID3DBlob> blob;
+			std::optional<std::wstring> diskPath;  // the cache entry (read from, or to write once the shader object exists)
+			bool fromCache = false;
+		};
+
+		/// (48g) The compile half of CompileShader (macros, flags and disk-cache key exactly as before 48g): bytecode only, no D3D11 object,
+		/// so it may run on a worker thread. a_skipCache: compile from source (a cached entry was rejected by the device).
+		Bytecode CompileBytecode(const CompileEnv& env, const wchar_t* FilePath, const std::vector<std::pair<const char*, const char*>>& Defines,
+			const char* ProgramType, const char* Program, bool a_skipCache)
+		{
+			Bytecode result;
+			CustomInclude include;
+
+			// Build defines (aka convert vector->D3DCONSTANT array)
+			std::vector<D3D_SHADER_MACRO> macros;
+			std::string str = Util::WStringToString(FilePath);
+
+			for (auto& i : Defines) {
+				if (i.first && _stricmp(i.first, "") != 0) {
+					macros.push_back({ i.first, i.second });
+				} else {
+					logger::error("Failed to process shader defines for {}", str);
+				}
+			}
+
+			if (env.vr)
+				macros.push_back({ "VR", "" });
+			if (env.developer) {
+				macros.push_back({ "D3DCOMPILE_SKIP_OPTIMIZATION", "" });
+				macros.push_back({ "D3DCOMPILE_DEBUG", "" });
+			}
+			for (const auto& [name, value] : env.defines)
+				macros.push_back({ name.c_str(), value.c_str() });
+			if (!_stricmp(ProgramType, "ps_5_0"))
+				macros.push_back({ "PSHADER", "" });
+			else if (!_stricmp(ProgramType, "vs_5_0"))
+				macros.push_back({ "VSHADER", "" });
+			else if (!_stricmp(ProgramType, "hs_5_0"))
+				macros.push_back({ "HULLSHADER", "" });
+			else if (!_stricmp(ProgramType, "ds_5_0"))
+				macros.push_back({ "DOMAINSHADER", "" });
+			else if (!_stricmp(ProgramType, "cs_5_0"))
+				macros.push_back({ "COMPUTESHADER", "" });
+			else if (!_stricmp(ProgramType, "cs_4_0"))
+				macros.push_back({ "COMPUTESHADER", "" });
+			else if (!_stricmp(ProgramType, "cs_5_1"))
+				macros.push_back({ "COMPUTESHADER", "" });
+			else
+				return result;
+
+			// Add null terminating entry
+			macros.push_back({ "WINPC", "" });
+			macros.push_back({ "DX11", "" });
+			macros.push_back({ nullptr, nullptr });
+
+			// Compiler setup
+			uint32_t flags = !env.developer ? (D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3) : D3DCOMPILE_DEBUG;
+			// (44j, upstream) Disk cache on = shipped, known-good shaders: skip fxc's validation pass on its own output.
+			const bool useDiskCache = env.diskCache;
+			if (useDiskCache && !env.developer)
+				flags |= D3DCOMPILE_SKIP_VALIDATION;
+
+			// (S4.14) RAII: both blobs are com_ptr (they leaked as raw pointers before, and the error blob was read uninitialised on a
+			// clean compile). com_ptr's destructor covers every exit.
+			winrt::com_ptr<ID3DBlob> shaderBlob;
+			winrt::com_ptr<ID3DBlob> shaderErrors;
+
+			if (!std::filesystem::exists(FilePath)) {
+				logger::error("Failed to compile shader; {} does not exist", str);
+				return result;
+			}
+			if (useDiskCache && IsCacheableTarget(ProgramType))
+				result.diskPath = GetCompileShaderDiskPath(FilePath, macros.data(), &include, Program, ProgramType, flags);
+
+			if (!a_skipCache && result.diskPath && std::filesystem::exists(*result.diskPath)) {
+				if (auto cachedBlob = SIE::SShaderCache::ReadIntactBlob(*result.diskPath)) {
+					result.blob = std::move(cachedBlob);
+					result.fromCache = true;
+					return result;
+				}
+			}
+
+			logger::debug("Compiling {} with {}", str, DefinesToString(macros));
+			if (FAILED(D3DCompileFromFile(FilePath, macros.data(), &include, Program, ProgramType, flags, 0, shaderBlob.put(), shaderErrors.put()))) {
+				logger::warn("Shader compilation failed:\n\n{}", shaderErrors ? static_cast<char*>(shaderErrors->GetBufferPointer()) : "Unknown error");
+				return result;
+			}
+			// A successful compile can still have produced warnings, and can equally have produced
+			// no blob at all -- hence the test rather than an unconditional read.
+			if (shaderErrors)
+				logger::debug("Shader logs:\n{}", static_cast<char*>(shaderErrors->GetBufferPointer()));
+			// Defensive: a SUCCEEDED return with no bytecode would make every GetBufferPointer
+			// below a null dereference. Not observed, but it is one branch against a hard crash.
+			if (!shaderBlob) {
+				logger::error("Shader compilation reported success but produced no bytecode for {}", str);
+				return result;
+			}
+			result.blob = std::move(shaderBlob);
+			return result;
+		}
+
+		/// (48g) The creation half, on the calling thread (the main thread for every background compile). A cached entry the device rejects
+		/// is dropped and the shader compiled again from source (as before 48g); a fresh compile is written to the cache once its object exists.
+		HRESULT CreateFromBytecode(Bytecode& a_bytecode, const CompileEnv& env, const wchar_t* FilePath,
+			const std::vector<std::pair<const char*, const char*>>& Defines, const char* ProgramType, const char* Program, ID3D11DeviceChild** o_shader)
+		{
+			*o_shader = nullptr;
+			auto device = globals::d3d::device;
+			if (!a_bytecode.blob)
+				return E_FAIL;
+			HRESULT createResult = CreateShaderObject(device, ProgramType, a_bytecode.blob.get(), o_shader);
+			if (a_bytecode.fromCache) {
+				if (SUCCEEDED(createResult) && *o_shader) {
+					logger::debug("Loaded {} from {}", Util::WStringToString(FilePath), Util::WStringToString(*a_bytecode.diskPath));
+					return createResult;
+				}
+				if (*o_shader) {
+					(*o_shader)->Release();
+					*o_shader = nullptr;
+				}
+				// An intact container can still hold bytecode the runtime rejects; drop the entry and compile from source.
+				logger::warn("Discarding cached shader {} rejected by the device", Util::WStringToString(*a_bytecode.diskPath));
+				std::error_code ec;
+				std::filesystem::remove(*a_bytecode.diskPath, ec);
+				a_bytecode = CompileBytecode(env, FilePath, Defines, ProgramType, Program, true);
+				if (!a_bytecode.blob)
+					return E_FAIL;
+				createResult = CreateShaderObject(device, ProgramType, a_bytecode.blob.get(), o_shader);
+			}
+			if (SUCCEEDED(createResult) && *o_shader && a_bytecode.diskPath)
+				StoreCompileShaderBlob(*a_bytecode.diskPath, a_bytecode.blob.get());
+			return createResult;
+		}
+	}
+
 	ID3D11DeviceChild* CompileShader(const wchar_t* FilePath, const std::vector<std::pair<const char*, const char*>>& Defines, const char* ProgramType, const char* Program)
 	{
 		EngineTiming::CompileTimer compileTimer;  // (46n) billed to the pass that asked for it (F7 trace pass_block "s")
-		auto device = globals::d3d::device;
-
-		CustomInclude include;
-
-		// Build defines (aka convert vector->D3DCONSTANT array)
-		std::vector<D3D_SHADER_MACRO> macros;
-		std::string str = Util::WStringToString(FilePath);
-
-		for (auto& i : Defines) {
-			if (i.first && _stricmp(i.first, "") != 0) {
-				macros.push_back({ i.first, i.second });
-			} else {
-				logger::error("Failed to process shader defines for {}", str);
-			}
-		}
-
-		if (REL::Module::IsVR())
-			macros.push_back({ "VR", "" });
-		if (globals::state->IsDeveloperMode()) {
-			macros.push_back({ "D3DCOMPILE_SKIP_OPTIMIZATION", "" });
-			macros.push_back({ "D3DCOMPILE_DEBUG", "" });
-		}
-		auto shaderDefines = globals::state->GetDefines();
-		if (!shaderDefines->empty()) {
-			for (unsigned int i = 0; i < shaderDefines->size(); i++)
-				macros.push_back({ shaderDefines->at(i).first.c_str(), shaderDefines->at(i).second.c_str() });
-		}
-		if (!_stricmp(ProgramType, "ps_5_0"))
-			macros.push_back({ "PSHADER", "" });
-		else if (!_stricmp(ProgramType, "vs_5_0"))
-			macros.push_back({ "VSHADER", "" });
-		else if (!_stricmp(ProgramType, "hs_5_0"))
-			macros.push_back({ "HULLSHADER", "" });
-		else if (!_stricmp(ProgramType, "ds_5_0"))
-			macros.push_back({ "DOMAINSHADER", "" });
-		else if (!_stricmp(ProgramType, "cs_5_0"))
-			macros.push_back({ "COMPUTESHADER", "" });
-		else if (!_stricmp(ProgramType, "cs_4_0"))
-			macros.push_back({ "COMPUTESHADER", "" });
-		else if (!_stricmp(ProgramType, "cs_5_1"))
-			macros.push_back({ "COMPUTESHADER", "" });
-		else
+		const CompileEnv env = CaptureCompileEnv();
+		Bytecode bytecode = CompileBytecode(env, FilePath, Defines, ProgramType, Program, false);
+		if (!bytecode.blob)
 			return nullptr;
-
-		// Add null terminating entry
-		macros.push_back({ "WINPC", "" });
-		macros.push_back({ "DX11", "" });
-		macros.push_back({ nullptr, nullptr });
-
-		// Compiler setup
-		uint32_t flags = !globals::state->IsDeveloperMode() ? (D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3) : D3DCOMPILE_DEBUG;
-		// (44j, upstream) Disk cache on = shipped, known-good shaders: skip fxc's validation pass on its own output.
-		const bool useDiskCache = globals::shaderCache && globals::shaderCache->IsDiskCache();
-		if (useDiskCache && !globals::state->IsDeveloperMode())
-			flags |= D3DCOMPILE_SKIP_VALIDATION;
-
-		// (S4.14) RAII, and not merely as tidiness: these were raw ID3DBlob* with no Release
-		// on any path. The success path leaked the bytecode blob -- for a shader of a few
-		// kilobytes, once per compile, and ClearShaderCache recompiles every shader of every
-		// feature on a settings change that sets a recompile flag, so the leak is unbounded
-		// over a session rather than a one-off. The failure path leaked the *error* blob:
-		// `shaderErrors` was read for the log message and then abandoned, and an error blob
-		// carries the full diagnostic text, which is the largest of the two.
-		//
-		// Both were also *uninitialised* raw pointers. D3DCompileFromFile does not write
-		// ppErrorMsgs when there is nothing to report, so on a clean compile `shaderErrors`
-		// kept whatever was on the stack and `if (shaderErrors)` then dereferenced it. That
-		// it never crashed is luck about stack contents, not correctness.
-		//
-		// com_ptr's destructor covers every exit -- the two early returns, all six of the
-		// per-profile returns below, the trailing return, and a throw out of
-		// DX::ThrowIfFailed on the compute paths.
-		winrt::com_ptr<ID3DBlob> shaderBlob;
-		winrt::com_ptr<ID3DBlob> shaderErrors;
-
-		if (!std::filesystem::exists(FilePath)) {
-			logger::error("Failed to compile shader; {} does not exist", str);
-			return nullptr;
-		}
-		std::optional<std::wstring> diskPath;
-		if (useDiskCache && IsCacheableTarget(ProgramType))
-			diskPath = GetCompileShaderDiskPath(FilePath, macros.data(), &include, Program, ProgramType, flags);
-
-		if (const auto cachedBlob = diskPath && std::filesystem::exists(*diskPath) ? SIE::SShaderCache::ReadIntactBlob(*diskPath) : nullptr) {
-			ID3D11DeviceChild* shader = nullptr;
-			if (SUCCEEDED(CreateShaderObject(device, ProgramType, cachedBlob.get(), &shader)) && shader) {
-				logger::debug("Loaded {} from {}", str, Util::WStringToString(*diskPath));
-				return shader;
-			}
-			// An intact container can still hold bytecode the runtime rejects; drop the entry and compile from source.
-			logger::warn("Discarding cached shader {} rejected by the device", Util::WStringToString(*diskPath));
-			std::error_code ec;
-			std::filesystem::remove(*diskPath, ec);
-		}
-
-		logger::debug("Compiling {} with {}", str, DefinesToString(macros));
-		if (FAILED(D3DCompileFromFile(FilePath, macros.data(), &include, Program, ProgramType, flags, 0, shaderBlob.put(), shaderErrors.put()))) {
-			logger::warn("Shader compilation failed:\n\n{}", shaderErrors ? static_cast<char*>(shaderErrors->GetBufferPointer()) : "Unknown error");
-			return nullptr;
-		}
-		// A successful compile can still have produced warnings, and can equally have produced
-		// no blob at all -- hence the test rather than an unconditional read.
-		if (shaderErrors)
-			logger::debug("Shader logs:\n{}", static_cast<char*>(shaderErrors->GetBufferPointer()));
-		// Defensive: a SUCCEEDED return with no bytecode would make every GetBufferPointer
-		// below a null dereference. Not observed, but it is one branch against a hard crash.
-		if (!shaderBlob) {
-			logger::error("Shader compilation reported success but produced no bytecode for {}", str);
-			return nullptr;
-		}
 		ID3D11DeviceChild* shader = nullptr;
-		const HRESULT createResult = CreateShaderObject(device, ProgramType, shaderBlob.get(), &shader);
+		const HRESULT createResult = CreateFromBytecode(bytecode, env, FilePath, Defines, ProgramType, Program, &shader);
+		if (!bytecode.blob)
+			return nullptr;  // the cached entry was rejected and the compile from source failed
 		// Same failure policy as before 44j: compute creation failures throw, the other stages return whatever
 		// the device produced (null on failure).
 		if (IsComputeTarget(ProgramType))
 			DX::ThrowIfFailed(createResult);
-		if (SUCCEEDED(createResult) && shader && diskPath)
-			StoreCompileShaderBlob(*diskPath, shaderBlob.get());
 		return shader;
 	}
 
-	// (48e) Background compiles.
+	// (48e) Background compiles. (48g) The worker produces bytecode only (defines captured on the main thread at Request); the shader object
+	// is created and released on the main thread (GetStatus / Reset), so an orphaned job (Reset while compiling) holds only a blob, never a
+	// D3D11 object.
 	struct AsyncComputeShader::Job
 	{
-		std::atomic<int> state{ 1 };              // 1 compiling, 2 ready, 3 failed (release-stored by the worker)
-		ID3D11ComputeShader* shader = nullptr;  // written by the worker before state
+		std::atomic<int> state{ 1 };  // 1 compiling, 2 bytecode ready, 3 failed (release-stored by the worker)
+		Bytecode bytecode;            // written by the worker before state
+		CompileEnv env;               // captured on the main thread at Request
+		std::wstring path;
+		std::vector<std::pair<std::string, std::string>> defines;
 		double ms = 0.0;
-		~Job()
-		{
-			if (shader)
-				shader->Release();
-		}
 	};
 
 	void AsyncComputeShader::Request(const wchar_t* a_path, const std::vector<std::pair<std::string, std::string>>& a_defines, std::string_view a_label)
@@ -382,26 +436,29 @@ namespace Util
 		key = std::move(newKey);
 		label = a_label;
 		auto newJob = std::make_shared<Job>();
+		newJob->env = CaptureCompileEnv();
+		newJob->path = a_path;
+		newJob->defines = a_defines;
 		job = newJob;
-		logger::info("[Shaders] {}: compiling in the background (disk cache {})", label, globals::shaderCache && globals::shaderCache->IsDiskCache() ? "on" : "off");
+		logger::info("[Shaders] {}: compiling in the background (disk cache {})", label, newJob->env.diskCache ? "on" : "off");
 		try {
-			std::thread([newJob, path = std::wstring(a_path), defines = a_defines]() {
+			std::thread([newJob]() {
 				// Below normal: a cache miss compiles for seconds; the game's own threads come first.
 				SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 				const auto start = std::chrono::steady_clock::now();
-				ID3D11ComputeShader* shader = nullptr;
+				bool ok = false;
 				try {
 					std::vector<std::pair<const char*, const char*>> macros;
-					macros.reserve(defines.size());
-					for (const auto& [name, value] : defines)
+					macros.reserve(newJob->defines.size());
+					for (const auto& [name, value] : newJob->defines)
 						macros.push_back({ name.c_str(), value.c_str() });
-					shader = static_cast<ID3D11ComputeShader*>(CompileShader(path.c_str(), macros, "cs_5_0"));
+					newJob->bytecode = CompileBytecode(newJob->env, newJob->path.c_str(), macros, "cs_5_0", "main", false);
+					ok = newJob->bytecode.blob != nullptr;
 				} catch (...) {
-					shader = nullptr;  // CompileShader throws when the device rejects a compute shader
+					ok = false;
 				}
 				newJob->ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-				newJob->shader = shader;
-				newJob->state.store(shader ? 2 : 3, std::memory_order_release);
+				newJob->state.store(ok ? 2 : 3, std::memory_order_release);
 			}).detach();
 		} catch (const std::exception& e) {
 			newJob->state.store(3, std::memory_order_release);
@@ -419,22 +476,44 @@ namespace Util
 		if (!reported) {
 			reported = true;
 			compileMs = job->ms;
-			if (state == 2)
+			if (state == 2) {
+				// (48g) The shader object, here on the main thread.
+				std::vector<std::pair<const char*, const char*>> macros;
+				macros.reserve(job->defines.size());
+				for (const auto& [name, value] : job->defines)
+					macros.push_back({ name.c_str(), value.c_str() });
+				ID3D11DeviceChild* object = nullptr;
+				HRESULT hr = E_FAIL;
+				try {
+					hr = CreateFromBytecode(job->bytecode, job->env, job->path.c_str(), macros, "cs_5_0", "main", &object);
+				} catch (...) {
+					hr = E_FAIL;
+				}
+				job->bytecode.blob = nullptr;
+				if (SUCCEEDED(hr) && object)
+					shader.attach(static_cast<ID3D11ComputeShader*>(object));
+				else if (object)
+					object->Release();
+				created = shader != nullptr;
+			}
+			if (created)
 				logger::info("[Shaders] {}: ready after {:.0f} ms in the background", label, compileMs);
 			else
 				logger::warn("[Shaders] {}: did not compile ({:.0f} ms); the old path keeps running", label, compileMs);
 		}
-		return state == 2 ? Status::Ready : Status::Failed;
+		return created ? Status::Ready : Status::Failed;
 	}
 
 	ID3D11ComputeShader* AsyncComputeShader::Poll()
 	{
-		return GetStatus() == Status::Ready ? job->shader : nullptr;
+		return GetStatus() == Status::Ready ? shader.get() : nullptr;
 	}
 
 	void AsyncComputeShader::Reset()
 	{
 		job.reset();
+		shader = nullptr;
+		created = false;
 		key.clear();
 		compileMs = 0.0;
 		reported = false;
