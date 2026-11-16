@@ -62,6 +62,10 @@ public:
 	std::unique_ptr<Texture2D> envCaptureTexture;
 	std::unique_ptr<Texture2D> envCaptureRawTexture;
 	std::unique_ptr<Texture2D> envCapturePositionTexture;
+	/// (48d) The eye position (CameraPosAdjust) of the last plain (no-sky) capture: envCapturePositionTexture holds positions relative to it
+	/// (RT reflections gap fill: the off-screen hit's cubemap lookup and position check). False until a capture ran / after a reset.
+	float3 plainCaptureEye{ 0.0f, 0.0f, 0.0f };
+	bool plainCaptureValid = false;
 
 	std::unique_ptr<Texture2D> envCaptureReflectionsTexture;
 	std::unique_ptr<Texture2D> envCaptureRawReflectionsTexture;

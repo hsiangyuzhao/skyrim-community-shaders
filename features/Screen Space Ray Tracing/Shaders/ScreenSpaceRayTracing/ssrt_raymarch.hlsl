@@ -202,7 +202,38 @@ cbuffer SSRTCB : register(b1)
     // buffer does not grow.
     float DistanceCapStart;
     float DistanceCapEnd;
+#if defined(SSRT_RT_REFLECT) && defined(SSRT_SPECULAR) && defined(DYNAMIC_CUBEMAPS)
+    // --- row 5 --- (48d) RT reflections gap fill; only the SSRT_RT_REFLECT permutation declares these two rows (every other
+    // permutation keeps declaring the five-row prefix, so its code is unchanged).
+    uint RTFlags;             // kRTFill* bits
+    float RTMatchRelative;    // cubemap position check: tolerance share of the hit's camera distance
+    float RTMatchMin;         // ... plus this many units
+    float RTPad0;
+    // --- row 6 ---
+    float4 RTCaptureOffset;   // xyz: this frame's camera minus the camera of the last plain cubemap capture (units); w 1 = known
+#endif
 };
+
+// (48d) RT reflections gap fill (SSRT_RT_REFLECT, specular only, needs Dynamic Cubemaps). Where SSR finds nothing (the cubemap fallback
+// branch below), this frame's reflection ray of the pixel (Ray Tracing's TraceReflectCS: hit type / confidence / distance + direction)
+// replaces the cubemap guess by a weight w (its confidence x the direction check):
+//   miss                -> the cubemap with sky (the sky really is visible in that direction), without the skylighting occlusion guess;
+//   hit, on screen      -> the screen colour at the projected hit (its depth matches), like an SSR hit;
+//   hit, off screen     -> the dynamic cubemap in the direction of the hit point from the cubemap's capture position: its raw colour
+//                          where the cubemap's stored position matches the hit, else the cubemap without sky (no sky term);
+//   nothing in a rough ray's shortened range, not traced, w 0 -> the old path exactly.
+// The permutation is used only on frames with a valid record (RayTracing::AcquireReflectionGapFill); otherwise the plain permutation runs.
+#if defined(SSRT_RT_REFLECT) && defined(SSRT_SPECULAR) && defined(DYNAMIC_CUBEMAPS)
+#   define SSRT_RT_FILL 1
+Texture2D<uint> RTReflectHit : register(t13);           // word 0: bit 7 traced, bits 0-2 type, 3-5 confidence, 16-31 distance (f16)
+Texture2D<uint> RTReflectDir : register(t14);           // word 1: octahedral direction, 16 + 16 bits
+TextureCube<float4> RTCubemapPosition : register(t15);  // Dynamic Cubemaps: the plain capture's stored positions (x 0.001 units)
+TextureCube<float4> RTCubemapRaw : register(t16);       // ... and its raw colours
+RWTexture2D<unorm float4> RTUseDebug : register(u2);    // "RT Reflection Use" (Ray Tracing's debug colour; written only with kRTFillDebug)
+static const uint kRTFillDebug = 1u, kRTFillBeyond = 2u, kRTFillLobe = 4u, kRTFillMatch = 8u, kRTFillHitDistance = 16u;
+#else
+#   define SSRT_RT_FILL 0
+#endif
 
 // (audit #21) Never defined by ScreenSpaceRayTracing::CompileComputeShaders, so this is
 // always 0 in every shipped permutation: the engine depth buffer is not inverted (see
@@ -846,6 +877,149 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
     return isFiniteSafe(ratio) ? ratio : 1.0f;
 }
 
+#if SSRT_RT_FILL
+// (48d) The inverse of TraceReflectCS's octahedral direction word.
+float3 SSRT_RTOctDecode(uint a_packed)
+{
+    const float2 e = float2(a_packed & 0xFFFFu, a_packed >> 16) / 65535.0 * 2.0 - 1.0;
+    float3 n = float3(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
+    const float t = saturate(-n.z);
+    n.xy += float2(n.x >= 0.0 ? -t : t, n.y >= 0.0 ? -t : t);
+    return normalize(n);
+}
+
+// (48d) The cubemap colour the old fallback gives in direction a_dir (the same textures, mip 0, CubemapNormalization), linear; a_sky false
+// leaves the sky part out. Outdoors with skylighting the sky part is added whole: the ray saw the sky, so no occlusion guess.
+float3 SSRT_RTEnvColor(float3 a_dir, bool a_sky)
+{
+    const float dirAmbLum = Color::RGBToLuminance(max(0.0, mul(SharedData::DirectionalAmbient, float4(a_dir, 1.0)))) * Color::ReflectionNormalisationScale;
+    float3 color = 0.0;
+#   if defined(SKYLIGHTING)
+    const bool skylit = !SharedData::InInterior;
+#   else
+    const bool skylit = false;
+#   endif
+    [branch] if (skylit)
+    {
+        const float3 noSky = EnvTexture.SampleLevel(LinearSampler, a_dir, 0);
+        const float noSkyLum = Color::RGBToLuminance(EnvTexture.SampleLevel(LinearSampler, a_dir, 15));
+        color = lerp(noSky, noSky * SSRT_CubemapNormalizationRatio(dirAmbLum, noSkyLum), CubemapNormalization);
+        if (a_sky)
+            color += max(EnvReflectionsTexture.SampleLevel(LinearSampler, a_dir, 0) - noSky, 0);
+    }
+    else if (a_sky)
+    {
+        // As the old path without skylighting / indoors (EnvReflectionsTexture is the no-sky cubemap indoors).
+        color = EnvReflectionsTexture.SampleLevel(LinearSampler, a_dir, 0);
+        const float lum = Color::RGBToLuminance(EnvReflectionsTexture.SampleLevel(LinearSampler, a_dir, 15));
+        color = lerp(color, color * SSRT_CubemapNormalizationRatio(dirAmbLum, lum), CubemapNormalization);
+    }
+    else
+    {
+        color = EnvTexture.SampleLevel(LinearSampler, a_dir, 0);
+        const float lum = Color::RGBToLuminance(EnvTexture.SampleLevel(LinearSampler, a_dir, 15));
+        color = lerp(color, color * SSRT_CubemapNormalizationRatio(dirAmbLum, lum), CubemapNormalization);
+    }
+    return Color::IrradianceToLinear(color);
+}
+
+// (48d) The gap fill of one pixel: its weight (0 = the old path), colour (linear, as the fallback's envColor after IrradianceToLinear),
+// what it used (1 screen, 2 cubemap matched, 3 cubemap without sky, 4 sky) and the hit distance (-1 = a miss / nothing).
+float SSRT_RTFill(uint2 a_pixel, float3 a_positionWS, float3 a_normalWS, float a_roughness, uint2 a_screenSize, uint a_eye, out float3 o_color, out uint o_use,
+    out float o_hitDistance)
+{
+    o_color = 0.0;
+    o_use = 0u;
+    o_hitDistance = -1.0;
+    const uint w0 = RTReflectHit[a_pixel];
+    if ((w0 & 0x80u) == 0u)
+        return 0.0;  // not traced (not selected, sky, no reprojected surface)
+    const uint type = w0 & 7u;
+    if (type == 6u)
+        return 0.0;  // nothing within a rough ray's shortened range: unknown, the old path
+    const float3 R = SSRT_RTOctDecode(RTReflectDir[a_pixel]);
+    const float3 V = -normalize(a_positionWS);
+    // The prep's confidence in last frame's normal (0..7), and the ray above this frame's surface.
+    float weight = smoothstep(0.2, 0.7, float((w0 >> 3) & 7u) / 7.0) * smoothstep(0.0, 0.05, dot(a_normalWS, R));
+    [branch] if (RTFlags & kRTFillLobe)
+    {
+        // Does the ray fit this frame's GGX lobe (a2 = r^4, as the trace and SSR sample it)? xi = the GGX CDF at the ray's half vector
+        // (uniform over [0, 1) for samples of this lobe): only the outer tail fades (from 0.85 to 0.97). alpha >= 0.03 keeps mirrors at a
+        // few degrees of tolerance (full up to ~4 degrees of half-vector angle, none past ~10).
+        const float3 H = normalize(R + V);
+        const float c = max(saturate(dot(a_normalWS, H)), 1e-3);
+        const float t2 = (1.0 - c * c) / (c * c);
+        const float alpha = max(a_roughness * a_roughness, 0.03);
+        const float xi = t2 / (alpha * alpha + t2);
+        weight *= 1.0 - smoothstep(0.85, 0.97, xi);
+    }
+    [branch] if (weight <= 0.0)
+        return 0.0;
+    [branch] if (type == 0u)
+    {
+        o_color = SSRT_RTEnvColor(R, true);
+        o_use = 4u;
+        return weight;
+    }
+    const float distance = f16tof32(w0 >> 16);
+    const float3 hitPos = a_positionWS + R * distance;
+    o_hitDistance = distance;
+    // On screen: the projected hit, where the depth there is the hit's (else something nearer hides it on screen).
+    float screenWeight = 0.0;
+    float3 screenColor = 0.0;
+    const float4 clip = mul(FrameBuffer::CameraViewProj[a_eye], float4(hitPos, 1.0));
+    [branch] if (clip.w > 1e-4)
+    {
+        const float3 ndc = clip.xyz / clip.w;
+        const float2 uvHit = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+        [branch] if (all(uvHit > 0.0) && all(uvHit < 1.0) && ndc.z > 0.0 && ndc.z < 1.0)
+        {
+            const uint2 q = min(uint2(uvHit * float2(a_screenSize)), a_screenSize - 1u);
+            const float hitZ = SSRT_NRDViewZ(ndc.z);
+            const float tolerance = 16.0 + 0.03 * hitZ;
+            const float2 border = smoothstep(0.0, 0.02, uvHit) * smoothstep(0.0, 0.02, 1.0 - uvHit);
+            screenWeight = (1.0 - smoothstep(tolerance, 2.0 * tolerance, abs(SSRT_NRDViewZ(DepthTexture[q]) - hitZ))) * border.x * border.y;
+            [branch] if (screenWeight > 0.0)
+            {
+                // As an SSR hit (the colour source may be render-sized: see the SSR read below).
+                uint colorWidth, colorHeight;
+                ScreenColorTextureMips.GetDimensions(colorWidth, colorHeight);
+                const float2 colorScale = SharedData::BufferDim.xy / float2(max(colorWidth, 1u), max(colorHeight, 1u));
+                screenColor = ScreenColorTextureMips.SampleLevel(LinearSampler, uvHit * FrameBuffer::DynamicResolutionParams1.xy * colorScale, 0).xyz;
+                screenColor = filterInf(filterNaN(Color::IrradianceToLinear(screenColor))) * SharedData::ssrtSettings.SpecularMult;
+            }
+        }
+    }
+    float3 offColor = 0.0;
+    uint offUse = 3u;
+    [branch] if (screenWeight < 1.0)
+    {
+        // Off screen: the dynamic cubemap in the direction of the hit point from the cubemap's capture position.
+        float3 dirC = hitPos + RTCaptureOffset.xyz;
+        const float lenC = length(dirC);
+        dirC = lenC > 1e-3 ? dirC / lenC : R;
+        offColor = SSRT_RTEnvColor(dirC, false);
+        [branch] if ((RTFlags & kRTFillMatch) && RTCaptureOffset.w > 0.5)
+        {
+            const float4 stored = RTCubemapPosition.SampleLevel(LinearSampler, dirC, 0);
+            const float3 storedPos = stored.xyz * 1000.0 - RTCaptureOffset.xyz;  // into this frame's camera space
+            const float tolerance = RTMatchMin + RTMatchRelative * length(hitPos);
+            const float match = (stored.w > 0.25 ? 1.0 : 0.0) * (1.0 - smoothstep(tolerance, 2.0 * tolerance, length(storedPos - hitPos)));
+            [branch] if (match > 0.0)
+            {
+                const float3 matched = filterInf(filterNaN(Color::IrradianceToLinear(max(RTCubemapRaw.SampleLevel(LinearSampler, dirC, 0).rgb, 0.0)))) *
+                                       SharedData::ssrtSettings.SpecularMult;
+                offColor = lerp(offColor, matched, match);
+                offUse = match >= 0.5 ? 2u : 3u;
+            }
+        }
+    }
+    o_color = lerp(offColor, screenColor, screenWeight);
+    o_use = screenWeight >= 0.5 ? 1u : offUse;
+    return weight;
+}
+#endif
+
 [numthreads(8, 8, SAMPLES_PER_PIXEL)] void main(uint3 groupID : SV_GroupID,
                                                 uint3 groupThreadID : SV_GroupThreadID,
                                                 uint3 DTid : SV_DispatchThreadID)
@@ -1102,8 +1276,22 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
     // confidence 0 -- which under ambient reinjection keeps the full vanilla ambient (diffuse) and
     // makes DeferredCompositeCS use the cubemap (specular). NRD is given the same limit as its
     // denoisingRange, so it skips these pixels too.
+#if SSRT_RT_FILL
+    // (48d) "Also Beyond SSR Distance": past the limit the march is skipped but the pixel still takes the fallback (+ gap fill).
+    bool rtBeyond = false;
+    float4 rtDebug = 0.0;
+    [branch] if (DistanceCapEnd > 0.0f)
+    {
+        const bool beyondCap = SSRT_NRDViewZ(depth) >= DistanceCapEnd;
+        if (RTFlags & kRTFillBeyond)
+            rtBeyond = beyondCap;
+        else
+            valid_ray = valid_ray && !beyondCap;
+    }
+#else
     [branch] if (DistanceCapEnd > 0.0f)
         valid_ray = valid_ray && SSRT_NRDViewZ(depth) < DistanceCapEnd;
+#endif
     uint hit_counter = 0;
     float3 hit = float3(0.0, 0.0, 0.0);
     float confidence = 0.0;
@@ -1151,6 +1339,12 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
         bool go_through_thin = false;
         uint numIterations;
         float thickness  = Thickness  + roughness * 10.0;
+#if SSRT_RT_FILL
+        valid_hit = false;
+        numIterations = 0;
+        hit = screen_uv_space_ray_origin;
+        [branch] if (!rtBeyond)
+#endif
         hit = SSRT_HierarchicalRaymarch(screen_uv_space_ray_origin,
                                             screen_space_ray_direction,
                                             is_mirror,
@@ -1416,6 +1610,24 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
 #   if defined(SSRT_SPECULAR)
             ao = GetSpecularOcclusionFromAmbientOcclusion(NdotV, ao, roughness);
             envColor *= ao;
+#       if SSRT_RT_FILL
+            {
+                // (48d) The gap fill: the ray's colour replaces the cubemap guess by its weight (SSR's own hits keep their confidence on top).
+                float3 rtColor;
+                uint rtUse;
+                float rtHitDistance;
+                const float rtWeight = SSRT_RTFill(coords.xy, positionWS.xyz, world_space_normal, roughness, screen_size, eyeIndex, rtColor, rtUse, rtHitDistance);
+                [branch] if (rtWeight > 0.0)
+                {
+                    envColor = lerp(envColor, rtColor, rtWeight);
+                    // REBLUR's hit distance: the ray's real one where it carries the pixel (SSR found nothing, the ray hit something).
+                    if ((RTFlags & kRTFillHitDistance) && confidence <= 0.0 && rtHitDistance > 0.0 && rtWeight >= 0.5)
+                        hit_distance = rtHitDistance;
+                    const float3 useColor = rtUse == 1u ? float3(0.1, 0.95, 0.2) : (rtUse == 2u ? float3(0.1, 0.9, 0.95) : (rtUse == 3u ? float3(1.0, 0.55, 0.1) : float3(0.2, 0.4, 1.0)));
+                    rtDebug = float4(useColor, 0.2 + 0.6 * rtWeight * (1.0 - confidence));
+                }
+            }
+#       endif
             sampleColor.xyz = lerp(envColor, sampleColor.xyz, confidence);
             confidence = 1;
 #   else
@@ -1559,6 +1771,10 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
     // Upscaling.cpp hands DLSS-RR as its specular hit-distance guide, so it is not the pack
     // pass's private input and cannot be traded away for the packed layout.
     SSRTHitDistanceOutput[coords.xy] = hit_distance;
+#   if SSRT_RT_FILL
+    [branch] if ((RTFlags & kRTFillDebug) && all(coords.xy < screen_size))
+        RTUseDebug[coords.xy] = rtDebug;  // (48d) "RT Reflection Use"; transparent where nothing of the ray was used
+#   endif
     if (NRDFrontEndPack != 0) {
         // The retired pack pass read hit_distance back out of the R32_FLOAT surface above --
         // an exact round trip, so no re-quantisation is owed here, unlike the diffuse case.

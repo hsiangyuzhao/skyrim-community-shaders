@@ -10,11 +10,13 @@
 
 #include "DynamicCubemaps.h"
 #include "ScreenSpaceGI.h"
+#include "RayTracing.h"
 #include "Skylighting.h"
 #include "Upscaling.h"
 
 #include "Utils/DenoiserTimers.h"
 #include "Utils/GpuTimers.h"
+#include "Utils/Game.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     ScreenSpaceRayTracing::Settings,
@@ -1840,11 +1842,13 @@ void ScreenSpaceRayTracing::ClearShaderCache()
         &diffuseCompositePackedCS, &diffuseCompositeExternalConfPackedCS,
         // (batch 12) sparse sampling: the two ray-march permutations and their two resolve passes
         &raymarchDiffuseHalfResCS, &raymarchDiffuseCheckerCS, &sparseResolveHalfResCS, &sparseResolveCheckerCS,
+        &raymarchSpecularRTCS,  // (48d) compiled again on first use
     };
 
     for (auto shader : shaderPtrs)
         *shader = nullptr;
 
+    rtGapFillFailed = false;  // (48d) tried again
     CompileComputeShaders();
 }
 
@@ -2347,7 +2351,7 @@ void ScreenSpaceRayTracing::BindCompositeConstants()
     // Only meaningful while the specular chain ran this frame; DeferredCompositeCS reads t16 only
     // under SharedData's EnableSpecular, which is the same setting.
     data.SpecularPacked = (settings.EnableSpecular && specularCompositePacked) ? 1u : 0u;
-    if (settings.EnableSpecular && DistanceLimitOnChain(true)) {
+    if (settings.EnableSpecular && SpecularCapActive()) {  // (48d) lifted while the gap fill runs beyond it
         data.SpecularCap = 1u;
         data.CapEnd = DistanceLimitUnits();
         data.CapStart = data.CapEnd * 0.8f;
@@ -2363,6 +2367,7 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     // unpack: the linear surface, as before. Reset every frame before any early-out.
     specularCompositeSRV = texSSRColor ? texSSRColor->srv.get() : nullptr;
     specularCompositePacked = false;
+    rtBeyondThisFrame = false;  // (48d) set again below only when this frame's ray march runs the gap fill beyond the limit
 
     if (!settings.EnableSpecular)
         return;
@@ -2550,9 +2555,66 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     srvs.at(10) = dynamicCubemaps.loaded && skylighting.loaded ? skylighting.texProbeArray->srv.get() : nullptr;
     srvs.at(11) = dynamicCubemaps.loaded && skylighting.loaded ? skylighting.stbn_vec3_2Dx1D_128x128x64.get() : nullptr;
 
+    // (48d) RT reflections gap fill: with RT Reflections = Gap Fill and this frame's hit record at this size, the D3D11 queue waits for the
+    // reflection list here (GPU-side, right before the ray march) and the SSRT_RT_REFLECT permutation runs; otherwise the plain one, with
+    // exactly the bindings and constants it always had.
+    std::array<ID3D11ShaderResourceView*, 4> rtSrvs = { nullptr };
+    bool gapFill = false;
+    {
+        RayTracing::ReflectionGapFill fill{};
+        auto& rayTracing = globals::features::rayTracing;
+        const bool cubemapsReady = dynamicCubemaps.loaded && dynamicCubemaps.envCapturePositionTexture && dynamicCubemaps.envCaptureRawTexture &&
+                                   dynamicCubemaps.envCapturePositionTexture->srv && dynamicCubemaps.envCaptureRawTexture->srv;
+        if (rayTracing.loaded && cubemapsReady && ssrCBData.UseDynamicCubemapsAsFallback != 0 && !rtGapFillFailed && rayTracing.settings.ReflectionsMode == 2) {
+            if (!raymarchSpecularRTCS) {
+                auto definesRT = std::vector<std::pair<const char*, const char*>>{ { "DYNAMIC_CUBEMAPS", nullptr } };
+                if (ssgi.loaded)
+                    definesRT.push_back({ "SSGI", nullptr });
+                if (skylighting.loaded)
+                    definesRT.push_back({ "SKYLIGHTING", nullptr });
+                const std::string sppStr = std::to_string(compiledDiffuseSPP ? compiledDiffuseSPP : settings.DiffuseSPP);
+                definesRT.push_back({ "DIFFUSE_SPP", sppStr.c_str() });
+                definesRT.push_back({ "SSRT_SPECULAR", nullptr });
+                definesRT.push_back({ "SSRT_RT_REFLECT", nullptr });
+                auto path = std::filesystem::path("Data\\Shaders\\ScreenSpaceRayTracing") / "ssrt_raymarch.hlsl";
+                if (auto rawPtr = reinterpret_cast<ID3D11ComputeShader*>(Util::CompileShader(path.c_str(), definesRT, "cs_5_0")))
+                    raymarchSpecularRTCS.attach(rawPtr);
+                else {
+                    rtGapFillFailed = true;
+                    logger::warn("[SSRT] The RT reflections gap fill ray march did not compile; the plain ray march keeps running");
+                }
+            }
+            // The wait has its own GPU row (RayTracingReflectSync): this pass's row pauses around it (rows do not nest).
+            bool acquired = false;
+            if (raymarchSpecularRTCS) {
+                Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTTraceSpecular);
+                acquired = rayTracing.AcquireReflectionGapFill(static_cast<std::uint32_t>(size.x), static_cast<std::uint32_t>(size.y), fill);
+                Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTTraceSpecular);
+            }
+            if (acquired) {
+                gapFill = true;
+                rtSrvs = { fill.hit, fill.dir, dynamicCubemaps.envCapturePositionTexture->srv.get(), dynamicCubemaps.envCaptureRawTexture->srv.get() };
+                uavs.at(2) = fill.debug;
+                ssrCBData.RTFlags = fill.flags;
+                ssrCBData.RTMatchRelative = 0.04f;  // 4 % of the hit's camera distance ...
+                ssrCBData.RTMatchMin = 32.0f;       // ... plus about half a metre (camera movement since the capture, filtering)
+                const auto eye = Util::GetEyePosition(0);
+                const auto& capture = dynamicCubemaps.plainCaptureEye;
+                ssrCBData.RTCaptureOffset[0] = dynamicCubemaps.plainCaptureValid ? eye.x - capture.x : 0.0f;
+                ssrCBData.RTCaptureOffset[1] = dynamicCubemaps.plainCaptureValid ? eye.y - capture.y : 0.0f;
+                ssrCBData.RTCaptureOffset[2] = dynamicCubemaps.plainCaptureValid ? eye.z - capture.z : 0.0f;
+                ssrCBData.RTCaptureOffset[3] = dynamicCubemaps.plainCaptureValid ? 1.0f : 0.0f;
+                ssrtCB->Update(ssrCBData);
+                rtBeyondThisFrame = (fill.flags & RayTracing::kGapFillBeyond) != 0 && DistanceLimitOnChain(true);
+            }
+        }
+    }
+
     context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
+    if (gapFill)
+        context->CSSetShaderResources(13, (uint)rtSrvs.size(), rtSrvs.data());
     context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
-    context->CSSetShader(raymarchSpecularCS.get(), nullptr, 0);
+    context->CSSetShader(gapFill ? raymarchSpecularRTCS.get() : raymarchSpecularCS.get(), nullptr, 0);
     context->CSSetConstantBuffers(1, 1, &buffer);
 
     context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
@@ -2560,6 +2622,10 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     state->EndPerfEvent();
     Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTTraceSpecular);
 
+    if (gapFill) {
+        rtSrvs.fill(nullptr);
+        context->CSSetShaderResources(13, (uint)rtSrvs.size(), rtSrvs.data());
+    }
     resetViews();
 
     // (defect D4) The temporal history must be fed from the *first* a-trous iteration, not
@@ -2892,7 +2958,7 @@ bool ScreenSpaceRayTracing::RunReblur(bool a_specular)
         // as inside the limit is certainly one NRD denoised; the sliver in between was not traced
         // and carries zero radiance, which NRD handles like any other input. Per instance: the
         // diffuse chain is limited only under ambient reinjection (DistanceLimitOnChain).
-        if (DistanceLimitOnChain(a_specular))
+        if (a_specular ? SpecularCapActive() : DistanceLimitOnChain(false))  // (48d) the specular limit lifted while the gap fill runs beyond it
             commonSettings.denoisingRange = DistanceLimitUnits() * 1.001f;
         if (resetFlag)
             commonSettings.accumulationMode = nrd::AccumulationMode::CLEAR_AND_RESTART;

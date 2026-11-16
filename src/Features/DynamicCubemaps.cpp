@@ -362,6 +362,11 @@ void DynamicCubemaps::UpdateCubemapCapture(bool a_reflections)
 	auto eyePosition = Util::GetEyePosition(0);
 
 	cameraPreviousPosAdjust[index] = { eyePosition.x, eyePosition.y, eyePosition.z };
+	if (!a_reflections) {
+		// (48d) What the positions of the plain capture are relative to from now on (read by the SSRT gap fill).
+		plainCaptureEye = { eyePosition.x, eyePosition.y, eyePosition.z };
+		plainCaptureValid = true;
+	}
 
 	updateCubemapCB->Update(updateData);
 
