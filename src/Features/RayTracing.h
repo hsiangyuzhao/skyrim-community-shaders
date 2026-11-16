@@ -363,6 +363,11 @@ public:
 		// start at 0 and grow the same way). Converged texels are unchanged (w = alpha = 1). Off: as 48d.
 		bool ReflectionsLoadingPrep = true;
 		bool ReflectionsCubemapWarmUp = true;
+		// (48f) ReflectionsMaterials "Reflections: Capture Materials" (the data half of the material step; nothing in the picture uses it yet): while RT
+		// Reflections is not Off, every captured triangle keeps its texcoords, material and face normal (16 bytes, D3D12), every shape / terrain
+		// quadrant gets a material and every distinct diffuse texture a 128x128 copy (D3D11, a few per frame), and the reflection rays write a
+		// surface record (the RT Albedo view). A change re-captures the scene. Off (or RT Reflections Off): nothing of it, exactly 48e.
+		bool ReflectionsMaterials = true;
 	};
 	/// (48d) What the SSRT specular ray march needs for the gap fill this frame (AcquireReflectionGapFill).
 	struct ReflectionGapFill
@@ -1051,6 +1056,7 @@ private:
 		HitDistance,       // near white .. far dark, miss blue
 		NormalConfidence,  // the reprojected last-frame normal: green sure .. red fell back
 		Use,               // (48d) what the gap fill used: on-screen hit / cubemap matched / unmatched / miss (written by the SSRT ray march)
+		Albedo,            // (48f) the hit's texture colour from the material copies (Capture Materials); missing data has its own colour
 		Count
 	};
 	ReflectDebugView reflectDebugView = ReflectDebugView::Off;  // not persisted
@@ -1079,6 +1085,15 @@ private:
 	void PrepareReflectionsImpl(RayTracingRT::FrameInput& a_input);  // (48d) inside PrepareReflections' try / catch
 	[[nodiscard]] static float ReflectionDistanceLimit();       // (48d) SSRT's specular distance limit (units; 0 = none)
 	void DrawReflectionDebug();
+	// (48f) Capture Materials: wanted (RT Reflections not Off, the switch on, the material shaders accepted), the texture copies (D3D11, never while the
+	// loading screen is presented; a_transition: the black screen / warm-up budget) and their shader (compiled in the background).
+	[[nodiscard]] bool MaterialsWanted() const;
+	void RunMaterialCopies(bool a_transition);
+	winrt::com_ptr<ID3D11ComputeShader> materialCopyCS;
+	Util::AsyncComputeShader materialCopyAsync;
+	bool materialCopyFailed = false;
+	winrt::com_ptr<ID3D11SamplerState> reflectDebugSampler;
+	bool inLoadingPump = false;  // (48f) TransitionFrame called from the loading pump (the loading screen owns the D3D11 context)
 	winrt::com_ptr<ID3D11Texture2D> aoPrevDepth;
 	winrt::com_ptr<ID3D11ShaderResourceView> aoPrevDepthSRV;
 	D3D11_TEXTURE2D_DESC aoPrevDepthDesc{};

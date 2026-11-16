@@ -295,9 +295,15 @@ namespace RayTracingScene
 		a_cell.terrainSignature = nullptr;
 		a_cell.terrainTriangles = 0;
 		a_cell.terrainTried = false;
+		for (auto& material : a_cell.terrainMaterials) {  // (48f)
+			if (material != RayTracingRT::kNoMaterial)
+				a_backend.ReleaseMaterial(material);
+			material = RayTracingRT::kNoMaterial;
+		}
 	}
 
-	bool Scene::ReadTerrainQuad(Cell& a_cell, int a_quad, RE::BSTriShape* a_shape, const RE::TESObjectLAND::LoadedLandData& a_land, RayTracingRT::ChunkGeometry& o_chunk)
+	bool Scene::ReadTerrainQuad(Cell& a_cell, int a_quad, RE::BSTriShape* a_shape, const RE::TESObjectLAND::LoadedLandData& a_land, RayTracingRT::ChunkGeometry& o_chunk,
+		std::uint16_t a_material)
 	{
 		// (48a) One landscape quadrant (17 x 17 vertices, 16 x 16 quads) into the cell's terrain chunk, positions relative to the cell's
 		// origin (as its static chunks). First the engine's CPU vertex copy (the 45e path, placed with the shape's world transform); without
@@ -350,6 +356,48 @@ namespace RayTracingScene
 				o_chunk.indices.insert(o_chunk.indices.end(), { v0, v1, v2, v1, v3, v2 });
 			}
 		}
+		if (config_.materials) {
+			// (48f) Capture Materials: per triangle the three corners' layer weights (5 bits x 6) and the quadrant's material | face normal. The
+			// weights come from the vertex copy's landscape blend weights (what the Lighting shader blends with); without them (heights path,
+			// or all zero) from LoadedLandData::percents, read as 0..100 for the five blended layers over the base (an approximation).
+			std::array<std::uint32_t, 289> weights{};
+			for (std::uint32_t i = 0; i < 289; ++i) {
+				float w[6]{};
+				bool fromVertex = false;
+				if (ok && mesh.landOffset != UINT32_MAX) {
+					const std::uint8_t* bytes = mesh.vertexBytes.data() + static_cast<std::size_t>(i) * mesh.stride + mesh.landOffset;
+					float sum = 0.0f;
+					for (int k = 0; k < 6; ++k) {
+						w[k] = static_cast<float>(bytes[k]);
+						sum += w[k];
+					}
+					fromVertex = sum >= 8.0f;
+				}
+				if (!fromVertex) {
+					float layers = 0.0f;
+					for (int k = 0; k < 5; ++k) {
+						w[k + 1] = std::min(static_cast<float>(static_cast<std::uint8_t>(a_land.percents[a_quad][i][k])), 100.0f);
+						layers += w[k + 1];
+					}
+					w[0] = std::max(100.0f - layers, 0.0f);
+				}
+				weights[i] = RayTracingRT::Attributes::PackTerrainWeights(w);
+			}
+			const std::size_t first = o_chunk.attributes.size();
+			o_chunk.attributes.resize(first + 16 * 16 * 2 * RayTracingRT::kAttributeWords);
+			std::uint32_t* out = o_chunk.attributes.data() + first;
+			const float* positions = o_chunk.positions.data();
+			const std::uint32_t* indices = o_chunk.indices.data() + o_chunk.indices.size() - 16 * 16 * 6;
+			for (std::uint32_t t = 0; t < 16 * 16 * 2; ++t) {
+				const std::uint32_t c0 = indices[t * 3], c1 = indices[t * 3 + 1], c2 = indices[t * 3 + 2];
+				out[t * 4 + 0] = weights[c0 - base];
+				out[t * 4 + 1] = weights[c1 - base];
+				out[t * 4 + 2] = weights[c2 - base];
+				out[t * 4 + 3] = RayTracingRT::Attributes::MaterialWord(a_material,
+					RayTracingRT::Attributes::PackFaceNormal(positions + static_cast<std::size_t>(c0) * 3, positions + static_cast<std::size_t>(c1) * 3,
+						positions + static_cast<std::size_t>(c2) * 3));
+			}
+		}
 		return true;
 	}
 
@@ -388,7 +436,12 @@ namespace RayTracingScene
 							auto* shape = land->loadedData->geom[q].get();
 							if (shape && shape->GetFlags().any(RE::NiAVObject::Flag::kHidden))
 								continue;
-							ReadTerrainQuad(*cell, q, shape, *land->loadedData, *chunk);
+							// (48f) Capture Materials: the quadrant's material (held by the cell until its terrain goes).
+							const std::uint16_t material = AcquireTerrainMaterial(a_backend, shape, *land->loadedData, q);
+							if (ReadTerrainQuad(*cell, q, shape, *land->loadedData, *chunk, material))
+								cell->terrainMaterials[q] = material;
+							else if (material != RayTracingRT::kNoMaterial)
+								a_backend.ReleaseMaterial(material);
 						}
 						if (chunk->Triangles() > 0) {
 							cell->terrainTriangles = chunk->Triangles();
@@ -461,6 +514,10 @@ namespace RayTracingScene
 		a_cell.stagePositions = {};  // (47u)
 		a_cell.stageIndices = {};
 		a_cell.staged = {};
+		a_cell.stageAttributes = {};  // (48f)
+		for (const auto material : a_cell.materials)
+			a_backend.ReleaseMaterial(material);
+		a_cell.materials.clear();
 	}
 
 	std::uint64_t Scene::MortonKey(const float a_lo[3], const float a_hi[3])
@@ -489,31 +546,33 @@ namespace RayTracingScene
 		// (47u) Spatial Static Chunks: the cell's shapes in Morton order of their box centres, filled into chunks of kChunkTriangles as
 		// before (a chunk closes once it holds at least that many). One- and two-sided shapes stay apart indoors (the window beams' face
 		// culling); outdoors they were staged on one side (no ray culls faces there).
-		std::vector<std::pair<std::uint64_t, std::uint32_t>> order;
-		order.reserve(a_cell.staged.size());
-		for (std::uint32_t i = 0; i < a_cell.staged.size(); ++i) {
-			const auto& shape = a_cell.staged[i];
-			order.emplace_back((static_cast<std::uint64_t>(shape.side) << 63) | (MortonKey(shape.lo, shape.hi) >> 1), i);
-		}
-		std::sort(order.begin(), order.end());
-		for (const auto& [key, i] : order) {
+		// (48f) The order and the per-shape append live in MaterialAttributes.h (StagedOrder / AppendStagedShape), so the offline check runs this
+		// very code: a shape's attributes follow its triangles into the chunk in the same order.
+		std::vector<std::uint64_t> keys;
+		keys.reserve(a_cell.staged.size());
+		for (const auto& shape : a_cell.staged)
+			keys.push_back((static_cast<std::uint64_t>(shape.side) << 63) | (MortonKey(shape.lo, shape.hi) >> 1));
+		// Attributes only when every staged shape has them (a chunk's attributes must match its triangles one to one).
+		bool attributes = !a_cell.stageAttributes.empty();
+		for (const auto& shape : a_cell.staged)
+			attributes = attributes && shape.firstTriangle != UINT32_MAX;
+		for (const std::uint32_t i : RayTracingRT::Attributes::StagedOrder(keys)) {
 			const auto& shape = a_cell.staged[i];
 			const int side = shape.side;
 			if (!a_cell.current[side])
 				a_cell.current[side] = std::make_unique<RayTracingRT::ChunkGeometry>();
 			auto& chunk = *a_cell.current[side];
-			const std::uint32_t base = chunk.Vertices();
-			const auto* positions = a_cell.stagePositions.data() + static_cast<std::size_t>(shape.firstVertex) * 3;
-			chunk.positions.insert(chunk.positions.end(), positions, positions + static_cast<std::size_t>(shape.vertices) * 3);
 			// No per-shape reserve (an exact reserve per shape would copy the whole chunk again for every shape): geometric growth.
-			for (std::uint32_t k = 0; k < shape.indices; ++k)
-				chunk.indices.push_back(base + a_cell.stageIndices[shape.firstIndex + k]);
+			RayTracingRT::Attributes::AppendStagedShape(a_cell.stagePositions.data(), shape.firstVertex, shape.vertices, a_cell.stageIndices.data(), shape.firstIndex,
+				shape.indices, attributes ? a_cell.stageAttributes.data() : nullptr, shape.firstTriangle, chunk.positions, chunk.indices,
+				attributes ? &chunk.attributes : nullptr);
 			a_cell.currentGeometries[side].push_back(shape.geometry);
 			if (chunk.Triangles() >= kChunkTriangles)
 				CloseChunk(a_backend, a_cell, side);
 		}
 		a_cell.stagePositions = {};
 		a_cell.stageIndices = {};
+		a_cell.stageAttributes = {};
 		a_cell.staged = {};
 	}
 
@@ -870,6 +929,13 @@ namespace RayTracingScene
 			if (offset + 4 <= stride)
 				o_mesh.normalOffset = offset;
 		}
+		// (48f) Landscape blend weights (the Lighting shader's LandBlendWeights1.xyzw / 2.xy: six unorm8 bytes used) for the terrain attributes.
+		o_mesh.landOffset = UINT32_MAX;
+		if (flags & RE::BSGraphics::Vertex::VF_LANDDATA) {
+			const std::uint32_t offset = rendererData->vertexDesc.GetAttributeOffset(RE::BSGraphics::Vertex::VA_LANDDATA);
+			if (offset + 6 <= stride)
+				o_mesh.landOffset = offset;
+		}
 		return true;
 	}
 
@@ -887,6 +953,15 @@ namespace RayTracingScene
 			return false;
 
 		const int side = (!a_landscape && IsTwoSided(a_shape)) ? 1 : 0;  // (46n) one-sided and two-sided shapes in separate chunks
+		// (48f) Capture Materials: every shape of the cell appends its triangles' attributes (material none when it has no texture), so a chunk's
+		// attributes always match its triangles one to one; the shape's material is held by the cell.
+		const bool attributes = config_.materials && gatherBackend_ && gatherBackend_->MaterialsEnabled();
+		std::uint16_t material = RayTracingRT::kNoMaterial;
+		if (attributes && !a_landscape) {
+			material = AcquireShapeMaterial(*gatherBackend_, a_shape);
+			if (material != RayTracingRT::kNoMaterial)
+				a_cell.materials.push_back(material);
+		}
 		if (a_cell.spatial) {
 			// (47u) Spatial Static Chunks: staged; packed by place when the cell is complete (FlushStaged).
 			Cell::StagedShape staged;
@@ -906,6 +981,13 @@ namespace RayTracingScene
 					staged.lo[a] = std::min(staged.lo[a], placed[v + a]);
 					staged.hi[a] = std::max(staged.hi[a], placed[v + a]);
 				}
+			if (attributes) {
+				// (48f) Staged with the shape; FlushStaged moves them with its triangles (same order).
+				staged.firstTriangle = static_cast<std::uint32_t>(a_cell.stageAttributes.size() / RayTracingRT::kAttributeWords);
+				if (!RayTracingRT::Attributes::AppendMeshAttributes(mesh.vertexBytes.data(), mesh.stride, mesh.uvOffset, mesh.vertexCount, placed.data(),
+						mesh.indices.data(), mesh.indices.size(), material, a_cell.stageAttributes))
+					staged.firstTriangle = UINT32_MAX;
+			}
 			a_cell.stagePositions.insert(a_cell.stagePositions.end(), placed.begin(), placed.end());
 			a_cell.stageIndices.insert(a_cell.stageIndices.end(), mesh.indices.begin(), mesh.indices.end());
 			a_cell.staged.push_back(staged);
@@ -923,6 +1005,13 @@ namespace RayTracingScene
 		if (!a_cell.current[side])
 			a_cell.current[side] = std::make_unique<RayTracingRT::ChunkGeometry>();
 		auto& chunk = *a_cell.current[side];
+		if (attributes) {
+			// (48f) Before the triangles go in: a shape whose attributes cannot be made (never: ReadMesh checked the indices) breaks the chunk's
+			// one-to-one match, so the chunk then carries none (CreateBlas ignores a wrong size).
+			if (!RayTracingRT::Attributes::AppendMeshAttributes(mesh.vertexBytes.data(), mesh.stride, mesh.uvOffset, mesh.vertexCount, placed.data(),
+					mesh.indices.data(), mesh.indices.size(), material, chunk.attributes))
+				chunk.attributes.clear();
+		}
 		const std::uint32_t base = chunk.Vertices();
 		chunk.positions.insert(chunk.positions.end(), placed.begin(), placed.end());
 		chunk.indices.reserve(chunk.indices.size() + mesh.indices.size());
@@ -1056,6 +1145,67 @@ namespace RayTracingScene
 		o_source.vertexAlpha = (vertexFlags & RE::BSGraphics::Vertex::VF_COLORS) && lighting->flags.any(F::kVertexColors) &&
 		                       lighting->flags.none(F::kTreeAnim, F::kLODObjects, F::kHDLODObjects);
 		return true;
+	}
+
+	namespace
+	{
+		/// (48f) A landscape quadrant's six layer textures: the material's base diffuse and its blended layers (SEH-guarded).
+		bool ReadLandscapeTextures(RE::BSLightingShaderProperty* a_lighting, RayTracingRT::TerrainLayerSource& o_layers)
+		{
+			__try {
+				auto* base = static_cast<RE::BSLightingShaderMaterialBase*>(a_lighting->material);
+				if (!base || base->GetFeature() != RE::BSShaderMaterial::Feature::kMultiTexLandLODBlend)
+					return false;
+				auto* land = static_cast<RE::BSLightingShaderMaterialLandscape*>(base);
+				auto take = [&](RE::NiSourceTexture* a_source, int a_slot) {
+					if (a_source && a_source->rendererTexture && a_source->rendererTexture->texture && a_source->rendererTexture->resourceView) {
+						o_layers.texture[a_slot] = a_source->rendererTexture->texture;
+						o_layers.view[a_slot] = a_source->rendererTexture->resourceView;
+					}
+				};
+				take(land->diffuseTexture.get(), 0);
+				const std::uint32_t layers = std::min<std::uint32_t>(land->numLandscapeTextures, 5);
+				for (std::uint32_t i = 0; i < layers; ++i)
+					take(land->landscapeDiffuseTexture[i].get(), static_cast<int>(i) + 1);
+				return o_layers.texture[0] != nullptr;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+	}
+
+	std::uint16_t Scene::AcquireShapeMaterial(RayTracingRT::Backend& a_backend, RE::BSGeometry* a_geometry) const
+	{
+		// (48f) The diffuse texture the Lighting shader samples, with its texcoord transform (ReadAlphaSource reads the same fields).
+		if (!config_.materials || !a_geometry || !a_backend.MaterialsEnabled())
+			return RayTracingRT::kNoMaterial;
+		const auto& runtime = a_geometry->GetGeometryRuntimeData();
+		auto* lighting = netimmerse_cast<RE::BSLightingShaderProperty*>(runtime.properties[RE::BSGeometry::States::kEffect].get());
+		if (!lighting)
+			return RayTracingRT::kNoMaterial;
+		RawAlphaSource raw{};
+		if (!ReadAlphaSource(lighting, raw))
+			return RayTracingRT::kNoMaterial;
+		return a_backend.AcquireMaterial(raw.texture, raw.view, raw.uv);
+	}
+
+	std::uint16_t Scene::AcquireTerrainMaterial(RayTracingRT::Backend& a_backend, RE::BSTriShape* a_shape, const RE::TESObjectLAND::LoadedLandData& a_land, int a_quad) const
+	{
+		if (!config_.materials || !a_shape || !a_backend.MaterialsEnabled())
+			return RayTracingRT::kNoMaterial;
+		auto* lighting = netimmerse_cast<RE::BSLightingShaderProperty*>(a_shape->GetGeometryRuntimeData().properties[RE::BSGeometry::States::kEffect].get());
+		RayTracingRT::TerrainLayerSource layers{};
+		if (!lighting || !ReadLandscapeTextures(lighting, layers))
+			return RayTracingRT::kNoMaterial;
+		// The quadrant's average vertex colour (the landscape shader tints its layers with it).
+		double sum[3]{};
+		for (std::uint32_t i = 0; i < 289; ++i)
+			for (int c = 0; c < 3; ++c)
+				sum[c] += static_cast<std::uint8_t>(a_land.colors[a_quad][i][c]);
+		std::uint32_t tint = 0xFF000000u;
+		for (int c = 0; c < 3; ++c)
+			tint |= static_cast<std::uint32_t>(std::clamp(std::lround(sum[c] / 289.0), 0l, 255l)) << (8 * c);
+		return a_backend.AcquireTerrainMaterial(layers, tint);
 	}
 
 	const char* Scene::ShapeRejectReason(RE::NiAVObject* a_object, bool a_allowTreeAnim, bool a_allowCutout, SkipCounts* o_counts,
@@ -1399,6 +1549,10 @@ namespace RayTracingScene
 				geometry->alphaUV[k * 2] = uv;
 				geometry->alphaUV[k * 2 + 1] = std::bit_cast<std::uint32_t>(alpha);
 			}
+			// (48f) Capture Materials: texcoords + face normal per triangle (the material is the shape's own: the instance carries it).
+			if (config_.materials && a_backend.MaterialsEnabled())
+				RayTracingRT::Attributes::AppendMeshAttributes(mesh.vertexBytes.data(), mesh.stride, mesh.uvOffset, mesh.vertexCount, local.data(), mesh.indices.data(),
+					mesh.indices.size(), RayTracingRT::kNoMaterial, geometry->attributes);
 			const auto handle = a_backend.CreateBlas(std::move(geometry));
 			if (handle == RayTracingRT::kInvalidBlas) {
 				++alphaStats.failedRecord;
@@ -1428,6 +1582,7 @@ namespace RayTracingScene
 		o_shape.alpha = true;
 		o_shape.texture = texture;
 		o_shape.info = info;
+		o_shape.material = config_.materials ? a_backend.AcquireMaterial(source.texture, source.view, source.material.uvTransform) : RayTracingRT::kNoMaterial;  // (48f)
 		MarkWindCandidate(o_shape, a_shape);  // (47l)
 		return true;
 	}
@@ -1452,6 +1607,9 @@ namespace RayTracingScene
 			a_backend.ReleaseAlphaTexture(a_shape.texture);
 		a_shape.info = RayTracingRT::kInvalidAlphaInfo;
 		a_shape.texture = RayTracingRT::kInvalidAlphaTexture;
+		if (a_shape.material != RayTracingRT::kNoMaterial)
+			a_backend.ReleaseMaterial(a_shape.material);  // (48f)
+		a_shape.material = RayTracingRT::kNoMaterial;
 		a_shape.ready = false;
 		a_shape.shown = false;
 		// (45j) The engine object is dropped later, a bounded number per frame (DrainGraves).
@@ -1495,6 +1653,9 @@ namespace RayTracingScene
 		}
 		if (a_shape.alpha)
 			instance.alphaInfo = a_shape.info;
+		// (48f) Capture Materials: the shape's own material, and the frozen mesh's attributes (also for its wind BLAS: same triangles, same order).
+		instance.material = a_shape.material;
+		instance.attrBlas = a_shape.blas;
 		if (a_expected) {
 			instance.refID = a_refID;
 			instance.label = geometry->name.c_str();
@@ -1588,6 +1749,10 @@ namespace RayTracingScene
 				auto geometry = std::make_unique<RayTracingRT::ChunkGeometry>();
 				geometry->positions = local;
 				geometry->indices = mesh.indices;
+				// (48f) Capture Materials: texcoords + face normal per triangle (shared mesh: the material is each shape's own, on its instance).
+				if (config_.materials && a_backend.MaterialsEnabled())
+					RayTracingRT::Attributes::AppendMeshAttributes(mesh.vertexBytes.data(), mesh.stride, mesh.uvOffset, mesh.vertexCount, local.data(),
+						mesh.indices.data(), mesh.indices.size(), RayTracingRT::kNoMaterial, geometry->attributes);
 				const auto handle = a_backend.CreateBlas(std::move(geometry));
 				if (handle == RayTracingRT::kInvalidBlas)
 					continue;
@@ -1600,6 +1765,7 @@ namespace RayTracingScene
 			objectShape.key = key;
 			objectShape.blas = it->second.blas;
 			objectShape.twoSided = IsTwoSided(shape);  // (46g)
+			objectShape.material = AcquireShapeMaterial(a_backend, shape);  // (48f)
 			MarkWindCandidate(objectShape, shape);     // (47l) swaying branches of trees and plants
 			entry->shapes.push_back(std::move(objectShape));
 		}

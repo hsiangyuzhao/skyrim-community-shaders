@@ -19,6 +19,7 @@
 #include <wrl/client.h>
 
 #include "Utils/FrameTrace.h"  // (46p) VramOwner, RtPrepWork
+#include "MaterialAttributes.h"  // (48f) kNoMaterial, attribute layout
 
 /**
  * @brief (45, RT prototype) The ray tracer's own D3D12 side: device, queue, BLAS/TLAS, trace pass.
@@ -49,6 +50,10 @@ namespace RayTracingRT
 		/// half2 texcoord as stored by the engine, y = its vertex alpha as float bits). Non-empty =
 		/// the BLAS geometry is non-opaque and its triangles are tested against their cut-out.
 		std::vector<std::uint32_t> alphaUV;
+		/// (48f) RT reflections, Capture Materials: kAttributeWords uints per triangle in index order (MaterialAttributes.h). Empty = none
+		/// (every BLAS before 48f, and every BLAS while RT Reflections is Off or Capture Materials is off). Kept in their own buffer for the
+		/// BLAS's life (Backend::CreateBlas); a wrong size is ignored (no attributes).
+		std::vector<std::uint32_t> attributes;
 		[[nodiscard]] std::uint32_t Triangles() const { return static_cast<std::uint32_t>(indices.size() / 3); }
 		[[nodiscard]] std::uint32_t Vertices() const { return static_cast<std::uint32_t>(positions.size() / 3); }
 		[[nodiscard]] bool Opaque() const { return alphaUV.empty(); }
@@ -385,6 +390,11 @@ namespace RayTracingRT
 		// (47n) Moved since last frame (its world transform differs from the engine's previous one): its instance carries
 		// kMovingInstanceKey in InstanceContributionToHitGroupIndex (TraceAOCS: RTAO's tight history near moving things).
 		bool moving = false;
+		// (48f) RT reflections, Capture Materials (FrameInput::materials): the instance's own material (objects, alpha shapes: one shape per
+		// instance; kNoMaterial = the per-triangle material of its attributes, as cell chunks and terrain), and the BLAS whose attributes
+		// describe its triangles (kInvalidBlas = `blas`; a swaying plant's wind BLAS uses its frozen mesh's: same triangles, same order).
+		std::uint16_t material = kNoMaterial;
+		BlasHandle attrBlas = kInvalidBlas;
 	};
 	/// (47n) InstanceContributionToHitGroupIndex of a moving scene instance (character instances carry their small owner keys).
 	inline constexpr std::uint32_t kMovingInstanceKey = 0x800000u;
@@ -426,6 +436,44 @@ namespace RayTracingRT
 		// read (object key, terrain mask; false = every instance descriptor exactly as before).
 		const ReflectInput* reflect = nullptr;
 		bool reflectTags = false;
+		// (48f) RT reflections, Capture Materials: the per-instance attribute table (TLAS order: attribute base, triangles, material, type) is
+		// written with the instance descriptors and the reflection rays read it (the RT_MATERIAL variant). false = nothing of it (48e).
+		bool materials = false;
+	};
+
+	/// (48f) RT reflections, Capture Materials: the per-triangle attributes (D3D12) and the material table + texture copies (D3D11).
+	struct MaterialStats
+	{
+		std::uint64_t attrBytes = 0;          // the attribute buffer (allocated with the first attribute BLAS, kept while enabled)
+		std::uint64_t attrBytesUsed = 0;      // ... in use (BLASes alive, frees behind the fence included)
+		std::uint64_t attrFull = 0;           // BLASes made without attributes: the buffer was full (total)
+		std::uint32_t materials = 0;          // live materials (registered shapes / terrain quadrants)
+		std::uint64_t materialsFull = 0;      // refused: id space full (total)
+		std::uint32_t textures = 0;           // distinct game textures registered
+		std::uint32_t texturesReady = 0;      // ... copied (128x128 RGBA8 with mips)
+		std::uint32_t texturesPending = 0;    // ... waiting for their copy (the backlog)
+		std::uint64_t texturesRefused = 0;    // not copyable (placeholder size, cube / array textures; total)
+		std::uint32_t texturesFull = 0;       // textures waiting with no layer left (every page full, the page cap reached): now
+		std::uint32_t pages = 0;              // texture-copy pages (kMaterialPageLayers layers each)
+		bool pageCreating = false;            // a page is being created on a worker thread
+		std::uint64_t textureBytes = 0;       // the pages' memory
+		std::uint64_t tableBytes = 0;         // the D3D11 material table
+		std::uint32_t copiesLastFrame = 0;    // copies made by the last UpdateMaterials
+		std::uint64_t copiesTotal = 0;
+		float copyCpuMs = 0.0f;               // render-thread ms of the last UpdateMaterials
+		std::uint64_t instanceTableBytes = 0; // the per-context instance tables (upload heaps)
+	};
+	/// (48f) Texture-copy pages: a Texture2DArray of kMaterialPageLayers layers of kMaterialTextureSize^2 RGBA8 with every mip; at most
+	/// kMaterialMaxPages (ReflectDebugCS / 48g's shading bind them as t4 .. t9).
+	inline constexpr std::uint32_t kMaterialTextureSize = 128;
+	inline constexpr std::uint32_t kMaterialTextureMips = 8;  // 128 .. 1
+	inline constexpr std::uint32_t kMaterialPageLayers = 256;
+	inline constexpr std::uint32_t kMaterialMaxPages = 6;
+	/// (48f) A terrain quadrant's six layer textures (base + the five blended ones; null = none) for AcquireTerrainMaterial.
+	struct TerrainLayerSource
+	{
+		ID3D11Texture2D* texture[6]{};
+		ID3D11ShaderResourceView* view[6]{};
 	};
 
 	/// (45k) Where the CPU time of the last ExecuteFrame went, call by call (ms). The sum of these
@@ -935,6 +983,45 @@ namespace RayTracingRT
 		[[nodiscard]] std::uint64_t ReflectBytes() const { return reflectBytes_; }
 		[[nodiscard]] const std::string& ReflectFault() const { return reflectFault_; }
 		void ClearReflectFault() { reflectFault_.clear(); }
+
+		// (48f) RT reflections, Capture Materials (BackendMaterial.cpp). Nothing of it exists while it is not enabled.
+		/// On: attribute BLASes keep their attributes, materials can be registered. Off: nothing new is registered; the attribute buffer, the
+		/// texture pages and the table go once nothing uses them any more (MaterialHousekeeping).
+		void SetMaterialsEnabled(bool a_on) { materialsEnabled_ = a_on; }
+		[[nodiscard]] bool MaterialsEnabled() const { return materialsEnabled_; }
+		/// The RT_MATERIAL variants of the reflection shader exist.
+		[[nodiscard]] bool MaterialTraceAvailable() const { return ReflectAvailable() && reflectMatPipeline_ != nullptr; }
+		/// A material for one shape: its diffuse texture (copied once into a 128x128 RGBA8 page layer, shared by every material using it) and
+		/// texcoord transform (offset xy, scale zw). kNoMaterial when not enabled / refused (counted). Counted per user (ReleaseMaterial).
+		std::uint16_t AcquireMaterial(ID3D11Texture2D* a_texture, ID3D11ShaderResourceView* a_view, const float a_uvTransform[4]);
+		/// A terrain quadrant's material: its six layer textures (their copies' last mip is the layer's average colour) and the quadrant's
+		/// average vertex colour (RGBA8). Never shared.
+		std::uint16_t AcquireTerrainMaterial(const TerrainLayerSource& a_layers, std::uint32_t a_tint);
+		/// Drops one user; the id (and its table entry) is recycled kMaterialRetireFrames later (a hit record of a frame in flight may name it).
+		void ReleaseMaterial(std::uint16_t a_material);
+		/// D3D11, render thread, never while the loading screen is presented: takes finished pages (created on a worker thread), starts the
+		/// next page when layers run out (up to kMaterialMaxPages), makes up to a_maxCopies pending texture copies with a_shader
+		/// (MaterialCopyCS) within a_cpuMs, uploads the table when it changed. a_frame: the frame counter (id recycling).
+		void UpdateMaterials(ID3D11ComputeShader* a_shader, std::uint32_t a_maxCopies, float a_cpuMs, std::uint32_t a_frame);
+		/// Every frame (also while Ray Tracing waits / is off): recycles retired ids and, when not enabled and nothing is used, releases the
+		/// attribute buffer, pages and table.
+		void MaterialHousekeeping(std::uint32_t a_frame);
+		[[nodiscard]] ID3D11ShaderResourceView* MaterialTableSRV() const { return matTableSrv_.Get(); }
+		[[nodiscard]] ID3D11ShaderResourceView* MaterialPageSRV(std::uint32_t a_page) const
+		{
+			return a_page < matPages_.size() ? matPages_[a_page].srv.Get() : nullptr;
+		}
+		[[nodiscard]] const MaterialStats& GetMaterialStats() const { return matStats_; }
+		/// The reflection rays' surface record (two shared R32_UINT textures D3D12 writes, D3D11 reads): sized like the hit record, created
+		/// only with materials. False = not available (the rays then run the 48e variants).
+		bool EnsureReflectSurfaceTextures(std::uint32_t a_width, std::uint32_t a_height);
+		void ReleaseReflectSurfaceTextures();
+		[[nodiscard]] bool ReflectSurfaceReady() const { return reflectSurf0_.resource12 && reflectSurf1_.resource12; }
+		[[nodiscard]] ID3D11ShaderResourceView* ReflectSurf0SRV() const { return reflectSurf0_.srv11.Get(); }
+		[[nodiscard]] ID3D11ShaderResourceView* ReflectSurf1SRV() const { return reflectSurf1_.srv11.Get(); }
+		[[nodiscard]] std::uint64_t ReflectSurfaceBytes() const { return reflectSurfBytes_; }
+		/// The last reflection list ran the RT_MATERIAL variant (its surface record is valid for this frame's hit record).
+		[[nodiscard]] bool ReflectMaterialLastFrame() const { return reflectMatLastFrame_; }
 		/// (47h) The RTAO trace output fell back to RGBA8 (TraceAOCS dithers its 8-bit weight then).
 		[[nodiscard]] bool AOIs8Bit() const { return aoFormat_ == kAOFormat8; }
 		/// The D3D11 queue waits (on the GPU) for the last RTAO trace (its second fence). No-op when nothing is pending.
@@ -1048,6 +1135,11 @@ namespace RayTracingRT
 			// signalled (0 = none).
 			ComPtr<ID3D12GraphicsCommandList4> reflectList;
 			std::uint64_t reflectFenceValue = 0;
+			// (48f) Capture Materials: this context's per-instance attribute table (upload heap, persistently mapped; uint4 per TLAS instance).
+			ComPtr<ID3D12Resource> instanceAttrBuffer;
+			void* instanceAttrMapped = nullptr;
+			std::uint32_t instanceAttrCapacity = 0;
+			bool instanceAttrWritten = false;  // this submission's TLAS wrote it
 			// (46m) Split Trace Sync: the point lights' own list (same allocator, recorded after the sun list); the
 			// trace timestamps of this submission then end with the sun (the point lights have their own pair).
 			ComPtr<ID3D12GraphicsCommandList4> pointList;
@@ -1085,6 +1177,9 @@ namespace RayTracingRT
 			// (45h) Alpha BLAS: its texcoords in the shared texcoord buffer (uint2 elements).
 			std::uint32_t uvOffset = UINT32_MAX;
 			std::uint32_t uvCount = 0;
+			// (48f) Its attributes in the attribute buffer (uint4 elements, one per triangle; UINT32_MAX = none).
+			std::uint32_t attrOffset = UINT32_MAX;
+			std::uint32_t attrCount = 0;
 			// (47l) A wind BLAS: its WindMesh (winds_); never in the build queue, never compacted (Ready once first built).
 			std::uint32_t wind = UINT32_MAX;
 		};
@@ -1217,6 +1312,112 @@ namespace RayTracingRT
 		void CollectAlphaRetired(std::uint64_t a_completed);
 		bool EnsureAlphaInfoBuffer(CommandContext& a_context);
 		void UpdateAlphaTextureStats();
+
+		// (48f) RT reflections, Capture Materials (BackendMaterial.cpp).
+		// Attributes: one default-heap buffer of kAttrBytes made with the first attribute BLAS (only while enabled: at the switch-on's
+		// re-capture or behind a loading screen), a range per BLAS (uint4 elements, freed behind the fence like the alpha texcoords).
+		static constexpr std::uint64_t kAttrBytes = 64ull << 20;  // 4.19 M triangles of 16 bytes
+		static constexpr std::uint32_t kMaterialRetireFrames = 4;
+		static constexpr std::uint32_t kMaterialMaxIds = 0xFFF0;    // ids >= this are markers (TraceReflectCS kMatNone ..)
+		bool materialsEnabled_ = false;
+		ComPtr<ID3D12Resource> attr_;
+		std::map<std::uint32_t, std::uint32_t> attrFree_;  // offset -> count (uint4 elements)
+		std::vector<DeferredFree> retiredAttr_;
+		std::uint64_t attrUsed_ = 0;                       // uint4 elements
+		bool attrFailed_ = false;                          // could not be created: no attributes until switched off and on
+		bool EnsureAttributes();
+		bool AllocateAttributes(std::uint32_t a_count, std::uint32_t& o_offset);
+		void FreeAttributes(std::uint32_t a_offset, std::uint32_t a_count);
+		void CollectAttrRetired(std::uint64_t a_completed);
+		bool EnsureInstanceAttrBuffer(CommandContext& a_context, std::uint32_t a_instances);
+		// Materials (D3D11 side): game textures -> page layers, materials -> table entries (MaterialCopyCS fills the layers).
+		struct MaterialGpu
+		{
+			std::uint32_t layer;    // global page layer of the texture (page = layer / kMaterialPageLayers), 0xFFFF = none / not copied yet
+			std::uint32_t flags;    // 1 terrain, 2 a texture is registered, 4 its copy is still pending
+			std::uint32_t terrain[3];  // terrain: the six layers' page layers, 16 bits each (0xFFFF = none / pending)
+			std::uint32_t tint;     // RGBA8 (terrain: the quadrant's average vertex colour; others white)
+			std::uint32_t pad[2];
+			float uvTransform[4];   // offset xy, scale zw
+		};
+		static_assert(sizeof(MaterialGpu) == 48);
+		struct MatTexture
+		{
+			ComPtr<ID3D11Texture2D> texture11;        // held: the key can never be a reused address
+			ComPtr<ID3D11ShaderResourceView> view11;  // source of the copy until it is made
+			std::uint32_t layer = UINT32_MAX;
+			std::uint32_t users = 0;
+			std::uint32_t sourceSize = 0;
+			std::uint32_t sourceMips = 1;
+			bool live = false;
+			bool ready = false;
+		};
+		struct MatEntry
+		{
+			std::array<std::uint32_t, 6> textures{ UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX };
+			float uvTransform[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
+			std::uint32_t tint = 0xFFFFFFFFu;
+			std::uint32_t users = 0;
+			bool terrain = false;
+			bool live = false;      // allocated (also while retired)
+			bool retired = false;   // no user any more, waiting kMaterialRetireFrames for its id to be reused
+		};
+		struct MatKey
+		{
+			std::uint32_t texture;
+			std::uint32_t uv[4];
+			bool operator==(const MatKey&) const = default;
+		};
+		struct MatKeyHash
+		{
+			std::size_t operator()(const MatKey& a_key) const noexcept
+			{
+				std::size_t h = a_key.texture;
+				for (const auto v : a_key.uv)
+					h = h * 1000003u ^ v;
+				return h;
+			}
+		};
+		struct MatPage
+		{
+			ComPtr<ID3D11Texture2D> texture;
+			ComPtr<ID3D11ShaderResourceView> srv;
+			std::array<ComPtr<ID3D11UnorderedAccessView>, kMaterialTextureMips> uavs;
+		};
+		struct MatPageJob
+		{
+			std::atomic<int> state{ 0 };  // 0 creating, 1 done, 2 failed
+			MatPage page;
+		};
+		std::vector<MatTexture> matTextures_;
+		std::vector<std::uint32_t> freeMatTextures_;
+		std::unordered_map<ID3D11Texture2D*, std::uint32_t> matTextureIndex_;
+		std::vector<MatEntry> materials_;
+		std::vector<std::uint16_t> freeMaterials_;
+		std::vector<std::pair<std::uint32_t, std::uint16_t>> retiredMaterials_;  // frame retired, id
+		std::unordered_map<MatKey, std::uint16_t, MatKeyHash> materialIndex_;
+		std::deque<std::uint32_t> matCopyQueue_;  // textures waiting for a layer / their copy
+		std::vector<MatPage> matPages_;
+		std::vector<std::uint32_t> freeMatLayers_;
+		std::uint32_t nextMatLayer_ = 0;
+		std::shared_ptr<MatPageJob> matPageJob_;
+		bool matPageFailed_ = false;
+		ComPtr<ID3D11Buffer> matTable_;
+		ComPtr<ID3D11ShaderResourceView> matTableSrv_;
+		std::uint32_t matTableCapacity_ = 0;
+		bool matTableDirty_ = false;
+		ComPtr<ID3D11Buffer> matCopyCB_;
+		ComPtr<ID3D11SamplerState> matCopySampler_;
+		std::uint32_t matFrame_ = 0;
+		MaterialStats matStats_{};
+		std::uint32_t AcquireMatTexture(ID3D11Texture2D* a_texture, ID3D11ShaderResourceView* a_view);
+		void ReleaseMatTexture(std::uint32_t a_texture);
+		std::uint16_t AllocateMaterial();
+		void RecycleMaterials(std::uint32_t a_frame, bool a_all);
+		void StartMaterialPage();
+		void UploadMaterialTable();
+		void UpdateMaterialStats();
+		void ReleaseMaterialResources();
 
 		// (45i) Skinned characters.
 		static constexpr std::uint32_t kSkinMaxVertices = 65536;          // per shape (16-bit indices in the game's data)
@@ -1619,7 +1820,7 @@ namespace RayTracingRT
 		// (47n) The 47l RTAO blue noise SRV (slot 11) is gone.
 		// (47z) + last frame's PLIdx SRV (point table offset 9, t8).
 		static constexpr std::uint32_t kDynSun = 0, kDynPoint = 2, kDynAO = 6, kDynWater = 8, kDynAONormal = 10, kDynPointPrev = 11, kDynPointWide = 12, kDynPointWidePrev = 13,
-		                               kDynReflect = 14, kDynamicDescriptors = 18;  // (47j) + the RTAO smooth normals SRV (RTAO table offset 4); (48a) + the wide slots UAV / prev SRV (point table offsets 10, 11) and the reflection table (depth SRV t1, output UAV u0, prep SRV t5; (48d) + direction UAV u2)
+		                               kDynReflect = 14, kDynamicDescriptors = 20;  // (48f) + the surface record UAVs u3 / u4 (reflection table offsets 4, 5). (47j) + the RTAO smooth normals SRV (RTAO table offset 4); (48a) + the wide slots UAV / prev SRV (point table offsets 10, 11) and the reflection table (depth SRV t1, output UAV u0, prep SRV t5; (48d) + direction UAV u2)
 		static constexpr std::uint32_t kDynamicBase = kPointDescriptorBase + kPointDescriptors;  // after the (unused) 46b point slots
 		ComPtr<ID3D12DescriptorHeap> stagingHeap_;
 		[[nodiscard]] D3D12_CPU_DESCRIPTOR_HANDLE StagingCpu(std::uint32_t a_slot) const;
@@ -1683,6 +1884,13 @@ namespace RayTracingRT
 		std::uint64_t reflectFrame_ = 0;
 		std::uint64_t reflectBytes_ = 0;
 		std::string reflectFault_;
+		// (48f) Capture Materials: the RT_MATERIAL variants (same root signature) and the surface record (u3 / u4).
+		ComPtr<ID3D12PipelineState> reflectMatPipeline_;
+		ComPtr<ID3D12PipelineState> reflectMatAlphaPipeline_;
+		SharedTexture reflectSurf0_, reflectSurf1_;
+		std::uint64_t reflectSurfBytes_ = 0;
+		bool reflectMatLastFrame_ = false;
+		void WriteReflectSurfaceDescriptors();
 		bool CreateReflectPipeline();
 		void WriteReflectDescriptors();
 		bool RecordReflectList(CommandContext& a_context, std::size_t a_index, const FrameInput& a_input, bool a_alphaFrame, D3D12_GPU_DESCRIPTOR_HANDLE a_table);

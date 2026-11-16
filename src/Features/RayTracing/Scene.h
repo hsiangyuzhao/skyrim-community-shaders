@@ -162,6 +162,9 @@ namespace RayTracingScene
 		bool windowMasks = false;
 		// (47u) Spatial Static Chunks: a cell's statics packed into chunks by place (Morton order), one- and two-sided together outdoors.
 		bool spatialChunks = false;
+		// (48f) RT reflections, Capture Materials: per-triangle attributes and a material per shape / terrain quadrant are captured (RT Reflections not
+		// Off and the switch on). A change re-captures the scene (as every other field).
+		bool materials = false;
 		bool operator==(const SceneConfig&) const = default;
 	};
 
@@ -541,6 +544,8 @@ namespace RayTracingScene
 			// (47n) Its transform the last time its instance was written (moving instances: RTAO's dynamic-occluder flag).
 			mutable float lastWorld[12]{};
 			mutable bool lastWorldValid = false;
+			// (48f) Capture Materials: its material (diffuse texture + texcoord transform; kNoMaterial = none), released with the shape.
+			std::uint16_t material = RayTracingRT::kNoMaterial;
 		};
 
 		struct TrackedRef
@@ -578,10 +583,15 @@ namespace RayTracingScene
 				std::uint32_t firstIndex = 0, indices = 0;  // into stageIndices (relative to the shape's first vertex)
 				float lo[3]{}, hi[3]{};
 				std::uint8_t side = 0;
+				std::uint32_t firstTriangle = UINT32_MAX;  // (48f) into stageAttributes (kAttributeWords per triangle); UINT32_MAX = none
 			};
 			bool spatial = false;  // captured with Spatial Static Chunks (fixed for the capture)
 			std::vector<float> stagePositions;
 			std::vector<std::uint32_t> stageIndices;
+			std::vector<std::uint32_t> stageAttributes;  // (48f) Capture Materials: the staged shapes' attributes, packed with them
+			// (48f) Capture Materials: the materials its chunk shapes hold (one per shape; released with the capture).
+			std::vector<std::uint16_t> materials;
+			std::uint16_t terrainMaterials[4] = { RayTracingRT::kNoMaterial, RayTracingRT::kNoMaterial, RayTracingRT::kNoMaterial, RayTracingRT::kNoMaterial };
 			std::vector<StagedShape> staged;
 			std::vector<RayTracingRT::BlasHandle> blas;
 			// (45f) Per BLAS: the shapes (indices into `geometries`) it was made from (for the self-check).
@@ -677,6 +687,7 @@ namespace RayTracingScene
 			std::uint32_t uvOffset = UINT32_MAX;     // (45h) half2 texcoord 0, when the mesh has one
 			std::uint32_t colorOffset = UINT32_MAX;  // (45h) ubyte4 vertex colour, when the mesh has one
 			std::uint32_t normalOffset = UINT32_MAX;  // (47l) ubyte4 normal, when the mesh has one
+			std::uint32_t landOffset = UINT32_MAX;    // (48f) landscape blend weights (6 x unorm8 used), when the mesh has them
 		};
 		// (47l) Foliage sway.
 		/// Per frame after the objects: the candidates within the sway radius get a wind BLAS (a few new ones per frame unless
@@ -757,7 +768,13 @@ namespace RayTracingScene
 		bool terrainLoadingPrep_ = true;  // (48e)
 		/// (48a) Builds / releases the cells' terrain BLASes (SetTerrain), within a_deadline (QPC).
 		void UpdateTerrain(RayTracingRT::Backend& a_backend, std::int64_t a_deadline);
-		bool ReadTerrainQuad(Cell& a_cell, int a_quad, RE::BSTriShape* a_shape, const RE::TESObjectLAND::LoadedLandData& a_land, RayTracingRT::ChunkGeometry& o_chunk);
+		bool ReadTerrainQuad(Cell& a_cell, int a_quad, RE::BSTriShape* a_shape, const RE::TESObjectLAND::LoadedLandData& a_land, RayTracingRT::ChunkGeometry& o_chunk,
+			std::uint16_t a_material = RayTracingRT::kNoMaterial);
+		/// (48f) Capture Materials: the shape's material (its Lighting material's diffuse texture and texcoord transform), registered with the
+		/// backend; kNoMaterial when materials are off or the shape has none. The caller releases it (ReleaseMaterial).
+		std::uint16_t AcquireShapeMaterial(RayTracingRT::Backend& a_backend, RE::BSGeometry* a_geometry) const;
+		/// (48f) A terrain quadrant's material (its landscape material's six textures, the quadrant's average vertex colour).
+		std::uint16_t AcquireTerrainMaterial(RayTracingRT::Backend& a_backend, RE::BSTriShape* a_shape, const RE::TESObjectLAND::LoadedLandData& a_land, int a_quad) const;
 		void ReleaseTerrain(RayTracingRT::Backend& a_backend, Cell& a_cell);
 		/// (45h) The shape's cut-out as the ray tracer needs it: the game's diffuse texture, threshold,
 		/// material alpha and texcoord transform; false when it cannot be traced (SEH-guarded).

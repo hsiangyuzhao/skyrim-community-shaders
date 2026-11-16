@@ -26,6 +26,8 @@
 // (48a) RT reflections step 1 (TraceReflectCS) and its alpha-tested variant.
 #include "RayTracing/TraceReflectAlphaCS.dxil.h"
 #include "RayTracing/TraceReflectCS.dxil.h"
+#include "RayTracing/TraceReflectMatAlphaCS.dxil.h"  // (48f)
+#include "RayTracing/TraceReflectMatCS.dxil.h"
 
 namespace RayTracingRT
 {
@@ -55,6 +57,18 @@ namespace RayTracingRT
 		}
 
 		std::uint64_t Align(std::uint64_t a_value, std::uint64_t a_alignment) { return (a_value + a_alignment - 1) & ~(a_alignment - 1); }
+
+		// (48f) The per-instance attribute table (TraceReflectCS RT_MATERIAL InstanceAttrs, uint4 per TLAS instance): attribute base (uint4
+		// elements; UINT32_MAX = none), its triangle count, the instance material | type << 16, unused.
+		constexpr std::uint32_t kInstanceAttrTerrain = 1u, kInstanceAttrCharacter = 2u;
+		void WriteInstanceAttr(std::uint32_t* a_table, std::uint32_t a_index, std::uint32_t a_base, std::uint32_t a_triangles, std::uint16_t a_material, std::uint32_t a_type)
+		{
+			std::uint32_t* entry = a_table + static_cast<std::size_t>(a_index) * 4;
+			entry[0] = a_base;
+			entry[1] = a_triangles;
+			entry[2] = static_cast<std::uint32_t>(a_material) | (a_type << 16);
+			entry[3] = 0;
+		}
 
 		std::int64_t QpcNow()
 		{
@@ -412,6 +426,9 @@ namespace RayTracingRT
 			device_->CreateShaderResourceView(nullptr, &nullSrv, StagingCpu(kDynReflect + 2));
 			// (48d) The hit record's direction word (u2).
 			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynReflect + 3));
+			// (48f) The surface record (u3, u4; filled while Capture Materials has its textures).
+			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynReflect + 4));
+			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynReflect + 5));
 		}
 
 		// (45h) Null views in every alpha slot (the copy layers and the bindless table are filled on use).
@@ -1340,7 +1357,9 @@ namespace RayTracingRT
 		// Its own root signature: constants b0, TLAS t0, table (depth t1, output u0, prep t5), ray counter u1; the alpha-tested variant
 		// also: records t2, texcoords t3, table (copy layers t4, bindless game textures t0 space1), s0 (as RTAO's).
 		// 36 + 2 + 1 + 2 + 2 + 2 + 1 = 46 DWORDs. (48d) The table also holds the direction word's UAV (u2, offset 3).
-		D3D12_DESCRIPTOR_RANGE ranges[4]{};
+		// (48f) + the surface record (u3 / u4, table offsets 4, 5), the instance table t6 and the attributes t7 (root SRVs): 50 DWORDs. Only the
+		// RT_MATERIAL variants reference them; the 48e variants run unchanged with this root signature.
+		D3D12_DESCRIPTOR_RANGE ranges[6]{};
 		ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
 		ranges[0].NumDescriptors = 1;
 		ranges[0].BaseShaderRegister = 1;
@@ -1357,6 +1376,12 @@ namespace RayTracingRT
 		ranges[3].NumDescriptors = 1;
 		ranges[3].BaseShaderRegister = 2;
 		ranges[3].OffsetInDescriptorsFromTableStart = 3;
+		for (int r = 4; r < 6; ++r) {
+			ranges[r].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+			ranges[r].NumDescriptors = 1;
+			ranges[r].BaseShaderRegister = static_cast<UINT>(r - 1);  // u3, u4
+			ranges[r].OffsetInDescriptorsFromTableStart = static_cast<UINT>(r);
+		}
 		D3D12_DESCRIPTOR_RANGE alphaRanges[2]{};
 		alphaRanges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
 		alphaRanges[0].NumDescriptors = 1;
@@ -1367,7 +1392,7 @@ namespace RayTracingRT
 		alphaRanges[1].BaseShaderRegister = 0;
 		alphaRanges[1].RegisterSpace = 1;
 		alphaRanges[1].OffsetInDescriptorsFromTableStart = 1;
-		D3D12_ROOT_PARAMETER params[7]{};
+		D3D12_ROOT_PARAMETER params[9]{};
 		params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 		params[0].Constants.ShaderRegister = 0;
 		params[0].Constants.Num32BitValues = sizeof(ReflectTraceConstants) / 4;
@@ -1376,7 +1401,7 @@ namespace RayTracingRT
 		params[1].Descriptor.ShaderRegister = 0;
 		params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-		params[2].DescriptorTable.NumDescriptorRanges = 4;
+		params[2].DescriptorTable.NumDescriptorRanges = 6;
 		params[2].DescriptorTable.pDescriptorRanges = ranges;
 		params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
@@ -1392,6 +1417,12 @@ namespace RayTracingRT
 		params[6].DescriptorTable.NumDescriptorRanges = 2;
 		params[6].DescriptorTable.pDescriptorRanges = alphaRanges;
 		params[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		params[7].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;  // (48f) instance table t6
+		params[7].Descriptor.ShaderRegister = 6;
+		params[7].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		params[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;  // (48f) attributes t7
+		params[8].Descriptor.ShaderRegister = 7;
+		params[8].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		D3D12_STATIC_SAMPLER_DESC sampler{};
 		sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
 		sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
@@ -1399,7 +1430,7 @@ namespace RayTracingRT
 		sampler.ShaderRegister = 0;
 		sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		D3D12_ROOT_SIGNATURE_DESC rootDesc{};
-		rootDesc.NumParameters = 7;
+		rootDesc.NumParameters = 9;
 		rootDesc.pParameters = params;
 		rootDesc.NumStaticSamplers = 1;
 		rootDesc.pStaticSamplers = &sampler;
@@ -1425,6 +1456,20 @@ namespace RayTracingRT
 		if (FAILED(hr = device_->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&reflectAlphaPipeline_)))) {
 			logger::warn("[RayTracing] The alpha-tested reflection ray query shader was rejected by the driver ({}); reflection rays ignore cut-outs", HrString(hr));
 			reflectAlphaPipeline_.Reset();
+		}
+		// (48f) Capture Materials: the RT_MATERIAL variants (the surface record). Without them the rays run the 48e variants (no material record).
+		psoDesc.CS.pShaderBytecode = g_TraceReflectMatCS;
+		psoDesc.CS.BytecodeLength = sizeof(g_TraceReflectMatCS);
+		if (FAILED(hr = device_->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&reflectMatPipeline_)))) {
+			logger::warn("[RayTracing] The reflection material shader was rejected by the driver ({}); reflection materials unavailable", HrString(hr));
+			reflectMatPipeline_.Reset();
+		}
+		psoDesc.CS.pShaderBytecode = g_TraceReflectMatAlphaCS;
+		psoDesc.CS.BytecodeLength = sizeof(g_TraceReflectMatAlphaCS);
+		if (reflectMatPipeline_ && FAILED(hr = device_->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&reflectMatAlphaPipeline_)))) {
+			logger::warn("[RayTracing] The alpha-tested reflection material shader was rejected by the driver ({}); frames with cut-outs run without materials",
+				HrString(hr));
+			reflectMatAlphaPipeline_.Reset();
 		}
 		return true;
 	}
@@ -1484,6 +1529,7 @@ namespace RayTracingRT
 			Retire(reflectOut_.resource12, 0, nullptr);
 		if (reflectDir_.resource12)
 			Retire(reflectDir_.resource12, 0, nullptr);  // (48d)
+		ReleaseReflectSurfaceTextures();  // (48f) sized with them
 		if (reflectCounterReadback_ && reflectCounterMapped_)
 			reflectCounterReadback_->Unmap(0, nullptr);
 		reflectCounterMapped_ = nullptr;
@@ -1579,6 +1625,7 @@ namespace RayTracingRT
 		// (48d) The reflection rays' own list (same allocator as the prep / trace / RTAO lists, all closed by now), submitted behind the
 		// RTAO list (or behind the trace) and signalling the third fence: the RTAO fence no longer waits for them.
 		stats_.reflectTracedLastFrame = false;
+		reflectMatLastFrame_ = false;  // (48f)
 		if (!a_input.reflect || !ReflectAvailable() || !ReflectReady() || !reflectFence_ || !reflectFence11_ || !a_context.reflectList || !depthMask_.resource12 ||
 			!tlas_)
 			return false;
@@ -1614,8 +1661,23 @@ namespace RayTracingRT
 		if (timestampHeap_)
 			a_list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase);
 		const bool alpha = a_input.reflect->alpha && a_alphaFrame && reflectAlphaPipeline_ && alphaUv_ && a_context.alphaInfoBuffer;
+		// (48f) Capture Materials: the RT_MATERIAL variant where this context's instance table was written, the attribute buffer and the surface
+		// record exist (and, on a frame with cut-outs, its alpha twin); otherwise the 48e variant (the D3D11 side then sees no material record).
+		const bool material = a_input.materials && a_context.instanceAttrWritten && a_context.instanceAttrBuffer && attr_ && ReflectSurfaceReady() &&
+		                      (alpha ? reflectMatAlphaPipeline_ != nullptr : reflectMatPipeline_ != nullptr);
+		reflectMatLastFrame_ = material;
+		if (material) {
+			D3D12_RESOURCE_BARRIER surfPre[2] = {
+				Transition(reflectSurf0_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+				Transition(reflectSurf1_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+			};
+			a_list->ResourceBarrier(2, surfPre);
+		}
+		ID3D12PipelineState* pipeline = alpha ? reflectAlphaPipeline_.Get() : reflectPipeline_.Get();
+		if (material)
+			pipeline = alpha ? reflectMatAlphaPipeline_.Get() : reflectMatPipeline_.Get();
 		a_list->SetComputeRootSignature(reflectRootSignature_.Get());
-		a_list->SetPipelineState(alpha ? reflectAlphaPipeline_.Get() : reflectPipeline_.Get());
+		a_list->SetPipelineState(pipeline);
 		a_list->SetComputeRoot32BitConstants(0, sizeof(ReflectTraceConstants) / 4, &a_input.reflect->constants, 0);
 		a_list->SetComputeRootShaderResourceView(1, tlas_->GetGPUVirtualAddress());
 		a_list->SetComputeRootDescriptorTable(2, a_table);
@@ -1627,9 +1689,20 @@ namespace RayTracingRT
 			alphaTable.ptr += static_cast<UINT64>(descriptorSize_) * (kAlphaDescriptorBase - 1);
 			a_list->SetComputeRootDescriptorTable(6, alphaTable);
 		}
+		if (material) {
+			a_list->SetComputeRootShaderResourceView(7, a_context.instanceAttrBuffer->GetGPUVirtualAddress());
+			a_list->SetComputeRootShaderResourceView(8, attr_->GetGPUVirtualAddress());
+		}
 		a_list->Dispatch((a_input.renderWidth + 7) / 8, (a_input.renderHeight + 7) / 8, 1);
 		if (timestampHeap_)
 			a_list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 1);
+		if (material) {
+			D3D12_RESOURCE_BARRIER surfPost[2] = {
+				Transition(reflectSurf0_.resource12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+				Transition(reflectSurf1_.resource12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+			};
+			a_list->ResourceBarrier(2, surfPost);
+		}
 		D3D12_RESOURCE_BARRIER post[4] = {
 			Transition(depthMask_.resource12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
 			Transition(reflectPrep_.resource12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
@@ -1733,6 +1806,8 @@ namespace RayTracingRT
 				context.boneBuffer->Unmap(0, nullptr);
 			if (context.pointBuffer && context.pointMapped)
 				context.pointBuffer->Unmap(0, nullptr);
+			if (context.instanceAttrBuffer && context.instanceAttrMapped)
+				context.instanceAttrBuffer->Unmap(0, nullptr);  // (48f)
 			context = {};
 		}
 		// (46b)
@@ -1797,6 +1872,17 @@ namespace RayTracingRT
 		reflectPipeline_.Reset();
 		reflectAlphaPipeline_.Reset();
 		reflectRootSignature_.Reset();
+		// (48f) Capture Materials.
+		reflectMatPipeline_.Reset();
+		reflectMatAlphaPipeline_.Reset();
+		reflectSurf0_ = {};
+		reflectSurf1_ = {};
+		reflectSurfBytes_ = 0;
+		reflectMatLastFrame_ = false;
+		attr_.Reset();  // the GPU is done (or the process ends): no retire
+		ReleaseMaterialResources();
+		matStats_ = {};
+		attrFailed_ = false;
 		stagingHeap_.Reset();
 		depthMask_ = {};
 		visibility_ = {};
@@ -2222,6 +2308,7 @@ namespace RayTracingRT
 			releaseCv_.notify_one();
 		}
 		CollectAlphaRetired(completed);
+		CollectAttrRetired(completed);  // (48f)
 		stats_.retiredLastCollect = count;
 		stats_.retireLastMs = static_cast<float>(QpcToMs(QpcNow() - start));
 		PumpPools();  // (46g) deferred pool frees, finished blocks, growth
@@ -2436,6 +2523,18 @@ namespace RayTracingRT
 			if (!PackAlphaCorners(a_geometry->alphaUV, a_geometry->Triangles()) || !AlphaAvailable() || !AllocateAlphaUv(uvCount, uvOffset))
 				return kInvalidBlas;
 		}
+		// (48f) Capture Materials: its attributes get their own range for the BLAS's life (none when not enabled, the size is wrong or the
+		// buffer is full: the BLAS is made all the same, its hits then carry no material).
+		std::uint32_t attrOffset = UINT32_MAX, attrCount = 0;
+		if (!a_geometry->attributes.empty()) {
+			const std::uint32_t triangles = a_geometry->Triangles();
+			if (materialsEnabled_ && a_geometry->attributes.size() == static_cast<std::size_t>(triangles) * kAttributeWords && AllocateAttributes(triangles, attrOffset))
+				attrCount = triangles;
+			else {
+				attrOffset = UINT32_MAX;
+				a_geometry->attributes = {};
+			}
+		}
 		const BlasHandle handle = AllocateHandle();
 		auto& blas = blas_[handle];
 		blas = {};
@@ -2443,6 +2542,8 @@ namespace RayTracingRT
 		blas.triangles = a_geometry->Triangles();
 		blas.uvOffset = uvOffset;
 		blas.uvCount = uvCount;
+		blas.attrOffset = attrOffset;
+		blas.attrCount = attrCount;
 		// (45f) Local box of the vertices the triangles use (for the TLAS self-check).
 		for (int a = 0; a < 3; ++a) {
 			blas.boundsMin[a] = FLT_MAX;
@@ -2489,6 +2590,8 @@ namespace RayTracingRT
 			postbuildOwner_[blas.postbuildSlot] = 0;
 		if (blas.uvOffset != UINT32_MAX)
 			FreeAlphaUv(blas.uvOffset, blas.uvCount);
+		if (blas.attrOffset != UINT32_MAX)
+			FreeAttributes(blas.attrOffset, blas.attrCount);  // (48f)
 		blas = {};
 		freeHandles_.push_back(a_handle);
 	}
@@ -2659,6 +2762,7 @@ namespace RayTracingRT
 			std::uint64_t indexOffset;
 			std::uint64_t uvOffset;  // (45h) alpha texcoords (alpha BLASes only)
 			D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info;
+			std::uint64_t attrOffset = 0;  // (48f) attributes (BLASes with an attribute range only)
 		};
 		std::vector<Pending> batch;
 		std::uint32_t batchTriangles = 0;
@@ -2708,6 +2812,11 @@ namespace RayTracingRT
 				entry.uvOffset = Align(uploadBytes, 256);
 				uploadBytes = entry.uvOffset + geometry.alphaUV.size() * sizeof(std::uint32_t);
 			}
+			const bool withAttributes = blas.attrOffset != UINT32_MAX && !geometry.attributes.empty();  // (48f)
+			if (withAttributes) {
+				entry.attrOffset = Align(uploadBytes, 256);
+				uploadBytes = entry.attrOffset + geometry.attributes.size() * sizeof(std::uint32_t);
+			}
 			if (!uploadPool_.Allocate(uploadBytes, entry.upload)) {
 				asPool_.Free(entry.result, 0);  // never used
 				++stats_.pools.allocFailsLastFrame;
@@ -2718,6 +2827,8 @@ namespace RayTracingRT
 			std::memcpy(mapped + entry.indexOffset, geometry.indices.data(), geometry.indices.size() * sizeof(std::uint32_t));
 			if (!geometry.Opaque())
 				std::memcpy(mapped + entry.uvOffset, geometry.alphaUV.data(), geometry.alphaUV.size() * sizeof(std::uint32_t));
+			if (withAttributes)
+				std::memcpy(mapped + entry.attrOffset, geometry.attributes.data(), geometry.attributes.size() * sizeof(std::uint32_t));
 			scratchNeed = std::max(scratchNeed, info.ScratchDataSizeInBytes);
 			scratchSum += Align(info.ScratchDataSizeInBytes, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);  // (46p)
 			batchTriangles += geometry.Triangles();
@@ -2761,6 +2872,25 @@ namespace RayTracingRT
 						entry.upload.offset + entry.uvOffset, static_cast<std::uint64_t>(blas.uvCount) * 8);
 				}
 				auto back = Transition(alphaUv_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+				a_list->ResourceBarrier(1, &back);
+			}
+		}
+		// (48f) Attributes into their buffer likewise (a range per BLAS, fixed for its life; uploaded with the build, inside its budget).
+		{
+			bool any = false;
+			for (const auto& entry : batch)
+				any = any || (blas_[entry.handle].attrOffset != UINT32_MAX && !blas_[entry.handle].geometry->attributes.empty());
+			if (any && attr_) {
+				auto toCopy = Transition(attr_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+				a_list->ResourceBarrier(1, &toCopy);
+				for (const auto& entry : batch) {
+					const auto& blas = blas_[entry.handle];
+					if (blas.attrOffset == UINT32_MAX || blas.geometry->attributes.empty())
+						continue;
+					a_list->CopyBufferRegion(attr_.Get(), static_cast<std::uint64_t>(blas.attrOffset) * 16, uploadPool_.Resource(entry.upload),
+						entry.upload.offset + entry.attrOffset, static_cast<std::uint64_t>(blas.attrCount) * 16);
+				}
+				auto back = Transition(attr_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 				a_list->ResourceBarrier(1, &back);
 			}
 		}
@@ -3128,6 +3258,12 @@ namespace RayTracingRT
 				count = 0;
 		}
 		std::uint32_t alphaInstances = 0;
+		// (48f) Capture Materials: the per-instance attribute table in TLAS order (TraceReflectCS RT_MATERIAL reads it by CommittedInstanceIndex).
+		// Without it (not enabled, no attribute buffer, the upload buffer failed) the reflection rays run the 48e variant.
+		context.instanceAttrWritten = false;
+		std::uint32_t* instanceAttrs = nullptr;
+		if (a_input.materials && attr_ && reflectMatPipeline_ && EnsureInstanceAttrBuffer(context, maxInstances))
+			instanceAttrs = static_cast<std::uint32_t*>(context.instanceAttrMapped);
 		for (const auto& instance : instances) {
 			const auto category = std::min<std::uint32_t>(instance.category, kInstanceCategories - 1);
 			if (instance.blas >= blas_.size()) {
@@ -3176,6 +3312,17 @@ namespace RayTracingRT
 			if (a_input.validate && instance.hasExpected)
 				CheckInstance(desc, instance, blas, a_input);
 			++check_.written[category];
+			if (instanceAttrs) {
+				// (48f) Its attributes: the BLAS that describes its triangles (a wind BLAS: its frozen mesh), when it has them and the count fits.
+				const BlasHandle attrHandle = instance.attrBlas != kInvalidBlas ? instance.attrBlas : instance.blas;
+				std::uint32_t attrBase = UINT32_MAX, attrTriangles = 0;
+				if (attrHandle < blas_.size() && blas_[attrHandle].state != BlasState::Free && blas_[attrHandle].attrOffset != UINT32_MAX &&
+					blas_[attrHandle].attrCount == blas.triangles) {
+					attrBase = blas_[attrHandle].attrOffset;
+					attrTriangles = blas_[attrHandle].attrCount;
+				}
+				WriteInstanceAttr(instanceAttrs, instanceCount, attrBase, attrTriangles, instance.material, category == kCategoryTerrain ? kInstanceAttrTerrain : 0u);
+			}
 			descs[instanceCount++] = desc;
 		}
 		// (45i) Skinned characters: identity rotation (the skinning put the vertices in world axes),
@@ -3220,6 +3367,8 @@ namespace RayTracingRT
 			}
 			desc.AccelerationStructure = asPool_.Address(skin.blas);
 			++check_.written[kCategoryCharacter];
+			if (instanceAttrs)
+				WriteInstanceAttr(instanceAttrs, instanceCount, UINT32_MAX, 0, kNoMaterial, kInstanceAttrCharacter);  // (48f)
 			descs[instanceCount++] = desc;
 			++characterInstances;
 			++charactersTraced;
@@ -3240,6 +3389,8 @@ namespace RayTracingRT
 			desc.Flags = kInstanceFlags;
 			desc.AccelerationStructure = group.blas;
 			check_.written[kCategoryCharacter] += group.members;
+			if (instanceAttrs)
+				WriteInstanceAttr(instanceAttrs, instanceCount, UINT32_MAX, 0, kNoMaterial, kInstanceAttrCharacter);  // (48f)
 			descs[instanceCount++] = desc;
 			++characterInstances;
 			charactersTraced += group.members;
@@ -3248,6 +3399,7 @@ namespace RayTracingRT
 		skinStats_.instancesLastFrame = characterInstances;
 
 		stats_.instancesLastFrame = instanceCount;
+		context.instanceAttrWritten = instanceAttrs != nullptr;  // (48f)
 		recWork_.tlasInstances = instanceCount;  // (46p)
 		lap(split.tlas);
 		// (45h) The alpha pipeline only on frames that hold alpha-tested instances (and their records

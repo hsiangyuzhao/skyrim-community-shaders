@@ -23,6 +23,16 @@
 // smoothly from 16 to 0 (0 = the first cut-out candidate counts as a hit: leaves are solid), and the ray range shortens smoothly from the
 // full length to 30 % between roughness 0.4 and 0.9; a shortened ray that hits nothing is kHitRangeEnd (not a sky miss: the gap fill
 // leaves such a pixel to the old cubemap path).
+//
+// (48f) RT_MATERIAL (Capture Materials; the data half of the material step, nothing in the picture uses it yet): for every traced pixel
+// also the hit surface record, two shared R32_UINT words (D3D11 reads them: the RT Albedo view now, 48g's shading later):
+//   ReflectSurf0 (u3): the interpolated texcoord at the hit (half2, the mesh's texcoord 0 before the material's transform); terrain: the
+//     six layer weights at the hit, 5 bits each (bits 0-29);
+//   ReflectSurf1 (u4): bits 0-15 the material id (0xFFFF none, 0xFFFE the instance has no attributes, 0xFFFD a character: 48f stores
+//     none for characters), bits 16-31 the hit's face normal (world axes, octahedral 8 + 8, turned towards the ray's origin).
+// The instance's entry in InstanceAttrs (t6, TLAS order = CommittedInstanceIndex) gives its attribute base and triangle count, its own
+// material (objects, cut-outs) and its type; Attributes (t7) holds 16 bytes per triangle (MaterialAttributes.h): three corner texcoords
+// (terrain: corner layer weights) and the material | face normal word.
 
 struct RFConstants
 {
@@ -40,6 +50,15 @@ Texture2D<uint> ReflectPrep : register(t5);
 RWTexture2D<uint> ReflectOut : register(u0);
 RWByteAddressBuffer RayCounter : register(u1);
 RWTexture2D<uint> ReflectDir : register(u2);  // (48d)
+
+#if defined(RT_MATERIAL)
+static const uint kMatNone = 0xFFFFu, kMatNoAttr = 0xFFFEu, kMatCharacter = 0xFFFDu;  // Backend: kNoMaterial, markers past kMaterialMaxIds
+static const uint kInstTerrain = 1u;                                                   // Backend.cpp kInstanceAttrTerrain
+StructuredBuffer<uint4> InstanceAttrs : register(t6);  // attribute base (UINT_MAX none), triangles, material | type << 16, unused
+StructuredBuffer<uint4> Attributes : register(t7);
+RWTexture2D<uint> ReflectSurf0 : register(u3);
+RWTexture2D<uint> ReflectSurf1 : register(u4);
+#endif
 
 static const uint kFlagCharacters = 1u;   // characters are in the TLAS: the character ray
 static const uint kFlagFirstPerson = 2u;  // no character ray for pixels near the camera
@@ -145,6 +164,64 @@ float2 OctEncode(float3 n)
 	return e;
 }
 
+#if defined(RT_MATERIAL)
+// (48f) MaterialAttributes.h PackOct8 / UnpackOct8.
+float3 OctDecode8(uint e)
+{
+	return OctDecode(float2(e & 0xFFu, (e >> 8) & 0xFFu) / 255.0 * 2.0 - 1.0);
+}
+
+uint OctEncode8(float3 n)
+{
+	const uint2 o = uint2(round(saturate(OctEncode(n) * 0.5 + 0.5) * 255.0));
+	return o.x | (o.y << 8);
+}
+
+float2 UnpackHalf2(uint packed)
+{
+	return f16tof32(uint2(packed & 0xFFFFu, packed >> 16));
+}
+
+// (48f) The hit surface record of a committed scene hit.
+void SurfaceRecord(uint instanceIndex, uint primitive, float2 bary, float3x3 objectToWorld, float3 R, out uint o_surf0, out uint o_surf1)
+{
+	const uint4 inst = InstanceAttrs[instanceIndex];
+	if (inst.x == 0xFFFFFFFFu || primitive >= inst.y) {
+		o_surf0 = 0u;
+		o_surf1 = kMatNoAttr | (OctEncode8(-R) << 16);
+		return;
+	}
+	const uint4 a = Attributes[inst.x + primitive];
+	uint material = inst.z & 0xFFFFu;
+	if (material == kMatNone)
+		material = a.w & 0xFFFFu;  // cell chunks / terrain: the triangle's own
+	float3 n = mul(objectToWorld, OctDecode8(a.w >> 16));
+	n = dot(n, n) > 1e-12 ? normalize(n) : -R;
+	if (dot(n, R) > 0.0)
+		n = -n;
+	const float w0 = 1.0 - bary.x - bary.y;
+	[branch] if ((inst.z >> 16) == kInstTerrain)
+	{
+		uint packed = 0u;
+		[unroll] for (uint i = 0u; i < 6u; ++i)
+		{
+			const uint s = 5u * i;
+			const float w = float((a.x >> s) & 31u) * w0 + float((a.y >> s) & 31u) * bary.x + float((a.z >> s) & 31u) * bary.y;
+			packed |= min(uint(round(w)), 31u) << s;
+		}
+		o_surf0 = packed;
+	}
+	else
+	{
+		float2 uv = UnpackHalf2(a.x) * w0 + UnpackHalf2(a.y) * bary.x + UnpackHalf2(a.z) * bary.y;
+		if (!all(isfinite(uv)))
+			uv = 0.0;
+		o_surf0 = f32tof16(uv.x) | (f32tof16(uv.y) << 16);
+	}
+	o_surf1 = material | (OctEncode8(n) << 16);
+}
+#endif
+
 // Karis, "Real Shading in Unreal Engine 4" (ssrt_common.hlsli ImportanceSampleGGX): a half vector around +z.
 float3 ImportanceSampleGGX(float2 E, float a2)
 {
@@ -156,10 +233,18 @@ float3 ImportanceSampleGGX(float2 E, float a2)
 
 // Closest hit against a_mask; o_type = the hit's type (static / object / cut-out / terrain), o_t = its distance. (48d) a_budget: cut-out
 // candidates tested against their alpha before the next one counts as a hit (16 = 48a; 0 = cut-outs solid).
-bool ClosestHit(float3 origin, float3 dir, float tMin, float tMax, uint mask, float footprint, uint a_budget, out uint o_type, out float o_t)
+bool ClosestHit(float3 origin, float3 dir, float tMin, float tMax, uint mask, float footprint, uint a_budget, out uint o_type, out float o_t
+#if defined(RT_MATERIAL)
+	, out uint o_surf0, out uint o_surf1
+#endif
+)
 {
 	o_type = kHitMiss;
 	o_t = tMax;
+#if defined(RT_MATERIAL)
+	o_surf0 = 0u;
+	o_surf1 = kMatNone;
+#endif
 	RayDesc ray;
 	ray.Origin = origin;
 	ray.Direction = dir;
@@ -194,6 +279,10 @@ bool ClosestHit(float3 origin, float3 dir, float tMin, float tMax, uint mask, fl
 			o_type = kHitObject;
 		else
 			o_type = kHitStatic;
+#if defined(RT_MATERIAL)
+		SurfaceRecord(q.CommittedInstanceIndex(), q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics(), (float3x3)q.CommittedObjectToWorld3x4(), dir,
+			o_surf0, o_surf1);
+#endif
 	}
 	return hit;
 }
@@ -276,7 +365,12 @@ bool SphereOnSegment(float3 origin, float3 dir, float tMax, float4 sphere)
 			uint type = kHitMiss;
 			float tHit = tMax;
 			const uint sceneMask = kSceneMask | ((flags & kFlagTerrain) ? kTerrainMask : 0u);
+#if defined(RT_MATERIAL)
+			uint surf0 = 0u, surf1 = kMatNone;
+			ClosestHit(origin, R, 0.0, tMax, sceneMask, footprint, budget, type, tHit, surf0, surf1);
+#else
 			ClosestHit(origin, R, 0.0, tMax, sceneMask, footprint, budget, type, tHit);
+#endif
 			const bool characters = (flags & kFlagCharacters) && !((flags & kFlagFirstPerson) && dist < kFirstPersonNear);
 			[branch] if (characters && (SphereOnSegment(origin, R, tHit, C.Spheres[0]) || SphereOnSegment(origin, R, tHit, C.Spheres[1])))
 			{
@@ -291,6 +385,10 @@ bool SphereOnSegment(float3 origin, float3 dir, float tMax, float4 sphere)
 				if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
 					type = kHitCharacter;
 					tHit = q.CommittedRayT();
+#if defined(RT_MATERIAL)
+					surf0 = 0u;
+					surf1 = kMatCharacter | (OctEncode8(-R) << 16);  // (48f) characters: no attributes yet (48g)
+#endif
 				}
 			}
 			if (type == kHitMiss && shortened)
@@ -301,6 +399,14 @@ bool SphereOnSegment(float3 origin, float3 dir, float tMax, float4 sphere)
 			// (48d) The direction word: what the gap fill reads (its hit point, the lobe check, the miss lookup).
 			const uint2 o = uint2(round(saturate(OctEncode(R) * 0.5 + 0.5) * 65535.0));
 			ReflectDir[p] = o.x | (o.y << 16);
+#if defined(RT_MATERIAL)
+			if (type == kHitMiss || type == kHitRangeEnd) {
+				surf0 = 0u;
+				surf1 = kMatNone;
+			}
+			ReflectSurf0[p] = surf0;
+			ReflectSurf1[p] = surf1;
+#endif
 		}
 		ReflectOut[p] = result;
 	}

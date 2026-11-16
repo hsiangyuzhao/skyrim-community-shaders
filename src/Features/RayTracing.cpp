@@ -185,6 +185,10 @@ namespace
 	constexpr double kWarmUpTimeoutMs = 5000.0;
 	constexpr double kFadeInMs = 500.0;
 	constexpr std::uint32_t kAlphaCopiesPerFrame = 16;  // (45h) 256x256 alpha copies made per frame (5 small dispatches each)
+	// (48f) Capture Materials: 128x128 texture copies per frame (one dispatch each) while playing / in the black screen and warm-up after a loading
+	// screen, each with a render-thread CPU cap (the first copy of a frame always goes).
+	constexpr std::uint32_t kMaterialCopiesPerFrame = 12, kMaterialCopiesTransition = 256;
+	constexpr float kMaterialCopyCpuMs = 0.3f, kMaterialCopyCpuMsTransition = 4.0f;
 	constexpr float kCharacterSelfShadowOffset = 6.0f;  // hits on characters nearer than this along the sun ray are ignored (units)
 	constexpr float kRayBiasConstant = 2.0f, kRayBiasPerUnit = 0.0015f;  // the ray start offset: 2 units + 0.15 % of the distance
 
@@ -937,6 +941,10 @@ void RayTracing::TransitionFrame()
 	cpuLast.characters = static_cast<float>(static_cast<double>(Qpc() - charactersStart) * QpcMs());
 	if (prewarmMs > 0.0f)
 		backend.Prewarm(prewarmMs, settings.Characters);
+	// (48f) Capture Materials: the texture copies of the destination. Never behind the loading screen itself (it is presented from another thread and
+	// owns the immediate context); the larger budget in the black screen and the dim part of the fade-in, the play budget once it is visible.
+	if (!loading)
+		RunMaterialCopies(!visible || lastFadeFactor > 0.0f);
 	if (loading)
 		buildMs = std::max(pumpMs - static_cast<float>(static_cast<double>(Qpc() - start) * QpcMs()), 1.0f);
 	backend.BuildOnly(buildTriangles, buildCount, buildMs);
@@ -1097,6 +1105,10 @@ void RayTracing::UpdateAlphaCasters()
 	else if (wanted && backend.IsReady() && !backend.AlphaAvailable())
 		switchOff("the GPU driver did not accept the alpha-tested ray query shader");
 	alphaRequested = settings.Foliage != static_cast<int>(RayTracingScene::FoliageMode::ShadowMap) || settings.Cutouts;
+	// (48f) Capture Materials: the backend accepts materials / attributes before the scene captures with them (its config below).
+	settings.ReflectionsMode = std::clamp(settings.ReflectionsMode, 0, 2);
+	if (backend.IsReady())
+		backend.SetMaterialsEnabled(MaterialsWanted());
 	scene.Configure(SceneConfigFromSettings());  // a change re-captures the scene
 	const bool alphaInUse = scene.AlphaWanted() || (settings.Characters && backend.SkinAlphaAvailable());
 	if (!alphaInUse && backend.IsReady() && backend.AlphaIdle())
@@ -1130,6 +1142,12 @@ void RayTracing::UpdateAlphaCasters()
 	scene.SetTerrainLoadingPrep(settings.ReflectionsLoadingPrep);  // (48e)
 	if (!ReflectionsWanted() && backend.IsReady() && backend.ReflectBytes())
 		backend.ReleaseReflectResources();
+	// (48f) Capture Materials off (or RT Reflections Off): no surface record; the rest goes once the re-captured scene no longer uses it.
+	if (backend.IsReady()) {
+		if (!MaterialsWanted() && backend.ReflectSurfaceBytes())
+			backend.ReleaseReflectSurfaceTextures();
+		backend.MaterialHousekeeping(globals::state->frameCount);
+	}
 }
 
 void RayTracing::FillWind(RayTracingRT::FrameInput& a_input)
@@ -1260,6 +1278,7 @@ RayTracingScene::SceneConfig RayTracing::SceneConfigFromSettings() const
 	// (46c) Window Shadows Ultimate's window masks indoors: with the alpha-tested point-light trace only.
 	config.windowMasks = alpha && backend.PointAlphaAvailable() && PointLightsOn() && InteriorsOn();
 	config.spatialChunks = settings.SpatialStaticChunks;  // (47u) a change re-captures the scene
+	config.materials = MaterialsWanted();                 // (48f) likewise
 	return config;
 }
 
@@ -1564,6 +1583,7 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.ReflectionsHitDistance = read("ReflectionsHitDistance", defaults.ReflectionsHitDistance);
 		settings.ReflectionsLoadingPrep = read("ReflectionsLoadingPrep", defaults.ReflectionsLoadingPrep);  // (48e)
 		settings.ReflectionsCubemapWarmUp = read("ReflectionsCubemapWarmUp", defaults.ReflectionsCubemapWarmUp);
+		settings.ReflectionsMaterials = read("ReflectionsMaterials", defaults.ReflectionsMaterials);  // (48f)
 		const float sunSize = read("SunSize", -1.0f);
 		if (sunSize >= 0.0f) {
 			settings.SunSize = sunSize;
@@ -1712,6 +1732,7 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["ReflectionsHitDistance"] = settings.ReflectionsHitDistance;
 	o_json["ReflectionsLoadingPrep"] = settings.ReflectionsLoadingPrep;  // (48e)
 	o_json["ReflectionsCubemapWarmUp"] = settings.ReflectionsCubemapWarmUp;
+	o_json["ReflectionsMaterials"] = settings.ReflectionsMaterials;  // (48f)
 	o_json["AOSmoothNormals"] = settings.AOSmoothNormals;  // (47j)
 	o_json["AOTemporalV2"] = settings.AOTemporalV2;  // (47l)
 	o_json["FoliageSway"] = settings.FoliageSway;  // (47l)
@@ -2727,6 +2748,8 @@ void RayTracing::SwitchedOffFrame()
 			backend.Tick();
 			if (backend.AlphaIdle())
 				backend.ReleaseAlphaResources();  // (45h) once the GPU is done with the released scene
+			backend.SetMaterialsEnabled(false);  // (48f) the released scene's materials and attributes go
+			backend.MaterialHousekeeping(globals::state->frameCount);
 			if (backend.SkinIdle())
 				backend.ReleaseSkinResources();  // (45i)
 		}
@@ -2863,7 +2886,9 @@ void RayTracing::LoadingPump()
 		DrainTransitionEvents();
 		backend.SetTransition(true);
 		scene.SetInteriorEnabled(InteriorWanted());
+		inLoadingPump = true;  // (48f) no D3D11 work from here
 		TransitionFrame();
+		inLoadingPump = false;
 		const std::int64_t endStart = Qpc();
 		scene.EndFrame(backend);
 		characters.EndFrame(backend);
@@ -2871,6 +2896,7 @@ void RayTracing::LoadingPump()
 	} catch (const std::exception& e) {
 		Disable(Status::Failed, std::format("exception: {}", e.what()));
 	}
+	inLoadingPump = false;  // (48f) also after an exception
 	pumpThisFrame = true;
 	pumpCpuMs = static_cast<float>(static_cast<double>(Qpc() - start) * QpcMs());
 	++pumpFrames;
@@ -3144,6 +3170,14 @@ void RayTracing::PublishCpuSplit()
 		// Fill) and the game queue's wait for the reflection list right before it.
 		detail.reflFill = settings.ReflectionsMode == 2 ? (reflectGapFillUsedLastFrame ? 1 : 0) : -1;
 		detail.reflSyncGpuMs = reflectGapFillUsedLastFrame ? std::max(timers->LastSampleMs(Util::GpuBucket::RayTracingReflectSync), 0.0f) : -1.0f;
+		// (48f) Capture Materials (-1 = off).
+		if (backend.MaterialsEnabled()) {
+			const auto& ms = backend.GetMaterialStats();
+			detail.matCopies = static_cast<int>(ms.copiesLastFrame);
+			detail.matPending = static_cast<int>(ms.texturesPending);
+			detail.matTextures = static_cast<int>(ms.texturesReady);
+			detail.matAttrMb = static_cast<float>(static_cast<double>(ms.attrBytesUsed) / (1024.0 * 1024.0));
+		}
 		// (46h) Where this frame's RTAO was traced and its mode (-1 = not traced this frame).
 		detail.rtaoIndoors = aoTraced && aoThisFrame ? (aoInteriorThisFrame ? 1 : 0) : -1;
 		detail.rtaoMode = aoTraced && aoThisFrame ? aoModeThisFrame : -1;
@@ -3684,6 +3718,7 @@ void RayTracing::RunFrame()
 		if (alphaMaskCS)
 			backend.RecordAlphaCopies(alphaMaskCS.get(), kAlphaCopiesPerFrame);
 	}
+	RunMaterialCopies(false);  // (48f) Capture Materials: texture copies (D3D11, per-frame budget)
 
 	// 0b. (47j) RTAO: Smooth Normals, from last frame's depth still in DepthMask (before step 1 overwrites it); (47u) or, with Start Sun
 	// Trace Earlier, right behind the ready signal from its copy. 1. Depth + engine mask -> the tracer's shared texture.
@@ -3938,6 +3973,7 @@ void RayTracing::RunNoSunFrame(ID3D11ShaderResourceView* a_depth, ID3D11ShaderRe
 		if (alphaMaskCS)
 			backend.RecordAlphaCopies(alphaMaskCS.get(), kAlphaCopiesPerFrame);
 	}
+	RunMaterialCopies(false);  // (48f) Capture Materials: texture copies (D3D11, per-frame budget)
 	ResolveRelevance(nullptr);  // (47u) no exact region on a sun "Off" frame: everything left stale by Skip Updates is updated now
 	PrepareDepthMask(context, prepare, a_depth, a_mask, a_width, a_height, input);  // (47u) (47j) normal prep + PrepareCS
 	const std::int64_t executeStart = Qpc();
@@ -5725,6 +5761,33 @@ bool RayTracing::ReflectionsWanted() const
 	return (settings.ReflectionsMode == 1 || settings.ReflectionsMode == 2) && backend.ReflectAvailable() && reflectOffReason.empty();
 }
 
+bool RayTracing::MaterialsWanted() const
+{
+	// (48f) Whenever RT Reflections is not Off (so Trace Only <-> Gap Fill never re-captures), with the switch on and the RT_MATERIAL shaders
+	// accepted by the driver. Off: nothing of it (48e).
+	return settings.ReflectionsMode != 0 && settings.ReflectionsMaterials && backend.IsReady() && backend.MaterialTraceAvailable() && reflectOffReason.empty();
+}
+
+void RayTracing::RunMaterialCopies(bool a_transition)
+{
+	// (48f) D3D11, on the render thread, never while the loading screen is presented (it owns the immediate context from another thread): finished
+	// pages, new layers, the texture copies within a per-frame budget (larger in the black screen / warm-up after a loading screen, when nothing
+	// or little is visible), the material table. The copy shader is compiled in the background; until then only the bookkeeping runs.
+	if (!backend.IsReady() || !backend.MaterialsEnabled() || inLoadingPump)
+		return;
+	if (!materialCopyCS && !materialCopyFailed) {
+		bool failed = false;
+		PollAsyncShader(materialCopyAsync, materialCopyCS, L"Data\\Shaders\\RayTracing\\MaterialCopyCS.hlsl", {}, "Ray Tracing MaterialCopyCS", failed);
+		if (failed) {
+			materialCopyFailed = true;
+			logger::error("[RayTracing] Reflection materials: MaterialCopyCS did not compile; textures stay uncopied (RT Albedo shows them as pending)");
+		}
+	}
+	const std::uint32_t copies = a_transition ? kMaterialCopiesTransition : kMaterialCopiesPerFrame;
+	const float cpuMs = a_transition ? kMaterialCopyCpuMsTransition : kMaterialCopyCpuMs;
+	backend.UpdateMaterials(materialCopyCS.get(), copies, cpuMs, globals::state->frameCount);
+}
+
 bool RayTracing::GapFillConsumer()
 {
 	const auto& ssrt = globals::features::screenSpaceRayTracing;
@@ -5747,11 +5810,13 @@ void RayTracing::PrepareReflections(RayTracingRT::FrameInput& a_input)
 	// (PrepareDepthMask).
 	reflectWantedThisFrame = false;
 	a_input.reflectTags = false;
+	a_input.materials = false;  // (48f)
 	try {
 		PrepareReflectionsImpl(a_input);
 	} catch (const std::exception& e) {
 		reflectWantedThisFrame = false;
 		a_input.reflectTags = false;
+		a_input.materials = false;
 		reflectOffReason = std::format("exception: {}", e.what());
 		logger::warn("[RayTracing] RT reflections switched off: {}", reflectOffReason);
 	}
@@ -5793,6 +5858,8 @@ void RayTracing::PrepareReflectionsImpl(RayTracingRT::FrameInput& a_input)
 	std::copy_n(a_input.constants.spheres, 8, c.spheres);
 	reflectInput.alpha = backend.AOAlphaAvailable();
 	a_input.reflectTags = true;
+	// (48f) Capture Materials: the surface record (sized like the hit record) and the per-instance table with this frame's TLAS.
+	a_input.materials = MaterialsWanted() && backend.MaterialsEnabled() && backend.EnsureReflectSurfaceTextures(width, height);
 	reflectWantedThisFrame = true;
 }
 
@@ -5917,22 +5984,55 @@ void RayTracing::DrawReflectionDebug()
 	cb.Size[1] = height;
 	cb.Size[2] = static_cast<std::uint32_t>(reflectDebugView);
 	cb.Params[0] = kReflectMaxRayLength;
+	// (48f) RT Albedo: the surface record, the material table and the copy pages (t1 .. t9, s0); w = this frame's record is valid.
+	const bool albedo = reflectDebugView == ReflectDebugView::Albedo;
+	ID3D11ShaderResourceView* srvs[10] = { backend.ReflectOutSRV() };
+	std::uint32_t srvCount = 1;
+	if (albedo) {
+		const bool record = backend.ReflectMaterialLastFrame() && backend.ReflectSurf0SRV() && backend.ReflectSurf1SRV() && backend.MaterialTableSRV();
+		cb.Size[3] = record ? 1u : 0u;
+		if (record) {
+			srvs[1] = backend.ReflectSurf0SRV();
+			srvs[2] = backend.ReflectSurf1SRV();
+			srvs[3] = backend.MaterialTableSRV();
+			for (std::uint32_t page = 0; page < RayTracingRT::kMaterialMaxPages; ++page)
+				srvs[4 + page] = backend.MaterialPageSRV(page);
+		}
+		srvCount = 10;
+		if (!reflectDebugSampler) {
+			D3D11_SAMPLER_DESC samplerDesc{};
+			samplerDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+			samplerDesc.AddressU = samplerDesc.AddressV = samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+			samplerDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+			samplerDesc.MaxLOD = D3D11_FLOAT32_MAX;
+			globals::d3d::device->CreateSamplerState(&samplerDesc, reflectDebugSampler.put());
+		}
+	}
 	reflectDebugCB->Update(cb);
 	auto* context = globals::d3d::context;
 	ID3D11Buffer* cbs[1] = { reflectDebugCB->CB() };
-	ID3D11ShaderResourceView* srvs[1] = { backend.ReflectOutSRV() };
 	ID3D11UnorderedAccessView* uavs[1] = { debugColorUAV.get() };
+	winrt::com_ptr<ID3D11SamplerState> previousSampler;
+	if (albedo) {
+		context->CSGetSamplers(0, 1, previousSampler.put());
+		ID3D11SamplerState* sampler = reflectDebugSampler.get();
+		context->CSSetSamplers(0, 1, &sampler);
+	}
 	context->CSSetConstantBuffers(0, 1, cbs);
-	context->CSSetShaderResources(0, 1, srvs);
+	context->CSSetShaderResources(0, srvCount, srvs);
 	context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
 	context->CSSetShader(reflectDebugCS.get(), nullptr, 0);
 	context->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
-	ID3D11ShaderResourceView* nullSrvs[1]{};
+	ID3D11ShaderResourceView* nullSrvs[10]{};
 	ID3D11UnorderedAccessView* nullUavs[1]{};
 	ID3D11Buffer* nullCbs[1]{};
-	context->CSSetShaderResources(0, 1, nullSrvs);
+	context->CSSetShaderResources(0, srvCount, nullSrvs);
 	context->CSSetUnorderedAccessViews(0, 1, nullUavs, nullptr);
 	context->CSSetConstantBuffers(0, 1, nullCbs);
+	if (albedo) {
+		ID3D11SamplerState* restore = previousSampler.get();
+		context->CSSetSamplers(0, 1, &restore);
+	}
 	context->CSSetShader(nullptr, nullptr, 0);
 	reflectDebugDrawn = true;
 }
@@ -6572,6 +6672,7 @@ void RayTracing::RunInteriorFrame()
 		if (alphaMaskCS)
 			backend.RecordAlphaCopies(alphaMaskCS.get(), kAlphaCopiesPerFrame);
 	}
+	RunMaterialCopies(false);  // (48f) Capture Materials: texture copies (D3D11, per-frame budget)
 	// (47j) RTAO: Smooth Normals, from last frame's depth still in DepthMask (before PrepareCS overwrites it); (47u) or behind the ready
 	// signal from its copy (Start Sun Trace Earlier).
 	ResolveRelevance(nullptr);  // (47u) indoors: everything left stale by Skip Updates is updated now
@@ -6908,6 +7009,15 @@ void RayTracing::DrawSettings()
 			ImGui::Text("On (default): the ground (terrain) for the reflection rays is built while the loading screen is up, and the switch to");
 			ImGui::Text("  RT after it waits for it like for everything else. Off: as 48d (at most 4 cells of ground per frame, after the switch).");
 		}
+		// (48f) The data half of the material step.
+		ImGui::Checkbox("Reflections: Capture Materials", &settings.ReflectionsMaterials);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): prepares what the reflection rays will need to colour what they hit (the next package uses it; the picture does");
+			ImGui::Text("  not change yet). Every captured surface keeps its texture coordinates and direction (16 bytes per triangle), every distinct");
+			ImGui::Text("  texture gets a small 128x128 copy (a few per frame while playing, many in the black screen after a loading screen), and the");
+			ImGui::Text("  rays note the texture and spot they hit. Check it with Reflection Debug View > RT Albedo. Changing it captures the scene again.");
+			ImGui::Text("Off: nothing of it (as 48e). Characters are not covered yet (they show purple in RT Albedo).");
+		}
 		// (48e) Background compiles of the reflection shaders (no first-use freeze).
 		if (settings.ReflectionsMode != 0) {
 			auto& ssrtFeature = globals::features::screenSpaceRayTracing;
@@ -6917,9 +7027,9 @@ void RayTracing::DrawSettings()
 				ImGui::TextDisabled("Preparing the reflection shaders in the background (the picture uses the old path until they are ready)...");
 		}
 		{
-			const char* kViews[5] = { "Off", "Hit Type", "Hit Distance", "Normal Confidence", "RT Reflection Use" };
+			const char* kViews[6] = { "Off", "Hit Type", "Hit Distance", "Normal Confidence", "RT Reflection Use", "RT Albedo" };
 			int view = static_cast<int>(reflectDebugView);
-			if (ImGui::Combo("Reflection Debug View", &view, kViews, 5))
+			if (ImGui::Combo("Reflection Debug View", &view, kViews, 6))
 				reflectDebugView = static_cast<ReflectDebugView>(std::clamp(view, 0, static_cast<int>(ReflectDebugView::Count) - 1));
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::Text("Not saved. Hit Type: green building / static, orange object, cyan leaves / cut-out, purple character, brown terrain,");
@@ -6929,6 +7039,9 @@ void RayTracing::DrawSettings()
 				ImGui::Text("RT Reflection Use (Gap Fill): what the picture used where SSR found nothing: green = a point on screen, cyan = the cubemap");
 				ImGui::Text("  at a matching position, orange = the cubemap without sky (position did not match), blue = sky; brighter = more weight.");
 				ImGui::Text("  Transparent = not used (SSR found it, not traced, or the direction check faded it out).");
+				ImGui::Text("RT Albedo (Capture Materials): the texture colour of what each traced ray hit (ground: its layers' average colours). Magenta =");
+				ImGui::Text("  captured without material data, red-orange = no readable texture, yellow / black checks = its copy is still pending,");
+				ImGui::Text("  purple = a character (not covered yet), dim blue / grey = nothing hit. Dark magenta everywhere = no material data this frame.");
 			}
 		}
 		ImGui::EndDisabled();
@@ -6947,6 +7060,28 @@ void RayTracing::DrawSettings()
 				ImGui::Text("  the terrain BLASes (built / made) and the video memory of terrain and the reflection textures. Terrain quadrants: %u from",
 					sc.terrainQuadsCpu);
 				ImGui::Text("  the game's vertex copy, %u rebuilt from its heights, %u failed.", sc.terrainQuadsHeights, sc.terrainQuadsFailed);
+			}
+			// (48f) Capture Materials.
+			if (settings.ReflectionsMaterials) {
+				const auto& ms = backend.GetMaterialStats();
+				if (!MaterialsWanted())
+					ImGui::TextDisabled("Capture Materials: not available (the GPU driver did not accept the material shader, or reflections are switched off)");
+				else {
+					ImGui::Text("Materials: %u, textures %u copied / %u waiting (%u copies last frame), %u page(s) %s, attributes %s of %s, record %s", ms.materials,
+						ms.texturesReady, ms.texturesPending, ms.copiesLastFrame, ms.pages, Megabytes(ms.textureBytes).c_str(), Megabytes(ms.attrBytesUsed).c_str(),
+						Megabytes(ms.attrBytes).c_str(), backend.ReflectMaterialLastFrame() ? "written" : "not written");
+					if (auto _tt = Util::HoverTooltipWrapper()) {
+						ImGui::Text("Registered materials (one per shape / ground quadrant, shared where texture and transform match), the 128x128 texture copies");
+						ImGui::Text("  made and still waiting (the backlog after entering a new area), the copy pages (256 textures each, made on a worker");
+						ImGui::Text("  thread), the per-triangle data in use of its buffer, and whether last frame's rays wrote the surface record.");
+						ImGui::Text("  Render-thread CPU of the copies last frame: %.2f ms. Surface record: %s. Material table: %s. Refused textures: %llu.",
+							ms.copyCpuMs, Megabytes(backend.ReflectSurfaceBytes()).c_str(), Megabytes(ms.tableBytes).c_str(),
+							static_cast<unsigned long long>(ms.texturesRefused));
+					}
+					if (ms.attrFull > 0 || ms.texturesFull > 0)
+						ImGui::TextColored({ 1.0f, 0.85f, 0.3f, 1.0f }, "Material buffers full: %llu shapes without data, %u textures without a copy layer",
+							static_cast<unsigned long long>(ms.attrFull), ms.texturesFull);
+				}
 			}
 			if (!reflectOffReason.empty())
 				RtErrorLine("RT reflections were switched off automatically", reflectOffReason);
@@ -8376,6 +8511,12 @@ std::string RayTracing::DescribeForProfile() const
 			settings.ReflectionsLobeCheck ? "on" : "off", settings.ReflectionsCubemapMatch ? "on" : "off", settings.ReflectionsHitDistance ? "on" : "off",
 			settings.ReflectionsCubemapWarmUp ? "on" : "off", settings.ReflectionsLoadingPrep ? "on" : "off",
 			settings.ReflectionsMode == 2 && !GapFillConsumer() ? " (no consumer: SSRT specular / its cubemap fallback off)" : "");
+		// (48f)
+		const auto& ms = backend.GetMaterialStats();
+		text += std::format(", capture materials {}{} ({} materials, {} textures copied / {} pending, attributes {:.1f} of {:.0f} MB, textures {:.1f} MB)",
+			settings.ReflectionsMaterials ? "on" : "off", settings.ReflectionsMaterials && !MaterialsWanted() ? " (not available)" : "", ms.materials, ms.texturesReady,
+			ms.texturesPending, static_cast<double>(ms.attrBytesUsed) / (1024.0 * 1024.0), static_cast<double>(ms.attrBytes) / (1024.0 * 1024.0),
+			static_cast<double>(ms.textureBytes) / (1024.0 * 1024.0));
 	}
 	// (46f)
 	static constexpr const char* kAOModes[] = { "RTAO (keeps SSGI contact AO)", "darker of RTAO and SSGI AO" };
@@ -8507,6 +8648,15 @@ nlohmann::json RayTracing::DescribeJson() const
 			{ "cubemap_warm_up_fix", settings.ReflectionsCubemapWarmUp }, { "loading_prep", settings.ReflectionsLoadingPrep },  // (48e)
 			{ "terrain_pending", scene.TerrainPending() }, { "prep_shader_ms", aoNormalReflectAsync.CompileMs() },
 			{ "gap_fill_shader_ms", globals::features::screenSpaceRayTracing.raymarchSpecularRTAsync.CompileMs() } };
+		// (48f) Capture Materials.
+		const auto& ms = backend.GetMaterialStats();
+		j["reflections"]["materials"] = { { "on", settings.ReflectionsMaterials }, { "wanted", MaterialsWanted() }, { "record_last_frame", backend.ReflectMaterialLastFrame() },
+			{ "materials", ms.materials }, { "textures", ms.textures }, { "textures_ready", ms.texturesReady }, { "textures_pending", ms.texturesPending },
+			{ "textures_refused", ms.texturesRefused }, { "textures_no_layer", ms.texturesFull }, { "pages", ms.pages },
+			{ "texture_mb", static_cast<double>(ms.textureBytes) / (1024.0 * 1024.0) }, { "attr_mb", static_cast<double>(ms.attrBytes) / (1024.0 * 1024.0) },
+			{ "attr_used_mb", static_cast<double>(ms.attrBytesUsed) / (1024.0 * 1024.0) }, { "attr_full", ms.attrFull }, { "copies_total", ms.copiesTotal },
+			{ "copy_cpu_ms", ms.copyCpuMs }, { "surface_mb", static_cast<double>(backend.ReflectSurfaceBytes()) / (1024.0 * 1024.0) },
+			{ "table_kb", static_cast<double>(ms.tableBytes) / 1024.0 }, { "copy_shader_ms", materialCopyAsync.CompileMs() } };
 	}
 	j["denoiser_effective"] = static_cast<int>(EffectiveDenoiser());
 	j["upscaling_rr_active"] = UpscalingRRActive();

@@ -211,6 +211,9 @@ namespace Util::FrameTrace
 		// list right before it (GPU ms; -1 = not used).
 		int reflFill = -1;
 		float reflSyncGpuMs = -1.0f;
+		// (48f) Capture Materials (-1 = off): texture copies made this frame, copies still waiting (backlog), copied textures, attribute MB in use.
+		int matCopies = -1, matPending = -1, matTextures = -1;
+		float matAttrMb = -1.0f;
 		// (48c) Extra Lights Where Crowded: the share of the pixels with a traced point light that traced at least one extra rank (percent, read back
 		// a few frames late; -1 = off this frame, K 6, or not known).
 		float plExtraPct = -1.0f;
