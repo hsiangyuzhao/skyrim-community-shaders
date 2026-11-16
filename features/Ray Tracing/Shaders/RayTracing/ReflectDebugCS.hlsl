@@ -1,6 +1,7 @@
 // (48a) RT reflections step 1: the debug views of the reflection rays (TraceReflectCS output, render size) into the debug colour texture
 // (drawn over the frame by OverlayCS like the other Ray Tracing views). Not traced pixels stay transparent.
-//   1 Hit Type: green static, orange object, cyan foliage / cut-out, purple character, brown terrain, blue miss (left the scene / too far);
+//   1 Hit Type: green static, orange object, cyan foliage / cut-out, purple character, brown terrain, blue miss (left the scene / too far),
+//     (48d) grey: nothing within the shortened range of a rough ray (Rough Rays: Leaves Solid; the gap fill keeps the old cubemap there);
 //   2 Hit Distance: white near -> dark far (log scale up to Params.x units); a miss is blue;
 //   3 Normal Confidence: how sure the reprojected last-frame normal is (green sure .. red fell back to the depth normal).
 
@@ -33,11 +34,15 @@ RWTexture2D<unorm float4> DebugColor : register(u0);
 				color = float4(0.1, 0.9, 0.9, 0.6);
 			else if (type == 4u)
 				color = float4(0.75, 0.2, 1.0, 0.6);
+			else if (type == 6u)
+				color = float4(0.5, 0.5, 0.5, 0.6);  // (48d) range end
 			else
 				color = float4(0.55, 0.35, 0.15, 0.7);
 		} else if (Size.z == 2u) {
 			if (type == 0u) {
 				color = float4(0.2, 0.4, 1.0, 0.6);
+			} else if (type == 6u) {
+				color = float4(0.5, 0.5, 0.5, 0.6);  // (48d) range end
 			} else {
 				const float t = saturate(log2(1.0 + distance / 70.0) / log2(1.0 + max(Params.x, 70.0) / 70.0));
 				color = float4((1.0 - t).xxx, 0.8);

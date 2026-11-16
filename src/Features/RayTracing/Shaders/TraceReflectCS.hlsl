@@ -13,9 +13,16 @@
 // as RTAO; without it they are culled), and one closest-hit ray against the characters (0x06, TMin Bias.z) where it passes their
 // bounds; the nearer hit wins.
 //
-// Output (shared R32_UINT, debug views only: RayTracing ReflectDebugCS): 0 = not traced; else bit 7 set, bits 0-2 the hit type
-// (kHitMiss .. kHitTerrain), bits 3-5 the prep's normal confidence (0..7), bits 16-31 the hit distance (f16, units; 0 for a miss).
+// Output (shared R32_UINT; the debug views and (48d) the SSRT specular ray march's gap fill): 0 = not traced; else bit 7 set, bits 0-2
+// the hit type (kHitMiss .. kHitRangeEnd), bits 3-5 the prep's normal confidence (0..7), bits 16-31 the hit distance (f16, units; 0 for a
+// miss). (48d) ReflectDir (u2, shared R32_UINT): the ray direction, octahedral 16 + 16 bits (unorm, 0..65535 = -1..1); written with it.
 // RayCounter[0]: pixels traced (monotonic, read back for F7).
+//
+// (48d) Which pixels: only those the prep selected (importance p = g(roughness) x saturate(lum(reflectance) / 0.04), stochastic with a
+// rolling noise; AONormalPrepCS). "Rough Rays: Leaves Solid" (kFlagRoughSolid): above roughness ~0.35 the cut-out candidate budget falls
+// smoothly from 16 to 0 (0 = the first cut-out candidate counts as a hit: leaves are solid), and the ray range shortens smoothly from the
+// full length to 30 % between roughness 0.4 and 0.9; a shortened ray that hits nothing is kHitRangeEnd (not a sky miss: the gap fill
+// leaves such a pixel to the old cubemap path).
 
 struct RFConstants
 {
@@ -32,10 +39,12 @@ Texture2D<float> DepthMask : register(t1);
 Texture2D<uint> ReflectPrep : register(t5);
 RWTexture2D<uint> ReflectOut : register(u0);
 RWByteAddressBuffer RayCounter : register(u1);
+RWTexture2D<uint> ReflectDir : register(u2);  // (48d)
 
 static const uint kFlagCharacters = 1u;   // characters are in the TLAS: the character ray
 static const uint kFlagFirstPerson = 2u;  // no character ray for pixels near the camera
 static const uint kFlagTerrain = 4u;      // terrain instances exist (kTerrainMask): include them
+static const uint kFlagRoughSolid = 8u;   // (48d) "Rough Rays: Leaves Solid"
 static const uint kSceneMask = 0x01u;
 static const uint kCharacterMasks = 0x06u;
 static const uint kTerrainMask = 0x08u;      // Backend::kTerrainMask
@@ -43,7 +52,7 @@ static const uint kTerrainKey = 0x400000u;   // Backend kTerrainInstanceKey
 static const uint kObjectKey = 0x200000u;    // Backend kObjectInstanceKey
 static const uint kMovingKey = 0x800000u;    // Backend kMovingInstanceKey (moved objects)
 static const float kFirstPersonNear = 96.0;
-static const uint kHitMiss = 0u, kHitStatic = 1u, kHitObject = 2u, kHitCutout = 3u, kHitCharacter = 4u, kHitTerrain = 5u;
+static const uint kHitMiss = 0u, kHitStatic = 1u, kHitObject = 2u, kHitCutout = 3u, kHitCharacter = 4u, kHitTerrain = 5u, kHitRangeEnd = 6u;
 static const uint kTraced = 0x80u;
 
 #if defined(RT_ALPHA)
@@ -126,6 +135,16 @@ float3 OctDecode(float2 e)
 	return normalize(n);
 }
 
+// (48d) Octahedral encode of a unit vector (-1..1 per axis), the inverse of OctDecode.
+float2 OctEncode(float3 n)
+{
+	n /= abs(n.x) + abs(n.y) + abs(n.z);
+	float2 e = n.xy;
+	if (n.z < 0.0)
+		e = (1.0 - abs(n.yx)) * float2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+	return e;
+}
+
 // Karis, "Real Shading in Unreal Engine 4" (ssrt_common.hlsli ImportanceSampleGGX): a half vector around +z.
 float3 ImportanceSampleGGX(float2 E, float a2)
 {
@@ -135,8 +154,9 @@ float3 ImportanceSampleGGX(float2 E, float a2)
 	return float3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta);
 }
 
-// Closest hit against a_mask; o_type = the hit's type (static / object / cut-out / terrain), o_t = its distance.
-bool ClosestHit(float3 origin, float3 dir, float tMin, float tMax, uint mask, float footprint, out uint o_type, out float o_t)
+// Closest hit against a_mask; o_type = the hit's type (static / object / cut-out / terrain), o_t = its distance. (48d) a_budget: cut-out
+// candidates tested against their alpha before the next one counts as a hit (16 = 48a; 0 = cut-outs solid).
+bool ClosestHit(float3 origin, float3 dir, float tMin, float tMax, uint mask, float footprint, uint a_budget, out uint o_type, out float o_t)
 {
 	o_type = kHitMiss;
 	o_t = tMax;
@@ -148,7 +168,7 @@ bool ClosestHit(float3 origin, float3 dir, float tMin, float tMax, uint mask, fl
 #if defined(RT_ALPHA)
 	RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
 	q.TraceRayInline(Scene, RAY_FLAG_NONE, mask, ray);
-	uint budget = kAlphaCandidateBudget;
+	uint budget = min(a_budget, kAlphaCandidateBudget);
 	while (q.Proceed()) {
 		if (q.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE)
 			continue;
@@ -243,12 +263,20 @@ bool SphereOnSegment(float3 origin, float3 dir, float tMax, float4 sphere)
 			}
 			R = normalize(R);
 			const float3 origin = P + Ng * (C.Bias.x + C.Bias.y * dist);
-			const float tMax = C.Params.z;
+			// (48d) Rough Rays: Leaves Solid: the cut-out budget and the range fall smoothly with the roughness (no hard step).
+			float tMax = C.Params.z;
+			uint budget = 16u;
+			[branch] if (flags & kFlagRoughSolid)
+			{
+				budget = uint(round(16.0 * (1.0 - smoothstep(0.35, 0.5, roughness))));
+				tMax *= lerp(1.0, 0.3, smoothstep(0.4, 0.9, roughness));
+			}
+			const bool shortened = tMax < C.Params.z * 0.999;
 			const float footprint = dist * 2.0 * C.RenderSize.w;
 			uint type = kHitMiss;
 			float tHit = tMax;
 			const uint sceneMask = kSceneMask | ((flags & kFlagTerrain) ? kTerrainMask : 0u);
-			ClosestHit(origin, R, 0.0, tMax, sceneMask, footprint, type, tHit);
+			ClosestHit(origin, R, 0.0, tMax, sceneMask, footprint, budget, type, tHit);
 			const bool characters = (flags & kFlagCharacters) && !((flags & kFlagFirstPerson) && dist < kFirstPersonNear);
 			[branch] if (characters && (SphereOnSegment(origin, R, tHit, C.Spheres[0]) || SphereOnSegment(origin, R, tHit, C.Spheres[1])))
 			{
@@ -265,9 +293,14 @@ bool SphereOnSegment(float3 origin, float3 dir, float tMax, float4 sphere)
 					tHit = q.CommittedRayT();
 				}
 			}
-			const float distance = type == kHitMiss ? 0.0 : min(tHit, 65000.0);
+			if (type == kHitMiss && shortened)
+				type = kHitRangeEnd;  // (48d) nothing within the shortened range: unknown, not the sky
+			const float distance = (type == kHitMiss || type == kHitRangeEnd) ? 0.0 : min(tHit, 65000.0);
 			result = kTraced | type | (min(confidence, 7u) << 3) | (f32tof16(distance) << 16);
 			traced = 1u;
+			// (48d) The direction word: what the gap fill reads (its hit point, the lobe check, the miss lookup).
+			const uint2 o = uint2(round(saturate(OctEncode(R) * 0.5 + 0.5) * 65535.0));
+			ReflectDir[p] = o.x | (o.y << 16);
 		}
 		ReflectOut[p] = result;
 	}

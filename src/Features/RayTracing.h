@@ -338,7 +338,33 @@ public:
 		// cells is in the TLAS under its own instance mask, which no shadow or AO ray includes.
 		int ReflectionsMode = 0;
 		bool ReflectionsTerrain = true;
+		// (48d) ReflectionsMode 2 Gap Fill: the SSRT specular ray march uses the hit record where SSR found nothing (RTAO no longer needed:
+		// their own list and fence). Which pixels trace: importance g(roughness) x saturate(lum(reflectance) / 0.04), g = 1 - smoothstep(
+		// ReflectionsRoughStart, ReflectionsRoughEnd, r) (ReflectionsFullRange: g = 1), stochastic (rolling noise), not past the SSR distance
+		// limit unless ReflectionsBeyondSSR (the specular chain then lifts its limit while the gap fill runs). ReflectionsRoughSolid "Rough
+		// Rays: Leaves Solid": rough rays treat cut-outs as solid and look less far. ReflectionsBestCandidate: the material from the more
+		// confident reprojection candidate. Gap Fill only: ReflectionsLobeCheck (the ray must fit this frame's normal / roughness),
+		// ReflectionsCubemapMatch (off-screen hits read the cubemap where its stored position matches), ReflectionsHitDistance (REBLUR gets
+		// the real hit distance).
+		float ReflectionsRoughStart = 0.30f;
+		float ReflectionsRoughEnd = 0.65f;
+		bool ReflectionsFullRange = false;
+		bool ReflectionsBeyondSSR = false;
+		bool ReflectionsRoughSolid = true;
+		bool ReflectionsBestCandidate = true;
+		bool ReflectionsLobeCheck = true;
+		bool ReflectionsCubemapMatch = true;
+		bool ReflectionsHitDistance = true;
 	};
+	/// (48d) What the SSRT specular ray march needs for the gap fill this frame (AcquireReflectionGapFill).
+	struct ReflectionGapFill
+	{
+		ID3D11ShaderResourceView* hit = nullptr;   // hit record word 0 (type, confidence, distance), render size
+		ID3D11ShaderResourceView* dir = nullptr;   // word 1 (octahedral ray direction)
+		ID3D11UnorderedAccessView* debug = nullptr;  // "RT Reflection Use" view target (null = view off)
+		std::uint32_t flags = 0;                   // kGapFill* bits
+	};
+	static constexpr std::uint32_t kGapFillDebug = 1u, kGapFillBeyond = 2u, kGapFillLobe = 4u, kGapFillMatch = 8u, kGapFillHitDistance = 16u;
 	/// (46f) RTAO modes (Settings::AOMode); with RTAO off the AO is SSGI's, exactly as before.
 	enum class AOModeKind : int
 	{
@@ -426,6 +452,14 @@ public:
 	/// then its 1/4-resolution bilateral filter, the clamped history and the mix with SSGI's AO (ScreenSpaceGI::aoOverride).
 	/// No-op unless this frame traced RTAO.
 	void DrawAmbientOcclusion();
+	/// (48d) Deferred::DeferredPasses, right before the SSRT specular pass: the reflection debug views (Hit Type / Hit Distance / Normal
+	/// Confidence) wait for the reflection list (third fence) and draw. No-op unless one is selected and this frame traced reflections.
+	void DrawReflectionDebugViews();
+	/// (48d) The SSRT specular pass, right before its ray march: with RT Reflections = Gap Fill and this frame's hit record at this size, the
+	/// D3D11 queue waits for the reflection list (GPU-side) and o_fill gets the record. False (o_fill empty): the ray march runs its old path.
+	bool AcquireReflectionGapFill(std::uint32_t a_width, std::uint32_t a_height, ReflectionGapFill& o_fill);
+	/// (48d) Gap Fill has a consumer: SSRT specular on with its cubemap fallback (Dynamic Cubemaps loaded). Without it nothing is traced.
+	[[nodiscard]] static bool GapFillConsumer();
 
 	/// (46b) Light Limit Fix, for each light it uploads: the ray-traced shadow tag (LightData::rtShadow), 0 unless
 	/// this frame's trace has a shadow source for the light.
@@ -976,7 +1010,7 @@ private:
 	/// Before PrepareCS: the smooth normals for this frame's RTAO trace (sets its flag); false = the trace keeps the depth normal.
 	/// (47u) a_defer: everything but the dispatch now (constants, the trace's flag); the dispatch goes behind the ready signal
 	/// (DispatchDeferredAONormal, reading last frame's depth from aoPrevDepth).
-	bool RunAONormalPrep(ID3D11DeviceContext* a_context, ID3D11ShaderResourceView* a_depth, std::uint32_t a_width, std::uint32_t a_height, bool a_defer = false);
+	bool RunAONormalPrep(ID3D11DeviceContext* a_context, ID3D11ShaderResourceView* a_depth, std::uint32_t a_width, std::uint32_t a_height, bool a_defer = false, bool a_ao = true);
 	/// After PrepareCS: this frame's camera, for next frame's reprojection.
 	void RememberAONormalFrame(std::uint32_t a_width, std::uint32_t a_height);
 	// (47u) "RT: Start Sun Trace Earlier" (Settings::SunTraceEarly): RTAO's normal prep (0.27-0.43 ms of D3D11 work that only RTAO reads)
@@ -1007,6 +1041,7 @@ private:
 		HitType,           // static / object / foliage-cutout / character / terrain / miss
 		HitDistance,       // near white .. far dark, miss blue
 		NormalConfidence,  // the reprojected last-frame normal: green sure .. red fell back
+		Use,               // (48d) what the gap fill used: on-screen hit / cubemap matched / unmatched / miss (written by the SSRT ray march)
 		Count
 	};
 	ReflectDebugView reflectDebugView = ReflectDebugView::Off;  // not persisted
@@ -1014,12 +1049,17 @@ private:
 	bool reflectWantedThisFrame = false;  // PrepareAO: the rays may go out this frame (their textures exist)
 	bool reflectPrepThisFrame = false;    // the normal prep wrote the reflection prep this frame
 	bool reflectDebugDrawn = false;       // the reflection debug view wrote debugColor this frame
+	bool reflectThisFrame = false;        // (48d) this frame's reflection list went out (its fence is pending until a wait)
+	bool reflectGapFillUsed = false;      // (48d) the SSRT ray march used the hit record this frame
+	bool reflectGapFillUsedLastFrame = false;  // (48d) for the F7 row (written before this frame's SSRT pass)
 	std::string reflectOffReason;
 	bool reflectRequested = false;
 	winrt::com_ptr<ID3D11ComputeShader> aoNormalReflectCS, reflectDebugCS;
 	std::unique_ptr<ConstantBuffer> reflectDebugCB;
 	[[nodiscard]] bool ReflectionsWanted() const;
 	void PrepareReflections(RayTracingRT::FrameInput& a_input);
+	void PrepareReflectionsImpl(RayTracingRT::FrameInput& a_input);  // (48d) inside PrepareReflections' try / catch
+	[[nodiscard]] static float ReflectionDistanceLimit();       // (48d) SSRT's specular distance limit (units; 0 = none)
 	void DrawReflectionDebug();
 	winrt::com_ptr<ID3D11Texture2D> aoPrevDepth;
 	winrt::com_ptr<ID3D11ShaderResourceView> aoPrevDepthSRV;

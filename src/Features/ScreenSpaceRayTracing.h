@@ -1003,10 +1003,21 @@ struct ScreenSpaceRayTracing : Feature
         /// floats, so the struct does not grow.
         float DistanceCapStart = 0.0f;
         float DistanceCapEnd = 0.0f;
+        // --- row 5 --- (48d) RT reflections gap fill. Declared only by the SSRT_RT_REFLECT permutation of ssrt_raymarch.hlsl; every
+        // other shader keeps declaring the five-row prefix (a legal prefix of a larger buffer), so their code does not change.
+        /// @brief RayTracing::kGapFill* bits (debug view, beyond the distance limit, direction check, cubemap position check, hit distance).
+        uint RTFlags = 0;
+        /// @brief Cubemap position check: tolerance = RTMatchMin + RTMatchRelative x the hit's camera distance (units).
+        float RTMatchRelative = 0.0f;
+        float RTMatchMin = 0.0f;
+        float RTPad0 = 0.0f;
+        // --- row 6 ---
+        /// @brief xyz: this frame's eye minus the eye of the last plain cubemap capture (units); w 1 = that capture is known.
+        float RTCaptureOffset[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     };
-    static_assert(sizeof(SSRTCB) == 80,
+    static_assert(sizeof(SSRTCB) == 112,
         "ScreenSpaceRayTracing::SSRTCB must stay whole 16-byte constant buffer rows; "
-        "ssrt_raymarch.hlsl and ssrt_diffuse_composite.hlsl mirror all five rows.");
+        "ssrt_raymarch.hlsl (SSRT_RT_REFLECT: all seven rows; else five) and ssrt_diffuse_composite.hlsl mirror it.");
 
     /// @brief (batch 36f) DeferredCompositeCS's `SSRTCompositeCB` at b1. Written by
     /// BindCompositeConstants right before that dispatch, after the specular chain has run, so it
@@ -1784,6 +1795,14 @@ struct ScreenSpaceRayTracing : Feature
 
     winrt::com_ptr<ID3D11ComputeShader> preprocessDepthCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> raymarchSpecularCS = nullptr;
+    /// @brief (48d) The specular ray march with the RT reflections gap fill (SSRT_RT_REFLECT). Compiled on first use (Gap Fill on), only
+    /// with Dynamic Cubemaps; a failure latches rtGapFillFailed for the session (the plain permutation keeps running).
+    winrt::com_ptr<ID3D11ComputeShader> raymarchSpecularRTCS = nullptr;
+    bool rtGapFillFailed = false;
+    /// @brief (48d) This frame's specular ray march used the gap fill with "Also Beyond SSR Distance": the composite and REBLUR then lift
+    /// the specular distance limit for this frame (SpecularCapActive).
+    bool rtBeyondThisFrame = false;
+    [[nodiscard]] bool SpecularCapActive() const { return DistanceLimitOnChain(true) && !rtBeyondThisFrame; }
     winrt::com_ptr<ID3D11ComputeShader> raymarchDiffuseCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> prepareColorCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> depthDownsampleCS = nullptr;

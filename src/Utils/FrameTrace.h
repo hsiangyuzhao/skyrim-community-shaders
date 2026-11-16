@@ -207,6 +207,10 @@ namespace Util::FrameTrace
 		// (48a) RT reflections step 1 (trace only): GPU ms of the reflection rays (in the RTAO list; -1 = not traced this frame) and the share
 		// of the render pixels they traced (percent, read back a few frames late; -1 = not traced).
 		float reflGpuMs = -1.0f, reflTracedPct = -1.0f;
+		// (48d) Gap Fill: the SSRT ray march used the hit record (1 / 0; -1 = mode not Gap Fill) and the game queue's wait for the reflection
+		// list right before it (GPU ms; -1 = not used).
+		int reflFill = -1;
+		float reflSyncGpuMs = -1.0f;
 		// (48c) Extra Lights Where Crowded: the share of the pixels with a traced point light that traced at least one extra rank (percent, read back
 		// a few frames late; -1 = off this frame, K 6, or not known).
 		float plExtraPct = -1.0f;

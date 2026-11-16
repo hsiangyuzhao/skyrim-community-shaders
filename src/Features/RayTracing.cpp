@@ -3,8 +3,10 @@
 #include "Deferred.h"
 #include "Features/RayTracing/CasterFilter.h"
 #include "Features/RayTracing/Wind.h"
+#include "Features/DynamicCubemaps.h"
 #include "Features/ScreenSpaceGI.h"
 #include "Features/ScreenSpacePointLightShadows.h"
+#include "Features/ScreenSpaceRayTracing.h"
 #include "Features/ScreenSpaceShadows.h"
 #include "Features/Upscaling.h"
 #include "State.h"
@@ -298,7 +300,7 @@ namespace
 	constexpr float kBeamRayMargin = 64.0f;  // (46c) a window beam's ray goes this far past the interior's box
 	// (46f) RTAO.
 	// (48a) RT reflections step 1: TraceReflectCS flags, and how far a reflection ray looks (about 117 m; past it: a miss).
-	constexpr std::uint32_t kReflectTraceCharacters = 1u, kReflectTraceFirstPerson = 2u, kReflectTraceTerrain = 4u;
+	constexpr std::uint32_t kReflectTraceCharacters = 1u, kReflectTraceFirstPerson = 2u, kReflectTraceTerrain = 4u, kReflectTraceRoughSolid = 8u;  // (48d) + Rough Rays: Leaves Solid
 	constexpr float kReflectMaxRayLength = 8192.0f;
 	constexpr float kAORayLengthMin = 35.0f, kAORayLengthMax = 210.0f;  // 0.5 - 3 m
 	constexpr float kAOFadeStartShare = 0.75f;  // the RT weight falls from 75 % of the distance to 0 at it (back to SSGI AO)
@@ -348,6 +350,10 @@ namespace
 		// where its weight reaches 0, y = 1 to skip the pixels the trace never reads (outside the rect / beyond x, with a margin).
 		float SkipRect[4];
 		float SkipFade[4];
+		// (48d) RT_REFLECT only (the plain variant declares the prefix): the pixel selection (roughness fade start / end, SSR distance
+		// limit in units or 0) and x frame, y bit 0 = the material from the more confident candidate.
+		float ReflectSelect[4];
+		std::uint32_t ReflectFlags[4];
 	};
 
 	// (46c) BSShadowFrustumLight / BSShadowParabolicLight::RenderShadowmaps (vfunc 0x0A): Ray Tracing may skip the shadow
@@ -870,6 +876,7 @@ void RayTracing::TransitionFrame()
 	lastFadeFactor = 0.0f;  // (46n) set below on fade-in frames
 	backend.WaitForTrace();
 	backend.WaitForAO();  // (46f)
+	backend.WaitForReflections();  // (48d)
 	const bool loading = phase == Phase::Loading;
 	const bool visible = phase == Phase::WarmUp && !blackScreen;
 	// (46k) Budgets. The loading pump (behind the loading screen): its own CPU per frame (LoadingPumpMs), split between the
@@ -1110,7 +1117,7 @@ void RayTracing::UpdateAlphaCasters()
 
 	// (48a) RT reflections step 1. Turned on (again): an earlier automatic switch-off is forgotten. Off: no terrain (the next scene
 	// Update releases every terrain BLAS), no textures, no dispatch.
-	settings.ReflectionsMode = std::clamp(settings.ReflectionsMode, 0, 1);
+	settings.ReflectionsMode = std::clamp(settings.ReflectionsMode, 0, 2);  // (48d) + Gap Fill
 	if (settings.ReflectionsMode != 0 && !reflectRequested) {
 		backend.ClearReflectFault();
 		reflectOffReason.clear();
@@ -1539,8 +1546,18 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.PointBeamSmooth = read("PointBeamSmooth", defaults.PointBeamSmooth);  // (48a)
 		settings.PointStickyJitterFix = read("PointStickyJitterFix", defaults.PointStickyJitterFix);  // (48c)
 		settings.PointExtraSlots = read("PointExtraSlots", defaults.PointExtraSlots);
-		settings.ReflectionsMode = std::clamp(read("ReflectionsMode", defaults.ReflectionsMode), 0, 1);
+		settings.ReflectionsMode = std::clamp(read("ReflectionsMode", defaults.ReflectionsMode), 0, 2);
 		settings.ReflectionsTerrain = read("ReflectionsTerrain", defaults.ReflectionsTerrain);
+		// (48d)
+		settings.ReflectionsRoughStart = std::clamp(read("ReflectionsRoughStart", defaults.ReflectionsRoughStart), 0.0f, 0.95f);
+		settings.ReflectionsRoughEnd = std::clamp(read("ReflectionsRoughEnd", defaults.ReflectionsRoughEnd), 0.05f, 1.0f);
+		settings.ReflectionsFullRange = read("ReflectionsFullRange", defaults.ReflectionsFullRange);
+		settings.ReflectionsBeyondSSR = read("ReflectionsBeyondSSR", defaults.ReflectionsBeyondSSR);
+		settings.ReflectionsRoughSolid = read("ReflectionsRoughSolid", defaults.ReflectionsRoughSolid);
+		settings.ReflectionsBestCandidate = read("ReflectionsBestCandidate", defaults.ReflectionsBestCandidate);
+		settings.ReflectionsLobeCheck = read("ReflectionsLobeCheck", defaults.ReflectionsLobeCheck);
+		settings.ReflectionsCubemapMatch = read("ReflectionsCubemapMatch", defaults.ReflectionsCubemapMatch);
+		settings.ReflectionsHitDistance = read("ReflectionsHitDistance", defaults.ReflectionsHitDistance);
 		const float sunSize = read("SunSize", -1.0f);
 		if (sunSize >= 0.0f) {
 			settings.SunSize = sunSize;
@@ -1678,6 +1695,15 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["PointExtraSlots"] = settings.PointExtraSlots;
 	o_json["ReflectionsMode"] = settings.ReflectionsMode;
 	o_json["ReflectionsTerrain"] = settings.ReflectionsTerrain;
+	o_json["ReflectionsRoughStart"] = settings.ReflectionsRoughStart;  // (48d)
+	o_json["ReflectionsRoughEnd"] = settings.ReflectionsRoughEnd;
+	o_json["ReflectionsFullRange"] = settings.ReflectionsFullRange;
+	o_json["ReflectionsBeyondSSR"] = settings.ReflectionsBeyondSSR;
+	o_json["ReflectionsRoughSolid"] = settings.ReflectionsRoughSolid;
+	o_json["ReflectionsBestCandidate"] = settings.ReflectionsBestCandidate;
+	o_json["ReflectionsLobeCheck"] = settings.ReflectionsLobeCheck;
+	o_json["ReflectionsCubemapMatch"] = settings.ReflectionsCubemapMatch;
+	o_json["ReflectionsHitDistance"] = settings.ReflectionsHitDistance;
 	o_json["AOSmoothNormals"] = settings.AOSmoothNormals;  // (47j)
 	o_json["AOTemporalV2"] = settings.AOTemporalV2;  // (47l)
 	o_json["FoliageSway"] = settings.FoliageSway;  // (47l)
@@ -2561,6 +2587,9 @@ void RayTracing::Prepass()
 	aoComposited = false;
 	aoDebugDrawn = false;
 	reflectDebugDrawn = false;  // (48a)
+	reflectThisFrame = false;   // (48d)
+	reflectGapFillUsedLastFrame = reflectGapFillUsed;
+	reflectGapFillUsed = false;
 	aoCpuMs = 0.0f;
 	// (45n) Whatever path this Prepass takes: an Early Prep context that the trace did not use is released
 	// (D3D12 signal only), and the frame-start flags end with this frame.
@@ -2640,6 +2669,7 @@ void RayTracing::SwitchedOffFrame()
 		if (backend.IsReady()) {
 			backend.WaitForTrace();  // (45l) a deferred wait left over (GPU-side only)
 			backend.WaitForAO();     // (46f) likewise the second fence
+			backend.WaitForReflections();  // (48d) and the third
 		}
 		if (status != Status::Off) {
 			// Switched off: the scene goes (BLASes retire on the GPU's schedule); the device stays.
@@ -3093,12 +3123,16 @@ void RayTracing::PublishCpuSplit()
 		detail.rtaoFilterGpuMs = aoComposedLastFrame ? std::max(timers->LastSampleMs(Util::GpuBucket::RayTracingAO), 0.0f) : -1.0f;
 		detail.rtaoSyncGpuMs = aoComposedLastFrame ? std::max(timers->LastSampleMs(Util::GpuBucket::RayTracingAOSync), 0.0f) : -1.0f;
 		detail.rtaoRays = aoTraced ? stats.aoRaysPerFrame : 0;
-		// (48a) RT reflections step 1 (-1 = not traced this frame).
-		if (aoTraced && stats.reflectTracedLastFrame) {
+		// (48a) RT reflections step 1 (-1 = not traced this frame). (48d) Their own list: no longer tied to RTAO.
+		if (activeThisFrame && stats.reflectTracedLastFrame) {
 			detail.reflGpuMs = stats.lastReflectGpuMs;
 			const double pixels = static_cast<double>(reflectInput.constants.renderSize[0]) * reflectInput.constants.renderSize[1];
 			detail.reflTracedPct = stats.reflectPixelsPerFrame >= 0 && pixels > 0.0 ? static_cast<float>(100.0 * static_cast<double>(stats.reflectPixelsPerFrame) / pixels) : -1.0f;
 		}
+		// (48d) Gap Fill (the row is written before this frame's SSRT pass: last frame's): used by the ray march (1 / 0; -1 = mode not Gap
+		// Fill) and the game queue's wait for the reflection list right before it.
+		detail.reflFill = settings.ReflectionsMode == 2 ? (reflectGapFillUsedLastFrame ? 1 : 0) : -1;
+		detail.reflSyncGpuMs = reflectGapFillUsedLastFrame ? std::max(timers->LastSampleMs(Util::GpuBucket::RayTracingReflectSync), 0.0f) : -1.0f;
 		// (46h) Where this frame's RTAO was traced and its mode (-1 = not traced this frame).
 		detail.rtaoIndoors = aoTraced && aoThisFrame ? (aoInteriorThisFrame ? 1 : 0) : -1;
 		detail.rtaoMode = aoTraced && aoThisFrame ? aoModeThisFrame : -1;
@@ -3241,6 +3275,7 @@ void RayTracing::RunFrame()
 	// frame's depth copy overwrites what the last trace read. (46f) Likewise RTAO's (it reads the same depth copy).
 	backend.WaitForTrace();
 	backend.WaitForAO();
+	backend.WaitForReflections();  // (48d) the reflection list reads the same depth copy and the reflection prep
 	UpdateAlphaCasters();  // (45h, 45j) per-kind choices: a change re-captures the scene
 	UpdateCharacters();                                // (45i)
 	UpdatePointLights();                               // (46b)
@@ -3528,6 +3563,7 @@ void RayTracing::RunFrame()
 		}
 		aoCpuMs = static_cast<float>(static_cast<double>(Qpc() - aoStart) * QpcMs());
 	}
+	PrepareReflections(input);  // (48d) their own list and fence (no longer inside the RTAO batch)
 	// (47u) Skip Updates That Cannot Affect the Image: this frame's exact rays (kept for the next frame's early region); what was culled
 	// and is reachable after all is updated before the trace.
 	{
@@ -3680,6 +3716,7 @@ void RayTracing::RunFrame()
 
 	// (46f) RTAO went out right behind it (second fence): DrawAmbientOcclusion uses it after Screen Space GI.
 	aoThisFrame = input.ao != nullptr && backend.GetStats().aoTracedLastFrame;
+	reflectThisFrame = input.reflect != nullptr && backend.GetStats().reflectSubmittedLastFrame;  // (48d)
 	aoModeThisFrame = aoThisFrame ? std::clamp(settings.AOMode, 0, static_cast<int>(AOModeKind::Count) - 1) : -1;  // (46h)
 	if (!aoThisFrame)
 		aoHistoryValid = false;
@@ -3832,7 +3869,8 @@ void RayTracing::RunNoSunFrame(ID3D11ShaderResourceView* a_depth, ID3D11ShaderRe
 		}
 		aoCpuMs = static_cast<float>(static_cast<double>(Qpc() - aoStart) * QpcMs());
 	}
-	if (!input.pointLights && !input.ao) {
+	PrepareReflections(input);  // (48d) their own list and fence (no longer inside the RTAO batch)
+	if (!input.pointLights && !input.ao && !reflectWantedThisFrame) {  // (48d) or reflection rays
 		// Nothing to trace (no shadow-casting light in view, RTAO off): the queued builds go on, nothing waits.
 		if (backend.HasPrepared()) {
 			backend.AbandonPrepared();
@@ -3915,6 +3953,7 @@ void RayTracing::RunNoSunFrame(ID3D11ShaderResourceView* a_depth, ID3D11ShaderRe
 		pointExtraThisFrame = false;  // (48c)
 	}
 	aoThisFrame = input.ao != nullptr && backend.GetStats().aoTracedLastFrame;
+	reflectThisFrame = input.reflect != nullptr && backend.GetStats().reflectSubmittedLastFrame;  // (48d)
 	aoModeThisFrame = aoThisFrame ? std::clamp(settings.AOMode, 0, static_cast<int>(AOModeKind::Count) - 1) : -1;
 	if (!aoThisFrame)
 		aoHistoryValid = false;
@@ -4566,14 +4605,15 @@ void RayTracing::PrepareDepthMask(ID3D11DeviceContext* a_context, ID3D11ComputeS
 	earlyNormalThisFrame = -1;
 	bool defer = false;
 	reflectPrepThisFrame = false;  // (48a)
-	if (a_input.ao) {
+	// (48d) Also for the reflection rays alone (RTAO off): the prep (RT_REFLECT variant) then writes only their input.
+	if (a_input.ao || reflectWantedThisFrame) {
 		const bool possible = EarlyNormalPrepPossible(a_width, a_height);
-		RunAONormalPrep(a_context, a_depth, a_width, a_height, possible);
+		RunAONormalPrep(a_context, a_depth, a_width, a_height, possible, a_input.ao != nullptr);
 		defer = possible && aoNormalDeferred.active;
 		earlyNormalThisFrame = aoNormalsThisFrame ? (defer ? 1 : 0) : -1;
 	}
-	// (48a) RT reflections step 1: their rays go into the RTAO list only on a frame whose prep wrote their input.
-	a_input.reflect = (a_input.ao && reflectWantedThisFrame && reflectPrepThisFrame) ? &reflectInput : nullptr;
+	// (48a) RT reflections: their rays go out only on a frame whose prep wrote their input. (48d) Their own list: RTAO not needed.
+	a_input.reflect = (reflectWantedThisFrame && reflectPrepThisFrame) ? &reflectInput : nullptr;
 	// Depth + engine mask -> the tracer's shared texture (combineCB holds this frame's constants).
 	{
 		ID3D11Buffer* cbs[1] = { combineCB->CB() };
@@ -4608,7 +4648,8 @@ void RayTracing::FlushDeferredAONormal()
 	DispatchDeferredAONormal();
 }
 
-bool RayTracing::RunAONormalPrep(ID3D11DeviceContext* a_context, ID3D11ShaderResourceView* a_depth, std::uint32_t a_width, std::uint32_t a_height, bool a_defer)
+bool RayTracing::RunAONormalPrep(ID3D11DeviceContext* a_context, ID3D11ShaderResourceView* a_depth, std::uint32_t a_width, std::uint32_t a_height, bool a_defer,
+	bool a_ao)
 {
 	aoNormalsThisFrame = false;
 	aoNormalDeferred.active = false;
@@ -4616,7 +4657,8 @@ bool RayTracing::RunAONormalPrep(ID3D11DeviceContext* a_context, ID3D11ShaderRes
 	// (47k) The Smooth Normals debug views: their texture only while one of them is on.
 	const int normalView = aoDebugView == AODebugView::NormalConfidence ? 1 : (aoDebugView == AODebugView::NormalNs ? 2 : (aoDebugView == AODebugView::NormalNg ? 3 : 0));
 	// (47n) Smooth Normals is a tier knob; a fault (its texture / shader) keeps it off for this session.
-	const bool tierSmooth = ResolveAOTier().smoothNormals && aoSmoothFault.empty();
+	// (48d) a_ao: this frame traces RTAO (false: the reflection rays alone use the prep; RTAO's smooth normals texture is not needed).
+	const bool tierSmooth = a_ao && ResolveAOTier().smoothNormals && aoSmoothFault.empty();
 	// (48a) RT reflections: the same prep (RT_REFLECT variant) feeds the reflection rays; it then runs even where the tier does not want
 	// smooth normals for RTAO (RTAO keeps its depth normal then: its flag below only with the tier).
 	const bool reflect = reflectWantedThisFrame && aoSmoothFault.empty();
@@ -4638,11 +4680,14 @@ bool RayTracing::RunAONormalPrep(ID3D11DeviceContext* a_context, ID3D11ShaderRes
 	auto& motion = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGET::kMOTION_VECTOR];
 	if (!prevValid || !a_depth || !normal.SRV || !motion.SRV || !backend.DepthMaskSRV())
 		return false;
-	if (!backend.EnsureAONormalTexture(a_width, a_height)) {
+	// (48d) RTAO's texture (u0) only when RTAO reads it; for the reflection rays alone u0 stays unbound (its writes are dropped).
+	if (tierSmooth && !backend.EnsureAONormalTexture(a_width, a_height)) {
 		aoSmoothFault = "its shared texture could not be created";
 		logger::warn("[RayTracing] RTAO: Smooth Normals: {}; switched off for this session", aoSmoothFault);
 		return false;
 	}
+	if (!tierSmooth && backend.HasAONormalTexture())
+		backend.ReleaseAONormalTexture();
 	if (!aoNormalCS) {
 		aoNormalCS.attach(static_cast<ID3D11ComputeShader*>(Util::CompileShader(L"Data\\Shaders\\RayTracing\\AONormalPrepCS.hlsl", {}, "cs_5_0")));
 		if (!aoNormalCS) {
@@ -4693,6 +4738,15 @@ bool RayTracing::RunAONormalPrep(ID3D11DeviceContext* a_context, ID3D11ShaderRes
 	const bool writeDebug = normalView && aoNormalDebug.uav;
 	cb.Flags[0] = 1u | (settings.AOPostTracedOnly ? 2u : 0u);  // (47n) v2 always; (47r) bit 2: the motion candidate reuses the camera one's search
 	cb.Flags[1] = writeDebug ? static_cast<std::uint32_t>(normalView) : 0u;
+	// (48d) The reflection pixel selection (RT_REFLECT only reads it).
+	if (reflectPrep) {
+		const float start = std::clamp(settings.ReflectionsRoughStart, 0.0f, 0.95f);
+		cb.ReflectSelect[0] = settings.ReflectionsFullRange ? 2.0f : start;
+		cb.ReflectSelect[1] = settings.ReflectionsFullRange ? 3.0f : std::max(std::clamp(settings.ReflectionsRoughEnd, 0.05f, 1.0f), start + 0.05f);
+		cb.ReflectSelect[2] = settings.ReflectionsBeyondSSR ? 0.0f : ReflectionDistanceLimit();
+		cb.ReflectFlags[0] = static_cast<std::uint32_t>(frameIndex % 1024u);
+		cb.ReflectFlags[1] = settings.ReflectionsBestCandidate ? 1u : 0u;
+	}
 	// (47p) Pixels the trace does not read (its weight is 0 there: outside its rect or beyond the fade end) keep "no smooth normal".
 	if (PerfOptions::settings.RtaoNormalFold && !writeDebug) {
 		std::copy_n(aoInput.constants.rect, 4, cb.SkipRect);
@@ -5639,7 +5693,6 @@ bool RayTracing::PrepareAO(RayTracingRT::FrameInput& a_input, const float a_trac
 	// Leaves / cut-outs the per-kind menu traces block AO rays with their cut-out (bounded candidates per ray).
 	aoInput.alpha = backend.AOAlphaAvailable();
 	a_input.ao = &aoInput;
-	PrepareReflections(a_input);  // (48a) they ride in this batch
 	return true;
 }
 
@@ -5649,14 +5702,47 @@ bool RayTracing::PrepareAO(RayTracingRT::FrameInput& a_input, const float a_trac
 
 bool RayTracing::ReflectionsWanted() const
 {
-	return settings.ReflectionsMode == 1 && backend.ReflectAvailable() && reflectOffReason.empty();
+	// (48d) Trace Only (1) or Gap Fill (2). Gap Fill without a consumer (SSRT specular off, its cubemap fallback off, no Dynamic Cubemaps)
+	// traces nothing: the textures and terrain go as with Off.
+	if (settings.ReflectionsMode == 2 && !GapFillConsumer())
+		return false;
+	return (settings.ReflectionsMode == 1 || settings.ReflectionsMode == 2) && backend.ReflectAvailable() && reflectOffReason.empty();
+}
+
+bool RayTracing::GapFillConsumer()
+{
+	const auto& ssrt = globals::features::screenSpaceRayTracing;
+	const auto& cubemaps = globals::features::dynamicCubemaps;
+	return ssrt.loaded && ssrt.settings.EnableSpecular && ssrt.settings.UseDynamicCubemapsAsFallbackSpecular && cubemaps.loaded && !ssrt.rtGapFillFailed;
+}
+
+float RayTracing::ReflectionDistanceLimit()
+{
+	// (48d) The SSR distance limit along the view axis (units; 0 = none): past it the composite never reads the specular result.
+	const auto& ssrt = globals::features::screenSpaceRayTracing;
+	if (!ssrt.loaded || !ssrt.settings.EnableSpecular || !ssrt.DistanceLimitOnChain(true))
+		return 0.0f;
+	return ssrt.DistanceLimitUnits();
 }
 
 void RayTracing::PrepareReflections(RayTracingRT::FrameInput& a_input)
 {
-	// Inside PrepareAO (its batch exists this frame). The rays go out only when the normal prep also writes their input (PrepareDepthMask).
+	// (48d) In every trace path, after RTAO (their own list and fence). The rays go out only when the normal prep also writes their input
+	// (PrepareDepthMask).
 	reflectWantedThisFrame = false;
 	a_input.reflectTags = false;
+	try {
+		PrepareReflectionsImpl(a_input);
+	} catch (const std::exception& e) {
+		reflectWantedThisFrame = false;
+		a_input.reflectTags = false;
+		reflectOffReason = std::format("exception: {}", e.what());
+		logger::warn("[RayTracing] RT reflections switched off: {}", reflectOffReason);
+	}
+}
+
+void RayTracing::PrepareReflectionsImpl(RayTracingRT::FrameInput& a_input)
+{
 	if (!ReflectionsWanted())
 		return;
 	const std::uint32_t width = std::max(a_input.renderWidth, 1u), height = std::max(a_input.renderHeight, 1u);
@@ -5678,6 +5764,8 @@ void RayTracing::PrepareReflections(RayTracingRT::FrameInput& a_input)
 	}
 	if (scene.Terrain() && scene.GetStats().terrainBuilt > 0)
 		flags |= kReflectTraceTerrain;
+	if (settings.ReflectionsRoughSolid)
+		flags |= kReflectTraceRoughSolid;  // (48d)
 	c.params[0] = static_cast<float>(frameIndex % 1024);
 	std::memcpy(&c.params[1], &flags, sizeof(float));
 	c.params[2] = kReflectMaxRayLength;
@@ -5692,10 +5780,64 @@ void RayTracing::PrepareReflections(RayTracingRT::FrameInput& a_input)
 	reflectWantedThisFrame = true;
 }
 
+void RayTracing::DrawReflectionDebugViews()
+{
+	// (48d) Right before the SSRT specular pass: the reflection list's wait (third fence), then the hit type / distance / confidence view.
+	// The "RT Reflection Use" view is written by the ray march itself (AcquireReflectionGapFill).
+	if (!reflectThisFrame || reflectDebugView == ReflectDebugView::Off || reflectDebugView == ReflectDebugView::Use)
+		return;
+	try {
+		auto* timers = Util::GpuPassTimers::GetSingleton();
+		timers->Begin(Util::GpuBucket::RayTracingReflectSync);
+		backend.WaitForReflections();
+		timers->End(Util::GpuBucket::RayTracingReflectSync);
+		DrawReflectionDebug();
+	} catch (const std::exception& e) {
+		logger::warn("[RayTracing] Reflection debug view failed: {}", e.what());
+		reflectDebugView = ReflectDebugView::Off;
+	}
+}
+
+bool RayTracing::AcquireReflectionGapFill(std::uint32_t a_width, std::uint32_t a_height, ReflectionGapFill& o_fill)
+{
+	// (48d) Only this frame's record, at the ray march's size; anything else (not traced, first frame after a resize / load, Trace Only,
+	// Off, a failure) leaves the ray march on its old path.
+	o_fill = {};
+	if (settings.ReflectionsMode != 2 || !reflectThisFrame || !RtWanted() || !backend.ReflectDirSRV() || !backend.ReflectOutSRV())
+		return false;
+	if (backend.ReflectWidth() != a_width || backend.ReflectHeight() != a_height)
+		return false;
+	if (static_cast<std::uint32_t>(reflectInput.constants.renderSize[0]) != a_width || static_cast<std::uint32_t>(reflectInput.constants.renderSize[1]) != a_height)
+		return false;
+	auto* timers = Util::GpuPassTimers::GetSingleton();
+	timers->Begin(Util::GpuBucket::RayTracingReflectSync);
+	backend.WaitForReflections();  // no-op when a debug view already took it
+	timers->End(Util::GpuBucket::RayTracingReflectSync);
+	if (backend.HasFailed())
+		return false;
+	o_fill.hit = backend.ReflectOutSRV();
+	o_fill.dir = backend.ReflectDirSRV();
+	if (reflectDebugView == ReflectDebugView::Use && EnsureDebugColor() && debugColorUAV) {
+		o_fill.debug = debugColorUAV.get();
+		o_fill.flags |= kGapFillDebug;
+		reflectDebugDrawn = true;
+	}
+	if (settings.ReflectionsBeyondSSR)
+		o_fill.flags |= kGapFillBeyond;
+	if (settings.ReflectionsLobeCheck)
+		o_fill.flags |= kGapFillLobe;
+	if (settings.ReflectionsCubemapMatch)
+		o_fill.flags |= kGapFillMatch;
+	if (settings.ReflectionsHitDistance)
+		o_fill.flags |= kGapFillHitDistance;
+	reflectGapFillUsed = true;
+	return true;
+}
+
 void RayTracing::DrawReflectionDebug()
 {
-	// After the RTAO wait (the reflection rays ran in that batch): the hit type / distance / normal confidence view into debugColor.
-	if (reflectDebugView == ReflectDebugView::Off || !debugColorUAV || !backend.ReflectOutSRV())
+	// (48d) After the reflection list's own wait: the hit type / distance / normal confidence view into debugColor.
+	if (reflectDebugView == ReflectDebugView::Off || reflectDebugView == ReflectDebugView::Use || !debugColorUAV || !backend.ReflectOutSRV())
 		return;
 	if (!reflectDebugCS) {
 		reflectDebugCS.attach(static_cast<ID3D11ComputeShader*>(Util::CompileShader(L"Data\\Shaders\\RayTracing\\ReflectDebugCS.hlsl", {}, "cs_5_0")));
@@ -5758,15 +5900,7 @@ void RayTracing::DrawAmbientOcclusionImpl()
 	if (!aoThisFrame)
 		return;
 	aoThisFrame = false;
-	// (48a) The reflection rays' debug view: they ran in the RTAO batch, so the same wait (taken here, before SSGI's checks; the AO path
-	// below then finds it done).
-	if (reflectDebugView != ReflectDebugView::Off && backend.GetStats().reflectTracedLastFrame) {
-		auto* syncTimers = Util::GpuPassTimers::GetSingleton();
-		syncTimers->Begin(Util::GpuBucket::RayTracingAOSync);
-		backend.WaitForAO();
-		syncTimers->End(Util::GpuBucket::RayTracingAOSync);
-		DrawReflectionDebug();
-	}
+	// (48d) The reflection debug views moved to DrawReflectionDebugViews (their own fence, right before the SSRT specular pass).
 	auto& ssgi = globals::features::screenSpaceGI;
 	// SSGI did not run this frame (switched off since the trace, shaders recompiling): its own (cleared) AO stays; the
 	// pending second-fence wait is taken before the next trace (Backend::ExecuteFrame / RunFrame).
@@ -6327,7 +6461,8 @@ void RayTracing::RunInteriorFrame()
 		}
 		aoCpuMs = static_cast<float>(static_cast<double>(Qpc() - aoStart) * QpcMs());
 	}
-	if (!input.pointLights && !input.ao) {
+	PrepareReflections(input);  // (48d) their own list and fence (no longer inside the RTAO batch)
+	if (!input.pointLights && !input.ao && !reflectWantedThisFrame) {  // (48d) or reflection rays
 		// Nothing to trace (no shadow-casting light in view, no RTAO): the queued builds go on, nothing waits.
 		if (backend.HasPrepared()) {  // (47j) an Early Prep context this frame does not trace with
 			backend.AbandonPrepared();
@@ -6410,6 +6545,7 @@ void RayTracing::RunInteriorFrame()
 	}
 	// (46h) RTAO went out right behind it (second fence): DrawAmbientOcclusion uses it after Screen Space GI.
 	aoThisFrame = input.ao != nullptr && backend.GetStats().aoTracedLastFrame;
+	reflectThisFrame = input.reflect != nullptr && backend.GetStats().reflectSubmittedLastFrame;  // (48d)
 	aoInteriorThisFrame = aoThisFrame;
 	aoModeThisFrame = aoThisFrame ? std::clamp(settings.AOModeInterior, 0, static_cast<int>(AOModeKind::Count) - 1) : -1;
 	if (!aoThisFrame)
@@ -6633,17 +6769,20 @@ void RayTracing::DrawSettings()
 		ImGui::Text("  showing one frame of raw rays (point lights: at least 2.5 px with a fixed pattern; sun: a small mean of the");
 		ImGui::Text("  neighbours on the same surface). Where the neighbourhood agrees (crisp contact shadows) nothing changes. Off: as 47x.");
 	}
-	// (48a) RT reflections step 1: cost measurement only, no visual change.
+	// (48a) RT reflections. (48d) Gap Fill: visible in the picture (the SSRT specular ray march uses the ray where SSR finds nothing).
 	ImGui::SeparatorText("Reflections (experimental)");
 	{
-		const char* kModes[2] = { "Off", "Trace Only" };
-		settings.ReflectionsMode = std::clamp(settings.ReflectionsMode, 0, 1);
-		ImGui::Combo("RT Reflections", &settings.ReflectionsMode, kModes, 2);
+		const char* kModes[3] = { "Off", "Trace Only", "Gap Fill" };
+		settings.ReflectionsMode = std::clamp(settings.ReflectionsMode, 0, 2);
+		ImGui::Combo("RT Reflections", &settings.ReflectionsMode, kModes, 3);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Step 1 of ray-traced reflections: measures what the reflection rays would cost. The picture does not change.");
-			ImGui::Text("  Trace Only: every pixel that reflects (last frame's G-buffer) traces one reflection ray into the ray-traced scene,");
-			ImGui::Text("  in the same batch as RT Ambient Occlusion (needs it on; no extra wait). Results only in the debug views and F7.");
-			ImGui::Text("Off (default): exactly as 47z (no terrain in the scene, no textures, no rays).");
+			ImGui::Text("Ray-traced reflections, step 2. Gap Fill changes the picture; Trace Only only measures the cost.");
+			ImGui::Text("  Gap Fill: where screen-space reflections (SSR) find nothing and the old path shows the cubemap (eaves, indoors, the screen");
+			ImGui::Text("  edge, wet ground), a reflection ray says what is really there: the sky (cubemap with sky), a point on screen (its colour),");
+			ImGui::Text("  or a point off screen (the dynamic cubemap where its stored position matches, else the cubemap without sky).");
+			ImGui::Text("  Needs Screen Space Ray Tracing specular on with its Dynamic Cubemaps fallback; otherwise nothing is traced.");
+			ImGui::Text("  Trace Only: the same rays, results only in the debug views and F7. RT Ambient Occlusion is no longer needed.");
+			ImGui::Text("Off (default): exactly as 48c (no terrain in the scene, no textures, no rays).");
 		}
 		ImGui::BeginDisabled(settings.ReflectionsMode == 0);
 		ImGui::Checkbox("Terrain in RT Scene (reflections only)", &settings.ReflectionsTerrain);
@@ -6652,32 +6791,89 @@ void RayTracing::DrawSettings()
 			ImGui::Text("  layer no shadow or ambient-occlusion ray sees: sun shadows, lamp shadows and RTAO stay exactly the same).");
 			ImGui::Text("  Takes effect only while RT Reflections is not Off. It also shows in the BLAS Coverage debug view.");
 		}
+		// (48d) Which pixels trace a ray.
+		ImGui::Checkbox("Full Roughness Range", &settings.ReflectionsFullRange);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("Off (default): rough surfaces trace fewer rays, fading smoothly between the two roughness values below (a pixel in the");
+			ImGui::Text("  fade traces on some frames and keeps the cubemap on the others; the denoiser blends the two). Reflections never stop at");
+			ImGui::Text("  a hard roughness edge. On: every reflecting surface traces, whatever its roughness (more cost; for comparing).");
+		}
+		ImGui::BeginDisabled(settings.ReflectionsFullRange);
+		ImGui::SliderFloat("Rough Fade Start", &settings.ReflectionsRoughStart, 0.0f, 0.9f, "%.2f");
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Roughness where the share of traced pixels starts to fall (default 0.30). Below it every reflecting pixel traces.");
+		ImGui::SliderFloat("Rough Fade End", &settings.ReflectionsRoughEnd, 0.1f, 1.0f, "%.2f");
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Roughness where no pixel traces any more (default 0.65; always at least 0.05 above the start).");
+		ImGui::EndDisabled();
+		settings.ReflectionsRoughStart = std::clamp(settings.ReflectionsRoughStart, 0.0f, 0.95f);
+		settings.ReflectionsRoughEnd = std::clamp(settings.ReflectionsRoughEnd, 0.05f, 1.0f);
+		ImGui::Checkbox("Also Beyond SSR Distance", &settings.ReflectionsBeyondSSR);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("Off (default): pixels beyond Screen Space Ray Tracing's distance limit trace nothing (the picture never uses them there).");
+			ImGui::Text("  On: they trace too, and while Gap Fill runs the specular chain lifts its distance limit for the gap fill (SSR itself");
+			ImGui::Text("  still stops at the limit; the denoiser then also works past it). More cost.");
+		}
+		ImGui::Checkbox("Rough Rays: Leaves Solid", &settings.ReflectionsRoughSolid);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): rays from rough surfaces (roughness above about 0.35, fading in smoothly) treat leaves and other cut-outs");
+			ImGui::Text("  as solid instead of testing up to 16 of them, and look less far (down to 30 %% of the range at roughness 0.9). A rough");
+			ImGui::Text("  ray that finds nothing in its shorter range keeps the old cubemap. Off: as 48c (every ray tests its cut-outs, full range).");
+		}
+		ImGui::Checkbox("Material From Best Candidate", &settings.ReflectionsBestCandidate);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): roughness and reflectance come from whichever of last frame's two matches (camera / motion) fits better, so a");
+			ImGui::Text("  moving character uses its own material. Off: as 48c (the camera match first: it read the background behind a walker).");
+		}
+		// (48d) Gap Fill only.
+		ImGui::BeginDisabled(settings.ReflectionsMode != 2);
+		ImGui::Checkbox("Gap Fill: Direction Check", &settings.ReflectionsLobeCheck);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): a ray is used only where its direction fits this frame's surface direction and roughness (it was aimed with");
+			ImGui::Text("  last frame's); where it does not (a character turned, a new edge) it fades smoothly to the old path. Off: always used.");
+		}
+		ImGui::Checkbox("Gap Fill: Cubemap Position Check", &settings.ReflectionsCubemapMatch);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): a hit off screen takes the dynamic cubemap's colour where the cubemap stored that same point; elsewhere the");
+			ImGui::Text("  cubemap without sky. Off: always the cubemap without sky.");
+		}
+		ImGui::Checkbox("Gap Fill: Real Hit Distance", &settings.ReflectionsHitDistance);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): the reflection denoiser gets the ray's real hit distance where the ray filled the gap (instead of 'far'),");
+			ImGui::Text("  which keeps near reflections steadier when moving. Off: as before.");
+		}
+		ImGui::EndDisabled();
 		{
-			const char* kViews[4] = { "Off", "Hit Type", "Hit Distance", "Normal Confidence" };
+			const char* kViews[5] = { "Off", "Hit Type", "Hit Distance", "Normal Confidence", "RT Reflection Use" };
 			int view = static_cast<int>(reflectDebugView);
-			if (ImGui::Combo("Reflection Debug View", &view, kViews, 4))
+			if (ImGui::Combo("Reflection Debug View", &view, kViews, 5))
 				reflectDebugView = static_cast<ReflectDebugView>(std::clamp(view, 0, static_cast<int>(ReflectDebugView::Count) - 1));
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::Text("Not saved. Hit Type: green building / static, orange object, cyan leaves / cut-out, purple character, brown terrain,");
-				ImGui::Text("  blue = the ray left the scene (sky, far away). Hit Distance: white near .. dark far. Normal Confidence: how sure the");
-				ImGui::Text("  reprojected last-frame surface direction is (green sure .. red fell back to the depth). Transparent = not traced.");
+				ImGui::Text("  blue = the ray left the scene (sky, far away), grey = nothing within a rough ray's shorter range. Hit Distance: white");
+				ImGui::Text("  near .. dark far. Normal Confidence: how sure the reprojected last-frame surface direction is (green sure .. red fell");
+				ImGui::Text("  back to the depth). Transparent = not traced.");
+				ImGui::Text("RT Reflection Use (Gap Fill): what the picture used where SSR found nothing: green = a point on screen, cyan = the cubemap");
+				ImGui::Text("  at a matching position, orange = the cubemap without sky (position did not match), blue = sky; brighter = more weight.");
+				ImGui::Text("  Transparent = not used (SSR found it, not traced, or the direction check faded it out).");
 			}
 		}
 		ImGui::EndDisabled();
 		if (settings.ReflectionsMode != 0) {
 			const auto& rs = backend.GetStats();
 			const auto& sc = scene.GetStats();
-			if (!AOOn())
-				ImGui::TextColored({ 1.0f, 0.85f, 0.3f, 1.0f }, "Needs RT Ambient Occlusion on: the rays ride in its batch.");
+			if (settings.ReflectionsMode == 2 && !GapFillConsumer())
+				ImGui::TextColored({ 1.0f, 0.85f, 0.3f, 1.0f }, "Gap Fill needs Screen Space Ray Tracing specular with its Dynamic Cubemaps fallback: nothing is traced.");
 			const double pixels = std::max(1.0, static_cast<double>(reflectInput.constants.renderSize[0]) * reflectInput.constants.renderSize[1]);
-			ImGui::Text("Rays: %.2f ms, %.0f %% of pixels traced; terrain: %u of %u cells built, %s", std::max(rs.lastReflectGpuMs, 0.0f),
-				rs.reflectPixelsPerFrame > 0 ? 100.0 * static_cast<double>(rs.reflectPixelsPerFrame) / pixels : 0.0, sc.terrainBuilt, sc.terrainCells,
-				Megabytes(sc.terrainBytes + backend.ReflectBytes()).c_str());
+			ImGui::Text("Rays: %.2f ms (wall), %.0f %% of pixels traced; gap fill %s; terrain: %u of %u cells built, %s", std::max(rs.lastReflectGpuMs, 0.0f),
+				rs.reflectPixelsPerFrame > 0 ? 100.0 * static_cast<double>(rs.reflectPixelsPerFrame) / pixels : 0.0, reflectGapFillUsedLastFrame ? "used" : "not used",
+				sc.terrainBuilt, sc.terrainCells, Megabytes(sc.terrainBytes + backend.ReflectBytes()).c_str());
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("GPU time of the reflection rays, the share of the render pixels traced, the terrain BLASes (built / made) and the video");
-				ImGui::Text("  memory of terrain and the two reflection textures. Terrain quadrants: %u from the game's vertex copy, %u rebuilt from", sc.terrainQuadsCpu,
-					sc.terrainQuadsHeights);
-				ImGui::Text("  its heights, %u failed.", sc.terrainQuadsFailed);
+				ImGui::Text("Time between the reflection rays' two GPU timestamps (wall time: other work runs in between; the real cost is the");
+				ImGui::Text("  frame's GPU time with and without), the share of the render pixels traced, whether the SSR pass used them last frame,");
+				ImGui::Text("  the terrain BLASes (built / made) and the video memory of terrain and the reflection textures. Terrain quadrants: %u from",
+					sc.terrainQuadsCpu);
+				ImGui::Text("  the game's vertex copy, %u rebuilt from its heights, %u failed.", sc.terrainQuadsHeights, sc.terrainQuadsFailed);
 			}
 			if (!reflectOffReason.empty())
 				RtErrorLine("RT reflections were switched off automatically", reflectOffReason);
@@ -8096,9 +8292,16 @@ std::string RayTracing::DescribeForProfile() const
 	{
 		const auto& sc = scene.GetStats();
 		text += std::format(", RT reflections {}{} (terrain in RT scene {}: {} of {} cells built, {:.1f} MB; reflection textures {:.1f} MB)",
-			settings.ReflectionsMode == 1 ? "trace only" : "off", reflectOffReason.empty() ? "" : " (switched off: " + reflectOffReason + ")",
-			settings.ReflectionsTerrain ? "on" : "off", sc.terrainBuilt, sc.terrainCells, static_cast<double>(sc.terrainBytes) / (1024.0 * 1024.0),
-			static_cast<double>(backend.ReflectBytes()) / (1024.0 * 1024.0));
+			settings.ReflectionsMode == 2 ? "gap fill" : (settings.ReflectionsMode == 1 ? "trace only" : "off"),
+			reflectOffReason.empty() ? "" : " (switched off: " + reflectOffReason + ")", settings.ReflectionsTerrain ? "on" : "off", sc.terrainBuilt, sc.terrainCells,
+			static_cast<double>(sc.terrainBytes) / (1024.0 * 1024.0), static_cast<double>(backend.ReflectBytes()) / (1024.0 * 1024.0));
+		// (48d)
+		text += std::format(", reflection pixels: {} (rough fade {:.2f}-{:.2f}), beyond SSR distance {}, rough rays leaves solid {}, best candidate {}, gap fill: "
+							"direction check {}, cubemap position check {}, real hit distance {}{}",
+			settings.ReflectionsFullRange ? "full roughness range" : "importance", settings.ReflectionsRoughStart, settings.ReflectionsRoughEnd,
+			settings.ReflectionsBeyondSSR ? "on" : "off", settings.ReflectionsRoughSolid ? "on" : "off", settings.ReflectionsBestCandidate ? "on" : "off",
+			settings.ReflectionsLobeCheck ? "on" : "off", settings.ReflectionsCubemapMatch ? "on" : "off", settings.ReflectionsHitDistance ? "on" : "off",
+			settings.ReflectionsMode == 2 && !GapFillConsumer() ? " (no consumer: SSRT specular / its cubemap fallback off)" : "");
 	}
 	// (46f)
 	static constexpr const char* kAOModes[] = { "RTAO (keeps SSGI contact AO)", "darker of RTAO and SSGI AO" };
@@ -8222,7 +8425,11 @@ nlohmann::json RayTracing::DescribeJson() const
 			{ "terrain_cells", sc.terrainCells }, { "terrain_built", sc.terrainBuilt }, { "terrain_triangles", sc.terrainTriangles },
 			{ "terrain_mb", static_cast<double>(sc.terrainBytes) / (1024.0 * 1024.0) }, { "terrain_quads_cpu_copy", sc.terrainQuadsCpu },
 			{ "terrain_quads_from_heights", sc.terrainQuadsHeights }, { "terrain_quads_failed", sc.terrainQuadsFailed }, { "terrain_cpu_ms", sc.terrainMs },
-			{ "debug_view", static_cast<int>(reflectDebugView) } };
+			{ "debug_view", static_cast<int>(reflectDebugView) }, { "rough_start", settings.ReflectionsRoughStart }, { "rough_end", settings.ReflectionsRoughEnd },
+			{ "full_range", settings.ReflectionsFullRange }, { "beyond_ssr", settings.ReflectionsBeyondSSR }, { "rough_solid", settings.ReflectionsRoughSolid },
+			{ "best_candidate", settings.ReflectionsBestCandidate }, { "lobe_check", settings.ReflectionsLobeCheck },
+			{ "cubemap_match", settings.ReflectionsCubemapMatch }, { "hit_distance", settings.ReflectionsHitDistance },
+			{ "gap_fill_consumer", GapFillConsumer() }, { "gap_fill_used_last_frame", reflectGapFillUsedLastFrame } };  // (48d)
 	}
 	j["denoiser_effective"] = static_cast<int>(EffectiveDenoiser());
 	j["upscaling_rr_active"] = UpscalingRRActive();

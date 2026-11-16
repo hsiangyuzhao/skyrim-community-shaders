@@ -102,6 +102,8 @@ namespace Util
 		RayTracingWaterPrep,
 		// (47l) RTAO: Smooth Normals: AONormalPrepCS (right before PrepareCS).
 		RayTracingAONormalPrep,
+		// (48d) RT reflections: the game queue's wait for the reflection list (third fence) right before the SSRT specular ray march.
+		RayTracingReflectSync,
 		Count
 	};
 

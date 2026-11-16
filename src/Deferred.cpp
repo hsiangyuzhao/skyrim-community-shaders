@@ -606,6 +606,13 @@ void Deferred::DeferredPasses()
 
 	auto& physSky = globals::features::physicalSky;
 
+	// (48d) RT reflections: their debug views wait for the reflection list (its own fence) here. With Gap Fill the SSRT specular pass
+	// takes that wait itself, right before its ray march (RayTracing::AcquireReflectionGapFill).
+	if (auto& rayTracing = globals::features::rayTracing; rayTracing.loaded) {
+		Util::CpuPassScope timer("Ray Tracing Reflections");
+		rayTracing.DrawReflectionDebugViews();
+	}
+
 	if (ssrt.loaded && ssrt.settings.EnableSpecular) {
 		Util::CpuPassScope timer("ScreenSpaceRayTracing");
 		ssrt.DrawSSRTSpecular();

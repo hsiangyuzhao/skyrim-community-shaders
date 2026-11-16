@@ -165,6 +165,9 @@ namespace Util
 			{ "RT Ambient Occlusion: Normal Prep",
 				"GPU time of the smooth normals for the ray-traced AO (RTAO: Smooth Normals: last frame's normals moved to this frame), "
 				"right before the trace. F7 column rtao_normal_prep_gpu_ms." },
+			{ "RT Reflections: Wait for Trace",
+				"With RT Reflections = Gap Fill: how long the game's GPU queue stood still waiting for the reflection rays, right before "
+				"the screen-space reflection pass (on the GPU; the CPU does not wait). Ideally about 0. F7 column rt_refl_sync_gpu_ms." },
 		};
 
 		static_assert(sizeof(kBucketInfo) / sizeof(kBucketInfo[0]) == static_cast<size_t>(GpuBucket::Count),

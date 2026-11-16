@@ -33,6 +33,12 @@ cbuffer AONormalCB : register(b0)
 	uint4 Flags;                         // (47k) x unused ((47q) v2 always), y debug view (0 none, 1 confidence, 2 Ns, 3 Ng)
 	float4 SkipRect;                     // (47p) the trace's rect (camera-relative xy min / max)
 	float4 SkipFade;                     // (47p) x: the trace's fade end (units), y: 1 = skip the pixels the trace never reads
+#if defined(RT_REFLECT)
+	// (48d) Which pixels trace a reflection ray: x / y the roughness fade (g = 1 - smoothstep(x, y, roughness); "Full Roughness Range"
+	// sends 2 / 3, so g = 1), z the SSR distance limit along the view axis (units; 0 = none: no limit or "Also Beyond SSR Distance").
+	float4 ReflectSelect;
+	uint4 ReflectFlags;                  // (48d) x frame (the rolling noise), y bit 0: material from the more confident candidate
+#endif
 };
 
 Texture2D<float> Depth : register(t0);         // this frame's depth (after the prepass)
@@ -45,6 +51,11 @@ RWTexture2D<unorm float4> DebugOut : register(u1);  // (47k) only bound while a 
 // those RTAO skips), its normal, last frame's roughness (1 - NORMALROUGHNESS.z) and confidence, where last frame's REFLECTANCE was not
 // black (the pixels the composite reflects at all). Packed: bits 0-10 / 11-21 octahedral normal (0..2047 = -1..1), 22-27 roughness
 // (0..63), 28-30 confidence (0..7), bit 31 valid (0 = no reflection ray: no reflectance, sky, nothing reprojected).
+// (48d) Bit 31 is now "selected": importance p = g(roughness) x saturate(lum(reflectance) / 0.04) (g = 1 - smoothstep(a, b, r)); below
+// 1/32 never; else traced where a per-frame rolling noise (animated interleaved gradient noise) is below p. No 1/p weight: an untraced
+// pixel keeps the cubemap, so over a few frames p is the RT / cubemap blend. Not past the SSR distance limit (unless "Also Beyond SSR
+// Distance"). The material (reflectance, roughness) comes from the more confident of the two reprojection candidates (ReflectFlags.y
+// bit 0; 48a always took the camera candidate, so a moving character read the background behind it).
 #if defined(RT_REFLECT)
 Texture2D<float4> PrevReflectance : register(t4);  // last frame's REFLECTANCE (Deferred.h)
 RWTexture2D<uint> ReflectPrep : register(u2);
@@ -247,8 +258,7 @@ float3 RingSmoothedNormal(int2 p, float3 P, float3 Ng, float footprint)
 			const bool inA = CandidateSearch(uvA, prevP, q0A, qA, errA);
 			cA = CandidateFinish(inA, qA, errA, tolA, Ng, nA, dataA);
 #if defined(RT_REFLECT)
-			if (dataA)
-				reflectQ = qA;
+			int2 reflectQB = int2(-1, -1);  // (48d) the motion candidate's pixel (its 3x3 best match)
 #endif
 			// B. Constant velocity: last frame's motion at the point it moved from (two fixed-point steps from the camera guess).
 			const float2 uv = (float2(p) + 0.5) * RenderSize.zw;
@@ -261,13 +271,44 @@ float3 RingSmoothedNormal(int2 p, float3 P, float3 Ng, float footprint)
 			// A moving surface moved: allow its motion in a frame (a walking character: a few units) on top of the depth noise.
 			// (47r) The same spot as A (same pixel, both in screen): A's search with B's tolerance.
 			const bool inB = !(any(uvB <= 0.0) || any(uvB >= 1.0));
+#if defined(RT_REFLECT)
+			// (48d) The same two candidates as below (Candidate = CandidateSearch + CandidateFinish), keeping the motion candidate's pixel.
+			[branch] if ((Flags.x & 2u) && inA && inB && all(int2(uvB * RenderSize.xy) == q0A))
+			{
+				cB = CandidateFinish(true, qA, errA, tolB, Ng, nB, dataB);
+				reflectQB = qA;
+			}
+			else
+			{
+				int2 q0B, qB;
+				float errB;
+				const bool inB2 = CandidateSearch(uvB, prevP, q0B, qB, errB);
+				cB = CandidateFinish(inB2, qB, errB, tolB, Ng, nB, dataB);
+				reflectQB = qB;
+			}
+			[branch] if (ReflectFlags.y & 1u)
+			{
+				// The material of the more confident candidate (a moving character: the motion one; a static surface: the camera one).
+				if (dataA && dataB)
+					reflectQ = cB > cA ? reflectQB : qA;
+				else if (dataA)
+					reflectQ = qA;
+				else if (dataB)
+					reflectQ = reflectQB;
+			}
+			else
+			{
+				// 48a: the camera candidate whenever it had data.
+				if (dataA)
+					reflectQ = qA;
+				else if (dataB)
+					reflectQ = clamp(int2(uvB * RenderSize.xy), int2(0, 0), int2(RenderSize.xy) - 1);
+			}
+#else
 			[branch] if ((Flags.x & 2u) && inA && inB && all(int2(uvB * RenderSize.xy) == q0A))
 				cB = CandidateFinish(true, qA, errA, tolB, Ng, nB, dataB);
 			else
 				cB = Candidate(uvB, prevP, tolB, Ng, nB, dataB);
-#if defined(RT_REFLECT)
-			if (!dataA && dataB)
-				reflectQ = clamp(int2(uvB * RenderSize.xy), int2(0, 0), int2(RenderSize.xy) - 1);
 #endif
 		}
 		const float c = max(cA, cB);
@@ -293,9 +334,20 @@ float3 RingSmoothedNormal(int2 p, float3 P, float3 Ng, float footprint)
 #if defined(RT_REFLECT)
 		[branch] if (reflectQ.x >= 0)
 		{
-			const float3 reflectance = PrevReflectance[reflectQ].rgb;
-			if (any(reflectance > 0.0)) {
-				const float roughness = saturate(1.0 - PrevNormal[reflectQ].z);
+			const float3 reflectance = max(PrevReflectance[reflectQ].rgb, 0.0);
+			const float roughness = saturate(1.0 - PrevNormal[reflectQ].z);
+			// (48d) Importance: how visible the reflection is (its weight, F0 0.04 = a plain dielectric = 1) times the roughness fade.
+			const float importance = (1.0 - smoothstep(ReflectSelect.x, ReflectSelect.y, roughness)) * saturate(dot(reflectance, float3(0.2126, 0.7152, 0.0722)) / 0.04);
+			// Past the SSR distance limit the composite never reads the specular result (the same view-axis distance as SSRT's limit).
+			bool inRange = true;
+			[branch] if (ReflectSelect.z > 0.0)
+			{
+				const float3 forward = normalize(PositionAt(float2(0.5, 0.5), 0.5, InvViewProj));
+				inRange = dot(P, forward) < ReflectSelect.z * 1.01;
+			}
+			const float2 np = float2(p) + 5.588238 * float(ReflectFlags.x & 63u);
+			const float noise = frac(52.9829189 * frac(dot(np, float2(0.06711056, 0.00583715))));
+			if (importance >= 1.0 / 32.0 && inRange && noise < importance) {
 				const uint2 o = uint2(round(saturate(OctEncode(n) * 0.5 + 0.5) * 2047.0));
 				reflectPacked = o.x | (o.y << 11) | (uint(round(roughness * 63.0)) << 22) | (uint(round(saturate(c) * 7.0)) << 28) | 0x80000000u;
 			}

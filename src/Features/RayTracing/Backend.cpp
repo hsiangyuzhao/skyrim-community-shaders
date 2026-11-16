@@ -199,6 +199,13 @@ namespace RayTracingRT
 			if (FAILED(aoList.As(&context.aoList)))
 				return fail("ID3D12GraphicsCommandList4 not available");
 			context.aoList->Close();
+			// (48d) The reflection rays' own list (same allocator, recorded after the RTAO list is closed).
+			ComPtr<ID3D12GraphicsCommandList> reflectList;
+			if (FAILED(hr = device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, context.allocator.Get(), nullptr, IID_PPV_ARGS(&reflectList))))
+				return fail(std::format("CreateCommandList failed ({})", HrString(hr)));
+			if (FAILED(reflectList.As(&context.reflectList)))
+				return fail("ID3D12GraphicsCommandList4 not available");
+			context.reflectList->Close();
 			// (46m) Split Trace Sync: the point lights' own list (same allocator, recorded after the sun list is closed).
 			// Optional: without it the trace is never split.
 			ComPtr<ID3D12GraphicsCommandList> pointList;
@@ -403,6 +410,8 @@ namespace RayTracingRT
 			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynReflect + 1));
 			nullSrv.Format = kReflectFormat;
 			device_->CreateShaderResourceView(nullptr, &nullSrv, StagingCpu(kDynReflect + 2));
+			// (48d) The hit record's direction word (u2).
+			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynReflect + 3));
 		}
 
 		// (45h) Null views in every alpha slot (the copy layers and the bindless table are filled on use).
@@ -1314,10 +1323,7 @@ namespace RayTracingRT
 		list->ResourceBarrier(1, &toUav);
 		if (timestampHeap_ && timestampReadback_)
 			list->ResolveQueryData(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase, 2, timestampReadback_.Get(), sizeof(std::uint64_t) * queryBase);
-		// (48a) RT reflections step 1: right behind the RTAO rays, in the same list (the same second fence and wait; nothing new).
-		stats_.reflectTracedLastFrame = false;
-		if (a_input.reflect && ReflectAvailable() && ReflectReady())
-			RecordReflectTrace(list, a_context, a_index, a_input, a_alphaFrame, Offset(a_table, kDynReflect - kDynAO, descriptorSize_));
+		// (48d) The reflection rays are no longer in this list (their own list and fence: RecordReflectList).
 		if (FAILED(hr = list->Close())) {
 			Fail("RTAO command list Close", hr);
 			return false;
@@ -1333,8 +1339,8 @@ namespace RayTracingRT
 	{
 		// Its own root signature: constants b0, TLAS t0, table (depth t1, output u0, prep t5), ray counter u1; the alpha-tested variant
 		// also: records t2, texcoords t3, table (copy layers t4, bindless game textures t0 space1), s0 (as RTAO's).
-		// 36 + 2 + 1 + 2 + 2 + 2 + 1 = 46 DWORDs.
-		D3D12_DESCRIPTOR_RANGE ranges[3]{};
+		// 36 + 2 + 1 + 2 + 2 + 2 + 1 = 46 DWORDs. (48d) The table also holds the direction word's UAV (u2, offset 3).
+		D3D12_DESCRIPTOR_RANGE ranges[4]{};
 		ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
 		ranges[0].NumDescriptors = 1;
 		ranges[0].BaseShaderRegister = 1;
@@ -1347,6 +1353,10 @@ namespace RayTracingRT
 		ranges[2].NumDescriptors = 1;
 		ranges[2].BaseShaderRegister = 5;
 		ranges[2].OffsetInDescriptorsFromTableStart = 2;
+		ranges[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+		ranges[3].NumDescriptors = 1;
+		ranges[3].BaseShaderRegister = 2;
+		ranges[3].OffsetInDescriptorsFromTableStart = 3;
 		D3D12_DESCRIPTOR_RANGE alphaRanges[2]{};
 		alphaRanges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
 		alphaRanges[0].NumDescriptors = 1;
@@ -1366,7 +1376,7 @@ namespace RayTracingRT
 		params[1].Descriptor.ShaderRegister = 0;
 		params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-		params[2].DescriptorTable.NumDescriptorRanges = 3;
+		params[2].DescriptorTable.NumDescriptorRanges = 4;
 		params[2].DescriptorTable.pDescriptorRanges = ranges;
 		params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
@@ -1425,11 +1435,19 @@ namespace RayTracingRT
 			return false;
 		if (a_width == reflectWidth_ && a_height == reflectHeight_ && ReflectReady())
 			return true;
+		// (48d) The third fence first (kept across resizes, like the RTAO one).
+		if (!EnsureReflectFence())
+			return false;
 		ReleaseReflectResources();
+		// (48d) The hit record is two R32_UINT words (type / confidence / distance, and the octahedral ray direction): the format the 48a
+		// prep and output already share, so no new shared format has to be accepted by the driver. A failure switches the reflections off
+		// (the reason on the page); everything then runs exactly as with RT Reflections Off.
 		if (!CreateSharedTexture(a_width, a_height, kReflectFormat, true, false, reflectPrep_, "RayTracing ReflectPrep", false) ||
-			!CreateSharedTexture(a_width, a_height, kReflectFormat, false, true, reflectOut_, "RayTracing ReflectOut", false)) {
+			!CreateSharedTexture(a_width, a_height, kReflectFormat, false, true, reflectOut_, "RayTracing ReflectOut", false) ||
+			!CreateSharedTexture(a_width, a_height, kReflectFormat, false, true, reflectDir_, "RayTracing ReflectDir", false)) {
 			reflectPrep_ = {};
 			reflectOut_ = {};
+			reflectDir_ = {};
 			reflectFault_ = "could not create its shared textures (see the log)";
 			logger::warn("[RayTracing] RT reflections: {}", reflectFault_);
 			return false;
@@ -1440,6 +1458,7 @@ namespace RayTracingRT
 		if (!reflectCounter_ || !reflectCounterReadback_ || FAILED(reflectCounterReadback_->Map(0, nullptr, &mapped)) || !mapped) {
 			reflectPrep_ = {};
 			reflectOut_ = {};
+			reflectDir_ = {};
 			reflectCounter_.Reset();
 			reflectCounterReadback_.Reset();
 			reflectFault_ = "could not create its ray counter";
@@ -1450,7 +1469,7 @@ namespace RayTracingRT
 		reflectCounterValid_ = false;
 		reflectWidth_ = a_width;
 		reflectHeight_ = a_height;
-		reflectBytes_ = static_cast<std::uint64_t>(a_width) * a_height * 8;
+		reflectBytes_ = static_cast<std::uint64_t>(a_width) * a_height * 12;  // (48d) prep + two record words
 		WriteReflectDescriptors();
 		logger::info("[RayTracing] RT reflections: textures {}x{} ({:.1f} MB)", a_width, a_height, static_cast<double>(reflectBytes_) / (1024.0 * 1024.0));
 		return true;
@@ -1463,6 +1482,8 @@ namespace RayTracingRT
 			Retire(reflectPrep_.resource12, 0, nullptr);
 		if (reflectOut_.resource12)
 			Retire(reflectOut_.resource12, 0, nullptr);
+		if (reflectDir_.resource12)
+			Retire(reflectDir_.resource12, 0, nullptr);  // (48d)
 		if (reflectCounterReadback_ && reflectCounterMapped_)
 			reflectCounterReadback_->Unmap(0, nullptr);
 		reflectCounterMapped_ = nullptr;
@@ -1474,6 +1495,7 @@ namespace RayTracingRT
 		reflectCounterReadback_.Reset();
 		reflectPrep_ = {};
 		reflectOut_ = {};
+		reflectDir_ = {};
 		reflectWidth_ = reflectHeight_ = 0;
 		reflectBytes_ = 0;
 		reflectCounterValid_ = false;
@@ -1482,11 +1504,13 @@ namespace RayTracingRT
 		stats_.lastReflectGpuMs = -1.0f;
 		stats_.reflectPixelsPerFrame = -1;
 		stats_.reflectTracedLastFrame = false;
+		stats_.reflectSubmittedLastFrame = false;
 		if (stagingHeap_ && device_) {
 			D3D12_UNORDERED_ACCESS_VIEW_DESC nullUav{};
 			nullUav.Format = kReflectFormat;
 			nullUav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
 			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynReflect + 1));
+			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynReflect + 3));  // (48d)
 			D3D12_SHADER_RESOURCE_VIEW_DESC nullSrv{};
 			nullSrv.Format = kReflectFormat;
 			nullSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -1498,7 +1522,7 @@ namespace RayTracingRT
 
 	void Backend::WriteReflectDescriptors()
 	{
-		if (!stagingHeap_ || !reflectPipeline_ || !reflectOut_.resource12 || !reflectPrep_.resource12)
+		if (!stagingHeap_ || !reflectPipeline_ || !reflectOut_.resource12 || !reflectPrep_.resource12 || !reflectDir_.resource12)
 			return;
 		D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
 		srvDesc.Format = kDepthMaskFormat;
@@ -1512,18 +1536,80 @@ namespace RayTracingRT
 		device_->CreateUnorderedAccessView(reflectOut_.resource12.Get(), nullptr, &uavDesc, StagingCpu(kDynReflect + 1));
 		srvDesc.Format = kReflectFormat;
 		device_->CreateShaderResourceView(reflectPrep_.resource12.Get(), &srvDesc, StagingCpu(kDynReflect + 2));
+		device_->CreateUnorderedAccessView(reflectDir_.resource12.Get(), nullptr, &uavDesc, StagingCpu(kDynReflect + 3));  // (48d)
+	}
+
+	bool Backend::EnsureReflectFence()
+	{
+		// (48d) The third fence: shared like the RTAO one (D3D12 signals behind the reflection list, D3D11 waits on the GPU). Created once.
+		if (reflectFence_ && reflectFence11_)
+			return true;
+		reflectFence_.Reset();
+		reflectFence11_.Reset();
+		HRESULT hr;
+		if (FAILED(hr = device_->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&reflectFence_)))) {
+			reflectFence_.Reset();
+			reflectFault_ = std::format("could not create its fence ({})", HrString(hr));
+			logger::warn("[RayTracing] RT reflections: {}", reflectFault_);
+			return false;
+		}
+		HANDLE shared = nullptr;
+		if (FAILED(hr = device_->CreateSharedHandle(reflectFence_.Get(), nullptr, GENERIC_ALL, nullptr, &shared))) {
+			reflectFence_.Reset();
+			reflectFault_ = std::format("could not share its fence ({})", HrString(hr));
+			logger::warn("[RayTracing] RT reflections: {}", reflectFault_);
+			return false;
+		}
+		hr = device11_->OpenSharedFence(shared, IID_PPV_ARGS(&reflectFence11_));
+		CloseHandle(shared);
+		if (FAILED(hr)) {
+			reflectFence_.Reset();
+			reflectFence11_.Reset();
+			reflectFault_ = std::format("D3D11 could not open its fence ({})", HrString(hr));
+			logger::warn("[RayTracing] RT reflections: {}", reflectFault_);
+			return false;
+		}
+		reflectFenceValue_ = 0;
+		pendingReflectWait_ = 0;
+		return true;
+	}
+
+	bool Backend::RecordReflectList(CommandContext& a_context, std::size_t a_index, const FrameInput& a_input, bool a_alphaFrame, D3D12_GPU_DESCRIPTOR_HANDLE a_table)
+	{
+		// (48d) The reflection rays' own list (same allocator as the prep / trace / RTAO lists, all closed by now), submitted behind the
+		// RTAO list (or behind the trace) and signalling the third fence: the RTAO fence no longer waits for them.
+		stats_.reflectTracedLastFrame = false;
+		if (!a_input.reflect || !ReflectAvailable() || !ReflectReady() || !reflectFence_ || !reflectFence11_ || !a_context.reflectList || !depthMask_.resource12 ||
+			!tlas_)
+			return false;
+		auto* list = a_context.reflectList.Get();
+		HRESULT hr;
+		if (FAILED(hr = list->Reset(a_context.allocator.Get(), nullptr))) {
+			Fail("reflection command list Reset", hr);
+			return false;
+		}
+		ID3D12DescriptorHeap* heaps[] = { descriptorHeap_.Get() };
+		list->SetDescriptorHeaps(1, heaps);
+		RecordReflectTrace(list, a_context, a_index, a_input, a_alphaFrame, a_table);
+		if (FAILED(hr = list->Close())) {
+			Fail("reflection command list Close", hr);
+			stats_.reflectTracedLastFrame = false;
+			return false;
+		}
+		return true;
 	}
 
 	void Backend::RecordReflectTrace(ID3D12GraphicsCommandList4* a_list, CommandContext& a_context, std::size_t a_index, const FrameInput& a_input, bool a_alphaFrame,
 		D3D12_GPU_DESCRIPTOR_HANDLE a_table)
 	{
-		// Inside the RTAO list (depth already back in COMMON after the AO dispatch): its own transitions, timestamps and counter.
-		D3D12_RESOURCE_BARRIER pre[3] = {
+		// (48d) In its own list (every shared texture in COMMON between lists): its own transitions, timestamps and counter.
+		D3D12_RESOURCE_BARRIER pre[4] = {
 			Transition(depthMask_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
 			Transition(reflectPrep_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
 			Transition(reflectOut_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+			Transition(reflectDir_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
 		};
-		a_list->ResourceBarrier(3, pre);
+		a_list->ResourceBarrier(4, pre);
 		const UINT queryBase = static_cast<UINT>(kContexts * 8 + a_index * 2);
 		if (timestampHeap_)
 			a_list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase);
@@ -1544,12 +1630,13 @@ namespace RayTracingRT
 		a_list->Dispatch((a_input.renderWidth + 7) / 8, (a_input.renderHeight + 7) / 8, 1);
 		if (timestampHeap_)
 			a_list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 1);
-		D3D12_RESOURCE_BARRIER post[3] = {
+		D3D12_RESOURCE_BARRIER post[4] = {
 			Transition(depthMask_.resource12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
 			Transition(reflectPrep_.resource12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
 			Transition(reflectOut_.resource12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+			Transition(reflectDir_.resource12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
 		};
-		a_list->ResourceBarrier(3, post);
+		a_list->ResourceBarrier(4, post);
 		D3D12_RESOURCE_BARRIER toCopy = Transition(reflectCounter_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
 		a_list->ResourceBarrier(1, &toCopy);
 		a_list->CopyBufferRegion(reflectCounterReadback_.Get(), sizeof(std::uint32_t) * a_index, reflectCounter_.Get(), 0, sizeof(std::uint32_t));
@@ -1575,6 +1662,20 @@ namespace RayTracingRT
 		return static_cast<float>(QpcToMs(QpcNow() - start));
 	}
 
+	bool Backend::WaitForReflections()
+	{
+		// (48d) The third fence (GPU-side): right before the first D3D11 pass that reads the hit record.
+		if (pendingReflectWait_ == 0 || !context11_ || !reflectFence11_)
+			return false;
+		const std::uint64_t value = pendingReflectWait_;
+		pendingReflectWait_ = 0;
+		if (FAILED(context11_->Wait(reflectFence11_.Get(), value))) {
+			Fail("D3D11 Wait (reflections)", E_FAIL);
+			return false;
+		}
+		return true;
+	}
+
 	void Backend::Shutdown(bool a_waitForGpu)
 	{
 		// (46q) Everything handed to the submit thread goes out first (its lists and fences are released below).
@@ -1598,6 +1699,11 @@ namespace RayTracingRT
 		// (46f) The last RTAO list (behind the second fence) too.
 		if (a_waitForGpu && aoFence_ && fenceEvent_ && aoFenceValue_ && aoFence_->GetCompletedValue() < aoFenceValue_) {
 			if (SUCCEEDED(aoFence_->SetEventOnCompletion(aoFenceValue_, fenceEvent_)))
+				WaitForSingleObject(fenceEvent_, 2000);
+		}
+		// (48d) And the last reflection list (behind the third fence).
+		if (a_waitForGpu && reflectFence_ && fenceEvent_ && reflectFenceValue_ && reflectFence_->GetCompletedValue() < reflectFenceValue_) {
+			if (SUCCEEDED(reflectFence_->SetEventOnCompletion(reflectFenceValue_, fenceEvent_)))
 				WaitForSingleObject(fenceEvent_, 2000);
 		}
 		ready_ = false;
@@ -1678,6 +1784,11 @@ namespace RayTracingRT
 		reflectCounterReadback_.Reset();
 		reflectPrep_ = {};
 		reflectOut_ = {};
+		reflectDir_ = {};  // (48d)
+		reflectFence11_.Reset();
+		reflectFence_.Reset();
+		reflectFenceValue_ = 0;
+		pendingReflectWait_ = 0;
 		reflectWidth_ = reflectHeight_ = 0;
 		reflectBytes_ = 0;
 		reflectCounterValid_ = false;
@@ -2909,7 +3020,7 @@ namespace RayTracingRT
 		}
 		lap(split.collect);
 		for (std::size_t i = 0; i < kContexts; ++i)
-			if (contexts_[i].fenceValue != 0 && contexts_[i].fenceValue <= completed && contexts_[i].aoFenceValue <= aoCompleted)
+			if (contexts_[i].fenceValue != 0 && contexts_[i].fenceValue <= completed && contexts_[i].aoFenceValue <= aoCompleted && contexts_[i].reflectFenceValue <= ReflectCompleted())
 				CollectTimestamps(i);
 		lap(split.timestamps);  // (46g)
 		if (index == kContexts) {
@@ -3315,8 +3426,13 @@ namespace RayTracingRT
 		if (failed_)
 			return false;
 		stats_.aoTracedLastFrame = aoFrame;
-		if (!aoFrame)
-			stats_.reflectTracedLastFrame = false;  // (48a) they ride in that list
+		// (48d) The reflection rays: their own list on this context (recorded now, submitted behind the RTAO list / the trace).
+		stats_.reflectSubmittedLastFrame = false;
+		const bool reflectFrame = a_input.reflect && RecordReflectList(context, index, a_input, alphaFrame, Offset(block, kDynReflect, descriptorSize_));
+		if (failed_)
+			return false;
+		if (!reflectFrame)
+			stats_.reflectTracedLastFrame = false;
 		lap(split.ao);  // (46g)
 
 		// (46f) A second-fence wait never issued last frame (the AO was not used): the D3D11 queue takes it before this
@@ -3326,6 +3442,13 @@ namespace RayTracingRT
 			pendingAOWait_ = 0;
 			if (FAILED(hr = context11_->Wait(aoFence11_.Get(), aoValue)))
 				return Fail("D3D11 Wait (RTAO)", hr);
+		}
+		// (48d) Likewise the third fence (the reflection list was not read last frame: Trace Only without a debug view, no consumer).
+		if (pendingReflectWait_ != 0) {
+			const std::uint64_t reflectValue = pendingReflectWait_;
+			pendingReflectWait_ = 0;
+			if (FAILED(hr = context11_->Wait(reflectFence11_.Get(), reflectValue)))
+				return Fail("D3D11 Wait (reflections)", hr);
 		}
 		// (46h) Likewise a trace wait never issued (an interior frame with RTAO only leaves it to the AO pass; the callers take it
 		// before the next trace, this is the guard): the D3D11 ready signal below must follow the last D3D12 done value.
@@ -3361,7 +3484,7 @@ namespace RayTracingRT
 		std::uint64_t afterValue = 0;
 		if (a_input.afterReady) {
 			const bool aoReads = a_input.afterReady();
-			if (aoReads && aoFrame && afterFence11_ && afterFence_) {
+			if (aoReads && (aoFrame || reflectFrame) && afterFence11_ && afterFence_) {  // (48d) or the reflection list reads it
 				afterValue = ++afterFenceValue_;
 				if (FAILED(hr = context11_->Signal(afterFence11_.Get(), afterValue)))
 					return Fail("D3D11 Signal (after ready)", hr);
@@ -3398,6 +3521,20 @@ namespace RayTracingRT
 			context.aoPending = true;
 			context.aoFrame = ++aoFrame_;
 			pendingAOWait_ = aoValue;
+		}
+		// (48d) The reflection rays right behind it (or behind the trace without RTAO), signalling the third fence: the D3D11 queue waits
+		// for it only right before the SSRT specular ray march (WaitForReflections). The RTAO fence above is signalled before they run,
+		// so the RTAO wait (rtao_sync) no longer includes them.
+		if (reflectFrame) {
+			if (!aoFrame && afterValue != 0 && FAILED(hr = QueueWait(afterFence_.Get(), afterValue, "D3D12 queue Wait (after ready)")))
+				return Fail("D3D12 queue Wait (after ready)", hr);
+			QueueExecute(context.reflectList.Get());
+			const std::uint64_t reflectValue = ++reflectFenceValue_;
+			if (FAILED(hr = QueueSignal(reflectFence_.Get(), reflectValue, "D3D12 queue Signal (reflections)")))
+				return Fail("D3D12 queue Signal (reflections)", hr);
+			context.reflectFenceValue = reflectValue;
+			pendingReflectWait_ = reflectValue;
+			stats_.reflectSubmittedLastFrame = true;
 		}
 		for (auto& blas : blas_)
 			if (blas.state == BlasState::Built && blas.buildFence == 0)
@@ -3466,7 +3603,7 @@ namespace RayTracingRT
 		}
 		lap(split.collect);
 		for (std::size_t i = 0; i < kContexts; ++i)
-			if (contexts_[i].fenceValue != 0 && contexts_[i].fenceValue <= completed && contexts_[i].aoFenceValue <= aoCompleted)
+			if (contexts_[i].fenceValue != 0 && contexts_[i].fenceValue <= completed && contexts_[i].aoFenceValue <= aoCompleted && contexts_[i].reflectFenceValue <= ReflectCompleted())
 				CollectTimestamps(i);
 		lap(split.timestamps);
 		if (index == kContexts)
@@ -3722,7 +3859,7 @@ namespace RayTracingRT
 		if (index == kContexts)
 			return false;
 		for (std::size_t i = 0; i < kContexts; ++i)
-			if (contexts_[i].fenceValue != 0 && contexts_[i].fenceValue <= completed && contexts_[i].aoFenceValue <= aoCompleted)
+			if (contexts_[i].fenceValue != 0 && contexts_[i].fenceValue <= completed && contexts_[i].aoFenceValue <= aoCompleted && contexts_[i].reflectFenceValue <= ReflectCompleted())
 				CollectTimestamps(i);
 		auto& context = contexts_[index];
 		cursor_ = (index + 1) % kContexts;
