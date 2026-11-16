@@ -841,6 +841,9 @@ bool RayTracing::DestinationReady(double a_sinceCloseMs) const
 		return false;
 	if (backend.QueuedBuilds() > 0 || backend.PendingSkinUploads() > 0)
 		return false;
+	// (48e) RT reflections: the destination's terrain BLASes too (made behind the loading screen; their builds are in QueuedBuilds).
+	if (settings.ReflectionsLoadingPrep && scene.TerrainPending() > 0)
+		return false;
 	// (46k) The player stands in what was captured (not in the place left, nor beside it).
 	auto* player = RE::PlayerCharacter::GetSingleton();
 	if (!player)
@@ -1124,6 +1127,7 @@ void RayTracing::UpdateAlphaCasters()
 	}
 	reflectRequested = settings.ReflectionsMode != 0;
 	scene.SetTerrain(ReflectionsWanted() && settings.ReflectionsTerrain);
+	scene.SetTerrainLoadingPrep(settings.ReflectionsLoadingPrep);  // (48e)
 	if (!ReflectionsWanted() && backend.IsReady() && backend.ReflectBytes())
 		backend.ReleaseReflectResources();
 }
@@ -1558,6 +1562,8 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.ReflectionsLobeCheck = read("ReflectionsLobeCheck", defaults.ReflectionsLobeCheck);
 		settings.ReflectionsCubemapMatch = read("ReflectionsCubemapMatch", defaults.ReflectionsCubemapMatch);
 		settings.ReflectionsHitDistance = read("ReflectionsHitDistance", defaults.ReflectionsHitDistance);
+		settings.ReflectionsLoadingPrep = read("ReflectionsLoadingPrep", defaults.ReflectionsLoadingPrep);  // (48e)
+		settings.ReflectionsCubemapWarmUp = read("ReflectionsCubemapWarmUp", defaults.ReflectionsCubemapWarmUp);
 		const float sunSize = read("SunSize", -1.0f);
 		if (sunSize >= 0.0f) {
 			settings.SunSize = sunSize;
@@ -1704,6 +1710,8 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["ReflectionsLobeCheck"] = settings.ReflectionsLobeCheck;
 	o_json["ReflectionsCubemapMatch"] = settings.ReflectionsCubemapMatch;
 	o_json["ReflectionsHitDistance"] = settings.ReflectionsHitDistance;
+	o_json["ReflectionsLoadingPrep"] = settings.ReflectionsLoadingPrep;  // (48e)
+	o_json["ReflectionsCubemapWarmUp"] = settings.ReflectionsCubemapWarmUp;
 	o_json["AOSmoothNormals"] = settings.AOSmoothNormals;  // (47j)
 	o_json["AOTemporalV2"] = settings.AOTemporalV2;  // (47l)
 	o_json["FoliageSway"] = settings.FoliageSway;  // (47l)
@@ -1863,6 +1871,8 @@ void RayTracing::ClearShaderCache()
 	pointDenoiseWideBeamCS = nullptr;
 	aoNormalReflectCS = nullptr;
 	reflectDebugCS = nullptr;
+	aoNormalReflectAsync.Reset();  // (48e) compiled again in the background on the next request
+	reflectDebugAsync.Reset();
 	pointMaskCS = nullptr;     // (46c)
 	forwardMergeCS = nullptr;  // (47z)
 	// (46f)
@@ -2768,6 +2778,7 @@ void RayTracing::Reset()
 	// (46k) Present hook, once per presented frame, before the real Present (State::Reset; frameCount is still this frame's).
 	RegisterEventSinks();
 	MaybeLogTransitionEvents();
+	PrewarmReflectionShaders();  // (48e) also at the main menu and behind loading screens
 	{
 		std::int64_t openQpc = 0;
 		{
@@ -4688,7 +4699,9 @@ bool RayTracing::RunAONormalPrep(ID3D11DeviceContext* a_context, ID3D11ShaderRes
 	}
 	if (!tierSmooth && backend.HasAONormalTexture())
 		backend.ReleaseAONormalTexture();
-	if (!aoNormalCS) {
+	// (48e) The plain variant only where RTAO's smooth normals read it (synchronous on first use, as before 48d); for the reflection rays
+	// alone it is not needed (48d compiled it anyway).
+	if (tierSmooth && !aoNormalCS) {
 		aoNormalCS.attach(static_cast<ID3D11ComputeShader*>(Util::CompileShader(L"Data\\Shaders\\RayTracing\\AONormalPrepCS.hlsl", {}, "cs_5_0")));
 		if (!aoNormalCS) {
 			aoSmoothFault = "AONormalPrepCS did not compile";
@@ -4697,11 +4710,14 @@ bool RayTracing::RunAONormalPrep(ID3D11DeviceContext* a_context, ID3D11ShaderRes
 			return false;
 		}
 	}
-	// (48a) The RT_REFLECT variant (a failure only keeps the reflection rays off; RTAO is unaffected).
+	// (48a) The RT_REFLECT variant (a failure only keeps the reflection rays off; RTAO is unaffected). (48e) Compiled in the background:
+	// until it is ready the reflection rays are not prepared (this frame runs as without reflections).
 	bool reflectPrep = reflect;
 	if (reflectPrep && !aoNormalReflectCS) {
-		aoNormalReflectCS.attach(static_cast<ID3D11ComputeShader*>(Util::CompileShader(L"Data\\Shaders\\RayTracing\\AONormalPrepCS.hlsl", { { "RT_REFLECT", "" } }, "cs_5_0")));
-		if (!aoNormalReflectCS) {
+		bool failed = false;
+		if (!PollAsyncShader(aoNormalReflectAsync, aoNormalReflectCS, L"Data\\Shaders\\RayTracing\\AONormalPrepCS.hlsl", { { "RT_REFLECT", "" } },
+				"Ray Tracing AONormalPrepCS (RT_REFLECT)", failed) &&
+			failed) {
 			reflectOffReason = "AONormalPrepCS (RT_REFLECT) did not compile";
 			logger::warn("[RayTracing] RT reflections: {}", reflectOffReason);
 		}
@@ -5780,6 +5796,39 @@ void RayTracing::PrepareReflectionsImpl(RayTracingRT::FrameInput& a_input)
 	reflectWantedThisFrame = true;
 }
 
+bool RayTracing::PollAsyncShader(Util::AsyncComputeShader& a_async, winrt::com_ptr<ID3D11ComputeShader>& a_shader, const wchar_t* a_path,
+	const std::vector<std::pair<std::string, std::string>>& a_defines, std::string_view a_label, bool& a_failed)
+{
+	// (48e) Never blocks (Request is a no-op while the job exists).
+	a_failed = false;
+	a_async.Request(a_path, a_defines, a_label);
+	switch (a_async.GetStatus()) {
+	case Util::AsyncComputeShader::Status::Ready:
+		a_shader.copy_from(a_async.Poll());
+		return a_shader != nullptr;
+	case Util::AsyncComputeShader::Status::Failed:
+		a_failed = true;
+		return false;
+	default:
+		return false;
+	}
+}
+
+void RayTracing::PrewarmReflectionShaders()
+{
+	// (48e) Started as soon as RT Reflections is not Off (main menu, loading screens, play): the first frame that needs them finds them
+	// ready instead of compiling them on the render thread. Each request is a no-op once its job exists.
+	if (!RtWanted() || settings.ReflectionsMode == 0)
+		return;
+	if (!aoNormalReflectCS && reflectOffReason.empty()) {
+		bool failed = false;
+		PollAsyncShader(aoNormalReflectAsync, aoNormalReflectCS, L"Data\\Shaders\\RayTracing\\AONormalPrepCS.hlsl", { { "RT_REFLECT", "" } },
+			"Ray Tracing AONormalPrepCS (RT_REFLECT)", failed);
+	}
+	if (settings.ReflectionsMode == 2)
+		globals::features::screenSpaceRayTracing.PrewarmRTGapFill();
+}
+
 void RayTracing::DrawReflectionDebugViews()
 {
 	// (48d) Right before the SSRT specular pass: the reflection list's wait (third fence), then the hit type / distance / confidence view.
@@ -5830,6 +5879,8 @@ bool RayTracing::AcquireReflectionGapFill(std::uint32_t a_width, std::uint32_t a
 		o_fill.flags |= kGapFillMatch;
 	if (settings.ReflectionsHitDistance)
 		o_fill.flags |= kGapFillHitDistance;
+	if (settings.ReflectionsCubemapWarmUp)
+		o_fill.flags |= kGapFillWarmUp;  // (48e)
 	reflectGapFillUsed = true;
 	return true;
 }
@@ -5840,10 +5891,13 @@ void RayTracing::DrawReflectionDebug()
 	if (reflectDebugView == ReflectDebugView::Off || reflectDebugView == ReflectDebugView::Use || !debugColorUAV || !backend.ReflectOutSRV())
 		return;
 	if (!reflectDebugCS) {
-		reflectDebugCS.attach(static_cast<ID3D11ComputeShader*>(Util::CompileShader(L"Data\\Shaders\\RayTracing\\ReflectDebugCS.hlsl", {}, "cs_5_0")));
-		if (!reflectDebugCS) {
-			logger::error("[RayTracing] Could not compile ReflectDebugCS");
-			reflectDebugView = ReflectDebugView::Off;
+		// (48e) In the background: the view simply stays undrawn until the shader is ready.
+		bool failed = false;
+		if (!PollAsyncShader(reflectDebugAsync, reflectDebugCS, L"Data\\Shaders\\RayTracing\\ReflectDebugCS.hlsl", {}, "Ray Tracing ReflectDebugCS", failed)) {
+			if (failed) {
+				logger::error("[RayTracing] Could not compile ReflectDebugCS");
+				reflectDebugView = ReflectDebugView::Off;
+			}
 			return;
 		}
 	}
@@ -6842,7 +6896,26 @@ void RayTracing::DrawSettings()
 			ImGui::Text("On (default): the reflection denoiser gets the ray's real hit distance where the ray filled the gap (instead of 'far'),");
 			ImGui::Text("  which keeps near reflections steadier when moving. Off: as before.");
 		}
+		ImGui::Checkbox("Gap Fill: Cubemap Warm-Up Fix", &settings.ReflectionsCubemapWarmUp);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): right after a loading screen the dynamic cubemap starts empty and fills in over many frames; the position");
+			ImGui::Text("  check and the off-screen colours undo that fill-in, so matched reflections appear at full strength from the first");
+			ImGui::Text("  capture of that direction. Once the cubemap has settled it changes nothing. Off: as 48d (they fade in over ~0.5 s).");
+		}
 		ImGui::EndDisabled();
+		ImGui::Checkbox("Reflections: Prepare Behind Loading Screens", &settings.ReflectionsLoadingPrep);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): the ground (terrain) for the reflection rays is built while the loading screen is up, and the switch to");
+			ImGui::Text("  RT after it waits for it like for everything else. Off: as 48d (at most 4 cells of ground per frame, after the switch).");
+		}
+		// (48e) Background compiles of the reflection shaders (no first-use freeze).
+		if (settings.ReflectionsMode != 0) {
+			auto& ssrtFeature = globals::features::screenSpaceRayTracing;
+			const bool prepCompiling = aoNormalReflectAsync.GetStatus() == Util::AsyncComputeShader::Status::Compiling;
+			const bool fillCompiling = settings.ReflectionsMode == 2 && ssrtFeature.raymarchSpecularRTAsync.GetStatus() == Util::AsyncComputeShader::Status::Compiling;
+			if (prepCompiling || fillCompiling)
+				ImGui::TextDisabled("Preparing the reflection shaders in the background (the picture uses the old path until they are ready)...");
+		}
 		{
 			const char* kViews[5] = { "Off", "Hit Type", "Hit Distance", "Normal Confidence", "RT Reflection Use" };
 			int view = static_cast<int>(reflectDebugView);
@@ -8297,10 +8370,11 @@ std::string RayTracing::DescribeForProfile() const
 			static_cast<double>(sc.terrainBytes) / (1024.0 * 1024.0), static_cast<double>(backend.ReflectBytes()) / (1024.0 * 1024.0));
 		// (48d)
 		text += std::format(", reflection pixels: {} (rough fade {:.2f}-{:.2f}), beyond SSR distance {}, rough rays leaves solid {}, best candidate {}, gap fill: "
-							"direction check {}, cubemap position check {}, real hit distance {}{}",
+							"direction check {}, cubemap position check {}, real hit distance {}, cubemap warm-up fix {}; prepare behind loading screens {}{}",
 			settings.ReflectionsFullRange ? "full roughness range" : "importance", settings.ReflectionsRoughStart, settings.ReflectionsRoughEnd,
 			settings.ReflectionsBeyondSSR ? "on" : "off", settings.ReflectionsRoughSolid ? "on" : "off", settings.ReflectionsBestCandidate ? "on" : "off",
 			settings.ReflectionsLobeCheck ? "on" : "off", settings.ReflectionsCubemapMatch ? "on" : "off", settings.ReflectionsHitDistance ? "on" : "off",
+			settings.ReflectionsCubemapWarmUp ? "on" : "off", settings.ReflectionsLoadingPrep ? "on" : "off",
 			settings.ReflectionsMode == 2 && !GapFillConsumer() ? " (no consumer: SSRT specular / its cubemap fallback off)" : "");
 	}
 	// (46f)
@@ -8429,7 +8503,10 @@ nlohmann::json RayTracing::DescribeJson() const
 			{ "full_range", settings.ReflectionsFullRange }, { "beyond_ssr", settings.ReflectionsBeyondSSR }, { "rough_solid", settings.ReflectionsRoughSolid },
 			{ "best_candidate", settings.ReflectionsBestCandidate }, { "lobe_check", settings.ReflectionsLobeCheck },
 			{ "cubemap_match", settings.ReflectionsCubemapMatch }, { "hit_distance", settings.ReflectionsHitDistance },
-			{ "gap_fill_consumer", GapFillConsumer() }, { "gap_fill_used_last_frame", reflectGapFillUsedLastFrame } };  // (48d)
+			{ "gap_fill_consumer", GapFillConsumer() }, { "gap_fill_used_last_frame", reflectGapFillUsedLastFrame },  // (48d)
+			{ "cubemap_warm_up_fix", settings.ReflectionsCubemapWarmUp }, { "loading_prep", settings.ReflectionsLoadingPrep },  // (48e)
+			{ "terrain_pending", scene.TerrainPending() }, { "prep_shader_ms", aoNormalReflectAsync.CompileMs() },
+			{ "gap_fill_shader_ms", globals::features::screenSpaceRayTracing.raymarchSpecularRTAsync.CompileMs() } };
 	}
 	j["denoiser_effective"] = static_cast<int>(EffectiveDenoiser());
 	j["upscaling_rr_active"] = UpscalingRRActive();

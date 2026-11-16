@@ -7,8 +7,11 @@
 #include "Utils/FrameTrace.h"
 #include "Utils/Format.h"
 
+#include <atomic>
+#include <chrono>
 #include <d3dcompiler.h>
 #include <fstream>
+#include <thread>
 #include <mutex>
 #include <optional>
 
@@ -353,6 +356,88 @@ namespace Util
 		if (SUCCEEDED(createResult) && shader && diskPath)
 			StoreCompileShaderBlob(*diskPath, shaderBlob.get());
 		return shader;
+	}
+
+	// (48e) Background compiles.
+	struct AsyncComputeShader::Job
+	{
+		std::atomic<int> state{ 1 };              // 1 compiling, 2 ready, 3 failed (release-stored by the worker)
+		ID3D11ComputeShader* shader = nullptr;  // written by the worker before state
+		double ms = 0.0;
+		~Job()
+		{
+			if (shader)
+				shader->Release();
+		}
+	};
+
+	void AsyncComputeShader::Request(const wchar_t* a_path, const std::vector<std::pair<std::string, std::string>>& a_defines, std::string_view a_label)
+	{
+		std::string newKey = WStringToString(a_path);
+		for (const auto& [name, value] : a_defines)
+			newKey += std::format("|{}={}", name, value);
+		if (job && newKey == key)
+			return;
+		Reset();
+		key = std::move(newKey);
+		label = a_label;
+		auto newJob = std::make_shared<Job>();
+		job = newJob;
+		logger::info("[Shaders] {}: compiling in the background (disk cache {})", label, globals::shaderCache && globals::shaderCache->IsDiskCache() ? "on" : "off");
+		try {
+			std::thread([newJob, path = std::wstring(a_path), defines = a_defines]() {
+				// Below normal: a cache miss compiles for seconds; the game's own threads come first.
+				SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+				const auto start = std::chrono::steady_clock::now();
+				ID3D11ComputeShader* shader = nullptr;
+				try {
+					std::vector<std::pair<const char*, const char*>> macros;
+					macros.reserve(defines.size());
+					for (const auto& [name, value] : defines)
+						macros.push_back({ name.c_str(), value.c_str() });
+					shader = static_cast<ID3D11ComputeShader*>(CompileShader(path.c_str(), macros, "cs_5_0"));
+				} catch (...) {
+					shader = nullptr;  // CompileShader throws when the device rejects a compute shader
+				}
+				newJob->ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+				newJob->shader = shader;
+				newJob->state.store(shader ? 2 : 3, std::memory_order_release);
+			}).detach();
+		} catch (const std::exception& e) {
+			newJob->state.store(3, std::memory_order_release);
+			logger::warn("[Shaders] {}: no background thread ({})", label, e.what());
+		}
+	}
+
+	AsyncComputeShader::Status AsyncComputeShader::GetStatus()
+	{
+		if (!job)
+			return Status::Idle;
+		const int state = job->state.load(std::memory_order_acquire);
+		if (state == 1)
+			return Status::Compiling;
+		if (!reported) {
+			reported = true;
+			compileMs = job->ms;
+			if (state == 2)
+				logger::info("[Shaders] {}: ready after {:.0f} ms in the background", label, compileMs);
+			else
+				logger::warn("[Shaders] {}: did not compile ({:.0f} ms); the old path keeps running", label, compileMs);
+		}
+		return state == 2 ? Status::Ready : Status::Failed;
+	}
+
+	ID3D11ComputeShader* AsyncComputeShader::Poll()
+	{
+		return GetStatus() == Status::Ready ? job->shader : nullptr;
+	}
+
+	void AsyncComputeShader::Reset()
+	{
+		job.reset();
+		key.clear();
+		compileMs = 0.0;
+		reported = false;
 	}
 
 	// RAII wrapper for D3D mapped resources

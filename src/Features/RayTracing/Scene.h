@@ -425,6 +425,12 @@ namespace RayTracingScene
 		/// captured exterior cell (a few per frame, within its CPU budget); off, every terrain BLAS is released on the next Update.
 		void SetTerrain(bool a_terrain) { terrain_ = a_terrain; }
 		[[nodiscard]] bool Terrain() const { return terrain_; }
+		/// (48e) "Reflections: Prepare Behind Loading Screens": while a transition / hold is on (loading screen, black screen, warm-up before
+		/// the late batch) terrain BLASes are made without the per-update cell limit (within the update's own deadline). Off: as 48d.
+		void SetTerrainLoadingPrep(bool a_on) { terrainLoadingPrep_ = a_on; }
+		/// (48e) Captured exterior cells whose land is loaded but whose terrain BLAS was not made yet (0 with terrain off / indoors). The
+		/// hand-off waits for 0 (a made BLAS still building counts in the backend's queued builds).
+		[[nodiscard]] std::uint32_t TerrainPending() const;
 		[[nodiscard]] bool InteriorEnabled() const { return interiorEnabled_; }
 		/// (46c) The world box of the captured interior (min xyz, max xyz, with a margin); false when no interior is captured
 		/// or nothing of it yet.
@@ -748,6 +754,7 @@ namespace RayTracingScene
 		bool gatherInterior_ = false;  // (46c) the cell being captured is an interior
 		bool interiorEnabled_ = false;  // (46c)
 		bool terrain_ = false;          // (48a)
+		bool terrainLoadingPrep_ = true;  // (48e)
 		/// (48a) Builds / releases the cells' terrain BLASes (SetTerrain), within a_deadline (QPC).
 		void UpdateTerrain(RayTracingRT::Backend& a_backend, std::int64_t a_deadline);
 		bool ReadTerrainQuad(Cell& a_cell, int a_quad, RE::BSTriShape* a_shape, const RE::TESObjectLAND::LoadedLandData& a_land, RayTracingRT::ChunkGeometry& o_chunk);

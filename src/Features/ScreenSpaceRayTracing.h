@@ -1799,6 +1799,16 @@ struct ScreenSpaceRayTracing : Feature
     /// with Dynamic Cubemaps; a failure latches rtGapFillFailed for the session (the plain permutation keeps running).
     winrt::com_ptr<ID3D11ComputeShader> raymarchSpecularRTCS = nullptr;
     bool rtGapFillFailed = false;
+    /// @brief (48e) raymarchSpecularRTCS is compiled on a background thread (the 48d synchronous compile froze the game for seconds on the
+    /// first Gap Fill frame); until it is ready the plain permutation runs, exactly as without the record. Started early (main menu,
+    /// loading screens: PrewarmRTGapFill from Ray Tracing's present hook) whenever RT Reflections = Gap Fill.
+    Util::AsyncComputeShader raymarchSpecularRTAsync;
+    /// @brief (48e) The SSRT_RT_REFLECT permutation's defines (as 48d compiled them).
+    [[nodiscard]] std::vector<std::pair<std::string, std::string>> RTGapFillDefines() const;
+    /// @brief (48e) Requests the gap fill permutation (non-blocking) and picks it up once ready; true when it can run this frame.
+    bool PollRTGapFillShader();
+    /// @brief (48e) Present hook (main menu, loading screens, every frame): starts the background compile when Gap Fill is selected.
+    void PrewarmRTGapFill();
     /// @brief (48d) This frame's specular ray march used the gap fill with "Also Beyond SSR Distance": the composite and REBLUR then lift
     /// the specular distance limit for this frame (SpecularCapActive).
     bool rtBeyondThisFrame = false;

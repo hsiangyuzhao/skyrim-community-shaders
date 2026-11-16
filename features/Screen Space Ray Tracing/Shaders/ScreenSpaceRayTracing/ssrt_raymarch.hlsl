@@ -230,7 +230,7 @@ Texture2D<uint> RTReflectDir : register(t14);           // word 1: octahedral di
 TextureCube<float4> RTCubemapPosition : register(t15);  // Dynamic Cubemaps: the plain capture's stored positions (x 0.001 units)
 TextureCube<float4> RTCubemapRaw : register(t16);       // ... and its raw colours
 RWTexture2D<unorm float4> RTUseDebug : register(u2);    // "RT Reflection Use" (Ray Tracing's debug colour; written only with kRTFillDebug)
-static const uint kRTFillDebug = 1u, kRTFillBeyond = 2u, kRTFillLobe = 4u, kRTFillMatch = 8u, kRTFillHitDistance = 16u;
+static const uint kRTFillDebug = 1u, kRTFillBeyond = 2u, kRTFillLobe = 4u, kRTFillMatch = 8u, kRTFillHitDistance = 16u, kRTFillWarmUp = 32u;
 #else
 #   define SSRT_RT_FILL 0
 #endif
@@ -1002,13 +1002,20 @@ float SSRT_RTFill(uint2 a_pixel, float3 a_positionWS, float3 a_normalWS, float a
         [branch] if ((RTFlags & kRTFillMatch) && RTCaptureOffset.w > 0.5)
         {
             const float4 stored = RTCubemapPosition.SampleLevel(LinearSampler, dirC, 0);
-            const float3 storedPos = stored.xyz * 1000.0 - RTCaptureOffset.xyz;  // into this frame's camera space
+            // (48e) Cubemap warm-up fix: the capture is cleared at every loading screen and blends each new capture in by CaptureWeight, so
+            // a texel's position (and its validity w, target 1 within 2.5 cells) starts at 0 and reaches its value only after ~5 captures;
+            // xyz / w is the captured position from the first capture on (w = 1 once settled: unchanged then).
+            const float3 storedRaw = ((RTFlags & kRTFillWarmUp) && stored.w > 0.25) ? stored.xyz / stored.w : stored.xyz;
+            const float3 storedPos = storedRaw * 1000.0 - RTCaptureOffset.xyz;  // into this frame's camera space
             const float tolerance = RTMatchMin + RTMatchRelative * length(hitPos);
             const float match = (stored.w > 0.25 ? 1.0 : 0.0) * (1.0 - smoothstep(tolerance, 2.0 * tolerance, length(storedPos - hitPos)));
             [branch] if (match > 0.0)
             {
-                const float3 matched = filterInf(filterNaN(Color::IrradianceToLinear(max(RTCubemapRaw.SampleLevel(LinearSampler, dirC, 0).rgb, 0.0)))) *
-                                       SharedData::ssrtSettings.SpecularMult;
+                float4 raw = RTCubemapRaw.SampleLevel(LinearSampler, dirC, 0);
+                // (48e) Likewise the raw colour: alpha (target 1) grows with the same blend, rgb / alpha is the captured colour.
+                if (RTFlags & kRTFillWarmUp)
+                    raw.rgb /= max(raw.a, 0.25);
+                const float3 matched = filterInf(filterNaN(Color::IrradianceToLinear(max(raw.rgb, 0.0)))) * SharedData::ssrtSettings.SpecularMult;
                 offColor = lerp(offColor, matched, match);
                 offUse = match >= 0.5 ? 2u : 3u;
             }

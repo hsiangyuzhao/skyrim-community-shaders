@@ -363,6 +363,8 @@ namespace RayTracingScene
 		stats_.terrainTriangles = 0;
 		stats_.terrainBytes = 0;
 		std::uint32_t made = 0;
+		// (48e) Behind the loading screen / in the black screen / before the late batch: no cell limit (the deadline still holds).
+		const std::uint32_t maxMade = terrainLoadingPrep_ && (transition_ || hold_) ? 4096u : 4u;
 		for (auto* list : { &cells_, &retiring_ }) {
 			for (auto& cell : *list) {
 				if (!terrain_ || cell->interior) {
@@ -375,7 +377,7 @@ namespace RayTracingScene
 				const void* signature = list == &cells_ ? LandSignature(cell->cell) : cell->terrainSignature;
 				if (list == &cells_ && (cell->terrainBlas != RayTracingRT::kInvalidBlas || cell->terrainTried) && signature != cell->terrainSignature)
 					ReleaseTerrain(a_backend, *cell);  // the land changed: rebuilt below
-				if (cell->terrainBlas == RayTracingRT::kInvalidBlas && !cell->terrainTried && list == &cells_ && made < 4 && Qpc() < a_deadline) {
+				if (cell->terrainBlas == RayTracingRT::kInvalidBlas && !cell->terrainTried && list == &cells_ && made < maxMade && Qpc() < a_deadline) {
 					cell->terrainTried = true;
 					cell->terrainSignature = signature;
 					if (land && land->loadedData) {
@@ -412,6 +414,22 @@ namespace RayTracingScene
 			logger::info("[RayTracing] Terrain for reflections: {} cell(s) made this frame, {} with a BLAS ({} built); quadrants so far: {} from the CPU vertex copy, "
 						 "{} rebuilt from heights, {} failed",
 				made, stats_.terrainCells, stats_.terrainBuilt, stats_.terrainQuadsCpu, stats_.terrainQuadsHeights, stats_.terrainQuadsFailed);
+	}
+
+	std::uint32_t Scene::TerrainPending() const
+	{
+		// (48e)
+		if (!terrain_)
+			return 0;
+		std::uint32_t pending = 0;
+		for (const auto& cell : cells_) {
+			if (cell->interior || cell->terrainTried || cell->terrainBlas != RayTracingRT::kInvalidBlas || !cell->cell)
+				continue;
+			const auto* land = cell->cell->GetRuntimeData().cellLand;
+			if (land && land->loadedData)
+				++pending;
+		}
+		return pending;
 	}
 
 	void Scene::Release(RayTracingRT::Backend& a_backend, Cell& a_cell)

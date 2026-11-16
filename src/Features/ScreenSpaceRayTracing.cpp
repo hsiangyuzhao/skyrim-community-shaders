@@ -1849,7 +1849,56 @@ void ScreenSpaceRayTracing::ClearShaderCache()
         *shader = nullptr;
 
     rtGapFillFailed = false;  // (48d) tried again
+    raymarchSpecularRTAsync.Reset();  // (48e) compiled again (in the background) on the next request
     CompileComputeShaders();
+}
+
+std::vector<std::pair<std::string, std::string>> ScreenSpaceRayTracing::RTGapFillDefines() const
+{
+    // (48e) The defines 48d compiled SSRT_RT_REFLECT with (DIFFUSE_SPP follows the compiled diffuse permutations).
+    std::vector<std::pair<std::string, std::string>> defines{ { "DYNAMIC_CUBEMAPS", "" } };
+    if (globals::features::screenSpaceGI.loaded)
+        defines.push_back({ "SSGI", "" });
+    if (globals::features::skylighting.loaded)
+        defines.push_back({ "SKYLIGHTING", "" });
+    defines.push_back({ "DIFFUSE_SPP", std::to_string(compiledDiffuseSPP ? compiledDiffuseSPP : settings.DiffuseSPP) });
+    defines.push_back({ "SSRT_SPECULAR", "" });
+    defines.push_back({ "SSRT_RT_REFLECT", "" });
+    return defines;
+}
+
+bool ScreenSpaceRayTracing::PollRTGapFillShader()
+{
+    // (48e) Never blocks: the request is a no-op while the same job exists; a changed define set starts a new one (the old shader is
+    // dropped at once, the plain permutation runs until the new one is ready).
+    if (rtGapFillFailed)
+        return false;
+    const auto path = std::filesystem::path("Data\\Shaders\\ScreenSpaceRayTracing") / "ssrt_raymarch.hlsl";
+    raymarchSpecularRTAsync.Request(path.c_str(), RTGapFillDefines(), "SSRT ray march (RT reflections gap fill)");
+    switch (raymarchSpecularRTAsync.GetStatus()) {
+    case Util::AsyncComputeShader::Status::Ready:
+        if (auto* shader = raymarchSpecularRTAsync.Poll(); shader != raymarchSpecularRTCS.get())
+            raymarchSpecularRTCS.copy_from(shader);
+        return raymarchSpecularRTCS != nullptr;
+    case Util::AsyncComputeShader::Status::Failed:
+        raymarchSpecularRTCS = nullptr;
+        rtGapFillFailed = true;  // Gap Fill then has no consumer (GapFillConsumer): nothing is traced for it
+        logger::warn("[SSRT] The RT reflections gap fill ray march did not compile; the plain ray march keeps running");
+        return false;
+    default:
+        raymarchSpecularRTCS = nullptr;
+        return false;
+    }
+}
+
+void ScreenSpaceRayTracing::PrewarmRTGapFill()
+{
+    const auto& rayTracing = globals::features::rayTracing;
+    if (!loaded || rtGapFillFailed || !rayTracing.loaded || rayTracing.settings.ReflectionsMode != 2)
+        return;
+    if (!settings.EnableSpecular || !settings.UseDynamicCubemapsAsFallbackSpecular || !globals::features::dynamicCubemaps.loaded)
+        return;
+    PollRTGapFillShader();
 }
 
 void ScreenSpaceRayTracing::CompileComputeShaders()
@@ -2566,27 +2615,12 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
         const bool cubemapsReady = dynamicCubemaps.loaded && dynamicCubemaps.envCapturePositionTexture && dynamicCubemaps.envCaptureRawTexture &&
                                    dynamicCubemaps.envCapturePositionTexture->srv && dynamicCubemaps.envCaptureRawTexture->srv;
         if (rayTracing.loaded && cubemapsReady && ssrCBData.UseDynamicCubemapsAsFallback != 0 && !rtGapFillFailed && rayTracing.settings.ReflectionsMode == 2) {
-            if (!raymarchSpecularRTCS) {
-                auto definesRT = std::vector<std::pair<const char*, const char*>>{ { "DYNAMIC_CUBEMAPS", nullptr } };
-                if (ssgi.loaded)
-                    definesRT.push_back({ "SSGI", nullptr });
-                if (skylighting.loaded)
-                    definesRT.push_back({ "SKYLIGHTING", nullptr });
-                const std::string sppStr = std::to_string(compiledDiffuseSPP ? compiledDiffuseSPP : settings.DiffuseSPP);
-                definesRT.push_back({ "DIFFUSE_SPP", sppStr.c_str() });
-                definesRT.push_back({ "SSRT_SPECULAR", nullptr });
-                definesRT.push_back({ "SSRT_RT_REFLECT", nullptr });
-                auto path = std::filesystem::path("Data\\Shaders\\ScreenSpaceRayTracing") / "ssrt_raymarch.hlsl";
-                if (auto rawPtr = reinterpret_cast<ID3D11ComputeShader*>(Util::CompileShader(path.c_str(), definesRT, "cs_5_0")))
-                    raymarchSpecularRTCS.attach(rawPtr);
-                else {
-                    rtGapFillFailed = true;
-                    logger::warn("[SSRT] The RT reflections gap fill ray march did not compile; the plain ray march keeps running");
-                }
-            }
+            // (48e) Compiled in the background (started at the main menu / loading screen when Gap Fill is selected); until it is ready the
+            // plain permutation runs and the record is simply not used (as 48d without a record).
+            const bool shaderReady = PollRTGapFillShader();
             // The wait has its own GPU row (RayTracingReflectSync): this pass's row pauses around it (rows do not nest).
             bool acquired = false;
-            if (raymarchSpecularRTCS) {
+            if (shaderReady && raymarchSpecularRTCS) {
                 Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTTraceSpecular);
                 acquired = rayTracing.AcquireReflectionGapFill(static_cast<std::uint32_t>(size.x), static_cast<std::uint32_t>(size.y), fill);
                 Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTTraceSpecular);

@@ -355,6 +355,14 @@ public:
 		bool ReflectionsLobeCheck = true;
 		bool ReflectionsCubemapMatch = true;
 		bool ReflectionsHitDistance = true;
+		// (48e) ReflectionsLoadingPrep "Reflections: Prepare Behind Loading Screens": the terrain BLASes of the destination are made without
+		// the 4-cells-per-update limit while a loading screen / the black screen / the warm-up is on, and the hand-off waits for them (as for
+		// every other BLAS). Off: as 48d. ReflectionsCubemapWarmUp "Gap Fill: Cubemap Warm-Up Fix": Dynamic Cubemaps is cleared at every
+		// loading screen and blends each new capture in by half, so its stored positions / raw colours start near zero and take ~5 captures
+		// to reach their value (the position check failed meanwhile); the gap fill divides them by their own coverage (w / alpha, which
+		// start at 0 and grow the same way). Converged texels are unchanged (w = alpha = 1). Off: as 48d.
+		bool ReflectionsLoadingPrep = true;
+		bool ReflectionsCubemapWarmUp = true;
 	};
 	/// (48d) What the SSRT specular ray march needs for the gap fill this frame (AcquireReflectionGapFill).
 	struct ReflectionGapFill
@@ -364,7 +372,8 @@ public:
 		ID3D11UnorderedAccessView* debug = nullptr;  // "RT Reflection Use" view target (null = view off)
 		std::uint32_t flags = 0;                   // kGapFill* bits
 	};
-	static constexpr std::uint32_t kGapFillDebug = 1u, kGapFillBeyond = 2u, kGapFillLobe = 4u, kGapFillMatch = 8u, kGapFillHitDistance = 16u;
+	static constexpr std::uint32_t kGapFillDebug = 1u, kGapFillBeyond = 2u, kGapFillLobe = 4u, kGapFillMatch = 8u, kGapFillHitDistance = 16u,
+	                                 kGapFillWarmUp = 32u;  // (48e)
 	/// (46f) RTAO modes (Settings::AOMode); with RTAO off the AO is SSGI's, exactly as before.
 	enum class AOModeKind : int
 	{
@@ -1055,6 +1064,15 @@ private:
 	std::string reflectOffReason;
 	bool reflectRequested = false;
 	winrt::com_ptr<ID3D11ComputeShader> aoNormalReflectCS, reflectDebugCS;
+	// (48e) Both compiled on a background thread (no first-use freeze): until ready the reflection rays are simply not prepared (the frame
+	// runs as without reflections) / the debug view is not drawn. The prep variant is started early (PrewarmReflectionShaders).
+	Util::AsyncComputeShader aoNormalReflectAsync, reflectDebugAsync;
+	/// (48e) Present hook (main menu, loading screens, every frame): background compiles of the reflection shaders when RT Reflections is
+	/// not Off (and SSRT's gap fill permutation with Gap Fill).
+	void PrewarmReflectionShaders();
+	/// (48e) Non-blocking pick-up of a background compile into a_shader; false while not ready (a failure sets a_failed).
+	static bool PollAsyncShader(Util::AsyncComputeShader& a_async, winrt::com_ptr<ID3D11ComputeShader>& a_shader, const wchar_t* a_path,
+		const std::vector<std::pair<std::string, std::string>>& a_defines, std::string_view a_label, bool& a_failed);
 	std::unique_ptr<ConstantBuffer> reflectDebugCB;
 	[[nodiscard]] bool ReflectionsWanted() const;
 	void PrepareReflections(RayTracingRT::FrameInput& a_input);
