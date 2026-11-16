@@ -1600,6 +1600,8 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.ReflectionsSunRay = read("ReflectionsSunRay", defaults.ReflectionsSunRay);
 		settings.ReflectionsShadeLights = read("ReflectionsShadeLights", defaults.ReflectionsShadeLights);
 		settings.ReflectionsCharacterMaterials = read("ReflectionsCharacterMaterials", defaults.ReflectionsCharacterMaterials);
+		settings.ReflectionsShadeGlow = read("ReflectionsShadeGlow", defaults.ReflectionsShadeGlow);  // (48h)
+		settings.ReflectionsPreferBrightCubemap = read("ReflectionsPreferBrightCubemap", defaults.ReflectionsPreferBrightCubemap);
 		const float sunSize = read("SunSize", -1.0f);
 		if (sunSize >= 0.0f) {
 			settings.SunSize = sunSize;
@@ -1754,6 +1756,8 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["ReflectionsSunRay"] = settings.ReflectionsSunRay;
 	o_json["ReflectionsShadeLights"] = settings.ReflectionsShadeLights;
 	o_json["ReflectionsCharacterMaterials"] = settings.ReflectionsCharacterMaterials;
+	o_json["ReflectionsShadeGlow"] = settings.ReflectionsShadeGlow;  // (48h)
+	o_json["ReflectionsPreferBrightCubemap"] = settings.ReflectionsPreferBrightCubemap;
 	o_json["AOSmoothNormals"] = settings.AOSmoothNormals;  // (47j)
 	o_json["AOTemporalV2"] = settings.AOTemporalV2;  // (47l)
 	o_json["FoliageSway"] = settings.FoliageSway;  // (47l)
@@ -3206,7 +3210,8 @@ void RayTracing::PublishCpuSplit()
 		if (shadeLastFrame) {
 			detail.shadeGpuMs = timers->LastSampleMs(Util::GpuBucket::RayTracingReflectShade);
 			detail.shadeMaterialPct = shadeMaterialShare >= 0.0f ? shadeMaterialShare * 100.0f : -1.0f;
-			detail.shadeRatio = shadeRatio;
+			detail.shadeRatio = shadeRatio;                  // (48h) this read-back's geometric mean
+			detail.shadeRatioSmoothed = shadeRatioSmoothed;  // (48h) the ~2 s average the panel shows
 		}
 		// (46h) Where this frame's RTAO was traced and its mode (-1 = not traced this frame).
 		detail.rtaoIndoors = aoTraced && aoThisFrame ? (aoInteriorThisFrame ? 1 : 0) : -1;
@@ -6011,8 +6016,11 @@ bool RayTracing::AcquireReflectionGapFill(std::uint32_t a_width, std::uint32_t a
 	if (ShadeWanted() && backend.ReflectMaterialLastFrame() && ShadeReflections(a_width, a_height, a_screenColor, a_depth)) {
 		o_fill.shade = shadeSRV.get();
 		o_fill.shadeScale = std::clamp(settings.ReflectionsOffscreenBrightness, 0.25f, 4.0f);
-		if (shadeFade > 0.0f)
+		if (shadeFade > 0.0f) {
 			o_fill.flags |= kGapFillMaterial;
+			if (settings.ReflectionsPreferBrightCubemap)
+				o_fill.flags |= kGapFillPreferBright;  // (48h)
+		}
 	}
 	reflectGapFillUsed = true;
 	return true;
@@ -6145,7 +6153,8 @@ bool RayTracing::ShadeReflections(std::uint32_t a_width, std::uint32_t a_height,
 	cb.Size[0] = a_width;
 	cb.Size[1] = a_height;
 	cb.Size[2] = globals::state->frameCount;
-	cb.Size[3] = (sky ? 1u : 0u) | (lamps ? 2u : 0u) | (debug && a_screenColor ? 4u : 0u) | (stats && a_screenColor ? 8u : 0u) | (reflectSunRayThisFrame ? 16u : 0u);
+	cb.Size[3] = (sky ? 1u : 0u) | (lamps ? 2u : 0u) | (debug && a_screenColor ? 4u : 0u) | (stats && a_screenColor ? 8u : 0u) | (reflectSunRayThisFrame ? 16u : 0u) |
+	              (settings.ReflectionsShadeGlow ? 32u : 0u);  // (48h) Material Hits: Glow
 	cb.Params[0] = kShadeFadeInFrames;
 	cb.Params[1] = std::clamp(shadeFade, 0.0f, 1.0f);
 	cb.Params[2] = lamps ? static_cast<float>(llf.lightCount) : 0.0f;
@@ -6222,7 +6231,34 @@ void RayTracing::ReadShadeStats()
 		const double hits = static_cast<double>(values[0]) + static_cast<double>(values[1]);
 		shadeMaterialShare = hits > 0.0 ? static_cast<float>(static_cast<double>(values[0]) / hits) : -1.0f;
 		shadeRatioGroups = values[4];
-		shadeRatio = values[4] > 0 && values[3] > 0 ? static_cast<float>(static_cast<double>(values[2]) / static_cast<double>(values[3])) : -1.0f;
+		shadeRatioArith = values[4] > 0 && values[3] > 0 ? static_cast<float>(static_cast<double>(values[2]) / static_cast<double>(values[3])) : -1.0f;
+		// (48h) The geometric mean (per-pixel log2 ratios, clamped to +-4 on the GPU; [5] signed x 32, [6] pixels), then smoothed over ~2 s of
+		// time: a single frame's mean jumps with the changing, stochastic set of hits that are also on screen.
+		shadeRatioPixels = values[6];
+		const std::int64_t now = Qpc();
+		if (values[6] > 0) {
+			const double frameLog = static_cast<double>(static_cast<std::int32_t>(values[5])) / 32.0 / static_cast<double>(values[6]);
+			shadeRatio = static_cast<float>(std::exp2(frameLog));
+			const double dt = shadeSmoothQpc != 0 ? static_cast<double>(now - shadeSmoothQpc) * QpcMs() / 1000.0 : 1e9;
+			if (!shadeSmoothValid || dt > kShadeSmoothResetS) {
+				shadeSmoothLog = frameLog;
+				shadeSmoothPixels = static_cast<double>(values[6]);
+				shadeSmoothValid = true;
+			} else {
+				const double alpha = (1.0 - std::exp(-std::clamp(dt, 0.0, 0.5) / kShadeSmoothTauS)) *
+				                     std::min(1.0, static_cast<double>(values[6]) / kShadeSmoothFullPixels);
+				shadeSmoothLog += (frameLog - shadeSmoothLog) * alpha;
+				shadeSmoothPixels += (static_cast<double>(values[6]) - shadeSmoothPixels) * (1.0 - std::exp(-std::clamp(dt, 0.0, 0.5) / kShadeSmoothTauS));
+			}
+			shadeSmoothQpc = now;
+			shadeRatioSmoothed = static_cast<float>(std::exp2(shadeSmoothLog));
+		} else {
+			shadeRatio = -1.0f;
+			if (shadeSmoothValid && shadeSmoothQpc != 0 && static_cast<double>(now - shadeSmoothQpc) * QpcMs() / 1000.0 > kShadeSmoothResetS) {
+				shadeSmoothValid = false;  // nothing comparable for a while: the next sample starts afresh
+				shadeRatioSmoothed = -1.0f;
+			}
+		}
 		break;
 	}
 }
@@ -7334,6 +7370,25 @@ void RayTracing::DrawSettings()
 				ImGui::Text("On (default): lamps, torches and fires (Light Limit Fix's lights) light the hits too (no lamp shadows). Off: only the sun");
 				ImGui::Text("  and the sky light (cheaper in towns at night).");
 			}
+			// (48h)
+			ImGui::Checkbox("Material Hits: Glow", &settings.ReflectionsShadeGlow);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): what glows in the game glows in the reflection too, worked out like the game does it: glowing windows");
+				ImGui::Text("  (their glow texture is copied as well, and their colour follows the time of day like the real window), lamps, embers.");
+				ImGui::Text("  The glow is tinted by the surface's own texture (stained glass stays coloured), so lit lamps are no longer too bright.");
+				ImGui::Text("  A glowing window waits until its glow copy is ready (the cubemap until then, then a fade-in).");
+				ImGui::Text("Off: as 48g (only the own glow colour of lamp-like shapes, added untinted; windows show as dark glass off screen).");
+				ImGui::Text("  The glow data is captured either way, so switching is instant.");
+			}
+			ImGui::BeginDisabled(settings.ReflectionsOffscreenColor != 1);
+			ImGui::Checkbox("Off-screen: Prefer Brighter Cubemap", &settings.ReflectionsPreferBrightCubemap);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Material only. On (default): where the dynamic cubemap stored the very point a ray hit off screen (Gap Fill: Cubemap");
+				ImGui::Text("  Position Check) and saw it much brighter than the Material colour (from 2x, fully at 4x), the reflection leans on the");
+				ImGui::Text("  cubemap's colour instead - for fires, glows and effects the ray-traced scene cannot show. Smooth, no hard edge.");
+				ImGui::Text("  (RT Reflection Use still shows them pale yellow.) Off: as 48g.");
+			}
+			ImGui::EndDisabled();
 		}
 		ImGui::EndDisabled();
 		// (48e) Background compiles of the reflection shaders (no first-use freeze).
@@ -7424,14 +7479,37 @@ void RayTracing::DrawSettings()
 							const float gpu = Util::GpuPassTimers::GetSingleton()->LastSampleMs(Util::GpuBucket::RayTracingReflectShade);
 							const std::string gpuText = gpu >= 0.0f && shadeLastFrame ? std::format("{:.2f} ms", gpu) : std::string("- ms");
 							const std::string shareText = shadeMaterialShare >= 0.0f ? std::format("{:.0f} %", shadeMaterialShare * 100.0f) : std::string("-");
-							const std::string ratioText = shadeRatio >= 0.0f ? std::format("{:.2f} ({} samples)", shadeRatio, shadeRatioGroups) : std::string("- (no hit also on screen)");
-							ImGui::Text("Off-screen shading: %s GPU, %s of the hits with material data (rest: cubemap), brightness shading / screen %s", gpuText.c_str(),
-								shareText.c_str(), ratioText.c_str());
+							ImGui::Text("Off-screen shading: %s GPU, %s of the hits with material data (rest: cubemap)", gpuText.c_str(), shareText.c_str());
 							if (auto _tt = Util::HoverTooltipWrapper()) {
-								ImGui::Text("GPU time of the hit shading pass (shown while the Performance Overlay or an F7 recording runs), the share of the traced");
-								ImGui::Text("  hits that had material data (texture copied, attributes captured) and so used their own colour, and the measured");
-								ImGui::Text("  brightness of the shading against the screen where a hit is also on screen (1.00 = equal; read a few frames late).");
-								ImGui::Text("  It is measured before Off-screen Hit Brightness: to match, set the slider to about 1 / this ratio.");
+								ImGui::Text("GPU time of the hit shading pass (shown while the Performance Overlay or an F7 recording runs) and the share of the traced");
+								ImGui::Text("  hits that had material data (texture copied, attributes captured) and so used their own colour.");
+							}
+							// (48h) The stable brightness ratio and the slider value it suggests.
+							if (shadeRatioSmoothed > 0.0f) {
+								const float suggested = std::clamp(1.0f / shadeRatioSmoothed, 0.25f, 4.0f);
+								ImGui::Text("Brightness shading / screen (2 s average): %.2f (%.0f px per frame) -> set Off-screen Hit Brightness to about %.2f",
+									shadeRatioSmoothed, shadeSmoothPixels, suggested);
+							} else {
+								ImGui::TextDisabled("Brightness shading / screen: - (no hit that is also on screen yet)");
+							}
+							if (auto _tt = Util::HoverTooltipWrapper()) {
+								ImGui::Text("Where a ray's hit is also visible on screen, how bright the shading is against the screen there (1.00 = equal), as a");
+								ImGui::Text("  typical value (geometric mean of the per-pixel ratios, each limited to 16x either way) averaged over about 2 seconds,");
+								ImGui::Text("  so single bright spots no longer make it jump. Measured before Off-screen Hit Brightness: the suggested slider");
+								ImGui::Text("  value is 1 / this ratio (look around a little and wait 2-3 s for it to settle).");
+								ImGui::Text("  This frame: %s; 48g's old formula (ratio of the means, outlier-prone): %s (%u groups).",
+									shadeRatio > 0.0f ? std::format("{:.2f} over {} px", shadeRatio, shadeRatioPixels).c_str() : "-",
+									shadeRatioArith >= 0.0f ? std::format("{:.2f}", shadeRatioArith).c_str() : "-", shadeRatioGroups);
+							}
+							// (48h) Emission capture.
+							ImGui::Text("Glow: %u emitting materials (%u follow a time-of-day source), %u with a glow texture (%u ready); %u glow textures, %u copy layers used",
+								ms.emitMaterials, ms.emitSourced, ms.glowMaterials, ms.glowMaterialsReady, ms.glowTextures, ms.glowTexturesReady);
+							if (auto _tt = Util::HoverTooltipWrapper()) {
+								ImGui::Text("Material Hits: Glow's data (captured whether the switch is on or off): materials with a glow colour (own glow, External");
+								ImGui::Text("  Emittance - windows whose colour follows a light / region as the time of day changes it - or a glow texture), the");
+								ImGui::Text("  glow-texture ones and how many have their copy, the distinct glow textures and their 128x128 copies (layers in the");
+								ImGui::Text("  same pages as the other textures). Colour refreshes that changed something so far: %llu. Switch: %s.",
+									static_cast<unsigned long long>(ms.emitRefreshes), settings.ReflectionsShadeGlow ? "on" : "off");
 							}
 						}
 					}
@@ -8872,10 +8950,11 @@ std::string RayTracing::DescribeForProfile() const
 			ms.texturesPending, static_cast<double>(ms.attrBytesUsed) / (1024.0 * 1024.0), static_cast<double>(ms.attrBytes) / (1024.0 * 1024.0),
 			static_cast<double>(ms.textureBytes) / (1024.0 * 1024.0));
 		// (48g)
-		text += std::format(", characters {}, off-screen hit color {} (brightness {:.2f}, sun shadow ray {}, lamps {}{})",
+		text += std::format(", characters {}, off-screen hit color {} (brightness {:.2f}, sun shadow ray {}, lamps {}, glow {}, prefer brighter cubemap {}{})",
 			settings.ReflectionsCharacterMaterials ? "on" : "off", settings.ReflectionsOffscreenColor == 1 ? "material" : "cubemap approx",
 			settings.ReflectionsOffscreenBrightness, settings.ReflectionsSunRay ? "on" : "off", settings.ReflectionsShadeLights ? "on" : "off",
-			shadeRatio >= 0.0f ? std::format("; measured shading / screen {:.2f}", shadeRatio) : std::string());
+			settings.ReflectionsShadeGlow ? "on" : "off", settings.ReflectionsPreferBrightCubemap ? "on" : "off",  // (48h)
+			shadeRatioSmoothed > 0.0f ? std::format("; measured shading / screen {:.2f} (2 s average)", shadeRatioSmoothed) : std::string());
 	}
 	// (46f)
 	static constexpr const char* kAOModes[] = { "RTAO (keeps SSGI contact AO)", "darker of RTAO and SSGI AO" };
@@ -9017,13 +9096,20 @@ nlohmann::json RayTracing::DescribeJson() const
 			{ "copy_cpu_ms", ms.copyCpuMs }, { "surface_mb", static_cast<double>(backend.ReflectSurfaceBytes()) / (1024.0 * 1024.0) },
 			{ "table_kb", static_cast<double>(ms.tableBytes) / 1024.0 }, { "copy_shader_ms", materialCopyAsync.CompileMs() },
 			{ "attr_full_fragmented", ms.attrRefusedFragmented }, { "attr_growths", ms.attrGrowths }, { "page_create_ms", ms.pageCreateMs },
-			{ "pages_made_in_play", ms.pagesMadeInPlay }, { "character_materials", settings.ReflectionsCharacterMaterials } };
+			{ "pages_made_in_play", ms.pagesMadeInPlay }, { "character_materials", settings.ReflectionsCharacterMaterials },
+			{ "emit_materials", ms.emitMaterials }, { "emit_sourced", ms.emitSourced }, { "glow_materials", ms.glowMaterials },  // (48h)
+			{ "glow_materials_ready", ms.glowMaterialsReady }, { "glow_textures", ms.glowTextures }, { "glow_textures_ready", ms.glowTexturesReady },
+			{ "emit_refreshes", ms.emitRefreshes } };
 		// (48g) The shading half.
 		j["reflections"]["shading"] = { { "offscreen_color", settings.ReflectionsOffscreenColor == 1 ? "material" : "cubemap" },
 			{ "brightness", settings.ReflectionsOffscreenBrightness }, { "sun_ray", settings.ReflectionsSunRay }, { "lamps", settings.ReflectionsShadeLights },
 			{ "wanted", ShadeWanted() }, { "ran_last_frame", shadeLastFrame }, { "fade", shadeFade }, { "failed", reflectShadeFailed },
 			{ "gpu_ms", Util::GpuPassTimers::GetSingleton()->LastSampleMs(Util::GpuBucket::RayTracingReflectShade) },
 			{ "material_share", shadeMaterialShare }, { "ratio_shaded_over_screen", shadeRatio }, { "ratio_samples", shadeRatioGroups },
+			{ "ratio_pixels", shadeRatioPixels }, { "ratio_smoothed", shadeRatioSmoothed }, { "ratio_smoothed_pixels", shadeSmoothPixels },
+			{ "ratio_arithmetic_48g", shadeRatioArith },
+			{ "suggested_brightness", shadeRatioSmoothed > 0.0f ? std::clamp(1.0f / shadeRatioSmoothed, 0.25f, 4.0f) : -1.0f },
+			{ "glow", settings.ReflectionsShadeGlow }, { "prefer_bright_cubemap", settings.ReflectionsPreferBrightCubemap },  // (48h)
 			{ "shader_ms", reflectShadeAsync.CompileMs() }, { "output_mb", static_cast<double>(shadeWidth) * shadeHeight * 8.0 / (1024.0 * 1024.0) },
 			{ "late_eviction_priorities", Util::FrameTrace::DeferredEvictionPriorities() } };
 	}

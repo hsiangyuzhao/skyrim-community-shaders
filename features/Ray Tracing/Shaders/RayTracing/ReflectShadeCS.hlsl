@@ -18,11 +18,21 @@
 //   emissive   = the shape's own emissive colour x multiplier (no glow maps);
 //   colour     = albedo x (sun + ambient + lamps) + emissive in the game's lighting space, then Color::IrradianceToLinear - the same space the
 //                ray march's screen colour has after IrradianceToLinear (it applies SpecularMult and "Off-screen Hit Brightness").
+// (48h) "Material Hits: Glow" (Size.w & kFlagGlow) replaces the emissive line by Lighting.hlsl's own emission (non-PBR path):
+//   emit       = Color::EmitColor(EmitColor) (EmitColor = emissive colour x multiplier of OwnEmit, External Emittance - the reference's source
+//                colour, refreshed by the CPU as the time of day changes it - or glow-map shapes), x Color::Glowmap(glow texture) for the
+//                glow-map technique (its copy in the same pages, Materials[].Glow.x);
+//   colour     = Color::Diffuse(albedo) x (sun + ambient + lamps + emit), as Lighting.hlsl's diffuseColor += emitColor; color += diffuseColor
+//                x baseColor (the emission is tinted by the texture: stained glass, lamp shades). A glow-map hit whose glow copy is still
+//                pending has no material data yet (cubemap path) and fades in from the later of its two copies.
+//   Off: exactly 48g's line above (Emissive.rgb is still 48g's own-emit product).
 // No fog, no specular of the hit surface, no subsurface / translucency, no wetness (all approximations; "RT Shading vs Screen" measures it).
 // Output u0 RGBA16F: rgb the colour, a = how much of it to use (0 = no material data: no attributes, no material, copy pending; fades in over
 // Params.x frames once its copy is ready, x Params.y the global fade of the Off-screen Hit Color switch). Untraced / miss pixels: 0.
 // Stats (u1, 8 uints, cleared by the CPU each frame): [0] hits with material data, [1] hits without, [2] / [3] / [4] the brightness
-// comparison where a hit is also on screen (per 8x8 group: mean shaded / mean screen luminance x 256, summed; groups).
+// comparison where a hit is also on screen (per 8x8 group: mean shaded / mean screen luminance x 256, summed; groups); (48h) [5] the sum of
+// the per-pixel log2(shaded / screen) (each clamped to +-4) x 32 as a signed 32-bit integer (rounded per group, two's complement adds; at
+// most 64 x 4 x 32 = 8192 a group, so even a 4K render size stays far inside int32), [6] its pixel count: the geometric mean the panel shows.
 // Debug (Size.w & kFlagDebug, u2): "RT Shading vs Screen".
 
 #include "Common/Color.hlsli"
@@ -38,6 +48,8 @@ cbuffer ReflectShadeCB : register(b0)
 };
 
 static const uint kFlagSkylighting = 1u, kFlagLights = 2u, kFlagDebug = 4u, kFlagStats = 8u, kFlagSunVisibility = 16u;
+static const uint kFlagGlow = 32u;                                           // (48h) "Material Hits: Glow"
+static const uint kEmitOn = 1u, kEmitGlowMap = 2u, kEmitGlowPending = 4u;  // (48h) Materials[].Glow.z (Backend kEmit*)
 
 Texture2D<uint> ReflectOut : register(t0);
 Texture2D<uint> ReflectDir : register(t1);
@@ -54,7 +66,9 @@ struct MaterialGpu
 	uint ReadyFrame;
 	uint Pad;
 	float4 UvTransform;
-	float4 Emissive;
+	float4 Emissive;  // (48g) rgb own emissive colour x multiplier (OwnEmit only): the Glow switch's off path
+	float4 Emit;      // (48h) rgb the emissive colour x multiplier (EmitColor; External Emittance refreshed), w the multiplier
+	uint4 Glow;       // (48h) x glow copy layer (0xFFFF none / pending), y its ready frame, z kEmit* flags, w unused (MaterialGpu 96 bytes)
 };
 StructuredBuffer<MaterialGpu> Materials : register(t4);
 Texture2DArray<float4> Page0 : register(t5);
@@ -97,6 +111,7 @@ static const float kIslScaledUnitsSq = 0.8 * 70.0 * 70.0;                       
 groupshared float gsShaded[64];
 groupshared float gsScreen[64];
 groupshared uint gsCounts[64];
+groupshared float gsLog[64];  // (48h) per-pixel log2(shaded / screen), clamped; only where gsShaded >= 0
 
 float3 OctDecode(float2 e)
 {
@@ -145,11 +160,14 @@ float3 PositionAt(uint2 p, float depth)
 	return pos.xyz / pos.w;
 }
 
-// The hit's albedo (game texture values as stored) and whether it is known (0 = no data / pending).
-float Albedo(uint s0, MaterialGpu m, float distance, out float3 o_albedo)
+// The hit's albedo (game texture values as stored) and whether it is known (0 = no data / pending). (48h) o_uv / o_lod: where the copy was
+// read (the glow copy is read at the same place: Lighting.hlsl samples the glow map with the diffuse texcoord).
+float Albedo(uint s0, MaterialGpu m, float distance, out float3 o_albedo, out float2 o_uv, out float o_lod)
 {
 	float3 albedo = 0.0;
 	float known = 0.0;
+	o_uv = 0.0;
+	o_lod = 0.0;
 	[branch] if (m.Flags & 1u)
 	{
 		float3 sum = 0.0;
@@ -180,14 +198,39 @@ float Albedo(uint s0, MaterialGpu m, float distance, out float3 o_albedo)
 		uv = uv * m.UvTransform.zw + m.UvTransform.xy;
 		if (!all(isfinite(uv)))
 			uv = 0.0;
-		albedo = SamplePage(m.Layer, uv, clamp(log2(1.0 + distance / 512.0), 0.0, 6.0));
+		o_lod = clamp(log2(1.0 + distance / 512.0), 0.0, 6.0);
+		o_uv = uv;
+		albedo = SamplePage(m.Layer, uv, o_lod);
 		known = 1.0;
 	}
 	o_albedo = albedo;
 	return known;
 }
 
-float3 ShadeHit(uint2 p, uint w0, float3 hitPos, float3 N, float3 albedo, MaterialGpu m)
+// (48h) Lighting.hlsl's emission (non-PBR): Color::EmitColor(EmitColor) [x Color::Glowmap(glow)] - Color::EmitColor's LIGHTING-only
+// form with this material's multiplier instead of the LLPerGeometry constant.
+float3 VanillaEmission(MaterialGpu m, float2 uv, float lod)
+{
+	float3 emit = 0.0;
+	[branch] if (m.Glow.z & kEmitOn)
+	{
+		const float mult = max(m.Emit.w, 0.0);
+		emit = max(m.Emit.rgb, 0.0);
+		if (SharedData::linearLightingSettings.enableLinearLighting)
+			emit = pow(abs(emit / max(mult, 1e-5)), SharedData::linearLightingSettings.emitColorGamma) * mult * SharedData::linearLightingSettings.emitColorMult;
+		[branch] if (m.Glow.z & kEmitGlowMap)
+		{
+			// No usable glow copy (refused texture): no emission rather than an unmasked glow over the whole shape.
+			float3 glow = 0.0;
+			[branch] if ((m.Glow.x & 0xFFFFu) != 0xFFFFu)
+				glow = Color::Glowmap(SamplePage(m.Glow.x & 0xFFFFu, uv, lod));
+			emit *= glow;
+		}
+	}
+	return emit;
+}
+
+float3 ShadeHit(uint2 p, uint w0, float3 hitPos, float3 N, float3 albedo, MaterialGpu m, float2 uv, float lod)
 {
 	// The game's lighting space (as Lighting.hlsl before its output; linear lighting aware through Color::*).
 	const float3 diffuse = Color::Diffuse(albedo);
@@ -243,7 +286,12 @@ float3 ShadeHit(uint2 p, uint w0, float3 hitPos, float3 N, float3 albedo, Materi
 			light += Color::PointLight(l.color, (l.lightFlags & kLightLinear) != 0) * attenuation * l.fade * nl;
 		}
 	}
-	return Color::IrradianceToLinear(max(0.0, diffuse * light + max(m.Emissive.rgb, 0.0)));
+	float3 color;
+	[branch] if (Size.w & kFlagGlow)
+		color = diffuse * (light + VanillaEmission(m, uv, lod));  // (48h) Lighting.hlsl: diffuseColor += emitColor; color = diffuseColor x baseColor
+	else
+		color = diffuse * light + max(m.Emissive.rgb, 0.0);  // 48g
+	return Color::IrradianceToLinear(max(0.0, color));
 }
 
 [numthreads(8, 8, 1)] void main(uint3 dtid : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
@@ -251,7 +299,7 @@ float3 ShadeHit(uint2 p, uint w0, float3 hitPos, float3 N, float3 albedo, Materi
 	const bool inside = all(p < Size.xy);
 	float4 shade = 0.0;
 	float4 debug = 0.0;
-	float shadedLum = -1.0, screenLum = -1.0;
+	float shadedLum = -1.0, screenLum = -1.0, logRatio = 0.0;
 	uint withMaterial = 0u, without = 0u;
 	[branch] if (inside)
 	{
@@ -271,12 +319,24 @@ float3 ShadeHit(uint2 p, uint w0, float3 hitPos, float3 N, float3 albedo, Materi
 			{
 				const MaterialGpu m = Materials[material];
 				float3 albedo;
-				const float known = Albedo(ReflectSurf0[p], m, distance, albedo);
+				float2 uv;
+				float lod;
+				float known = Albedo(ReflectSurf0[p], m, distance, albedo, uv, lod);
+				uint readyFrame = m.ReadyFrame;
+				[branch] if ((Size.w & kFlagGlow) && (m.Glow.z & (kEmitOn | kEmitGlowMap)) == (kEmitOn | kEmitGlowMap))
+				{
+					// (48h) A glow-map hit waits for its glow copy too (else it shows as dark glass, then pops): the cubemap path until then,
+					// then it fades in from the later of its two copies.
+					if (m.Glow.z & kEmitGlowPending)
+						known = 0.0;
+					else if ((m.Glow.x & 0xFFFFu) != 0xFFFFu && Size.z - m.Glow.y < Size.z - readyFrame)
+						readyFrame = m.Glow.y;
+				}
 				[branch] if (known > 0.0)
 				{
-					const float fade = saturate(float(Size.z - m.ReadyFrame) / max(Params.x, 1.0));
+					const float fade = saturate(float(Size.z - readyFrame) / max(Params.x, 1.0));
 					use = known * fade * Params.y;
-					color = ShadeHit(p, w0, hitPos, OctDecode8(s1 >> 16), albedo, m);
+					color = ShadeHit(p, w0, hitPos, OctDecode8(s1 >> 16), albedo, m, uv, lod);
 				}
 			}
 			shade = float4(color, use);
@@ -308,6 +368,7 @@ float3 ShadeHit(uint2 p, uint w0, float3 hitPos, float3 N, float3 albedo, Materi
 					const float b = Color::RGBToLuminance(screen);
 					shadedLum = min(a, 64.0);
 					screenLum = min(b, 64.0);
+					logRatio = clamp(log2(max(a, 1e-4) / max(b, 1e-4)), -4.0, 4.0);  // (48h) the robust (geometric) mean's sample
 					const float ratio = clamp(log2(max(a, 1e-4) / max(b, 1e-4)), -2.0, 2.0);
 					// Green = within about 20 %, red = RT brighter, blue = RT darker (full colour at 4x).
 					debug = abs(ratio) < 0.25 ? float4(0.1, 0.9, 0.2, 0.75) : (ratio > 0.0 ? float4(1.0, 0.25 * (1.0 - ratio * 0.5), 0.1, 0.4 + 0.2 * ratio) : float4(0.1, 0.35 * (1.0 + ratio * 0.5), 1.0, 0.4 - 0.2 * ratio));
@@ -327,16 +388,18 @@ float3 ShadeHit(uint2 p, uint w0, float3 hitPos, float3 N, float3 albedo, Materi
 		gsShaded[gi] = shadedLum;
 		gsScreen[gi] = screenLum;
 		gsCounts[gi] = withMaterial | (without << 16);
+		gsLog[gi] = logRatio;
 		GroupMemoryBarrierWithGroupSync();
 		[branch] if (gi == 0u)
 		{
-			float sumA = 0.0, sumB = 0.0;
+			float sumA = 0.0, sumB = 0.0, sumLog = 0.0;
 			uint n = 0u, counts = 0u;
 			for (uint k = 0u; k < 64u; ++k) {
 				counts += gsCounts[k];
 				if (gsShaded[k] >= 0.0) {
 					sumA += gsShaded[k];
 					sumB += gsScreen[k];
+					sumLog += gsLog[k];
 					++n;
 				}
 			}
@@ -349,6 +412,8 @@ float3 ShadeHit(uint2 p, uint w0, float3 hitPos, float3 N, float3 albedo, Materi
 				Stats.InterlockedAdd(8, uint(round(sumA / float(n) * 256.0)), previous);
 				Stats.InterlockedAdd(12, uint(round(sumB / float(n) * 256.0)), previous);
 				Stats.InterlockedAdd(16, 1u, previous);
+				Stats.InterlockedAdd(20, asuint(int(round(sumLog * 32.0))), previous);  // (48h) signed, two's complement
+				Stats.InterlockedAdd(24, n, previous);
 			}
 		}
 	}

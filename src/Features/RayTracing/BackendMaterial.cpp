@@ -326,7 +326,7 @@ namespace RayTracingRT
 		return id;
 	}
 
-	std::uint16_t Backend::AcquireMaterial(ID3D11Texture2D* a_texture, ID3D11ShaderResourceView* a_view, const float a_uvTransform[4], const float* a_emissive)
+	std::uint16_t Backend::AcquireMaterial(ID3D11Texture2D* a_texture, ID3D11ShaderResourceView* a_view, const float a_uvTransform[4], const MaterialEmission* a_emission)
 	{
 		if (!materialsEnabled_ || !ready_ || failed_ || !a_texture || !a_view)
 			return kNoMaterial;
@@ -334,13 +334,25 @@ namespace RayTracingRT
 		for (int i = 0; i < 4; ++i)
 			uv[i] = std::isfinite(a_uvTransform[i]) ? a_uvTransform[i] : (i < 2 ? 0.0f : 1.0f);
 		float emissive[3] = { 0.0f, 0.0f, 0.0f };  // (48g)
-		if (a_emissive)
+		if (a_emission)
 			for (int i = 0; i < 3; ++i)
-				emissive[i] = std::isfinite(a_emissive[i]) ? std::clamp(a_emissive[i], 0.0f, 64.0f) : 0.0f;
+				emissive[i] = std::isfinite(a_emission->ownProduct[i]) ? std::clamp(a_emission->ownProduct[i], 0.0f, 64.0f) : 0.0f;
+		// (48h) The Glow path's emission. The glow texture is acquired first (one user for this call); a refused glow texture keeps the glow-map
+		// flag with no copy (ReflectShadeCS then gives that shape no emission). Released again below when the material already exists.
+		MatEntry emit{};
+		if (a_emission && a_emission->emits) {
+			emit.emitFlags = kEmitOn | (a_emission->glowMap ? kEmitGlowMap : 0u) | (a_emission->source ? kEmitSourced : 0u);
+			for (int i = 0; i < 3; ++i)
+				emit.emitColor[i] = std::isfinite(a_emission->color[i]) ? std::clamp(a_emission->color[i], 0.0f, 64.0f) : 0.0f;
+			emit.emitMult = std::isfinite(a_emission->mult) ? std::clamp(a_emission->mult, 0.0f, 64.0f) : 0.0f;
+			emit.emitSource = a_emission->source;
+			if (a_emission->glowMap && a_emission->glowTexture && a_emission->glowView)
+				emit.textures[1] = AcquireMatTexture(a_emission->glowTexture, a_emission->glowView);
+		}
 		// Shared by every shape with the same texture and transform (the texture's handle is its key while it lives).
 		const auto known = matTextureIndex_.find(a_texture);
 		if (known != matTextureIndex_.end()) {
-			const MatKey key = MakeMatKey(known->second, uv, emissive);
+			const MatKey key = MakeMatKey(known->second, uv, emissive, emit);
 			if (const auto it = materialIndex_.find(key); it != materialIndex_.end()) {
 				auto& entry = materials_[it->second];
 				if (entry.retired) {
@@ -349,24 +361,80 @@ namespace RayTracingRT
 					std::erase_if(retiredMaterials_, [&](const auto& a_retired) { return a_retired.second == it->second; });
 				}
 				++entry.users;
+				if (emit.textures[1] != UINT32_MAX)
+					ReleaseMatTexture(emit.textures[1]);  // the existing material holds its own user of it
 				return it->second;
 			}
 		}
 		const std::uint32_t texture = AcquireMatTexture(a_texture, a_view);
-		if (texture == UINT32_MAX)
+		if (texture == UINT32_MAX) {
+			if (emit.textures[1] != UINT32_MAX)
+				ReleaseMatTexture(emit.textures[1]);
 			return kNoMaterial;
+		}
 		const std::uint16_t id = AllocateMaterial();
 		if (id == kNoMaterial) {
 			ReleaseMatTexture(texture);
+			if (emit.textures[1] != UINT32_MAX)
+				ReleaseMatTexture(emit.textures[1]);
 			return kNoMaterial;
 		}
 		auto& entry = materials_[id];
 		entry.textures[0] = texture;
+		entry.textures[1] = emit.textures[1];  // (48h)
 		std::copy_n(uv, 4, entry.uvTransform);
 		std::copy_n(emissive, 3, entry.emissive);
-		materialIndex_[MakeMatKey(texture, uv, emissive)] = id;
+		entry.emitFlags = emit.emitFlags;
+		std::copy_n(emit.emitColor, 3, entry.emitColor);
+		entry.emitMult = emit.emitMult;
+		entry.emitSource = emit.emitSource;
+		materialIndex_[MakeMatKey(texture, uv, emissive, entry)] = id;
 		matTableDirty_ = true;
 		return id;
+	}
+
+	namespace
+	{
+		/// (48h) Three floats of a source form's colour; false (and zeros) if the read faults. Finite and clamped like the capture.
+		bool ReadEmitSource(const float* a_source, float o_color[3])
+		{
+			__try {
+				for (int i = 0; i < 3; ++i) {
+					const float v = a_source[i];
+					o_color[i] = std::isfinite(v) ? (v < 0.0f ? 0.0f : (v > 64.0f ? 64.0f : v)) : 0.0f;
+				}
+				return true;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				o_color[0] = o_color[1] = o_color[2] = 0.0f;
+				return false;
+			}
+		}
+	}
+
+	void Backend::RefreshEmission()
+	{
+		// (48h) External Emittance: the reference's source (a light or region form) changes its colour with the time of day; Lighting.hlsl reads
+		// it every frame. The table entry follows within kEmitRefreshFrames; the material keeps its id and key (the key holds the source).
+		if (++emitRefreshTick_ < kEmitRefreshFrames)
+			return;
+		emitRefreshTick_ = 0;
+		for (auto& entry : materials_) {
+			if (!entry.live || entry.retired || !entry.emitSource || entry.emitSourceDead)
+				continue;
+			float color[3];
+			if (!ReadEmitSource(entry.emitSource, color)) {
+				entry.emitSourceDead = true;  // never read again; keeps its last colour (the key, which holds the pointer, is unchanged)
+				continue;
+			}
+			bool changed = false;
+			for (int i = 0; i < 3; ++i)
+				changed = changed || std::fabs(color[i] - entry.emitColor[i]) > 1e-4f;
+			if (changed) {
+				std::copy_n(color, 3, entry.emitColor);
+				matTableDirty_ = true;
+				++matStats_.emitRefreshes;
+			}
+		}
 	}
 
 	std::uint16_t Backend::AcquireTerrainMaterial(const TerrainLayerSource& a_layers, std::uint32_t a_tint)
@@ -409,7 +477,7 @@ namespace RayTracingRT
 				return true;
 			auto& entry = materials_[id];
 			if (!entry.terrain) {
-				const MatKey key = MakeMatKey(entry.textures[0], entry.uvTransform, entry.emissive);
+				const MatKey key = MakeMatKey(entry.textures[0], entry.uvTransform, entry.emissive, entry);
 				if (const auto it = materialIndex_.find(key); it != materialIndex_.end() && it->second == id)
 					materialIndex_.erase(it);
 			}
@@ -584,6 +652,20 @@ namespace RayTracingRT
 				std::copy_n(entry.uvTransform, 4, gpu.uvTransform);
 				gpu.tint = entry.tint;
 				std::copy_n(entry.emissive, 3, gpu.emissive);  // (48g)
+				// (48h) The Glow path: EmitColor = colour x multiplier (clamped as 48g's product), the multiplier, the glow copy.
+				gpu.glow[0] = 0xFFFFu;
+				if (!entry.terrain && (entry.emitFlags & kEmitOn)) {
+					for (int i = 0; i < 3; ++i)
+						gpu.emit[i] = std::clamp(entry.emitColor[i] * entry.emitMult, 0.0f, 64.0f);
+					gpu.emit[3] = entry.emitMult;
+					std::uint32_t flags = entry.emitFlags;
+					if (entry.emitFlags & kEmitGlowMap) {
+						gpu.glow[0] = layerOf(entry.textures[1]);
+						gpu.glow[1] = readyOf(entry.textures[1]);
+						flags |= (entry.textures[1] != UINT32_MAX && gpu.glow[0] == 0xFFFFu) ? kEmitGlowPending : 0u;
+					}
+					gpu.glow[2] = flags;
+				}
 				if (entry.terrain) {
 					gpu.flags = 1u;
 					bool pending = false;
@@ -617,6 +699,28 @@ namespace RayTracingRT
 				continue;
 			++matStats_.textures;
 			++(entry.ready ? matStats_.texturesReady : matStats_.texturesPending);
+		}
+		// (48h) Emission: emitting / glow-map / sourced materials, and the distinct glow textures (their copy layers).
+		matStats_.emitMaterials = matStats_.glowMaterials = matStats_.glowMaterialsReady = matStats_.emitSourced = 0;
+		matStats_.glowTextures = matStats_.glowTexturesReady = 0;
+		glowMarks_.assign(matTextures_.size(), 0);
+		for (const auto& entry : materials_) {
+			if (!entry.live || entry.retired || !(entry.emitFlags & kEmitOn))
+				continue;
+			++matStats_.emitMaterials;
+			matStats_.emitSourced += entry.emitSource && !entry.emitSourceDead ? 1u : 0u;
+			if (!(entry.emitFlags & kEmitGlowMap))
+				continue;
+			++matStats_.glowMaterials;
+			const std::uint32_t glow = entry.textures[1];
+			if (glow >= matTextures_.size() || !matTextures_[glow].live)
+				continue;
+			matStats_.glowMaterialsReady += matTextures_[glow].ready ? 1u : 0u;
+			if (!glowMarks_[glow]) {
+				glowMarks_[glow] = 1;
+				++matStats_.glowTextures;
+				matStats_.glowTexturesReady += matTextures_[glow].ready ? 1u : 0u;
+			}
 		}
 		matStats_.pages = static_cast<std::uint32_t>(matPages_.size());
 		matStats_.pageCreating = false;  // (48g) pages are made synchronously on the render thread
@@ -744,6 +848,7 @@ namespace RayTracingRT
 				}
 			}
 		}
+		RefreshEmission();  // (48h)
 		UploadMaterialTable();
 		UpdateMaterialStats();
 		matStats_.copyCpuMs = static_cast<float>(MatQpcToMs(MatQpc() - start));

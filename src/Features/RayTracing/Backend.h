@@ -475,6 +475,16 @@ namespace RayTracingRT
 		std::uint64_t attrLargestFreeBytes = 0;   // the largest free range at that refusal
 		float pageCreateMs = 0.0f;              // render-thread ms of the last texture-copy page creation
 		std::uint32_t pagesMadeInPlay = 0;      // pages made while playing (not at enable / in a transition)
+		// (48h) Emission ("Material Hits: Glow"): live materials that emit, of them with the glow-map technique, of those with their glow copy
+		// ready; distinct glow textures registered / copied (their page layers); materials whose colour follows an External Emittance source
+		// (refreshed at runtime), refreshes that changed a colour (total).
+		std::uint32_t emitMaterials = 0;
+		std::uint32_t glowMaterials = 0;
+		std::uint32_t glowMaterialsReady = 0;
+		std::uint32_t glowTextures = 0;
+		std::uint32_t glowTexturesReady = 0;
+		std::uint32_t emitSourced = 0;
+		std::uint64_t emitRefreshes = 0;
 	};
 	/// (48f) Texture-copy pages: a Texture2DArray of kMaterialPageLayers layers of kMaterialTextureSize^2 RGBA8 with every mip; at most
 	/// kMaterialMaxPages (ReflectDebugCS / 48g's shading bind them as t4 .. t9).
@@ -487,6 +497,19 @@ namespace RayTracingRT
 	{
 		ID3D11Texture2D* texture[6]{};
 		ID3D11ShaderResourceView* view[6]{};
+	};
+	/// (48h) A shape's emission for AcquireMaterial: 48g's own-emit product (the "Material Hits: Glow" off path, unchanged) and what
+	/// Lighting.hlsl's EmitColor / glow map get (the Glow on path).
+	struct MaterialEmission
+	{
+		float ownProduct[3]{};          // OwnEmit only: emissive colour x multiplier (exactly 48g's value)
+		bool emits = false;             // OwnEmit, External Emittance or the glow-map technique
+		float color[3]{};               // the emissive colour (EmitColor / multiplier)
+		float mult = 0.0f;              // the emissive multiplier
+		const float* source = nullptr;  // External Emittance: the source form's NiColor (r, g, b; refreshed at runtime; forms live all session)
+		bool glowMap = false;           // the glow-map technique (EmitColor x glow texture)
+		ID3D11Texture2D* glowTexture = nullptr;
+		ID3D11ShaderResourceView* glowView = nullptr;
 	};
 
 	/// (45k) Where the CPU time of the last ExecuteFrame went, call by call (ms). The sum of these
@@ -1008,8 +1031,9 @@ namespace RayTracingRT
 		[[nodiscard]] bool MaterialTraceAvailable() const { return ReflectAvailable() && reflectMatPipeline_ != nullptr; }
 		/// A material for one shape: its diffuse texture (copied once into a 128x128 RGBA8 page layer, shared by every material using it) and
 		/// texcoord transform (offset xy, scale zw). kNoMaterial when not enabled / refused (counted). Counted per user (ReleaseMaterial).
-		/// (48g) a_emissive: the shape's own emissive colour x multiplier (gamma units, as Lighting.hlsl adds it; null = none).
-		std::uint16_t AcquireMaterial(ID3D11Texture2D* a_texture, ID3D11ShaderResourceView* a_view, const float a_uvTransform[4], const float* a_emissive = nullptr);
+		/// (48g) / (48h) a_emission: the shape's emission (null = none): 48g's own-emit product plus the EmitColor / glow map of Lighting.hlsl;
+		/// the glow texture gets its own copy layer (same pages and budget). External Emittance colours are refreshed in UpdateMaterials.
+		std::uint16_t AcquireMaterial(ID3D11Texture2D* a_texture, ID3D11ShaderResourceView* a_view, const float a_uvTransform[4], const MaterialEmission* a_emission = nullptr);
 		/// A terrain quadrant's material: its six layer textures (their copies' last mip is the layer's average colour) and the quadrant's
 		/// average vertex colour (RGBA8). Never shared.
 		std::uint16_t AcquireTerrainMaterial(const TerrainLayerSource& a_layers, std::uint32_t a_tint);
@@ -1370,8 +1394,12 @@ namespace RayTracingRT
 			std::uint32_t pad;
 			float uvTransform[4];   // offset xy, scale zw
 			float emissive[4];      // (48g) rgb the shape's emissive colour x multiplier (gamma units), w unused
+			float emit[4];          // (48h) rgb EmitColor (colour x multiplier; External Emittance refreshed), w the multiplier
+			std::uint32_t glow[4];  // (48h) glow copy layer (0xFFFF none / pending), its ready frame, kEmit* flags, 0
 		};
-		static_assert(sizeof(MaterialGpu) == 64);
+		static_assert(sizeof(MaterialGpu) == 96);
+		static constexpr std::uint32_t kEmitOn = 1u, kEmitGlowMap = 2u, kEmitGlowPending = 4u, kEmitSourced = 8u;  // (48h) MaterialGpu::glow[2]
+		static constexpr std::uint32_t kEmitRefreshFrames = 8;  // (48h) External Emittance colours re-read every this many UpdateMaterials
 		struct MatTexture
 		{
 			ComPtr<ID3D11Texture2D> texture11;        // held: the key can never be a reused address
@@ -1390,6 +1418,12 @@ namespace RayTracingRT
 			float uvTransform[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
 			std::uint32_t tint = 0xFFFFFFFFu;
 			float emissive[3] = { 0.0f, 0.0f, 0.0f };  // (48g)
+			// (48h) The Glow path's emission; textures[1] holds the glow texture (released with the others).
+			std::uint32_t emitFlags = 0;              // kEmitOn / kEmitGlowMap / kEmitSourced
+			float emitColor[3] = { 0.0f, 0.0f, 0.0f };  // colour (not multiplied); for a sourced one the last value read
+			float emitMult = 0.0f;
+			const float* emitSource = nullptr;
+			bool emitSourceDead = false;              // a read of the source faulted: not read again
 			std::uint32_t users = 0;
 			bool terrain = false;
 			bool live = false;      // allocated (also while retired)
@@ -1399,15 +1433,28 @@ namespace RayTracingRT
 		{
 			std::uint32_t texture;
 			std::uint32_t uv[7];  // (48g) uv transform (4) + emissive (3), as bit patterns
+			// (48h) The Glow path: glow texture handle, kEmit* flags, colour (zero for a sourced one: its colour changes at runtime) and
+			// multiplier as bit patterns, the source pointer.
+			std::uint32_t glow;
+			std::uint32_t emitFlags;
+			std::uint32_t emit[4];
+			std::uint64_t source;
 			bool operator==(const MatKey&) const = default;
 		};
-		static MatKey MakeMatKey(std::uint32_t a_texture, const float a_uv[4], const float a_emissive[3])
+		static MatKey MakeMatKey(std::uint32_t a_texture, const float a_uv[4], const float a_emissive[3], const MatEntry& a_emit)
 		{
-			MatKey key{ a_texture, {} };
+			MatKey key{};
+			key.texture = a_texture;
 			for (int i = 0; i < 4; ++i)
 				key.uv[i] = std::bit_cast<std::uint32_t>(a_uv[i]);
 			for (int i = 0; i < 3; ++i)
 				key.uv[4 + i] = std::bit_cast<std::uint32_t>(a_emissive[i]);
+			key.glow = a_emit.textures[1];
+			key.emitFlags = a_emit.emitFlags;
+			for (int i = 0; i < 3; ++i)
+				key.emit[i] = a_emit.emitSource ? 0u : std::bit_cast<std::uint32_t>(a_emit.emitColor[i]);
+			key.emit[3] = std::bit_cast<std::uint32_t>(a_emit.emitMult);
+			key.source = reinterpret_cast<std::uintptr_t>(a_emit.emitSource);
 			return key;
 		}
 		struct MatKeyHash
@@ -1417,9 +1464,19 @@ namespace RayTracingRT
 				std::size_t h = a_key.texture;
 				for (const auto v : a_key.uv)
 					h = h * 1000003u ^ v;
+				h = h * 1000003u ^ a_key.glow;
+				h = h * 1000003u ^ a_key.emitFlags;
+				for (const auto v : a_key.emit)
+					h = h * 1000003u ^ v;
+				h = h * 1000003u ^ static_cast<std::size_t>(a_key.source);
 				return h;
 			}
 		};
+		/// (48h) Re-reads the External Emittance colours (every kEmitRefreshFrames calls; SEH-guarded reads of the source forms); a changed
+		/// colour marks the table dirty (never the key: the material keeps its id).
+		void RefreshEmission();
+		std::uint32_t emitRefreshTick_ = 0;
+		std::vector<std::uint8_t> glowMarks_;  // (48h) UpdateMaterialStats scratch (distinct glow textures)
 		struct MatPage
 		{
 			ComPtr<ID3D11Texture2D> texture;

@@ -379,6 +379,12 @@ public:
 		bool ReflectionsSunRay = true;
 		bool ReflectionsShadeLights = true;
 		bool ReflectionsCharacterMaterials = true;
+		// (48h) ReflectionsShadeGlow "Material Hits: Glow": the hit's emission as Lighting.hlsl makes it (EmitColor of OwnEmit / External
+		// Emittance / glow-map shapes x the glow texture, tinted by the texture); off: 48g's own-emit term exactly. Data is captured either way
+		// (instant A/B). ReflectionsPreferBrightCubemap "Off-screen: Prefer Brighter Cubemap": Material mode, where the cubemap position check
+		// matches and the cubemap saw that point much brighter than the shading, blend to the cubemap (glows the RT scene cannot represent).
+		bool ReflectionsShadeGlow = true;
+		bool ReflectionsPreferBrightCubemap = true;
 	};
 	/// (48d) What the SSRT specular ray march needs for the gap fill this frame (AcquireReflectionGapFill).
 	struct ReflectionGapFill
@@ -392,7 +398,8 @@ public:
 	};
 	static constexpr std::uint32_t kGapFillDebug = 1u, kGapFillBeyond = 2u, kGapFillLobe = 4u, kGapFillMatch = 8u, kGapFillHitDistance = 16u,
 	                                 kGapFillWarmUp = 32u,   // (48e)
-	                                 kGapFillMaterial = 64u;  // (48g)
+	                                 kGapFillMaterial = 64u,  // (48g)
+	                                 kGapFillPreferBright = 128u;  // (48h) only together with kGapFillMaterial
 	/// (46f) RTAO modes (Settings::AOMode); with RTAO off the AO is SSGI's, exactly as before.
 	enum class AOModeKind : int
 	{
@@ -1139,8 +1146,20 @@ private:
 	bool reflectSunRayThisFrame = false;  // (48g) this frame's material trace casts sun visibility rays (ReflectOut bits 8 / 9 valid)
 	float shadeGpuMs = -1.0f;        // its GPU time (GpuPassTimers RayTracingReflectShade; -1 = not run / not timed)
 	float shadeMaterialShare = -1.0f;  // share of the traced hits with material data (last read-back; -1 = none)
-	float shadeRatio = -1.0f;        // mean shaded / mean screen brightness where hits are also on screen (-1 = no sample)
+	float shadeRatio = -1.0f;        // (48h) geometric mean of shaded / screen brightness where hits are also on screen, last read-back (-1 = no sample)
 	std::uint32_t shadeRatioGroups = 0;
+	// (48h) The stable number: the per-pixel log2 ratio's mean, smoothed over ~2 s of time (frame-rate independent EMA, weighted by the
+	// sample count; restarts after kShadeSmoothResetS without samples). shadeRatioArith = 48g's ratio of summed means (tooltip / F12 only).
+	float shadeRatioArith = -1.0f;
+	std::uint32_t shadeRatioPixels = 0;   // pixels in the last read-back's mean
+	double shadeSmoothLog = 0.0;          // smoothed log2 ratio
+	double shadeSmoothPixels = 0.0;       // smoothed pixels per read-back
+	bool shadeSmoothValid = false;
+	std::int64_t shadeSmoothQpc = 0;      // last read-back with samples
+	float shadeRatioSmoothed = -1.0f;     // 2^shadeSmoothLog (-1 = none yet)
+	static constexpr double kShadeSmoothTauS = 2.0;
+	static constexpr double kShadeSmoothResetS = 5.0;
+	static constexpr double kShadeSmoothFullPixels = 1000.0;  // a read-back with fewer pixels moves the mean proportionally less
 	bool inLoadingPump = false;  // (48f) TransitionFrame called from the loading pump (the loading screen owns the D3D11 context)
 	winrt::com_ptr<ID3D11Texture2D> aoPrevDepth;
 	winrt::com_ptr<ID3D11ShaderResourceView> aoPrevDepthSRV;

@@ -217,6 +217,8 @@ namespace Util::FrameTrace
 		// (48g) The shading half (-1 = not run last frame / not known): ReflectShadeCS GPU ms, share of the traced hits with material data (%),
 		// mean shaded / screen brightness where hits are also on screen (read back a few frames late).
 		float shadeGpuMs = -1.0f, shadeMaterialPct = -1.0f, shadeRatio = -1.0f;
+		// (48h) shadeRatio is now the geometric mean of the per-pixel ratios; shadeRatioSmoothed its ~2 s time average (the panel's number).
+		float shadeRatioSmoothed = -1.0f;
 		// (48c) Extra Lights Where Crowded: the share of the pixels with a traced point light that traced at least one extra rank (percent, read back
 		// a few frames late; -1 = off this frame, K 6, or not known).
 		float plExtraPct = -1.0f;

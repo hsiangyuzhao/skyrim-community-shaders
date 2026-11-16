@@ -232,6 +232,7 @@ TextureCube<float4> RTCubemapRaw : register(t16);       // ... and its raw colou
 RWTexture2D<unorm float4> RTUseDebug : register(u2);    // "RT Reflection Use" (Ray Tracing's debug colour; written only with kRTFillDebug)
 static const uint kRTFillDebug = 1u, kRTFillBeyond = 2u, kRTFillLobe = 4u, kRTFillMatch = 8u, kRTFillHitDistance = 16u, kRTFillWarmUp = 32u;
 static const uint kRTFillMaterial = 64u;  // (48g) "Off-screen Hit Color: Material": RTShade holds the hit's own shaded colour
+static const uint kRTFillPreferBright = 128u;  // (48h) "Off-screen: Prefer Brighter Cubemap" (only with kRTFillMaterial)
 Texture2D<float4> RTShade : register(t18);  // (48g) ReflectShadeCS: rgb linear colour, a = how much of it to use (0 = no material data)
 #else
 #   define SSRT_RT_FILL 0
@@ -994,6 +995,7 @@ float SSRT_RTFill(uint2 a_pixel, float3 a_positionWS, float3 a_normalWS, float a
     }
     float3 offColor = 0.0;
     uint offUse = 3u;
+    float cubeMatch = 0.0;      // (48h) the position check's match, for Prefer Brighter Cubemap
     [branch] if (screenWeight < 1.0)
     {
         // Off screen: the dynamic cubemap in the direction of the hit point from the cubemap's capture position.
@@ -1020,6 +1022,7 @@ float SSRT_RTFill(uint2 a_pixel, float3 a_positionWS, float3 a_normalWS, float a
                 const float3 matched = filterInf(filterNaN(Color::IrradianceToLinear(max(raw.rgb, 0.0)))) * SharedData::ssrtSettings.SpecularMult;
                 offColor = lerp(offColor, matched, match);
                 offUse = match >= 0.5 ? 2u : 3u;
+                cubeMatch = match;
             }
         }
         // (48g) "Off-screen Hit Color: Material": the hit's own shaded colour (ReflectShadeCS), faded against the cubemap path above by its
@@ -1029,7 +1032,21 @@ float SSRT_RTFill(uint2 a_pixel, float3 a_positionWS, float3 a_normalWS, float a
             const float4 shade = RTShade[a_pixel];
             [branch] if (shade.a > 0.0)
             {
-                const float3 material = filterInf(filterNaN(max(shade.rgb, 0.0))) * SharedData::ssrtSettings.SpecularMult * RTShadeScale;
+                float3 material = filterInf(filterNaN(max(shade.rgb, 0.0))) * SharedData::ssrtSettings.SpecularMult * RTShadeScale;
+                // (48h) "Off-screen: Prefer Brighter Cubemap": where the cubemap stored this very point (match from 0.4, full at 0.6) and saw it
+                // much brighter than the shading (from 2x, fully at 4x; +0.01 keeps dark noise out), lean on the cubemap: glows, fire and
+                // effect planes the RT scene cannot represent. Smooth in both measures (no hard edge); off = 48g exactly.
+                [branch] if ((RTFlags & kRTFillPreferBright) && cubeMatch > 0.0)
+                {
+                    // The matched cubemap colour again (as above; read here so the off path keeps 48g's code exactly).
+                    float4 raw = RTCubemapRaw.SampleLevel(LinearSampler, dirC, 0);
+                    if (RTFlags & kRTFillWarmUp)
+                        raw.rgb /= max(raw.a, 0.25);
+                    const float3 cubeMatched = filterInf(filterNaN(Color::IrradianceToLinear(max(raw.rgb, 0.0)))) * SharedData::ssrtSettings.SpecularMult;
+                    const float brighter = smoothstep(1.0, 2.0, log2((Color::RGBToLuminance(cubeMatched) + 0.01) / (Color::RGBToLuminance(material) + 0.01)));
+                    const float prefer = brighter * smoothstep(0.4, 0.6, cubeMatch);
+                    material = lerp(material, cubeMatched, prefer);
+                }
                 offColor = lerp(offColor, material, saturate(shade.a));
                 if (shade.a >= 0.5)
                     offUse = 5u;

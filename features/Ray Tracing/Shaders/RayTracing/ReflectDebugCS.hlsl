@@ -34,7 +34,9 @@ struct MaterialGpu
 	uint ReadyFrame;  // (48g)
 	uint Pad;
 	float4 UvTransform;
-	float4 Emissive;  // (48g) MaterialGpu is 64 bytes
+	float4 Emissive;  // (48g)
+	float4 Emit;      // (48h) emission colour x multiplier, multiplier (ReflectShadeCS "Material Hits: Glow")
+	uint4 Glow;       // (48h) glow copy layer, its ready frame, emission flags; MaterialGpu is 96 bytes
 };
 StructuredBuffer<MaterialGpu> Materials : register(t3);
 Texture2DArray<float4> Page0 : register(t4);

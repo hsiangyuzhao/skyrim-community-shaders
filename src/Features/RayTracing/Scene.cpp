@@ -1150,18 +1150,82 @@ namespace RayTracingScene
 	namespace
 	{
 		/// (48g) The shape's own emissive colour x multiplier (only with the OwnEmit flag, as the Lighting shader; SEH-guarded).
-		void ReadOwnEmissive(RE::BSLightingShaderProperty* a_lighting, float o_emissive[3])
+		/// (48h) Also what Lighting.hlsl's EmitColor / glow map get ("Material Hits: Glow"): with OwnEmit, External Emittance (a_source: the
+		/// reference's source form colour when found, else the property's colour) or the glow-map technique, the colour and multiplier, and
+		/// the glow texture. ownProduct stays exactly 48g's value (the Glow switch's off path).
+		void ReadEmission(RE::BSLightingShaderProperty* a_lighting, const float* a_source, RayTracingRT::MaterialEmission& o_emission)
 		{
 			__try {
-				if (!a_lighting->flags.any(RE::BSShaderProperty::EShaderPropertyFlag::kOwnEmit) || !a_lighting->emissiveColor)
-					return;
+				using F = RE::BSShaderProperty::EShaderPropertyFlag;
+				const RE::NiColor* color = a_lighting->emissiveColor;
 				const float mult = a_lighting->emissiveMult;
-				o_emissive[0] = a_lighting->emissiveColor->red * mult;
-				o_emissive[1] = a_lighting->emissiveColor->green * mult;
-				o_emissive[2] = a_lighting->emissiveColor->blue * mult;
+				const bool own = a_lighting->flags.any(F::kOwnEmit);
+				if (own && color) {
+					o_emission.ownProduct[0] = color->red * mult;
+					o_emission.ownProduct[1] = color->green * mult;
+					o_emission.ownProduct[2] = color->blue * mult;
+				}
+				const bool external = a_lighting->flags.any(F::kExternalEmittance);
+				auto* base = static_cast<RE::BSLightingShaderMaterialBase*>(a_lighting->material);
+				const bool glowMap = base && base->GetFeature() == RE::BSShaderMaterial::Feature::kGlowMap;
+				if (!own && !external && !glowMap)
+					return;
+				const float* rgb = (external && a_source) ? a_source : (color ? &color->red : nullptr);
+				if (!rgb)
+					return;
+				o_emission.emits = true;
+				o_emission.color[0] = rgb[0];
+				o_emission.color[1] = rgb[1];
+				o_emission.color[2] = rgb[2];
+				o_emission.mult = mult;
+				o_emission.source = (external && a_source) ? a_source : nullptr;
+				if (glowMap) {
+					o_emission.glowMap = true;
+					auto* glow = static_cast<RE::BSLightingShaderMaterialGlowmap*>(base)->glowTexture.get();
+					if (glow && glow->rendererTexture && glow->rendererTexture->texture && glow->rendererTexture->resourceView) {
+						o_emission.glowTexture = glow->rendererTexture->texture;
+						o_emission.glowView = glow->rendererTexture->resourceView;
+					}
+				}
 			} __except (EXCEPTION_EXECUTE_HANDLER) {
-				o_emissive[0] = o_emissive[1] = o_emissive[2] = 0.0f;
+				o_emission = RayTracingRT::MaterialEmission{};
 			}
+		}
+
+		/// (48h) External Emittance: the colour of the reference's emittance source (XEMI: a light or a region). Forms live for the session,
+		/// so the pointer can be re-read at runtime (the time of day changes the colour). Null when the shape has no such source.
+		const float* FindEmittanceSource(RE::BSGeometry* a_geometry, RE::BSLightingShaderProperty* a_lighting)
+		{
+			auto* ref = a_geometry->GetUserData();
+			if (!ref)
+				return nullptr;
+			const auto* extra = ref->extraList.GetByType<RE::ExtraEmittanceSource>();
+			if (!extra || !extra->source)
+				return nullptr;
+			const float* source = nullptr;
+			if (auto* light = extra->source->As<RE::TESObjectLIGH>())
+				source = &light->emittanceColor.red;
+			else if (auto* region = extra->source->As<RE::TESRegion>())
+				source = &region->emittanceColor.red;
+			// Diagnostics: the first few, with whether the game pointed the property's colour at that source.
+			static std::atomic<std::uint32_t> logged{ 0 };
+			if (source && logged.fetch_add(1) < 8)
+				logger::info("[RayTracing] Reflection materials: External Emittance source {:08X} ({}), the shape's colour pointer {} it", extra->source->GetFormID(),
+					extra->source->Is(RE::FormType::Light) ? "light" : "region",
+					static_cast<const void*>(a_lighting->emissiveColor) == static_cast<const void*>(source) ? "points at" : "does not point at");
+			return source;
+		}
+
+		/// (48h) The shape's emission for AcquireMaterial (OwnEmit / External Emittance / glow map; see ReadEmission).
+		void ReadShapeEmission(RE::BSGeometry* a_geometry, RE::BSLightingShaderProperty* a_lighting, RayTracingRT::MaterialEmission& o_emission)
+		{
+			o_emission = {};
+			if (!a_geometry || !a_lighting)
+				return;
+			const float* source = nullptr;
+			if (a_lighting->flags.any(RE::BSShaderProperty::EShaderPropertyFlag::kExternalEmittance))
+				source = FindEmittanceSource(a_geometry, a_lighting);
+			ReadEmission(a_lighting, source, o_emission);
 		}
 
 		/// (48f) A landscape quadrant's six layer textures: the material's base diffuse and its blended layers (SEH-guarded).
@@ -1201,10 +1265,11 @@ namespace RayTracingScene
 		RawAlphaSource raw{};
 		if (!ReadAlphaSource(lighting, raw))
 			return RayTracingRT::kNoMaterial;
-		// (48g) Its own emissive colour x multiplier (OwnEmit shapes: lamps, glowing objects; glow maps are not copied).
-		float emissive[3] = { 0.0f, 0.0f, 0.0f };
-		ReadOwnEmissive(lighting, emissive);
-		return a_backend.AcquireMaterial(raw.texture, raw.view, raw.uv, emissive);
+		// (48g) Its own emissive colour x multiplier (OwnEmit shapes: lamps, glowing objects). (48h) Plus Lighting.hlsl's EmitColor and glow
+		// map for "Material Hits: Glow" (External Emittance windows, glow-map shapes; the glow texture gets its own copy).
+		RayTracingRT::MaterialEmission emission;
+		ReadShapeEmission(a_geometry, lighting, emission);
+		return a_backend.AcquireMaterial(raw.texture, raw.view, raw.uv, &emission);
 	}
 
 	std::uint16_t Scene::AcquireTerrainMaterial(RayTracingRT::Backend& a_backend, RE::BSTriShape* a_shape, const RE::TESObjectLAND::LoadedLandData& a_land, int a_quad) const
@@ -1600,7 +1665,15 @@ namespace RayTracingScene
 		o_shape.alpha = true;
 		o_shape.texture = texture;
 		o_shape.info = info;
-		o_shape.material = config_.materials ? a_backend.AcquireMaterial(source.texture, source.view, source.material.uvTransform) : RayTracingRT::kNoMaterial;  // (48f)
+		o_shape.material = RayTracingRT::kNoMaterial;
+		if (config_.materials) {  // (48f)
+			// (48h) Cut-outs get Lighting.hlsl's emission too (only for "Material Hits: Glow": their own-emit product stays 0, as 48g).
+			RayTracingRT::MaterialEmission emission;
+			ReadShapeEmission(a_shape, netimmerse_cast<RE::BSLightingShaderProperty*>(a_shape->GetGeometryRuntimeData().properties[RE::BSGeometry::States::kEffect].get()),
+				emission);
+			std::fill_n(emission.ownProduct, 3, 0.0f);
+			o_shape.material = a_backend.AcquireMaterial(source.texture, source.view, source.material.uvTransform, &emission);
+		}
 		MarkWindCandidate(o_shape, a_shape);  // (47l)
 		return true;
 	}
