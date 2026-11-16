@@ -513,6 +513,9 @@ namespace RayTracingRT
 		// (46g) Point lights: pixels whose top-K source set changed per frame (-1 = not known); window beams per slot: sampled cone
 		// pixels traced / blocked per frame (1 of 16 pixels), beamSamples counts the read-backs.
 		std::int64_t pointChurnPerFrame = -1;
+		// (48c) Extra Lights Where Crowded (RayCounter words 3 - 5, counted only on frames that ran it; -1 = not known): pixels with a traced
+		// light, of which with an extra rank traced, and pixels where an extra rank 4 - 5 passed its cut (needs the slot 4 - 5 textures).
+		std::int64_t pointTracedPixelsPerFrame = -1, pointExtraPixelsPerFrame = -1, pointExtraWideWantPerFrame = -1;
 		std::array<std::uint32_t, 64> beamTraced{}, beamBlocked{};
 		std::uint64_t beamSamples = 0;
 		// (47w) Adaptive skip: the last read-back's counts per engine shadow-map light (per frame), coverageSamples counts the read-backs.
@@ -943,6 +946,7 @@ namespace RayTracingRT
 			stats_.lastAOGpuMs = -1.0f;
 			stats_.pointRaysPerFrame = -1;
 			stats_.pointWaterRaysPerFrame = -1;
+			stats_.pointTracedPixelsPerFrame = stats_.pointExtraPixelsPerFrame = stats_.pointExtraWideWantPerFrame = -1;  // (48c)
 			stats_.aoRaysPerFrame = -1;
 			stats_.pointTracedLastFrame = false;
 			stats_.aoTracedLastFrame = false;

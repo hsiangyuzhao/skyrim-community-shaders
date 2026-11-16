@@ -283,6 +283,8 @@ namespace
 	// (t7 / u4), their history (t8) valid, Window Beams: Smooth Edges.
 	constexpr std::uint32_t kPointFlagWide = 16384u, kPointFlagWidePrev = 32768u, kPointFlagBeamSmooth = 65536u;
 	constexpr std::uint32_t kPointDenoiseWide = 32u, kPointDenoiseWideHistory = 64u, kPointDenoiseBeamSmooth = 128u;
+	// (48c) TracePointLightsCS kFlagExtra: Extra Lights Where Crowded (K < 6: ranks K..5 traced where they hold kExtraShare of the pixel's point light).
+	constexpr std::uint32_t kPointFlagExtra = 131072u;
 	// (47w) Adaptive skip thresholds (per frame, read back). Bad: more than 1 % of its lit pixels uncovered (and at least 32 pixels, so a
 	// light lighting a handful of pixels does not flip on noise), or 4096 uncovered pixels whatever the share. Good: under 0.25 % and
 	// under 1024 pixels. Skip again after kCoverageEnterFrames good frames (first time) or kCoverageRestoreFrames (after a bad frame);
@@ -1535,6 +1537,8 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.PointBeamRange = read("PointBeamRange", defaults.PointBeamRange);
 		settings.PointStickyReproject = read("PointStickyReproject", defaults.PointStickyReproject);
 		settings.PointBeamSmooth = read("PointBeamSmooth", defaults.PointBeamSmooth);  // (48a)
+		settings.PointStickyJitterFix = read("PointStickyJitterFix", defaults.PointStickyJitterFix);  // (48c)
+		settings.PointExtraSlots = read("PointExtraSlots", defaults.PointExtraSlots);
 		settings.ReflectionsMode = std::clamp(read("ReflectionsMode", defaults.ReflectionsMode), 0, 1);
 		settings.ReflectionsTerrain = read("ReflectionsTerrain", defaults.ReflectionsTerrain);
 		const float sunSize = read("SunSize", -1.0f);
@@ -1670,6 +1674,8 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["PointBeamRange"] = settings.PointBeamRange;
 	o_json["PointStickyReproject"] = settings.PointStickyReproject;
 	o_json["PointBeamSmooth"] = settings.PointBeamSmooth;  // (48a)
+	o_json["PointStickyJitterFix"] = settings.PointStickyJitterFix;  // (48c)
+	o_json["PointExtraSlots"] = settings.PointExtraSlots;
 	o_json["ReflectionsMode"] = settings.ReflectionsMode;
 	o_json["ReflectionsTerrain"] = settings.ReflectionsTerrain;
 	o_json["AOSmoothNormals"] = settings.AOSmoothNormals;  // (47j)
@@ -2530,6 +2536,7 @@ void RayTracing::Prepass()
 	pointThisFrame = false;
 	pointK = 0;
 	pointWideThisFrame = false;  // (48a)
+	pointExtraThisFrame = false;  // (48c)
 	waterTraced = false;  // (47i)
 	waterLodSkip = false;  // (47l) set again by this frame's point-light preparation
 	pointCpuMs = 0.0f;
@@ -3137,6 +3144,10 @@ void RayTracing::PublishCpuSplit()
 		detail.plRejIntensity = ps.byReason[2];
 		detail.plKept = ps.kept;
 		detail.plChurn = pointThisFrame ? stats.pointChurnPerFrame : -1;
+		// (48c) Extra Lights Where Crowded: pixels with an extra rank traced / pixels with a traced light (newest read-back).
+		detail.plExtraPct = pointThisFrame && pointExtraThisFrame && stats.pointTracedPixelsPerFrame > 0 && stats.pointExtraPixelsPerFrame >= 0 ?
+		                        static_cast<float>(100.0 * static_cast<double>(stats.pointExtraPixelsPerFrame) / static_cast<double>(stats.pointTracedPixelsPerFrame)) :
+		                        -1.0f;
 		detail.plBeamsExcluded = 0;  // fixed (47m): the Window Beam Guard is gone
 		if (pointThisFrame) {  // (46x)
 			detail.plFillDirect = static_cast<int>(ps.fillDirectAimed + ps.fillDirectPoint);
@@ -3678,6 +3689,7 @@ void RayTracing::RunFrame()
 	if (!pointThisFrame) {
 		pointK = 0;
 		pointWideThisFrame = false;  // (48a)
+		pointExtraThisFrame = false;  // (48c)
 	}
 
 	// (45l) The D3D11 side of this frame: FinishFrame (now, or after the other prepasses with Late Sync).
@@ -3900,6 +3912,7 @@ void RayTracing::RunNoSunFrame(ID3D11ShaderResourceView* a_depth, ID3D11ShaderRe
 	if (!pointThisFrame) {
 		pointK = 0;
 		pointWideThisFrame = false;  // (48a)
+		pointExtraThisFrame = false;  // (48c)
 	}
 	aoThisFrame = input.ao != nullptr && backend.GetStats().aoTracedLastFrame;
 	aoModeThisFrame = aoThisFrame ? std::clamp(settings.AOMode, 0, static_cast<int>(AOModeKind::Count) - 1) : -1;
@@ -4816,6 +4829,7 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 {
 	pointK = 0;
 	pointWideThisFrame = false;  // (48a)
+	pointExtraThisFrame = false;  // (48c)
 	waterTraced = false;  // (47i)
 	waterGateLights.clear();  // (47p)
 	if (!PointLightsOn() || !backend.PointAvailable())  // (47n) no MaskTemp needed (the sun may be "Off")
@@ -4896,9 +4910,16 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	std::uint32_t K = static_cast<std::uint32_t>(ValidPointK(a_interior ? tier.kInterior : tier.k));
 	// (48a) Lights per pixel 5 - 6: slots 4 - 5 in their own textures, made on the first such frame (failing that: 4 slots). Freed again
 	// after kPointWideIdleFrames point frames at K <= 4 (outdoors, a lower tier), so K <= 4 costs nothing once they are gone.
-	const bool wide = K > 4 && EnsurePointWide(width, height);
+	// (48c) Extra Lights Where Crowded (K < 6): the extra ranks K..3 go to the main slots; ranks 4 - 5 need the slot 4 - 5 textures, kept (made)
+	// while the trace reports pixels whose extra rank 4 - 5 passed its cut (read back a few frames late; counted also while the textures are
+	// missing), freed like 48a after kPointWideIdleFrames point frames without. (48c) After the slot 4 - 5 denoiser failed: 4 slots.
+	const bool extra = settings.PointExtraSlots && K < 6;
+	const bool extraWide = extra && backend.GetStats().pointExtraWideWantPerFrame > 0;
+	const bool wantWide = !pointWideDenoiseFailed && (K > 4 || extraWide);
+	const bool wide = wantWide && EnsurePointWide(width, height);
 	if (K > 4 && !wide)
 		K = 4;
+	pointExtraThisFrame = extra;
 	if (wide) {
 		pointWideIdleFrames = 0;
 	} else if (backend.PointWideReady() || pointWide[0].texture) {
@@ -4981,10 +5002,32 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 		flags |= kPointFlagWide | (widePrev ? kPointFlagWidePrev : 0u);
 	if (settings.PointBeamSmooth)
 		flags |= kPointFlagBeamSmooth;
+	if (extra)  // (48c)
+		flags |= kPointFlagExtra;
 	// (47z) Stable Light Choice When the Camera Moves: last trace's camera -> this frame's camera-relative positions to last trace's clip
 	// space, one matrix (last view-projection x the translation by the camera's move), appended to the sources (Backend). The trace
 	// reads its copy of last frame's PLIdx there. Without a last camera: 47y (the same pixel).
 	pointInput.reproject = false;
+	// (48c) This frame's jitter in NDC (x right, y up), the offset between the jittered and the unjittered view-projection of the same frame:
+	// jittered row r = unjittered row r + j_r x row 3 (r = 0, 1), so j_r = (difference . row 3) / |row 3|^2. Not finite or more than 4 px:
+	// none (a matrix that is not a jittered copy). Recorded every trace, so the first frame after the switch goes on has last frame's too.
+	float jitterNow[2] = { 0.0f, 0.0f };
+	{
+		const auto& unjittered = globals::game::frameBufferCached.GetCameraViewProjUnjittered(0);
+		float unjitteredF[16];
+		std::memcpy(unjitteredF, &unjittered, sizeof(unjitteredF));
+		double w2 = 0.0;
+		for (int c4 = 0; c4 < 4; ++c4)
+			w2 += static_cast<double>(viewProjF[12 + c4]) * viewProjF[12 + c4];
+		for (int r = 0; r < 2 && w2 > 1e-20; ++r) {
+			double dot = 0.0;
+			for (int c4 = 0; c4 < 4; ++c4)
+				dot += (static_cast<double>(viewProjF[r * 4 + c4]) - unjitteredF[r * 4 + c4]) * viewProjF[12 + c4];
+			const double j = dot / w2;
+			const double limit = 8.0 / static_cast<double>(r == 0 ? width : height);  // 4 px in NDC (2 / size per px)
+			jitterNow[r] = std::isfinite(j) && std::abs(j) <= limit ? static_cast<float>(j) : 0.0f;
+		}
+	}
 	if (settings.PointStickyReproject && pointPrevValid) {
 		const double delta[3] = { a_camX - pointPrevCamera[0], a_camY - pointPrevCamera[1], a_camZ - pointPrevCamera[2] };
 		for (int r = 0; r < 4; ++r) {
@@ -4994,10 +5037,24 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 			pointInput.reprojectMatrix[r * 4 + 2] = row[2];
 			pointInput.reprojectMatrix[r * 4 + 3] = static_cast<float>(static_cast<double>(row[3]) + row[0] * delta[0] + row[1] * delta[1] + row[2] * delta[2]);
 		}
+		// (48c) Stable Light Choice: Jitter Fix. Last trace's matrix is jittered by its jitter, this frame's positions come from pixel centres
+		// under this frame's jitter: a still camera landed (this jitter - last jitter) off the pixel centre, often in the neighbour (48b).
+		// Shift the result by this frame's jitter minus last frame's (clip.xy += delta x clip.w: rows 0 / 1 += delta x row 3), so a still
+		// camera maps every pixel centre onto itself; a moving camera keeps the true motion. Off: 48b's matrix, untouched.
+		if (settings.PointStickyJitterFix) {
+			const float jx = jitterNow[0] - pointPrevJitter[0], jy = jitterNow[1] - pointPrevJitter[1];
+			for (int c4 = 0; c4 < 4; ++c4) {
+				const float w = pointInput.reprojectMatrix[12 + c4];
+				pointInput.reprojectMatrix[0 + c4] += jx * w;
+				pointInput.reprojectMatrix[4 + c4] += jy * w;
+			}
+		}
 		pointInput.reproject = true;
 		flags |= kPointFlagStickyReproject;
 	}
 	std::copy_n(viewProjF, 16, pointPrevViewProj);
+	pointPrevJitter[0] = jitterNow[0];  // (48c)
+	pointPrevJitter[1] = jitterNow[1];
 	pointPrevCamera[0] = a_camX;
 	pointPrevCamera[1] = a_camY;
 	pointPrevCamera[2] = a_camZ;
@@ -5054,10 +5111,27 @@ void RayTracing::FinishPointLights()
 	bool wide = pointWideThisFrame && backend.PointWideSRV() && pointWide[0].texture && pointWide[1].texture;
 	bool beamSmooth = settings.PointBeamSmooth && pointBeamMask != 0 && pointBeamTan > 0.0f;
 	ID3D11ComputeShader* shader = (wide || beamSmooth) ? PointDenoiseShader(wide, beamSmooth) : nullptr;
+	if (!shader && wide && beamSmooth) {
+		// (48c) Keep slots 4 - 5 without the beam edges when only the combined variant failed.
+		shader = PointDenoiseShader(true, false);
+		if (shader)
+			beamSmooth = false;
+	}
 	if (!shader) {
+		if (wide && !pointWideDenoiseFailed) {
+			// (48c) The slot 4 - 5 variant does not compile: 4 slots from the next trace on (no K 5 - 6, no extra ranks 4 - 5).
+			pointWideDenoiseFailed = true;
+			logger::warn("[RayTracing] PointDenoiseCS (slots 4-5) did not compile: 4 lights per pixel are traced from now on");
+		}
 		wide = false;
 		beamSmooth = false;
 		shader = PointDenoiseShader(false, false);
+	}
+	// (48c) This frame denoises (and binds) 4 slots only: the light tags (PointLightTag) and the shadow mask must not look in slots 4 - 5
+	// (48b kept tagging kTagWide after the fallback: Lighting looked in the unbound t46).
+	if (!wide && pointWideThisFrame) {
+		pointWideThisFrame = false;
+		pointWideHistoryValid = false;
 	}
 	if (!shader) {
 		SwitchOffPointLights("the point-light denoiser (PointDenoiseCS) did not compile");
@@ -6332,6 +6406,7 @@ void RayTracing::RunInteriorFrame()
 	if (!pointThisFrame) {
 		pointK = 0;
 		pointWideThisFrame = false;  // (48a)
+		pointExtraThisFrame = false;  // (48c)
 	}
 	// (46h) RTAO went out right behind it (second fence): DrawAmbientOcclusion uses it after Screen Space GI.
 	aoThisFrame = input.ao != nullptr && backend.GetStats().aoTracedLastFrame;
@@ -7167,6 +7242,14 @@ void RayTracing::DrawPointLightPage()
 					ImGui::Text("  gain most from 4 and up). 5 or 6 trace up to 50 %% more rays than 4 and take extra video memory. 2 or 1 = cheaper.");
 				}
 				ImGui::EndDisabled();
+				// (48c) Not a tier knob: stays as set when the tier changes.
+				ImGui::Checkbox("Extra Lights Where Crowded", &settings.PointExtraSlots);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("On (default): with fewer than 6 lights per pixel, a pixel also traces the next strongest lights (up to 6 in all) where");
+					ImGui::Text("  such a light still gives at least 7 %% of its lamp light. Fixes shadows with holes and ragged edges under crowded");
+					ImGui::Text("  candle and lamp groups. Changes the picture. More rays only in those spots; may take the extra video memory of");
+					ImGui::Text("  5 - 6 lights per pixel (about 16 bytes per pixel, freed again after a while without such spots). Off: as 48b.");
+				}
 				changed |= ImGui::SliderInt("Max Lights", &v.maxSources, 8, static_cast<int>(RayTracingPointLights::kMaxSources));
 				if (auto _tt = Util::HoverTooltipWrapper())
 					ImGui::Text("Shadow-casting lights per frame at most (the ones that matter most on screen). Lights within 64 units count as one.");
@@ -7254,6 +7337,17 @@ void RayTracing::DrawPointLightPage()
 				ImGui::Text("  the camera), not at the same spot of the screen, so turning or walking no longer reshuffles which lights cast");
 				ImGui::Text("  ray-traced shadows. Off: as 47y.");
 			}
+			// (48c)
+			ImGui::Indent();
+			ImGui::BeginDisabled(!settings.PointStickyReproject);
+			ImGui::Checkbox("Stable Light Choice: Jitter Fix", &settings.PointStickyJitterFix);
+			ImGui::EndDisabled();
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): with the camera still, each pixel keeps the lights it traced itself last frame. Before, the upscaler's");
+				ImGui::Text("  tiny camera shake made many pixels copy a neighbour's choice, so where two similar lamps meet the shadows crawled");
+				ImGui::Text("  and flickered. Changes the picture (calmer shadows). Off: as 48b.");
+			}
+			ImGui::Unindent();
 			// (46c, 47m: default on; 47x: default off again)
 			ImGui::BeginDisabled(!settings.PointLightsInteriors);
 			ImGui::Checkbox("Skip the Game's Shadow Maps for RT-Shadowed Lights", &settings.PointLightsSkipShadowMaps);
@@ -8110,6 +8204,14 @@ nlohmann::json RayTracing::DescribeJson() const
 	j["point_k_this_frame"] = pointThisFrame ? pointK : 0u;
 	j["point_wide_slots"] = { { "in_use", pointWideThisFrame }, { "allocated", backend.PointWideReady() },
 		{ "mb", static_cast<double>(backend.PointWideBytes() + pointWideD3D11Bytes) / (1024.0 * 1024.0) } };
+	{
+		// (48c)
+		const auto& es = backend.GetStats();
+		j["point_sticky_jitter_fix"] = settings.PointStickyJitterFix;
+		j["point_extra_slots"] = { { "enabled", settings.PointExtraSlots }, { "this_frame", pointExtraThisFrame },
+			{ "traced_pixels", es.pointTracedPixelsPerFrame }, { "extra_pixels", es.pointExtraPixelsPerFrame },
+			{ "wide_want_pixels", es.pointExtraWideWantPerFrame }, { "wide_denoise_failed", pointWideDenoiseFailed } };
+	}
 	{
 		// (48a) RT reflections step 1.
 		const auto& sc = scene.GetStats();

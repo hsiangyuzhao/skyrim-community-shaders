@@ -577,6 +577,10 @@ cbuffer PerTechnique : register(b0)
 	float4 VPOSOffset : packoffset(c2);         // ???
 };
 
+// (48c) Vanilla Fresnel "Env Mask: Apply Once": bit 8 of vanillaFresnelSettings.EyeDirectSpecularMode (VanillaFresnel::kEnvMaskApplyOnceBit; the
+// mode itself is the low byte). No SharedData layout change.
+static const uint kVFEnvMaskApplyOnce = 0x100u;
+
 cbuffer PerMaterial : register(b1)
 {
 	float4 LODTexParams : packoffset(c0);  // TerrainTexOffset in xy, LodBlendingEnabled in z
@@ -3035,12 +3039,21 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 				envMask = saturate(envMask);
 #			if defined(VANILLA_FRESNEL)
 				if (enableVanillaFresnel) {
+					// (48c) Env Mask: Apply Once. A material with its own mask (EnvmapData.y) gets the reflection multiplied by
+					// lerp(1, envMask, EnvMaskStrength) further down; lerping F0 / roughness toward the cubemap's by envMask as well
+					// applied the mask twice (the cubemap part of F0 scaled with mask^2 at strength 1: batch 10's oversight; upstream
+					// and bedec8379 apply it once). The lerps take lerp(envMask, 1, strength): strength 0 = envMask (the old result
+					// exactly, the later multiply is 1 then), strength 1 = the unmasked cubemap F0 / roughness, masked once below.
+					// Materials without a mask texture (envMask = glossiness, no later multiply) keep envMask. Off: envMask, as 48b.
+					float envMaskF0 = envMask;
+					[branch] if ((SharedData::vanillaFresnelSettings.EyeDirectSpecularMode & kVFEnvMaskApplyOnce) != 0u && EnvmapData.y != 0.0)
+						envMaskF0 = lerp(envMask, 1.0, SharedData::vanillaFresnelSettings.EnvMaskStrength);
 #				if defined(SPECULAR)
-					F0 = max(lerp(baseF0, F0, envMask), SharedData::vanillaFresnelSettings.MinF0);
+					F0 = max(lerp(baseF0, F0, envMaskF0), SharedData::vanillaFresnelSettings.MinF0);
 #				else
-					F0 = max(lerp(0, F0, envMask), SharedData::vanillaFresnelSettings.MinF0);
+					F0 = max(lerp(0, F0, envMaskF0), SharedData::vanillaFresnelSettings.MinF0);
 #				endif
-					roughness = lerp(roughness, envRoughness, envMask);
+					roughness = lerp(roughness, envRoughness, envMaskF0);
 				} else {
 					roughness = envRoughness;
 				}
@@ -3138,7 +3151,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	if (enableVanillaFresnel && applyEyeHandling) {
 		directSpecularRoughness = clamp(SharedData::vanillaFresnelSettings.EyeDirectRoughness, 0.04, 1.0);
 
-		const uint eyeDirectSpecularMode = SharedData::vanillaFresnelSettings.EyeDirectSpecularMode;
+		// (48c) Low byte only: bit 8 carries Env Mask: Apply Once (kVFEnvMaskApplyOnce).
+		const uint eyeDirectSpecularMode = SharedData::vanillaFresnelSettings.EyeDirectSpecularMode & 0xFFu;
 		if (eyeDirectSpecularMode == SharedData::EyeDirectSpecularModeVanillaPhong) {
 			// Phong lobe plus both gates, and the gate uses plain SpecularColor.xyz with no
 			// converted-cubemap F0 mixed in. That is exactly what bedec8379 compiled to for an

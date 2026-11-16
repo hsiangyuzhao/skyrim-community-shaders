@@ -818,6 +818,7 @@ namespace RayTracingRT
 			context.pointPending = false;
 		stats_.pointRaysPerFrame = -1;
 		stats_.pointWaterRaysPerFrame = -1;  // (47j)
+		stats_.pointTracedPixelsPerFrame = stats_.pointExtraPixelsPerFrame = stats_.pointExtraWideWantPerFrame = -1;  // (48c)
 		stats_.lastPointGpuMs = -1.0f;
 		if (stagingHeap_ && device_) {
 			// Back to null views (staging: the blocks of submissions in flight keep what they were recorded with).
@@ -2169,6 +2170,10 @@ namespace RayTracingRT
 				// (46g) Top-K churn and the window beams' sampled pixels (traced / blocked), per frame.
 				stats_.pointChurnPerFrame = static_cast<std::int64_t>(static_cast<std::uint32_t>(words[1] - pointCounterWords_[1]) / frames);
 				stats_.pointWaterRaysPerFrame = static_cast<std::int64_t>(static_cast<std::uint32_t>(words[2] - pointCounterWords_[2]) / frames);  // (47j)
+				// (48c) Extra Lights Where Crowded (words 3 - 5 move only on frames that ran it: the caller knows whether it did).
+				stats_.pointTracedPixelsPerFrame = static_cast<std::int64_t>(static_cast<std::uint32_t>(words[3] - pointCounterWords_[3]) / frames);
+				stats_.pointExtraPixelsPerFrame = static_cast<std::int64_t>(static_cast<std::uint32_t>(words[4] - pointCounterWords_[4]) / frames);
+				stats_.pointExtraWideWantPerFrame = static_cast<std::int64_t>(static_cast<std::uint32_t>(words[5] - pointCounterWords_[5]) / frames);
 				for (std::uint32_t slot = 0; slot < kPointBeamSlots; ++slot) {
 					const std::uint32_t w = kPointBeamBase + slot * 2;
 					stats_.beamTraced[slot] = static_cast<std::uint32_t>(words[w] - pointCounterWords_[w]) / frames;

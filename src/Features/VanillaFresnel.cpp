@@ -115,12 +115,15 @@ void VanillaFresnel::PinEyeDirectSpecular()
 void VanillaFresnel::RestoreDefaultSettings()
 {
 	settings = {};
+	EnvMaskApplyOnce = true;  // (48c)
 	PinEyeDirectSpecular();
 }
 
 void VanillaFresnel::LoadSettings(json& o_json)
 {
     settings = o_json;
+    // (48c) Its own key (not a Settings member: the struct is the cbuffer layout).
+    EnvMaskApplyOnce = o_json.contains("EnvMaskApplyOnce") && o_json["EnvMaskApplyOnce"].is_boolean() ? o_json["EnvMaskApplyOnce"].get<bool>() : true;
 
     // (batch 9) Reconcile the one combination that cannot be right: the auto cubemap
     // conversion feeding a GGX-shaped F0/roughness into a pixel where GGX is switched off,
@@ -151,6 +154,7 @@ void VanillaFresnel::LoadSettings(json& o_json)
 void VanillaFresnel::SaveSettings(json& o_json)
 {
     o_json = settings;
+    o_json["EnvMaskApplyOnce"] = EnvMaskApplyOnce;  // (48c)
 }
 
 void VanillaFresnel::DrawSettings()
@@ -247,4 +251,13 @@ void VanillaFresnel::DrawSettings()
         ImGui::Text(
             "How much a material's own reflection mask (where it may reflect) is obeyed. 0 = ignore masks, 1 = obey fully.\n"
             "Vanilla masks are dark, so high values cut metal armour and weapon reflections a lot.");
+
+    // (48c)
+    ImGui::Checkbox("Env Mask: Apply Once", &EnvMaskApplyOnce);
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text(
+            "On (default): a material's reflection mask is applied once, as intended. Before, materials with their own mask had it\n"
+            "applied twice with Auto Cubemaps Conversion on, so at Environment Mask Strength 1 their reflections were several times\n"
+            "too weak (about 1/4 to 1/6 for typical masks). Changes the picture: masked armour, weapons and jewellery reflect more.\n"
+            "At strength 0 nothing changes. Off: as 48b.");
 }

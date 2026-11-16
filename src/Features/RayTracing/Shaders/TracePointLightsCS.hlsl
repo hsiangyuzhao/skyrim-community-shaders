@@ -11,7 +11,8 @@
 // Inputs: t0 TLAS, t1 DepthMask (|value| = depth after the prepass, see PrepareCS), t2 this frame's sun trace, t3 the sources.
 // Sun gate: at a sunlit pixel a point light under Extra.z of the sun's light there is not traced (its shadow would not
 // show): in daylight only the surroundings of strong fixtures are traced.
-// Outputs (R8G8B8A8_UNORM, shared with D3D11), per slot s = 0..3 (slots past K are empty):
+// Outputs (R8G8B8A8_UNORM, shared with D3D11), per slot s = 0..3 (slots past K are empty; (48c) unless Extra Lights Where Crowded
+// traced a rank there, kFlagExtra):
 //   PLVis[s]: 1 = lit; < 1 = blocked, the value is sqrt(blocker distance / light distance) * 254/255
 //             (the denoiser's penumbra width);
 //   PLIdx[s]: byte = source slot + 1 (0 = empty slot), bit 7 of byte s = bit s of the pixel's candidate
@@ -120,6 +121,14 @@ static const uint kFlagWidePrev = 32768u;
 // (depth normal) counts as blocked at once (it enters the surface it starts on: beam rays cull front faces, the character ray skips its
 // first 6 units, so thin parts and back faces came out lit).
 static const uint kFlagBeamSmooth = 65536u;
+// (48c) Extra Lights Where Crowded (K < 6): the top 6 are ranked; ranks K..5 are traced as well, into slots K..5 (4 - 5 in PLWide, only with
+// kFlagWide), but only where that light holds at least kExtraShare of the pixel's point light (the share cut's total), or half of it where
+// the pixel traced the light last frame (no flipping at the threshold). Off: exactly 48b (the ranking stops at K).
+static const uint kFlagExtra = 131072u;
+static const float kExtraShare = 0.07;
+static const uint kTracedPixelWord = 3u;     // (48c) RayCounter words (kFlagExtra only): [3] pixels with a traced light,
+static const uint kExtraPixelWord = 4u;      //   [4] of which with at least one extra rank traced,
+static const uint kExtraWideWantWord = 5u;   //   [5] pixels where an extra rank 4 - 5 passed its cut (traced, or not for want of PLWide)
 static const uint kReprojectRecord = 64u;  // Backend kPointReprojectRecord
 static const uint kSunOutProbed = 64u, kSunOutRtSurfaceRaw = 128u;  // TraceShadowsCS kOutProbed / kOutRtSurfaceRaw
 static const float kStickyBonus = 1.5;
@@ -493,6 +502,9 @@ groupshared uint gsMask[2];
 	const uint scan = min(uint(C.Params.x), 64u);
 	const bool wide = (flags & kFlagWide) != 0u;  // (48a) K 5 - 6: slots 4 - 5 in PLWide
 	const uint K = clamp(uint(C.Params.w), 1u, wide ? 6u : 4u);
+	// (48c) Extra Lights Where Crowded: the ranking keeps 6 entries (ranks K..5 are the extra candidates); off: K, as 48b.
+	const bool extra = (flags & kFlagExtra) != 0u && K < 6u;
+	const uint KR = extra ? 6u : K;
 	const bool inside = all(float2(p) < C.RenderSize.xy);
 	const float depth = inside ? abs(DepthMask[p]) : 0.0;
 	bool valid = inside && depth < 0.999999 && depth > 0.0;
@@ -649,7 +661,7 @@ groupshared uint gsMask[2];
 			uint vi = i + 1u;
 			[unroll] for (uint k = 0u; k < 4u; ++k)
 			{
-				if (k < K && v > best[k]) {
+				if (k < KR && v > best[k]) {  // (48c) KR: K, or 6 with Extra Lights Where Crowded
 					const float tv = best[k];
 					const float tc = bestC[k];
 					const uint ti = bestIdx[k];
@@ -661,11 +673,11 @@ groupshared uint gsMask[2];
 					vi = ti;
 				}
 			}
-			[branch] if (wide)  // (48a) entries 4 - 5
+			[branch] if (wide || extra)  // (48a) entries 4 - 5; (48c) ranked for the extra slots too (traced only with PLWide)
 			{
 				[unroll] for (uint k2 = 4u; k2 < 6u; ++k2)
 				{
-					if (k2 < K && v > best[k2]) {
+					if (k2 < KR && v > best[k2]) {
 						const float tv = best[k2];
 						const float tc = bestC[k2];
 						const uint ti = bestIdx[k2];
@@ -701,10 +713,26 @@ groupshared uint gsMask[2];
 	// (48a) Six slots (4 - 5 only with K > 4: otherwise bestIdx is 0 there and the slot is skipped at once).
 	float visA[6] = { 1.0, 1.0, 1.0, 1.0, 1.0, 1.0 };
 	uint idxA[6] = { 0u, 0u, 0u, 0u, 0u, 0u };
+	bool extraUsed = false;      // (48c) an extra rank traced here
+	bool extraWideWant = false;  // (48c) an extra rank 4 - 5 passed its cut (traced with PLWide, else left out)
 	[unroll] for (uint k = 0u; k < 6u; ++k)
 	{
 		if (bestIdx[k] == 0u || bestC[k] < ((sticky && (any(prevIdx == bestIdx[k]) || any(prevIdx2 == bestIdx[k]))) ? stickyThreshold : threshold))
 			continue;
+		// (48c) Extra Lights Where Crowded: a rank past K only with kExtraShare of the pixel's point light (half where it was traced here last
+		// frame); its slot is its rank, slots 4 - 5 only with PLWide. (Without kFlagExtra bestIdx is 0 past K: never reached.)
+		[branch] if (k >= K)
+		{
+			const bool wasHere = any(prevIdx == bestIdx[k]) || any(prevIdx2 == bestIdx[k]);
+			if (bestC[k] < total * (wasHere ? kExtraShare * 0.5 : kExtraShare))
+				continue;
+			if (k >= 4u) {
+				extraWideWant = true;
+				if (!wide)
+					continue;
+			}
+			extraUsed = true;
+		}
 		const PLSource src = Sources[bestIdx[k] - 1u];
 		const bool isBeam = (src.Info.x & kSourceBeam) != 0u;
 		// (46x) A direct fill aimed at its window spot: its rays go to the spot like the beam's (it is the beam's floor patch).
@@ -789,6 +817,24 @@ groupshared uint gsMask[2];
 			RayCounter.InterlockedAdd(word * 4u, 1u, previousBeam);
 			if (blocked)
 				RayCounter.InterlockedAdd((word + 1u) * 4u, 1u, previousBeam);
+		}
+	}
+	// (48c) Extra Lights Where Crowded: per wave, the pixels with a traced light / with an extra rank traced / wanting PLWide for one (F7
+	// rt_pl_extra_pct; Ray Tracing keeps the slot 4 - 5 textures while the last one is non-zero). kFlagExtra is uniform: no work without it.
+	[branch] if (extra)
+	{
+		const bool tracedAny = idxA[0] != 0u || idxA[1] != 0u || idxA[2] != 0u || idxA[3] != 0u || idxA[4] != 0u || idxA[5] != 0u;
+		const uint tracedCount = WaveActiveCountBits(tracedAny);
+		const uint extraCount = WaveActiveCountBits(extraUsed);
+		const uint wantCount = WaveActiveCountBits(extraWideWant);
+		if (WaveIsFirstLane()) {
+			uint previousExtra;
+			if (tracedCount > 0u)
+				RayCounter.InterlockedAdd(kTracedPixelWord * 4u, tracedCount, previousExtra);
+			if (extraCount > 0u)
+				RayCounter.InterlockedAdd(kExtraPixelWord * 4u, extraCount, previousExtra);
+			if (wantCount > 0u)
+				RayCounter.InterlockedAdd(kExtraWideWantWord * 4u, wantCount, previousExtra);
 		}
 	}
 	uint4 idx = uint4(idxA[0], idxA[1], idxA[2], idxA[3]);

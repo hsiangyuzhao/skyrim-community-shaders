@@ -63,7 +63,7 @@ std::pair<unsigned char*, size_t> GetFeatureBufferData(bool a_inWorld)
 		globals::features::postProcessing.settings,
 		globals::features::skin.GetCommonBufferData(),
 		globals::features::screenSpacePointLightShadows.GetCommonBufferData(),
-		globals::features::vanillaFresnel.settings,
+		globals::features::vanillaFresnel.GetCommonBufferData(),  // (48c) Env Mask: Apply Once rides in EyeDirectSpecularMode bit 8
 		globals::features::physicalSky.cbData,
 		globals::features::screenSpaceRayTracing.GetCommonBufferData(),
 		globals::features::exponentialHeightFog.GetCommonBufferData(),

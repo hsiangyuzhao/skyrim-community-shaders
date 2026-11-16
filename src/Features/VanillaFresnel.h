@@ -229,6 +229,22 @@ struct VanillaFresnel : public Feature
         float EyeBackLightCut = 0.4f;
 	} settings;
 
+	// (48c) "Env Mask: Apply Once": a material with its own environment mask (EnvmapData.y) had the mask applied twice on the dynamic-cubemap
+	// path with Vanilla Fresnel on (batch 10: in the F0 / roughness lerp toward the cubemap's F0 and again on the reflection), so the cubemap
+	// part scaled with mask^2 at Environment Mask Strength 1. On: the lerps take lerp(mask, 1, strength) and the final multiply stays, so
+	// strength 0 is exactly the old result and strength 1 applies the mask once to the whole reflection. Off: 48b exactly.
+	// Outside Settings (its size is load-bearing): the cbuffer copy carries it as bit 8 of EyeDirectSpecularMode (pinned to 0, read only by
+	// Lighting.hlsl, which masks the mode with 0xFF), see GetCommonBufferData.
+	bool EnvMaskApplyOnce = true;
+	static constexpr uint kEnvMaskApplyOnceBit = 0x100u;  // Lighting.hlsl kVFEnvMaskApplyOnce
+	[[nodiscard]] Settings GetCommonBufferData() const
+	{
+		Settings data = settings;
+		if (EnvMaskApplyOnce)
+			data.EyeDirectSpecularMode |= kEnvMaskApplyOnceBit;
+		return data;
+	}
+
 	// (batch 10b) FeatureData is a naked concatenation of every feature's settings struct
 	// (src/FeatureBuffer.cpp), so this struct's *size* is load-bearing: get it wrong and every
 	// feature struct after this one in the cbuffer silently misaligns instead of failing to

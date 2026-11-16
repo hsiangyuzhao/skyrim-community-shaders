@@ -322,6 +322,16 @@ public:
 		// pattern stepped along R2 per frame (not the denoiser's sliding IGN), a beam ray into its own surface counting as blocked.
 		// Off = 47z exactly.
 		bool PointBeamSmooth = true;
+		// (48c) Outside the settings macro. Each on by default, off = 48b exactly.
+		// PointStickyJitterFix "Stable Light Choice: Jitter Fix" (Point Light Shadows > Advanced, under Stable Light Choice When the Camera
+		// Moves): the reprojection takes the upscaler's jitter of both frames out (last frame's jittered view-projection, shifted by this
+		// frame's jitter minus last frame's), so a still camera reads last frame's lights at the same pixel (48b: up to 1 px off, about 40 %
+		// of the frames a neighbour's lights: the light choice between two similar lights crawled).
+		bool PointStickyJitterFix = true;
+		// PointExtraSlots "Extra Lights Where Crowded" (Point Light Shadows > Advanced, under the lights-per-pixel controls): with fewer than
+		// 6 lights per pixel the trace still ranks the top 6 and traces ranks K..5 where that light holds at least 7 % of the pixel's point
+		// light (3.5 % where it was traced there last frame), into slots K..5 (4 - 5: the 48a slot textures, kept while such pixels exist).
+		bool PointExtraSlots = true;
 		// (48a) Outside the settings macro. RT reflections step 1 (Ray Tracing > Reflections (experimental)): ReflectionsMode 0 Off (47z
 		// exactly: no terrain, no textures, no dispatch), 1 Trace Only (reflection rays in the RTAO batch, no shading, debug views and F7
 		// only; needs RTAO). ReflectionsTerrain "Terrain in RT Scene (reflections only)": with the rays on, the landscape of the captured
@@ -871,6 +881,10 @@ private:
 	bool pointWideHistoryValid = false;  // pointWide[read] holds last frame's denoised slots 4 - 5
 	std::uint32_t pointWideIdleFrames = 0;
 	std::uint64_t pointWideD3D11Bytes = 0;
+	// (48c) Extra Lights Where Crowded in effect this frame (switch on, K < 6); the slot 4 - 5 denoiser variant failed to compile (from then on
+	// this session traces 4 slots: no K 5 - 6, no extra ranks 4 - 5; 48b kept tagging kTagWide after such a fallback).
+	bool pointExtraThisFrame = false;
+	bool pointWideDenoiseFailed = false;
 	bool EnsurePointWide(std::uint32_t a_width, std::uint32_t a_height);
 	void ReleasePointWide();
 	std::unique_ptr<ConstantBuffer> pointDenoiseCB;
@@ -936,6 +950,7 @@ private:
 	void ReleaseForwardShadowMap();
 	// (47z) Stable Light Choice When the Camera Moves: the camera of the last point trace (its jittered view-projection, position).
 	float pointPrevViewProj[16]{};
+	float pointPrevJitter[2]{};  // (48c) Jitter Fix: that trace's jitter (NDC), from its jittered and unjittered view-projections
 	double pointPrevCamera[3]{};
 	bool pointPrevValid = false;
 	std::unique_ptr<ConstantBuffer> waterPrepCB;
