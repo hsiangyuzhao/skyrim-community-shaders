@@ -153,6 +153,26 @@ namespace
 		{ 3, 8192.0f, 0, true, true, true, "3 detail rays, up to about 117 m, every pixel, the broad AO filtered at full resolution. Cleanest." },
 	};
 	constexpr const char* kBroadRateNames[3] = { "Every pixel", "Half (checkerboard)", "One in four (rotating)" };
+	// (48i) RT reflection quality presets (ReflectionsQuality 0 - 3; 4 = Custom). Order of the values: terrain, full roughness range, rough
+	// fade start, end, beyond SSR distance, rough rays leaves solid, capture materials, characters, off-screen hit color (0 Cubemap Approx,
+	// 1 Material), sun shadow ray, lamps, glow, prefer brighter cubemap. High = the 48h defaults (RayTracing::ReflectionPresetValues{}).
+	constexpr const char* kReflectionQualityNames[5] = { "Low", "Medium", "High", "Ultra", "Custom" };
+	constexpr RayTracing::ReflectionPresetValues kReflectionPresets[4] = {
+		{ true, false, 0.15f, 0.35f, false, true, false, false, 0, false, false, false, false },
+		{ true, false, 0.25f, 0.50f, false, true, true, false, 1, false, true, true, true },
+		{ true, false, 0.30f, 0.65f, false, true, true, true, 1, true, true, true, true },
+		{ true, false, 0.40f, 0.80f, true, true, true, true, 1, true, true, true, true },
+	};
+	// One line per row of the preset tooltip (printed with "%s").
+	constexpr const char* kReflectionPresetTooltips[4][2] = {
+		{ "Low: only mirror-like surfaces trace (roughness fade 0.15-0.35: polished floors, calm water, metal); off-screen hits use",
+			"  the cubemap guess (no material capture, no texture copies, no shading pass). Cheapest (estimate: a third to half of High's cost)." },
+		{ "Medium: roughness fade 0.25-0.50; off-screen hits shaded with their own texture, lamps and glow, but no reflected characters",
+			"  and no sun shadow ray (reflected shadows are lit). Estimate: 60-75 % of High's cost." },
+		{ "High (the 48h defaults): roughness fade 0.30-0.65; everything on, including reflected characters and the sun shadow ray.", "" },
+		{ "Ultra: High plus a wider roughness fade (0.40-0.80: satin and worn surfaces too) and rays past the SSR distance limit.",
+			"  Estimate: 1.4-2x High's cost, most in the rain." },
+	};
 
 	constexpr float kCaptureBudgetMs = 1.0f;      // CPU per frame for capturing new cells (45j: 1.5 -> 1.0, resumable per shape)
 	constexpr std::uint32_t kBuildBudget = 131072;  // triangles of BLAS builds per frame (about one chunk)
@@ -1602,6 +1622,51 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.ReflectionsCharacterMaterials = read("ReflectionsCharacterMaterials", defaults.ReflectionsCharacterMaterials);
 		settings.ReflectionsShadeGlow = read("ReflectionsShadeGlow", defaults.ReflectionsShadeGlow);  // (48h)
 		settings.ReflectionsPreferBrightCubemap = read("ReflectionsPreferBrightCubemap", defaults.ReflectionsPreferBrightCubemap);
+		// (48i) The reflection Quality preset. Loading never changes a value: a saved preset whose values no longer match, or no key
+		// (saved before 48i), shows the preset the values match, else Custom.
+		{
+			const ReflectionPresetValues live = CurrentReflectionValues();
+			ReflectionPresetValues custom = live;
+			if (const auto it = o_json.find("ReflectionsCustom"); it != o_json.end() && it->is_object()) {
+				const json& c = *it;
+				const auto field = [&c](const char* a_key, auto a_default) {
+					const auto f = c.find(a_key);
+					if (f == c.end())
+						return a_default;
+					try {
+						return f->template get<decltype(a_default)>();
+					} catch (const std::exception&) {
+						return a_default;
+					}
+				};
+				custom.terrain = field("Terrain", live.terrain);
+				custom.fullRange = field("FullRange", live.fullRange);
+				custom.roughStart = std::clamp(field("RoughStart", live.roughStart), 0.0f, 0.95f);
+				custom.roughEnd = std::clamp(field("RoughEnd", live.roughEnd), 0.05f, 1.0f);
+				custom.beyondSSR = field("BeyondSSR", live.beyondSSR);
+				custom.roughSolid = field("RoughSolid", live.roughSolid);
+				custom.materials = field("Materials", live.materials);
+				custom.characters = field("CharacterMaterials", live.characters);
+				custom.offscreenColor = std::clamp(field("OffscreenColor", live.offscreenColor), 0, 1);
+				custom.sunRay = field("SunRay", live.sunRay);
+				custom.lamps = field("ShadeLights", live.lamps);
+				custom.glow = field("ShadeGlow", live.glow);
+				custom.preferBright = field("PreferBrightCubemap", live.preferBright);
+			}
+			const int saved = read("ReflectionsQuality", -1);
+			const int matched = MatchReflectionPreset();
+			if (saved == kReflectionCustom)
+				settings.ReflectionsQuality = kReflectionCustom;
+			else if (saved >= 0 && saved < kReflectionCustom)
+				settings.ReflectionsQuality = matched == saved ? saved : kReflectionCustom;
+			else
+				settings.ReflectionsQuality = matched;
+			// In Custom the Custom values are the live ones.
+			settings.ReflectionsCustom = settings.ReflectionsQuality == kReflectionCustom ? live : custom;
+			if (saved != settings.ReflectionsQuality)
+				logger::info("[RayTracing] RT reflections quality (48i): {} ({}; values unchanged)", kReflectionQualityNames[settings.ReflectionsQuality],
+					saved < 0 ? "no saved preset: the one the saved values match" : "the saved preset's values did not match the saved values");
+		}
 		const float sunSize = read("SunSize", -1.0f);
 		if (sunSize >= 0.0f) {
 			settings.SunSize = sunSize;
@@ -1758,6 +1823,14 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["ReflectionsCharacterMaterials"] = settings.ReflectionsCharacterMaterials;
 	o_json["ReflectionsShadeGlow"] = settings.ReflectionsShadeGlow;  // (48h)
 	o_json["ReflectionsPreferBrightCubemap"] = settings.ReflectionsPreferBrightCubemap;
+	o_json["ReflectionsQuality"] = settings.ReflectionsQuality;  // (48i)
+	{
+		const ReflectionPresetValues c = settings.ReflectionsQuality == kReflectionCustom ? CurrentReflectionValues() : settings.ReflectionsCustom;
+		o_json["ReflectionsCustom"] = { { "Terrain", c.terrain }, { "FullRange", c.fullRange }, { "RoughStart", c.roughStart }, { "RoughEnd", c.roughEnd },
+			{ "BeyondSSR", c.beyondSSR }, { "RoughSolid", c.roughSolid }, { "Materials", c.materials }, { "CharacterMaterials", c.characters },
+			{ "OffscreenColor", c.offscreenColor }, { "SunRay", c.sunRay }, { "ShadeLights", c.lamps }, { "ShadeGlow", c.glow },
+			{ "PreferBrightCubemap", c.preferBright } };
+	}
 	o_json["AOSmoothNormals"] = settings.AOSmoothNormals;  // (47j)
 	o_json["AOTemporalV2"] = settings.AOTemporalV2;  // (47l)
 	o_json["FoliageSway"] = settings.FoliageSway;  // (47l)
@@ -7217,7 +7290,7 @@ namespace
 void RayTracing::DrawSettings()
 {
 	// (46r) The "Ray Tracing" entry: the master switch and status, a one-line summary, Advanced (loading screens) and the
-	// diagnostics (both collapsed). Sun Shadows, Point Light Shadows and Ambient Occlusion have their own entries in the
+	// diagnostics (both collapsed). Sun Shadows, Point Light Shadows, Ambient Occlusion and (48i) Reflections have their own entries in the
 	// Ray Tracing category (each shows the switch and the status on top).
 	ImGui::PushID("rtMainPage");  // tree-node open states of its own (other pages also have Advanced / Diagnostics)
 	DrawMasterHeader();
@@ -7236,161 +7309,161 @@ void RayTracing::DrawSettings()
 		ImGui::Text("  showing one frame of raw rays (point lights: at least 2.5 px with a fixed pattern; sun: a small mean of the");
 		ImGui::Text("  neighbours on the same surface). Where the neighbourhood agrees (crisp contact shadows) nothing changes. Off: as 47x.");
 	}
-	// (48a) RT reflections. (48d) Gap Fill: visible in the picture (the SSRT specular ray march uses the ray where SSR finds nothing).
-	ImGui::SeparatorText("Reflections (experimental)");
+	DrawObjectRows();  // (47n) one per-kind choice for the sun, the point lights and RTAO
+	DrawDiagnostics();
+	ImGui::PopID();
+}
+
+namespace
+{
+	/// (48i) Two sets of preset values equal (a_tolerance: for the saved roughness floats).
+	bool SameReflectionValues(const RayTracing::ReflectionPresetValues& a, const RayTracing::ReflectionPresetValues& b, float a_tolerance)
 	{
-		const char* kModes[3] = { "Off", "Trace Only", "Gap Fill" };
-		settings.ReflectionsMode = std::clamp(settings.ReflectionsMode, 0, 2);
-		ImGui::Combo("RT Reflections", &settings.ReflectionsMode, kModes, 3);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Ray-traced reflections, step 2. Gap Fill changes the picture; Trace Only only measures the cost.");
-			ImGui::Text("  Gap Fill: where screen-space reflections (SSR) find nothing and the old path shows the cubemap (eaves, indoors, the screen");
-			ImGui::Text("  edge, wet ground), a reflection ray says what is really there: the sky (cubemap with sky), a point on screen (its colour),");
-			ImGui::Text("  or a point off screen (the dynamic cubemap where its stored position matches, else the cubemap without sky).");
-			ImGui::Text("  Needs Screen Space Ray Tracing specular on with its Dynamic Cubemaps fallback; otherwise nothing is traced.");
-			ImGui::Text("  Trace Only: the same rays, results only in the debug views and F7. RT Ambient Occlusion is no longer needed.");
-			ImGui::Text("Off (default): exactly as 48c (no terrain in the scene, no textures, no rays).");
+		return a.terrain == b.terrain && a.fullRange == b.fullRange && std::abs(a.roughStart - b.roughStart) <= a_tolerance &&
+		       std::abs(a.roughEnd - b.roughEnd) <= a_tolerance && a.beyondSSR == b.beyondSSR && a.roughSolid == b.roughSolid &&
+		       a.materials == b.materials && a.characters == b.characters && a.offscreenColor == b.offscreenColor && a.sunRay == b.sunRay &&
+		       a.lamps == b.lamps && a.glow == b.glow && a.preferBright == b.preferBright;
+	}
+}
+
+RayTracing::ReflectionPresetValues RayTracing::CurrentReflectionValues() const
+{
+	ReflectionPresetValues v;
+	v.terrain = settings.ReflectionsTerrain;
+	v.fullRange = settings.ReflectionsFullRange;
+	v.roughStart = settings.ReflectionsRoughStart;
+	v.roughEnd = settings.ReflectionsRoughEnd;
+	v.beyondSSR = settings.ReflectionsBeyondSSR;
+	v.roughSolid = settings.ReflectionsRoughSolid;
+	v.materials = settings.ReflectionsMaterials;
+	v.characters = settings.ReflectionsCharacterMaterials;
+	v.offscreenColor = settings.ReflectionsOffscreenColor;
+	v.sunRay = settings.ReflectionsSunRay;
+	v.lamps = settings.ReflectionsShadeLights;
+	v.glow = settings.ReflectionsShadeGlow;
+	v.preferBright = settings.ReflectionsPreferBrightCubemap;
+	return v;
+}
+
+void RayTracing::ApplyReflectionValues(const ReflectionPresetValues& a_values)
+{
+	settings.ReflectionsTerrain = a_values.terrain;
+	settings.ReflectionsFullRange = a_values.fullRange;
+	settings.ReflectionsRoughStart = std::clamp(a_values.roughStart, 0.0f, 0.95f);
+	settings.ReflectionsRoughEnd = std::clamp(a_values.roughEnd, 0.05f, 1.0f);
+	settings.ReflectionsBeyondSSR = a_values.beyondSSR;
+	settings.ReflectionsRoughSolid = a_values.roughSolid;
+	settings.ReflectionsMaterials = a_values.materials;
+	settings.ReflectionsCharacterMaterials = a_values.characters;
+	settings.ReflectionsOffscreenColor = std::clamp(a_values.offscreenColor, 0, 1);
+	settings.ReflectionsSunRay = a_values.sunRay;
+	settings.ReflectionsShadeLights = a_values.lamps;
+	settings.ReflectionsShadeGlow = a_values.glow;
+	settings.ReflectionsPreferBrightCubemap = a_values.preferBright;
+}
+
+int RayTracing::MatchReflectionPreset() const
+{
+	const ReflectionPresetValues live = CurrentReflectionValues();
+	for (int t = 0; t < kReflectionCustom; ++t)
+		if (SameReflectionValues(live, kReflectionPresets[t], 0.005f))
+			return t;
+	return kReflectionCustom;
+}
+
+void RayTracing::DrawReflectionsPage()
+{
+	// (48i) Was the "Reflections (experimental)" section of the main page (48a-48h). Same values, same behaviour; the top holds the switch,
+	// the Quality preset and the brightness calibration, Advanced what the presets set, Diagnostics the fixes kept for A/B, the debug view
+	// and the detailed status.
+	ImGui::PushID("rtReflectPage");
+	DrawMasterHeader();
+	settings.ReflectionsMode = std::clamp(settings.ReflectionsMode, 0, 2);
+	settings.ReflectionsQuality = std::clamp(settings.ReflectionsQuality, 0, kReflectionCustom);
+	settings.ReflectionsOffscreenColor = std::clamp(settings.ReflectionsOffscreenColor, 0, 1);
+	settings.ReflectionsRoughStart = std::clamp(settings.ReflectionsRoughStart, 0.0f, 0.95f);
+	settings.ReflectionsRoughEnd = std::clamp(settings.ReflectionsRoughEnd, 0.05f, 1.0f);
+	settings.ReflectionsOffscreenBrightness = std::clamp(settings.ReflectionsOffscreenBrightness, 0.25f, 4.0f);
+	if (ImGui::TreeNodeEx("Reflections", ImGuiTreeNodeFlags_DefaultOpen)) {
+		// Off / On (Gap Fill). Trace Only (the same rays, nothing in the picture) is under Diagnostics.
+		{
+			const char* preview = settings.ReflectionsMode == 0 ? "Off" : (settings.ReflectionsMode == 2 ? "On (Gap Fill)" : "Trace Only (see Diagnostics)");
+			if (ImGui::BeginCombo("RT Reflections", preview)) {
+				if (ImGui::Selectable("Off", settings.ReflectionsMode == 0))
+					settings.ReflectionsMode = 0;
+				if (ImGui::Selectable("On (Gap Fill)", settings.ReflectionsMode == 2))
+					settings.ReflectionsMode = 2;
+				ImGui::EndCombo();
+			}
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Ray-traced reflections fill the gaps of screen-space reflections (SSR).");
+				ImGui::Text("  On (Gap Fill): where SSR finds nothing and the old path shows the cubemap (eaves, indoors, the screen edge, wet ground),");
+				ImGui::Text("  a reflection ray says what is really there: the sky (cubemap with sky), a point on screen (its colour), or a point off");
+				ImGui::Text("  screen (its own shaded colour, or the dynamic cubemap where its stored position matches).");
+				ImGui::Text("  Needs Screen Space Ray Tracing specular on with its Dynamic Cubemaps fallback; otherwise nothing is traced.");
+				ImGui::Text("Off (default): exactly as 48c (no terrain in the scene, no textures, no rays).");
+				ImGui::Text("Trace Only (the same rays, results only in the debug views and F7) is under Diagnostics.");
+			}
 		}
 		ImGui::BeginDisabled(settings.ReflectionsMode == 0);
-		ImGui::Checkbox("Terrain in RT Scene (reflections only)", &settings.ReflectionsTerrain);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): the ground of the loaded cells goes into the ray-traced scene for the reflection rays only (a separate");
-			ImGui::Text("  layer no shadow or ambient-occlusion ray sees: sun shadows, lamp shadows and RTAO stay exactly the same).");
-			ImGui::Text("  Takes effect only while RT Reflections is not Off. It also shows in the BLAS Coverage debug view.");
-		}
-		// (48d) Which pixels trace a ray.
-		ImGui::Checkbox("Full Roughness Range", &settings.ReflectionsFullRange);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Off (default): rough surfaces trace fewer rays, fading smoothly between the two roughness values below (a pixel in the");
-			ImGui::Text("  fade traces on some frames and keeps the cubemap on the others; the denoiser blends the two). Reflections never stop at");
-			ImGui::Text("  a hard roughness edge. On: every reflecting surface traces, whatever its roughness (more cost; for comparing).");
-		}
-		ImGui::BeginDisabled(settings.ReflectionsFullRange);
-		ImGui::SliderFloat("Rough Fade Start", &settings.ReflectionsRoughStart, 0.0f, 0.9f, "%.2f");
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("Roughness where the share of traced pixels starts to fall (default 0.30). Below it every reflecting pixel traces.");
-		ImGui::SliderFloat("Rough Fade End", &settings.ReflectionsRoughEnd, 0.1f, 1.0f, "%.2f");
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("Roughness where no pixel traces any more (default 0.65; always at least 0.05 above the start).");
-		ImGui::EndDisabled();
-		settings.ReflectionsRoughStart = std::clamp(settings.ReflectionsRoughStart, 0.0f, 0.95f);
-		settings.ReflectionsRoughEnd = std::clamp(settings.ReflectionsRoughEnd, 0.05f, 1.0f);
-		ImGui::Checkbox("Also Beyond SSR Distance", &settings.ReflectionsBeyondSSR);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Off (default): pixels beyond Screen Space Ray Tracing's distance limit trace nothing (the picture never uses them there).");
-			ImGui::Text("  On: they trace too, and while Gap Fill runs the specular chain lifts its distance limit for the gap fill (SSR itself");
-			ImGui::Text("  still stops at the limit; the denoiser then also works past it). More cost.");
-		}
-		ImGui::Checkbox("Rough Rays: Leaves Solid", &settings.ReflectionsRoughSolid);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): rays from rough surfaces (roughness above about 0.35, fading in smoothly) treat leaves and other cut-outs");
-			ImGui::Text("  as solid instead of testing up to 16 of them, and look less far (down to 30 %% of the range at roughness 0.9). A rough");
-			ImGui::Text("  ray that finds nothing in its shorter range keeps the old cubemap. Off: as 48c (every ray tests its cut-outs, full range).");
-		}
-		ImGui::Checkbox("Material From Best Candidate", &settings.ReflectionsBestCandidate);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): roughness and reflectance come from whichever of last frame's two matches (camera / motion) fits better, so a");
-			ImGui::Text("  moving character uses its own material. Off: as 48c (the camera match first: it read the background behind a walker).");
-		}
-		// (48d) Gap Fill only.
-		ImGui::BeginDisabled(settings.ReflectionsMode != 2);
-		ImGui::Checkbox("Gap Fill: Direction Check", &settings.ReflectionsLobeCheck);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): a ray is used only where its direction fits this frame's surface direction and roughness (it was aimed with");
-			ImGui::Text("  last frame's); where it does not (a character turned, a new edge) it fades smoothly to the old path. Off: always used.");
-		}
-		ImGui::Checkbox("Gap Fill: Cubemap Position Check", &settings.ReflectionsCubemapMatch);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): a hit off screen takes the dynamic cubemap's colour where the cubemap stored that same point; elsewhere the");
-			ImGui::Text("  cubemap without sky. Off: always the cubemap without sky.");
-		}
-		ImGui::Checkbox("Gap Fill: Real Hit Distance", &settings.ReflectionsHitDistance);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): the reflection denoiser gets the ray's real hit distance where the ray filled the gap (instead of 'far'),");
-			ImGui::Text("  which keeps near reflections steadier when moving. Off: as before.");
-		}
-		ImGui::Checkbox("Gap Fill: Cubemap Warm-Up Fix", &settings.ReflectionsCubemapWarmUp);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): right after a loading screen the dynamic cubemap starts empty and fills in over many frames; the position");
-			ImGui::Text("  check and the off-screen colours undo that fill-in, so matched reflections appear at full strength from the first");
-			ImGui::Text("  capture of that direction. Once the cubemap has settled it changes nothing. Off: as 48d (they fade in over ~0.5 s).");
-		}
-		ImGui::EndDisabled();
-		ImGui::Checkbox("Reflections: Prepare Behind Loading Screens", &settings.ReflectionsLoadingPrep);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): the ground (terrain) for the reflection rays is built while the loading screen is up, and the switch to");
-			ImGui::Text("  RT after it waits for it like for everything else. Off: as 48d (at most 4 cells of ground per frame, after the switch).");
-		}
-		// (48f) The data half of the material step.
-		ImGui::Checkbox("Reflections: Capture Materials", &settings.ReflectionsMaterials);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): what the reflection rays need to colour what they hit. Every captured surface keeps its texture coordinates and");
-			ImGui::Text("  direction (16 bytes per triangle), every distinct texture gets a small 128x128 copy (a few per frame while playing, many in");
-			ImGui::Text("  the black screen after a loading screen), and the rays note the texture and spot they hit. Check it with Reflection Debug");
-			ImGui::Text("  View > RT Albedo. Changing it captures the scene again. (48g) Used by 'Off-screen Hit Color: Material' below.");
-			ImGui::Text("Off: nothing of it (as 48e); off-screen hits keep the cubemap colour.");
-		}
-		// (48g) The shading half.
-		ImGui::BeginDisabled(!settings.ReflectionsMaterials);
-		ImGui::Checkbox("Capture Materials: Characters", &settings.ReflectionsCharacterMaterials);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): characters also keep their texture coordinates and their own texture (faces per person), so reflected people");
-			ImGui::Text("  get their real colours (RT Albedo no longer shows them purple). Changing it captures the characters again (a moment of");
-			ImGui::Text("  shadow-map shadows on them). Off: as 48f (purple in RT Albedo, the cubemap colour in the picture).");
+		{
+			int pick = settings.ReflectionsQuality;
+			if (ImGui::Combo("Quality##Reflections", &pick, kReflectionQualityNames, IM_ARRAYSIZE(kReflectionQualityNames))) {
+				pick = std::clamp(pick, 0, kReflectionCustom);
+				if (pick != settings.ReflectionsQuality) {
+					if (settings.ReflectionsQuality == kReflectionCustom)
+						settings.ReflectionsCustom = CurrentReflectionValues();  // kept for when Custom is picked again
+					settings.ReflectionsQuality = pick;
+					ApplyReflectionValues(pick == kReflectionCustom ? settings.ReflectionsCustom : kReflectionPresets[pick]);
+				}
+			}
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Reflections pay off on smooth surfaces (polished floors, calm water, metal, wet stone); the cost grows with how many");
+				ImGui::Text("  rougher surfaces also trace, with the material shading, reflected characters and the sun shadow ray.");
+				for (const auto& lines : kReflectionPresetTooltips)
+					for (const char* line : lines)
+						if (line[0] != '\0')
+							ImGui::Text("%s", line);
+				ImGui::Text("Custom: the values under Advanced (kept when you pick a preset; picking Custom brings them back).");
+				ImGui::Text("Changing a value under Advanced switches to Custom. A preset never changes RT Reflections (Off / On), Off-screen Hit");
+				ImGui::Text("  Brightness or anything under Diagnostics. Picking one that changes Capture Materials or Characters captures the scene again.");
+			}
 		}
 		ImGui::EndDisabled();
 		ImGui::BeginDisabled(settings.ReflectionsMode != 2 || !settings.ReflectionsMaterials);
-		{
-			const char* kOffscreen[2] = { "Cubemap Approx", "Material" };
-			settings.ReflectionsOffscreenColor = std::clamp(settings.ReflectionsOffscreenColor, 0, 1);
-			ImGui::Combo("Off-screen Hit Color", &settings.ReflectionsOffscreenColor, kOffscreen, 2);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Gap Fill + Capture Materials. What a reflection ray that hits something OFF screen shows (hits on screen always take the");
-				ImGui::Text("  screen's own colour):");
-				ImGui::Text("  Material (default): the hit's own texture, lit by the sun (with a shadow ray), the sky light, the lamps and its own glow.");
-				ImGui::Text("    Where its data is missing (texture copy still pending, no material, captured before) it fades to the cubemap guess;");
-				ImGui::Text("    new copies fade in over about half a second, so nothing pops.");
-				ImGui::Text("  Cubemap Approx: as 48f (the dynamic cubemap where its stored point matches, else the cubemap without sky).");
-				ImGui::Text("  Switching fades over about 0.4 s.");
-			}
-			ImGui::SliderFloat("Off-screen Hit Brightness", &settings.ReflectionsOffscreenBrightness, 0.25f, 4.0f, "%.2f");
-			settings.ReflectionsOffscreenBrightness = std::clamp(settings.ReflectionsOffscreenBrightness, 0.25f, 4.0f);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Default 1.00. Scales the Material colour of off-screen hits, to match it by eye to what the screen shows (the shading is");
-				ImGui::Text("  simplified: no fog, no shine of the hit surface). Reflection Debug View > RT Shading vs Screen and the status line below show");
-				ImGui::Text("  how much brighter (> 1) or darker (< 1) it measures where a hit is also on screen.");
-			}
-			ImGui::Checkbox("Material Hits: Sun Shadow Ray", &settings.ReflectionsSunRay);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On (default): each hit that faces the sun sends one more ray to the sun (leaves count as solid), so reflected shadows are");
-				ImGui::Text("  dark. A small extra cost on the ray-tracing GPU queue. Off: every hit facing the sun is lit (no shadows in the reflection).");
-			}
-			ImGui::Checkbox("Material Hits: Lamps", &settings.ReflectionsShadeLights);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On (default): lamps, torches and fires (Light Limit Fix's lights) light the hits too (no lamp shadows). Off: only the sun");
-				ImGui::Text("  and the sky light (cheaper in towns at night).");
-			}
-			// (48h)
-			ImGui::Checkbox("Material Hits: Glow", &settings.ReflectionsShadeGlow);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On (default): what glows in the game glows in the reflection too, worked out like the game does it: glowing windows");
-				ImGui::Text("  (their glow texture is copied as well, and their colour follows the time of day like the real window), lamps, embers.");
-				ImGui::Text("  The glow is tinted by the surface's own texture (stained glass stays coloured), so lit lamps are no longer too bright.");
-				ImGui::Text("  A glowing window waits until its glow copy is ready (the cubemap until then, then a fade-in).");
-				ImGui::Text("Off: as 48g (only the own glow colour of lamp-like shapes, added untinted; windows show as dark glass off screen).");
-				ImGui::Text("  The glow data is captured either way, so switching is instant.");
-			}
-			ImGui::BeginDisabled(settings.ReflectionsOffscreenColor != 1);
-			ImGui::Checkbox("Off-screen: Prefer Brighter Cubemap", &settings.ReflectionsPreferBrightCubemap);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Material only. On (default): where the dynamic cubemap stored the very point a ray hit off screen (Gap Fill: Cubemap");
-				ImGui::Text("  Position Check) and saw it much brighter than the Material colour (from 2x, fully at 4x), the reflection leans on the");
-				ImGui::Text("  cubemap's colour instead - for fires, glows and effects the ray-traced scene cannot show. Smooth, no hard edge.");
-				ImGui::Text("  (RT Reflection Use still shows them pale yellow.) Off: as 48g.");
-			}
-			ImGui::EndDisabled();
+		ImGui::SliderFloat("Off-screen Hit Brightness", &settings.ReflectionsOffscreenBrightness, 0.25f, 4.0f, "%.2f");
+		settings.ReflectionsOffscreenBrightness = std::clamp(settings.ReflectionsOffscreenBrightness, 0.25f, 4.0f);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("Default 1.00. Scales the Material colour of off-screen hits, to match it by eye to what the screen shows (the shading is");
+			ImGui::Text("  simplified: no fog, no shine of the hit surface). Reflection Debug View > RT Shading vs Screen (Diagnostics) and the line");
+			ImGui::Text("  below show how much brighter (> 1) or darker (< 1) it measures where a hit is also on screen. Not part of the presets.");
+			ImGui::Text("  Needs Off-screen Hit Color: Material (Advanced).");
 		}
 		ImGui::EndDisabled();
+		// (48h) The stable brightness ratio and the slider value it suggests (only while the off-screen shading runs).
+		if (settings.ReflectionsMode == 2) {
+			const bool shading = settings.ReflectionsMaterials && MaterialsWanted() && ShadeWanted() && !reflectShadeFailed && reflectShadeCS;
+			if (!shading) {
+				ImGui::TextDisabled("Brightness shading / screen: - (only while Off-screen Hit Color: Material is shading)");
+			} else {
+				if (shadeRatioSmoothed > 0.0f) {
+					const float suggested = std::clamp(1.0f / shadeRatioSmoothed, 0.25f, 4.0f);
+					ImGui::Text("Brightness shading / screen (2 s average): %.2f (%.0f px per frame) -> set Off-screen Hit Brightness to about %.2f",
+						shadeRatioSmoothed, shadeSmoothPixels, suggested);
+				} else {
+					ImGui::TextDisabled("Brightness shading / screen: - (no hit that is also on screen yet)");
+				}
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("Where a ray's hit is also visible on screen, how bright the shading is against the screen there (1.00 = equal), as a");
+					ImGui::Text("  typical value (geometric mean of the per-pixel ratios, each limited to 16x either way) averaged over about 2 seconds,");
+					ImGui::Text("  so single bright spots no longer make it jump. Measured before Off-screen Hit Brightness: the suggested slider");
+					ImGui::Text("  value is 1 / this ratio (look around a little and wait 2-3 s for it to settle).");
+					ImGui::Text("  This frame: %s; 48g's old formula (ratio of the means, outlier-prone): %s (%u groups).",
+						shadeRatio > 0.0f ? std::format("{:.2f} over {} px", shadeRatio, shadeRatioPixels).c_str() : "-",
+						shadeRatioArith >= 0.0f ? std::format("{:.2f}", shadeRatioArith).c_str() : "-", shadeRatioGroups);
+				}
+			}
+		}
 		// (48e) Background compiles of the reflection shaders (no first-use freeze).
 		if (settings.ReflectionsMode != 0) {
 			auto& ssrtFeature = globals::features::screenSpaceRayTracing;
@@ -7398,131 +7471,283 @@ void RayTracing::DrawSettings()
 			const bool fillCompiling = settings.ReflectionsMode == 2 && ssrtFeature.raymarchSpecularRTAsync.GetStatus() == Util::AsyncComputeShader::Status::Compiling;
 			if (prepCompiling || fillCompiling)
 				ImGui::TextDisabled("Preparing the reflection shaders in the background (the picture uses the old path until they are ready)...");
-		}
-		{
-			const char* kViews[7] = { "Off", "Hit Type", "Hit Distance", "Normal Confidence", "RT Reflection Use", "RT Albedo", "RT Shading vs Screen" };
-			int view = static_cast<int>(reflectDebugView);
-			if (ImGui::Combo("Reflection Debug View", &view, kViews, 7))
-				reflectDebugView = static_cast<ReflectDebugView>(std::clamp(view, 0, static_cast<int>(ReflectDebugView::Count) - 1));
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Not saved. Hit Type: green building / static, orange object, cyan leaves / cut-out, purple character, brown terrain,");
-				ImGui::Text("  blue = the ray left the scene (sky, far away), grey = nothing within a rough ray's shorter range. Hit Distance: white");
-				ImGui::Text("  near .. dark far. Normal Confidence: how sure the reprojected last-frame surface direction is (green sure .. red fell");
-				ImGui::Text("  back to the depth). Transparent = not traced.");
-				ImGui::Text("RT Reflection Use (Gap Fill): what the picture used where SSR found nothing: green = a point on screen, cyan = the cubemap");
-				ImGui::Text("  at a matching position, orange = the cubemap without sky (position did not match), blue = sky; brighter = more weight.");
-				ImGui::Text("  Transparent = not used (SSR found it, not traced, or the direction check faded it out).");
-				ImGui::Text("RT Albedo (Capture Materials): the texture colour of what each traced ray hit (ground: its layers' average colours). Magenta =");
-				ImGui::Text("  captured without material data, red-orange = no readable texture, yellow / black checks = its copy is still pending,");
-				ImGui::Text("  purple = a character without material data, dim blue / grey = nothing hit. Dark magenta everywhere = no material data this frame.");
-				ImGui::Text("RT Reflection Use also shows pale yellow = the hit's own Material colour (Off-screen Hit Color: Material).");
-				ImGui::Text("RT Shading vs Screen (Gap Fill + Capture Materials): where a ray's hit is also visible on screen, the shaded colour against");
-				ImGui::Text("  the screen's: green = within about 20 %%, red = shading brighter, blue = shading darker (stronger = up to 4x). Elsewhere the");
-				ImGui::Text("  shaded colour itself (hits off screen). The mean ratio is on the status line below (Off-screen Hit Brightness).");
-			}
-		}
-		ImGui::EndDisabled();
-		if (settings.ReflectionsMode != 0) {
-			const auto& rs = backend.GetStats();
-			const auto& sc = scene.GetStats();
 			if (settings.ReflectionsMode == 2 && !GapFillConsumer())
 				ImGui::TextColored({ 1.0f, 0.85f, 0.3f, 1.0f }, "Gap Fill needs Screen Space Ray Tracing specular with its Dynamic Cubemaps fallback: nothing is traced.");
-			const double pixels = std::max(1.0, static_cast<double>(reflectInput.constants.renderSize[0]) * reflectInput.constants.renderSize[1]);
-			ImGui::Text("Rays: %.2f ms (wall), %.0f %% of pixels traced; gap fill %s; terrain: %u of %u cells built, %s", std::max(rs.lastReflectGpuMs, 0.0f),
-				rs.reflectPixelsPerFrame > 0 ? 100.0 * static_cast<double>(rs.reflectPixelsPerFrame) / pixels : 0.0, reflectGapFillUsedLastFrame ? "used" : "not used",
-				sc.terrainBuilt, sc.terrainCells, Megabytes(sc.terrainBytes + backend.ReflectBytes()).c_str());
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Time between the reflection rays' two GPU timestamps (wall time: other work runs in between; the real cost is the");
-				ImGui::Text("  frame's GPU time with and without), the share of the render pixels traced, whether the SSR pass used them last frame,");
-				ImGui::Text("  the terrain BLASes (built / made) and the video memory of terrain and the reflection textures. Terrain quadrants: %u from",
-					sc.terrainQuadsCpu);
-				ImGui::Text("  the game's vertex copy, %u rebuilt from its heights, %u failed.", sc.terrainQuadsHeights, sc.terrainQuadsFailed);
-			}
-			// (48f) Capture Materials.
-			if (settings.ReflectionsMaterials) {
-				const auto& ms = backend.GetMaterialStats();
-				if (!MaterialsWanted())
-					ImGui::TextDisabled("Capture Materials: not available (the GPU driver did not accept the material shader, or reflections are switched off)");
-				else {
-					ImGui::Text("Materials: %u, textures %u copied / %u waiting (%u copies last frame), %u page(s) %s, attributes %s of %s, record %s", ms.materials,
-						ms.texturesReady, ms.texturesPending, ms.copiesLastFrame, ms.pages, Megabytes(ms.textureBytes).c_str(), Megabytes(ms.attrBytesUsed).c_str(),
-						Megabytes(ms.attrBytes).c_str(), backend.ReflectMaterialLastFrame() ? "written" : "not written");
-					if (auto _tt = Util::HoverTooltipWrapper()) {
-						ImGui::Text("Registered materials (one per shape / ground quadrant, shared where texture and transform match), the 128x128 texture copies");
-						ImGui::Text("  made and still waiting (the backlog after entering a new area), the copy pages (256 textures each; (48g) made on the");
-						ImGui::Text("  render thread, last one in %.2f ms), the per-triangle data in use of its buffer, and whether last frame's rays wrote", ms.pageCreateMs);
-						ImGui::Text("  the surface record. Pages made while playing (not at the switch-on / after a load): %u.", ms.pagesMadeInPlay);
-						ImGui::Text("  Render-thread CPU of the copies last frame: %.2f ms. Surface record: %s. Material table: %s. Refused textures: %llu.",
-							ms.copyCpuMs, Megabytes(backend.ReflectSurfaceBytes()).c_str(), Megabytes(ms.tableBytes).c_str(),
-							static_cast<unsigned long long>(ms.texturesRefused));
-					}
-					if (ms.attrFull > 0 || ms.texturesFull > 0) {
-						ImGui::TextColored({ 1.0f, 0.85f, 0.3f, 1.0f }, "Material buffers full: %llu shapes without data since switched on, %u textures without a copy layer",
-							static_cast<unsigned long long>(ms.attrFull), ms.texturesFull);
-						if (auto _tt = Util::HoverTooltipWrapper()) {
-							ImGui::Text("(48g) Of the refused shapes, %llu found free memory only in pieces (no single range large enough). The last refused",
-								static_cast<unsigned long long>(ms.attrRefusedFragmented));
-							ImGui::Text("  range was %s with the largest free range %s. The buffer grows (64 -> 96 -> 128 MB) behind the next loading screen,",
-								Megabytes(ms.attrLastRefusedBytes).c_str(), Megabytes(ms.attrLargestFreeBytes).c_str());
-							ImGui::Text("  never while playing; those shapes get their data when their cell is captured again. Growths so far: %u.", ms.attrGrowths);
-						}
-					}
-					// (48g) The shading half.
-					if (settings.ReflectionsMode == 2) {
-						if (!ShadeWanted()) {
-							ImGui::TextDisabled("Off-screen shading: off (Off-screen Hit Color: Cubemap Approx)");
-						} else if (reflectShadeFailed) {
-							ImGui::TextColored({ 1.0f, 0.4f, 0.3f, 1.0f }, "Off-screen shading: unavailable (its shader did not compile or its textures could not be made)");
-						} else if (!reflectShadeCS) {
-							ImGui::TextDisabled("Off-screen shading: preparing its shader in the background...");
-						} else {
-							const float gpu = Util::GpuPassTimers::GetSingleton()->LastSampleMs(Util::GpuBucket::RayTracingReflectShade);
-							const std::string gpuText = gpu >= 0.0f && shadeLastFrame ? std::format("{:.2f} ms", gpu) : std::string("- ms");
-							const std::string shareText = shadeMaterialShare >= 0.0f ? std::format("{:.0f} %", shadeMaterialShare * 100.0f) : std::string("-");
-							ImGui::Text("Off-screen shading: %s GPU, %s of the hits with material data (rest: cubemap)", gpuText.c_str(), shareText.c_str());
-							if (auto _tt = Util::HoverTooltipWrapper()) {
-								ImGui::Text("GPU time of the hit shading pass (shown while the Performance Overlay or an F7 recording runs) and the share of the traced");
-								ImGui::Text("  hits that had material data (texture copied, attributes captured) and so used their own colour.");
-							}
-							// (48h) The stable brightness ratio and the slider value it suggests.
-							if (shadeRatioSmoothed > 0.0f) {
-								const float suggested = std::clamp(1.0f / shadeRatioSmoothed, 0.25f, 4.0f);
-								ImGui::Text("Brightness shading / screen (2 s average): %.2f (%.0f px per frame) -> set Off-screen Hit Brightness to about %.2f",
-									shadeRatioSmoothed, shadeSmoothPixels, suggested);
-							} else {
-								ImGui::TextDisabled("Brightness shading / screen: - (no hit that is also on screen yet)");
-							}
-							if (auto _tt = Util::HoverTooltipWrapper()) {
-								ImGui::Text("Where a ray's hit is also visible on screen, how bright the shading is against the screen there (1.00 = equal), as a");
-								ImGui::Text("  typical value (geometric mean of the per-pixel ratios, each limited to 16x either way) averaged over about 2 seconds,");
-								ImGui::Text("  so single bright spots no longer make it jump. Measured before Off-screen Hit Brightness: the suggested slider");
-								ImGui::Text("  value is 1 / this ratio (look around a little and wait 2-3 s for it to settle).");
-								ImGui::Text("  This frame: %s; 48g's old formula (ratio of the means, outlier-prone): %s (%u groups).",
-									shadeRatio > 0.0f ? std::format("{:.2f} over {} px", shadeRatio, shadeRatioPixels).c_str() : "-",
-									shadeRatioArith >= 0.0f ? std::format("{:.2f}", shadeRatioArith).c_str() : "-", shadeRatioGroups);
-							}
-							// (48h) Emission capture.
-							ImGui::Text("Glow: %u emitting materials (%u follow a time-of-day source), %u with a glow texture (%u ready); %u glow textures, %u copy layers used",
-								ms.emitMaterials, ms.emitSourced, ms.glowMaterials, ms.glowMaterialsReady, ms.glowTextures, ms.glowTexturesReady);
-							if (auto _tt = Util::HoverTooltipWrapper()) {
-								ImGui::Text("Material Hits: Glow's data (captured whether the switch is on or off): materials with a glow colour (own glow, External");
-								ImGui::Text("  Emittance - windows whose colour follows a light / region as the time of day changes it - or a glow texture), the");
-								ImGui::Text("  glow-texture ones and how many have their copy, the distinct glow textures and their 128x128 copies (layers in the");
-								ImGui::Text("  same pages as the other textures). Colour refreshes that changed something so far: %llu. Switch: %s.",
-									static_cast<unsigned long long>(ms.emitRefreshes), settings.ReflectionsShadeGlow ? "on" : "off");
-							}
-						}
-					}
-				}
-			}
 			if (!reflectOffReason.empty())
 				RtErrorLine("RT reflections were switched off automatically", reflectOffReason);
 			else if (backend.IsReady() && !backend.ReflectAvailable())
 				RtErrorLine("RT reflections unavailable", backend.ReflectFault().empty() ? std::string("the GPU driver did not accept their shader") : backend.ReflectFault());
 		}
+
+		// Advanced (collapsed): what the presets set. Any change switches the Quality to Custom.
+		if (ImGui::TreeNodeEx("Advanced")) {
+			const ReflectionPresetValues before = CurrentReflectionValues();
+			ImGui::BeginDisabled(settings.ReflectionsMode == 0);
+			ImGui::Checkbox("Terrain in RT Scene (reflections only)", &settings.ReflectionsTerrain);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (all presets): the ground of the loaded cells goes into the ray-traced scene for the reflection rays only (a separate");
+				ImGui::Text("  layer no shadow or ambient-occlusion ray sees: sun shadows, lamp shadows and RTAO stay exactly the same).");
+				ImGui::Text("  Takes effect only while RT Reflections is not Off. It also shows in the BLAS Coverage debug view.");
+				ImGui::Text("  Off: reflection rays pass through hills (on water they may show sky where a hill should be); saves its video memory.");
+			}
+			// (48d) Which pixels trace a ray.
+			ImGui::Checkbox("Full Roughness Range", &settings.ReflectionsFullRange);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Off (all presets): rough surfaces trace fewer rays, fading smoothly between the two roughness values below (a pixel in the");
+				ImGui::Text("  fade traces on some frames and keeps the cubemap on the others; the denoiser blends the two). Reflections never stop at");
+				ImGui::Text("  a hard roughness edge. On: every reflecting surface traces, whatever its roughness (much more cost; for comparing).");
+			}
+			ImGui::BeginDisabled(settings.ReflectionsFullRange);
+			ImGui::SliderFloat("Rough Fade Start", &settings.ReflectionsRoughStart, 0.0f, 0.9f, "%.2f");
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Roughness where the share of traced pixels starts to fall. Below it every reflecting pixel traces.");
+				ImGui::Text("  Low 0.15, Medium 0.25, High 0.30 (the 48h default), Ultra 0.40.");
+			}
+			ImGui::SliderFloat("Rough Fade End", &settings.ReflectionsRoughEnd, 0.1f, 1.0f, "%.2f");
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Roughness where no pixel traces any more (always at least 0.05 above the start).");
+				ImGui::Text("  Low 0.35, Medium 0.50, High 0.65 (the 48h default), Ultra 0.80. The biggest cost lever: a wider fade traces more pixels.");
+			}
+			ImGui::EndDisabled();
+			settings.ReflectionsRoughStart = std::clamp(settings.ReflectionsRoughStart, 0.0f, 0.95f);
+			settings.ReflectionsRoughEnd = std::clamp(settings.ReflectionsRoughEnd, 0.05f, 1.0f);
+			ImGui::Checkbox("Also Beyond SSR Distance", &settings.ReflectionsBeyondSSR);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Off (Low - High): pixels beyond Screen Space Ray Tracing's distance limit trace nothing (the picture never uses them there).");
+				ImGui::Text("  On (Ultra): they trace too, and while Gap Fill runs the specular chain lifts its distance limit for the gap fill (SSR");
+				ImGui::Text("  itself still stops at the limit; the denoiser then also works past it). More cost.");
+			}
+			ImGui::Checkbox("Rough Rays: Leaves Solid", &settings.ReflectionsRoughSolid);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (all presets): rays from rough surfaces (roughness above about 0.35, fading in smoothly) treat leaves and other cut-outs");
+				ImGui::Text("  as solid instead of testing up to 16 of them, and look less far (down to 30 %% of the range at roughness 0.9). A rough");
+				ImGui::Text("  ray that finds nothing in its shorter range keeps the old cubemap. Off: as 48c (every ray tests its cut-outs, full range).");
+			}
+			// (48f) The data half of the material step.
+			ImGui::Checkbox("Reflections: Capture Materials", &settings.ReflectionsMaterials);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (Medium - Ultra): what the reflection rays need to colour what they hit. Every captured surface keeps its texture");
+				ImGui::Text("  coordinates and direction (16 bytes per triangle), every distinct texture gets a small 128x128 copy (a few per frame while");
+				ImGui::Text("  playing, many in the black screen after a loading screen), and the rays note the texture and spot they hit. Check it with");
+				ImGui::Text("  Reflection Debug View > RT Albedo. Changing it captures the scene again. Used by 'Off-screen Hit Color: Material' below.");
+				ImGui::Text("Off (Low): nothing of it (as 48e); off-screen hits keep the cubemap colour.");
+			}
+			// (48g) The shading half.
+			ImGui::BeginDisabled(!settings.ReflectionsMaterials);
+			ImGui::Checkbox("Capture Materials: Characters", &settings.ReflectionsCharacterMaterials);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (High, Ultra): characters also keep their texture coordinates and their own texture (faces per person), so reflected");
+				ImGui::Text("  people get their real colours (RT Albedo no longer shows them purple). Changing it captures the characters again (a moment");
+				ImGui::Text("  of shadow-map shadows on them). Off (Low, Medium): as 48f (purple in RT Albedo, the cubemap colour in the picture).");
+			}
+			ImGui::EndDisabled();
+			ImGui::BeginDisabled(settings.ReflectionsMode != 2 || !settings.ReflectionsMaterials);
+			{
+				const char* kOffscreen[2] = { "Cubemap Approx", "Material" };
+				ImGui::Combo("Off-screen Hit Color", &settings.ReflectionsOffscreenColor, kOffscreen, 2);
+				settings.ReflectionsOffscreenColor = std::clamp(settings.ReflectionsOffscreenColor, 0, 1);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("Gap Fill + Capture Materials. What a reflection ray that hits something OFF screen shows (hits on screen always take the");
+					ImGui::Text("  screen's own colour):");
+					ImGui::Text("  Material (Medium - Ultra): the hit's own texture, lit by the sun (with a shadow ray), the sky light, the lamps and its own");
+					ImGui::Text("    glow. Where its data is missing (texture copy still pending, no material, captured before) it fades to the cubemap guess;");
+					ImGui::Text("    new copies fade in over about half a second, so nothing pops.");
+					ImGui::Text("  Cubemap Approx (Low): as 48f (the dynamic cubemap where its stored point matches, else the cubemap without sky).");
+					ImGui::Text("  Switching fades over about 0.4 s.");
+				}
+				ImGui::Checkbox("Material Hits: Sun Shadow Ray", &settings.ReflectionsSunRay);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("On (High, Ultra): each hit that faces the sun sends one more ray to the sun (leaves count as solid), so reflected shadows");
+					ImGui::Text("  are dark. A small extra cost on the ray-tracing GPU queue. Off (Low, Medium): every hit facing the sun is lit (no shadows");
+					ImGui::Text("  in the reflection).");
+				}
+				ImGui::Checkbox("Material Hits: Lamps", &settings.ReflectionsShadeLights);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("On (Medium - Ultra): lamps, torches and fires (Light Limit Fix's lights) light the hits too (no lamp shadows). Off: only");
+					ImGui::Text("  the sun and the sky light (cheaper in towns at night).");
+				}
+				// (48h)
+				ImGui::Checkbox("Material Hits: Glow", &settings.ReflectionsShadeGlow);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("On (Medium - Ultra): what glows in the game glows in the reflection too, worked out like the game does it: glowing windows");
+					ImGui::Text("  (their glow texture is copied as well, and their colour follows the time of day like the real window), lamps, embers.");
+					ImGui::Text("  The glow is tinted by the surface's own texture (stained glass stays coloured), so lit lamps are no longer too bright.");
+					ImGui::Text("  A glowing window waits until its glow copy is ready (the cubemap until then, then a fade-in).");
+					ImGui::Text("Off: as 48g (only the own glow colour of lamp-like shapes, added untinted; windows show as dark glass off screen).");
+					ImGui::Text("  The glow data is captured either way, so switching is instant.");
+				}
+				ImGui::BeginDisabled(settings.ReflectionsOffscreenColor != 1);
+				ImGui::Checkbox("Off-screen: Prefer Brighter Cubemap", &settings.ReflectionsPreferBrightCubemap);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("Material only. On (Medium - Ultra): where the dynamic cubemap stored the very point a ray hit off screen (Gap Fill:");
+					ImGui::Text("  Cubemap Position Check, Diagnostics) and saw it much brighter than the Material colour (from 2x, fully at 4x), the");
+					ImGui::Text("  reflection leans on the cubemap's colour instead - for fires, glows and effects the ray-traced scene cannot show.");
+					ImGui::Text("  Smooth, no hard edge. (RT Reflection Use still shows them pale yellow.) Off: as 48g.");
+				}
+				ImGui::EndDisabled();
+			}
+			ImGui::EndDisabled();
+			ImGui::EndDisabled();
+			// An edit: Custom, with the values as they are now.
+			if (!SameReflectionValues(before, CurrentReflectionValues(), 0.0f))
+				settings.ReflectionsQuality = kReflectionCustom;
+			ImGui::TreePop();
+		}
+
+		// Diagnostics (collapsed): the fixes kept as switches for A/B (always on by default, not touched by the presets), Trace Only,
+		// the debug view and the detailed status.
+		if (ImGui::TreeNodeEx("Diagnostics")) {
+			ImGui::BeginDisabled(settings.ReflectionsMode == 0);
+			{
+				bool traceOnly = settings.ReflectionsMode == 1;
+				if (ImGui::Checkbox("Trace Only (measure the cost, picture unchanged)", &traceOnly))
+					settings.ReflectionsMode = traceOnly ? 1 : 2;
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("On: the same reflection rays are traced, but their results go only to the debug views and F7; the picture is as with");
+					ImGui::Text("  RT Reflections Off (for measuring the cost of the rays alone). Off (default): RT Reflections On (Gap Fill).");
+				}
+			}
+			ImGui::Checkbox("Material From Best Candidate", &settings.ReflectionsBestCandidate);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): roughness and reflectance come from whichever of last frame's two matches (camera / motion) fits better, so a");
+				ImGui::Text("  moving character uses its own material. Off: as 48c (the camera match first: it read the background behind a walker).");
+			}
+			// (48d) Gap Fill only.
+			ImGui::BeginDisabled(settings.ReflectionsMode != 2);
+			ImGui::Checkbox("Gap Fill: Direction Check", &settings.ReflectionsLobeCheck);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): a ray is used only where its direction fits this frame's surface direction and roughness (it was aimed with");
+				ImGui::Text("  last frame's); where it does not (a character turned, a new edge) it fades smoothly to the old path. Off: always used.");
+			}
+			ImGui::Checkbox("Gap Fill: Cubemap Position Check", &settings.ReflectionsCubemapMatch);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): a hit off screen takes the dynamic cubemap's colour where the cubemap stored that same point; elsewhere the");
+				ImGui::Text("  cubemap without sky. Off: always the cubemap without sky (and Prefer Brighter Cubemap has nothing to compare with).");
+			}
+			ImGui::Checkbox("Gap Fill: Real Hit Distance", &settings.ReflectionsHitDistance);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): the reflection denoiser gets the ray's real hit distance where the ray filled the gap (instead of 'far'),");
+				ImGui::Text("  which keeps near reflections steadier when moving. Off: as before.");
+			}
+			ImGui::Checkbox("Gap Fill: Cubemap Warm-Up Fix", &settings.ReflectionsCubemapWarmUp);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): right after a loading screen the dynamic cubemap starts empty and fills in over many frames; the position");
+				ImGui::Text("  check and the off-screen colours undo that fill-in, so matched reflections appear at full strength from the first");
+				ImGui::Text("  capture of that direction. Once the cubemap has settled it changes nothing. Off: as 48d (they fade in over ~0.5 s).");
+			}
+			ImGui::EndDisabled();
+			ImGui::Checkbox("Reflections: Prepare Behind Loading Screens", &settings.ReflectionsLoadingPrep);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): the ground (terrain) for the reflection rays is built while the loading screen is up, and the switch to");
+				ImGui::Text("  RT after it waits for it like for everything else. Off: as 48d (at most 4 cells of ground per frame, after the switch).");
+			}
+			{
+				const char* kViews[7] = { "Off", "Hit Type", "Hit Distance", "Normal Confidence", "RT Reflection Use", "RT Albedo", "RT Shading vs Screen" };
+				int view = static_cast<int>(reflectDebugView);
+				if (ImGui::Combo("Reflection Debug View", &view, kViews, 7))
+					reflectDebugView = static_cast<ReflectDebugView>(std::clamp(view, 0, static_cast<int>(ReflectDebugView::Count) - 1));
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("Not saved. Hit Type: green building / static, orange object, cyan leaves / cut-out, purple character, brown terrain,");
+					ImGui::Text("  blue = the ray left the scene (sky, far away), grey = nothing within a rough ray's shorter range. Hit Distance: white");
+					ImGui::Text("  near .. dark far. Normal Confidence: how sure the reprojected last-frame surface direction is (green sure .. red fell");
+					ImGui::Text("  back to the depth). Transparent = not traced.");
+					ImGui::Text("RT Reflection Use (Gap Fill): what the picture used where SSR found nothing: green = a point on screen, cyan = the cubemap");
+					ImGui::Text("  at a matching position, orange = the cubemap without sky (position did not match), blue = sky; brighter = more weight.");
+					ImGui::Text("  Transparent = not used (SSR found it, not traced, or the direction check faded it out).");
+					ImGui::Text("RT Albedo (Capture Materials): the texture colour of what each traced ray hit (ground: its layers' average colours). Magenta =");
+					ImGui::Text("  captured without material data, red-orange = no readable texture, yellow / black checks = its copy is still pending,");
+					ImGui::Text("  purple = a character without material data, dim blue / grey = nothing hit. Dark magenta everywhere = no material data this frame.");
+					ImGui::Text("RT Reflection Use also shows pale yellow = the hit's own Material colour (Off-screen Hit Color: Material).");
+					ImGui::Text("RT Shading vs Screen (Gap Fill + Capture Materials): where a ray's hit is also visible on screen, the shaded colour against");
+					ImGui::Text("  the screen's: green = within about 20 %%, red = shading brighter, blue = shading darker (stronger = up to 4x). Elsewhere the");
+					ImGui::Text("  shaded colour itself (hits off screen). The mean ratio is on the page's top, under Off-screen Hit Brightness.");
+				}
+			}
+			ImGui::EndDisabled();
+			if (settings.ReflectionsMode != 0) {
+				const auto& rs = backend.GetStats();
+				const auto& sc = scene.GetStats();
+				const double pixels = std::max(1.0, static_cast<double>(reflectInput.constants.renderSize[0]) * reflectInput.constants.renderSize[1]);
+				ImGui::Text("Rays: %.2f ms (wall), %.0f %% of pixels traced; gap fill %s; terrain: %u of %u cells built, %s", std::max(rs.lastReflectGpuMs, 0.0f),
+					rs.reflectPixelsPerFrame > 0 ? 100.0 * static_cast<double>(rs.reflectPixelsPerFrame) / pixels : 0.0, reflectGapFillUsedLastFrame ? "used" : "not used",
+					sc.terrainBuilt, sc.terrainCells, Megabytes(sc.terrainBytes + backend.ReflectBytes()).c_str());
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("Time between the reflection rays' two GPU timestamps (wall time: other work runs in between; the real cost is the");
+					ImGui::Text("  frame's GPU time with and without), the share of the render pixels traced, whether the SSR pass used them last frame,");
+					ImGui::Text("  the terrain BLASes (built / made) and the video memory of terrain and the reflection textures. Terrain quadrants: %u from",
+						sc.terrainQuadsCpu);
+					ImGui::Text("  the game's vertex copy, %u rebuilt from its heights, %u failed.", sc.terrainQuadsHeights, sc.terrainQuadsFailed);
+				}
+				// (48f) Capture Materials.
+				if (settings.ReflectionsMaterials) {
+					const auto& ms = backend.GetMaterialStats();
+					if (!MaterialsWanted())
+						ImGui::TextDisabled("Capture Materials: not available (the GPU driver did not accept the material shader, or reflections are switched off)");
+					else {
+						ImGui::Text("Materials: %u, textures %u copied / %u waiting (%u copies last frame), %u page(s) %s, attributes %s of %s, record %s", ms.materials,
+							ms.texturesReady, ms.texturesPending, ms.copiesLastFrame, ms.pages, Megabytes(ms.textureBytes).c_str(), Megabytes(ms.attrBytesUsed).c_str(),
+							Megabytes(ms.attrBytes).c_str(), backend.ReflectMaterialLastFrame() ? "written" : "not written");
+						if (auto _tt = Util::HoverTooltipWrapper()) {
+							ImGui::Text("Registered materials (one per shape / ground quadrant, shared where texture and transform match), the 128x128 texture copies");
+							ImGui::Text("  made and still waiting (the backlog after entering a new area), the copy pages (256 textures each; (48g) made on the");
+							ImGui::Text("  render thread, last one in %.2f ms), the per-triangle data in use of its buffer, and whether last frame's rays wrote", ms.pageCreateMs);
+							ImGui::Text("  the surface record. Pages made while playing (not at the switch-on / after a load): %u.", ms.pagesMadeInPlay);
+							ImGui::Text("  Render-thread CPU of the copies last frame: %.2f ms. Surface record: %s. Material table: %s. Refused textures: %llu.",
+								ms.copyCpuMs, Megabytes(backend.ReflectSurfaceBytes()).c_str(), Megabytes(ms.tableBytes).c_str(),
+								static_cast<unsigned long long>(ms.texturesRefused));
+						}
+						if (ms.attrFull > 0 || ms.texturesFull > 0) {
+							ImGui::TextColored({ 1.0f, 0.85f, 0.3f, 1.0f }, "Material buffers full: %llu shapes without data since switched on, %u textures without a copy layer",
+								static_cast<unsigned long long>(ms.attrFull), ms.texturesFull);
+							if (auto _tt = Util::HoverTooltipWrapper()) {
+								ImGui::Text("(48g) Of the refused shapes, %llu found free memory only in pieces (no single range large enough). The last refused",
+									static_cast<unsigned long long>(ms.attrRefusedFragmented));
+								ImGui::Text("  range was %s with the largest free range %s. The buffer grows (64 -> 96 -> 128 MB) behind the next loading screen,",
+									Megabytes(ms.attrLastRefusedBytes).c_str(), Megabytes(ms.attrLargestFreeBytes).c_str());
+								ImGui::Text("  never while playing; those shapes get their data when their cell is captured again. Growths so far: %u.", ms.attrGrowths);
+							}
+						}
+						// (48g) The shading half.
+						if (settings.ReflectionsMode == 2) {
+							if (!ShadeWanted()) {
+								ImGui::TextDisabled("Off-screen shading: off (Off-screen Hit Color: Cubemap Approx)");
+							} else if (reflectShadeFailed) {
+								ImGui::TextColored({ 1.0f, 0.4f, 0.3f, 1.0f }, "Off-screen shading: unavailable (its shader did not compile or its textures could not be made)");
+							} else if (!reflectShadeCS) {
+								ImGui::TextDisabled("Off-screen shading: preparing its shader in the background...");
+							} else {
+								const float gpu = Util::GpuPassTimers::GetSingleton()->LastSampleMs(Util::GpuBucket::RayTracingReflectShade);
+								const std::string gpuText = gpu >= 0.0f && shadeLastFrame ? std::format("{:.2f} ms", gpu) : std::string("- ms");
+								const std::string shareText = shadeMaterialShare >= 0.0f ? std::format("{:.0f} %", shadeMaterialShare * 100.0f) : std::string("-");
+								ImGui::Text("Off-screen shading: %s GPU, %s of the hits with material data (rest: cubemap)", gpuText.c_str(), shareText.c_str());
+								if (auto _tt = Util::HoverTooltipWrapper()) {
+									ImGui::Text("GPU time of the hit shading pass (shown while the Performance Overlay or an F7 recording runs) and the share of the traced");
+									ImGui::Text("  hits that had material data (texture copied, attributes captured) and so used their own colour.");
+								}
+								// (48h) Emission capture.
+								ImGui::Text("Glow: %u emitting materials (%u follow a time-of-day source), %u with a glow texture (%u ready); %u glow textures, %u copy layers used",
+									ms.emitMaterials, ms.emitSourced, ms.glowMaterials, ms.glowMaterialsReady, ms.glowTextures, ms.glowTexturesReady);
+								if (auto _tt = Util::HoverTooltipWrapper()) {
+									ImGui::Text("Material Hits: Glow's data (captured whether the switch is on or off): materials with a glow colour (own glow, External");
+									ImGui::Text("  Emittance - windows whose colour follows a light / region as the time of day changes it - or a glow texture), the");
+									ImGui::Text("  glow-texture ones and how many have their copy, the distinct glow textures and their 128x128 copies (layers in the");
+									ImGui::Text("  same pages as the other textures). Colour refreshes that changed something so far: %llu. Switch: %s.",
+										static_cast<unsigned long long>(ms.emitRefreshes), settings.ReflectionsShadeGlow ? "on" : "off");
+								}
+							}
+						}
+					}
+				}
+			} else {
+				ImGui::TextDisabled("RT Reflections are off.");
+			}
+			ImGui::TreePop();
+		}
+		ImGui::TreePop();
 	}
-	DrawObjectRows();  // (47n) one per-kind choice for the sun, the point lights and RTAO
-	DrawDiagnostics();
+	// In Custom the Custom values are the live ones.
+	if (settings.ReflectionsQuality == kReflectionCustom)
+		settings.ReflectionsCustom = CurrentReflectionValues();
 	ImGui::PopID();
 }
 
@@ -8593,11 +8818,15 @@ void RayTracing::DrawDiagnostics()
 	                           backend.PointWideBytes() + backend.ReflectBytes();  // (48a)
 
 	// Summary for players: where the settings are, what is on, what it costs.
-	ImGui::TextWrapped("The settings are on the Sun Shadows, Point Light Shadows and Ambient Occlusion pages (below this one in the list).");
+	ImGui::TextWrapped("The settings are on the Sun Shadows, Point Light Shadows, Ambient Occlusion and Reflections pages (below this one in the list).");
 	if (settings.Enabled) {
-		ImGui::Text("In use: sun shadows %s, point-light shadows %s, ambient occlusion %s",
+		// (48i) + reflections (Off / Trace Only / the Quality preset).
+		const std::string reflText = settings.ReflectionsMode == 0 ? std::string("Off") :
+		                             settings.ReflectionsMode == 1 ? std::string("Trace Only") :
+		                                                             std::string(kReflectionQualityNames[std::clamp(settings.ReflectionsQuality, 0, kReflectionCustom)]);
+		ImGui::Text("In use: sun shadows %s, point-light shadows %s, ambient occlusion %s, reflections %s",
 			settings.SunShadows ? kQualityNames[std::clamp(settings.QualityLevel, 0, 5)] : "Off", settings.PointLights ? kTierNames[std::clamp(settings.PointQuality, 0, kTierCustom) + 1] : "Off",
-			settings.AO ? kTierNames[std::clamp(settings.AOQuality, 0, kTierCustom) + 1] : "Off");
+			settings.AO ? kTierNames[std::clamp(settings.AOQuality, 0, kTierCustom) + 1] : "Off", reflText.c_str());
 		if (status == Status::Active || status == Status::Inactive || status == Status::Waiting)
 			ImGui::Text("Cost: %.1f ms on the graphics card, %s of video memory", rt.smoothedGpuMs, Megabytes(vram).c_str());
 		if (auto _tt = Util::HoverTooltipWrapper())
@@ -8931,8 +9160,9 @@ std::string RayTracing::DescribeForProfile() const
 		pointThisFrame ? pointK : 0u, pointWideThisFrame ? " (slots 4-5 in use)" : "");
 	{
 		const auto& sc = scene.GetStats();
-		text += std::format(", RT reflections {}{} (terrain in RT scene {}: {} of {} cells built, {:.1f} MB; reflection textures {:.1f} MB)",
+		text += std::format(", RT reflections {}, quality {}{} (terrain in RT scene {}: {} of {} cells built, {:.1f} MB; reflection textures {:.1f} MB)",
 			settings.ReflectionsMode == 2 ? "gap fill" : (settings.ReflectionsMode == 1 ? "trace only" : "off"),
+			kReflectionQualityNames[std::clamp(settings.ReflectionsQuality, 0, kReflectionCustom)],  // (48i)
 			reflectOffReason.empty() ? "" : " (switched off: " + reflectOffReason + ")", settings.ReflectionsTerrain ? "on" : "off", sc.terrainBuilt, sc.terrainCells,
 			static_cast<double>(sc.terrainBytes) / (1024.0 * 1024.0), static_cast<double>(backend.ReflectBytes()) / (1024.0 * 1024.0));
 		// (48d)
@@ -9072,7 +9302,8 @@ nlohmann::json RayTracing::DescribeJson() const
 		// (48a) RT reflections step 1.
 		const auto& sc = scene.GetStats();
 		const auto& rs = backend.GetStats();
-		j["reflections"] = { { "mode", settings.ReflectionsMode }, { "terrain_in_rt_scene", settings.ReflectionsTerrain }, { "off_reason", reflectOffReason },
+		j["reflections"] = { { "mode", settings.ReflectionsMode }, { "quality", kReflectionQualityNames[std::clamp(settings.ReflectionsQuality, 0, kReflectionCustom)] },  // (48i)
+			{ "terrain_in_rt_scene", settings.ReflectionsTerrain }, { "off_reason", reflectOffReason },
 			{ "available", backend.ReflectAvailable() }, { "traced_last_frame", rs.reflectTracedLastFrame }, { "gpu_ms", rs.lastReflectGpuMs },
 			{ "pixels_per_frame", rs.reflectPixelsPerFrame }, { "textures_mb", static_cast<double>(backend.ReflectBytes()) / (1024.0 * 1024.0) },
 			{ "terrain_cells", sc.terrainCells }, { "terrain_built", sc.terrainBuilt }, { "terrain_triangles", sc.terrainTriangles },

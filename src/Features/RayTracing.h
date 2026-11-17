@@ -97,6 +97,27 @@ public:
 		Count
 	};
 
+	/// (48i) The RT reflection values a Quality preset sets (Reflections page > Advanced). The defaults are the High preset (= the 48h
+	/// defaults). Not part of a preset: the mode (Off / Trace Only / Gap Fill), Off-screen Hit Brightness and the Diagnostics fixes.
+	struct ReflectionPresetValues
+	{
+		bool terrain = true;          // ReflectionsTerrain
+		bool fullRange = false;       // ReflectionsFullRange
+		float roughStart = 0.30f;     // ReflectionsRoughStart
+		float roughEnd = 0.65f;       // ReflectionsRoughEnd
+		bool beyondSSR = false;       // ReflectionsBeyondSSR
+		bool roughSolid = true;       // ReflectionsRoughSolid
+		bool materials = true;        // ReflectionsMaterials
+		bool characters = true;       // ReflectionsCharacterMaterials
+		int offscreenColor = 1;       // ReflectionsOffscreenColor (0 Cubemap Approx, 1 Material)
+		bool sunRay = true;           // ReflectionsSunRay
+		bool lamps = true;            // ReflectionsShadeLights
+		bool glow = true;             // ReflectionsShadeGlow
+		bool preferBright = true;     // ReflectionsPreferBrightCubemap
+	};
+	/// (48i) ReflectionsQuality: 0 Low, 1 Medium, 2 High, 3 Ultra, 4 Custom.
+	static constexpr int kReflectionCustom = 4;
+
 	struct Settings
 	{
 		bool Enabled = false;
@@ -332,7 +353,7 @@ public:
 		// 6 lights per pixel the trace still ranks the top 6 and traces ranks K..5 where that light holds at least 7 % of the pixel's point
 		// light (3.5 % where it was traced there last frame), into slots K..5 (4 - 5: the 48a slot textures, kept while such pixels exist).
 		bool PointExtraSlots = true;
-		// (48a) Outside the settings macro. RT reflections step 1 (Ray Tracing > Reflections (experimental)): ReflectionsMode 0 Off (47z
+		// (48a) Outside the settings macro. RT reflections step 1 ((48i) Ray Tracing > Reflections page): ReflectionsMode 0 Off (47z
 		// exactly: no terrain, no textures, no dispatch), 1 Trace Only (reflection rays in the RTAO batch, no shading, debug views and F7
 		// only; needs RTAO). ReflectionsTerrain "Terrain in RT Scene (reflections only)": with the rays on, the landscape of the captured
 		// cells is in the TLAS under its own instance mask, which no shadow or AO ray includes.
@@ -385,6 +406,12 @@ public:
 		// matches and the cubemap saw that point much brighter than the shading, blend to the cubemap (glows the RT scene cannot represent).
 		bool ReflectionsShadeGlow = true;
 		bool ReflectionsPreferBrightCubemap = true;
+		// (48i) Reflections page "Quality" (0 Low, 1 Medium, 2 High, 3 Ultra, 4 Custom). The fields above stay the live values the renderer
+		// reads; picking a preset writes its values into them (ReflectionPresetValues), an edit under Advanced switches to Custom.
+		// ReflectionsCustom: the Custom values (kept while a preset is picked; picking Custom brings them back). On load a preset whose
+		// values do not match the saved ones shows as Custom; settings saved without the key get the preset they match (else Custom).
+		int ReflectionsQuality = 2;
+		ReflectionPresetValues ReflectionsCustom{};
 	};
 	/// (48d) What the SSRT specular ray march needs for the gap fill this frame (AcquireReflectionGapFill).
 	struct ReflectionGapFill
@@ -443,7 +470,13 @@ public:
 	void DrawObjectRows();
 	void DrawPointLightPage();
 	void DrawAOPage();
+	/// (48i) The Reflections entry of the Ray Tracing category (was the "Reflections (experimental)" section of the main page).
+	void DrawReflectionsPage();
 	void DrawDiagnostics();
+	/// (48i) Reflection quality presets: the live values, applying a preset's, and which preset (or Custom) they equal.
+	[[nodiscard]] ReflectionPresetValues CurrentReflectionValues() const;
+	void ApplyReflectionValues(const ReflectionPresetValues& a_values);
+	[[nodiscard]] int MatchReflectionPreset() const;
 	virtual void LoadSettings(json& o_json) override;
 	virtual void SaveSettings(json& o_json) override;
 	virtual void RestoreDefaultSettings() override;

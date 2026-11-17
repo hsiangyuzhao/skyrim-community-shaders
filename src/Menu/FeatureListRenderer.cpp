@@ -139,6 +139,7 @@ std::vector<FeatureListRenderer::MenuFuncInfo> FeatureListRenderer::BuildMenuLis
 					menuList.push_back(BuiltInMenu{ "Sun Shadows", []() { globals::features::rayTracing.DrawSunPage(); } });
 					menuList.push_back(BuiltInMenu{ "Point Light Shadows", []() { globals::features::rayTracing.DrawPointLightPage(); } });
 					menuList.push_back(BuiltInMenu{ "Ambient Occlusion", []() { globals::features::rayTracing.DrawAOPage(); } });
+					menuList.push_back(BuiltInMenu{ "Reflections", []() { globals::features::rayTracing.DrawReflectionsPage(); } });  // (48i)
 				}
 			}
 		}
