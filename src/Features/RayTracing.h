@@ -353,6 +353,22 @@ public:
 		// 6 lights per pixel the trace still ranks the top 6 and traces ranks K..5 where that light holds at least 7 % of the pixel's point
 		// light (3.5 % where it was traced there last frame), into slots K..5 (4 - 5: the 48a slot textures, kept while such pixels exist).
 		bool PointExtraSlots = true;
+		// (48k) Outside the settings macro. PointNoiseFix "Point Lights: Noise Fix" (Point Light Shadows > Point Lights > Advanced, after
+		// Close-Contact Shadows on Characters): the master switch of four parts, each on by default; master off = 48j exactly.
+		//   PointNoiseDecorrelate "Decorrelated Sampling": every slot's emitter-disc sample is the 48a beam pattern (a static per-pixel
+		//     pattern stepped along R2 per frame, not IGN), and the denoiser rotates its taps with an independent hash (not the IGN the
+		//     trace sampled with: the filter never decorrelated, a regular dotted lattice).
+		//   PointNoiseStable "Stable Penumbra": the 48a beam denoise path for every point slot (wide pass also where the history is
+		//     partial, at least 2 px, history clamp to the filtered mean +- 2 sigma, this frame weighs 0.1 for static lights).
+		//   PointNoiseCloseBlur "Close Blockers: Minimum Blur": a disagreeing 3x3 with a very close blocker (hair on a face, contact
+		//     shadows) is filtered at least 3 px wide (the penumbra formula gave 1 px: 3x3 + history only, halftone specks).
+		//   PointNoiseDarkSide "Consistent Dark Side": a ray toward a point light from a traced surface whose smoothed normal faces away
+		//     from it counts as blocked at once (as the 48a beam rays do): no random escapes along the shading terminator.
+		bool PointNoiseFix = true;
+		bool PointNoiseDecorrelate = true;
+		bool PointNoiseStable = true;
+		bool PointNoiseCloseBlur = true;
+		bool PointNoiseDarkSide = true;
 		// (48a) Outside the settings macro. RT reflections step 1 ((48i) Ray Tracing > Reflections page): ReflectionsMode 0 Off (47z
 		// exactly: no terrain, no textures, no dispatch), 1 Trace Only (reflection rays in the RTAO batch, no shading, debug views and F7
 		// only; needs RTAO). ReflectionsTerrain "Terrain in RT Scene (reflections only)": with the rays on, the landscape of the captured
@@ -989,13 +1005,16 @@ private:
 	// this session traces 4 slots: no K 5 - 6, no extra ranks 4 - 5; 48b kept tagging kTagWide after such a fallback).
 	bool pointExtraThisFrame = false;
 	bool pointWideDenoiseFailed = false;
+	bool pointNoiseFixFailed = false;  // (48k) the PL_FIX denoiser variant did not compile this session: the 48j variants run
 	bool EnsurePointWide(std::uint32_t a_width, std::uint32_t a_height);
 	void ReleasePointWide();
 	std::unique_ptr<ConstantBuffer> pointDenoiseCB;
 	winrt::com_ptr<ID3D11ComputeShader> pointDenoiseCS;
 	// (48a) Variants: Window Beams: Smooth Edges (PL_BEAM; only on frames with soft beam slots), slots 4 - 5 (PL_WIDE; K > 4), both.
 	winrt::com_ptr<ID3D11ComputeShader> pointDenoiseBeamCS, pointDenoiseWideCS, pointDenoiseWideBeamCS;
-	ID3D11ComputeShader* PointDenoiseShader(bool a_wide, bool a_beam);
+	// (48k) Point Lights: Noise Fix (PL_FIX): the same four variants with the fix compiled in, index (wide ? 1 : 0) | (beam ? 2 : 0).
+	winrt::com_ptr<ID3D11ComputeShader> pointDenoiseFixCS[4];
+	ID3D11ComputeShader* PointDenoiseShader(bool a_wide, bool a_beam, bool a_fix = false);
 	/// Turns the point lights off (not the rest of Ray Tracing) with a reason for the page.
 	void SwitchOffPointLights(std::string a_reason);
 	void UpdatePointLights();
@@ -1126,6 +1145,9 @@ private:
 	bool reflectGapFillUsedLastFrame = false;  // (48d) for the F7 row (written before this frame's SSRT pass)
 	std::string reflectOffReason;
 	bool reflectRequested = false;
+	// (48k) RT reflections are hidden (no menu page) and always Off: settings.ReflectionsMode stays 0 at runtime; the saved value is kept
+	// here only so SettingsUser.json keeps its "ReflectionsMode" key as it was (the code stays compiled for later).
+	int reflectionsModeSaved = 0;
 	winrt::com_ptr<ID3D11ComputeShader> aoNormalReflectCS, reflectDebugCS;
 	// (48e) Both compiled on a background thread (no first-use freeze): until ready the reflection rays are simply not prepared (the frame
 	// runs as without reflections) / the debug view is not drawn. The prep variant is started early (PrewarmReflectionShaders).

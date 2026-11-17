@@ -317,6 +317,11 @@ namespace
 	constexpr std::uint32_t kPointDenoiseWide = 32u, kPointDenoiseWideHistory = 64u, kPointDenoiseBeamSmooth = 128u;
 	// (48c) TracePointLightsCS kFlagExtra: Extra Lights Where Crowded (K < 6: ranks K..5 traced where they hold kExtraShare of the pixel's point light).
 	constexpr std::uint32_t kPointFlagExtra = 131072u;
+	// (48k) Point Lights: Noise Fix. TracePointLightsCS: Decorrelated Sampling (every slot's disc sample from the beam pattern), Consistent
+	// Dark Side (a ray from a traced surface whose smoothed normal faces away from the light is blocked). PointDenoiseCS (PL_FIX variant):
+	// Decorrelated Sampling (taps rotated by a hash), Stable Penumbra (the beam path for every point slot), Close Blockers: Minimum Blur.
+	constexpr std::uint32_t kPointFlagNoiseDecorrelate = 262144u, kPointFlagNoiseDarkSide = 524288u;
+	constexpr std::uint32_t kPointDenoiseNoiseDecorrelate = 256u, kPointDenoiseNoiseStable = 512u, kPointDenoiseNoiseCloseBlur = 1024u;
 	// (47w) Adaptive skip thresholds (per frame, read back). Bad: more than 1 % of its lit pixels uncovered (and at least 32 pixels, so a
 	// light lighting a handful of pixels does not flip on noise), or 4096 uncovered pixels whatever the share. Good: under 0.25 % and
 	// under 1024 pixels. Skip again after kCoverageEnterFrames good frames (first time) or kCoverageRestoreFrames (after a bad frame);
@@ -1132,7 +1137,7 @@ void RayTracing::UpdateAlphaCasters()
 		switchOff("the GPU driver did not accept the alpha-tested ray query shader");
 	alphaRequested = settings.Foliage != static_cast<int>(RayTracingScene::FoliageMode::ShadowMap) || settings.Cutouts;
 	// (48f) Capture Materials: the backend accepts materials / attributes before the scene captures with them (its config below).
-	settings.ReflectionsMode = std::clamp(settings.ReflectionsMode, 0, 2);
+	settings.ReflectionsMode = 0;  // (48k) RT reflections hidden: always Off (the 48j Off path)
 	if (backend.IsReady())
 		backend.SetMaterialsEnabled(MaterialsWanted());
 	if (backend.IsReady() && backend.MaterialsEnabled())
@@ -1161,7 +1166,7 @@ void RayTracing::UpdateAlphaCasters()
 
 	// (48a) RT reflections step 1. Turned on (again): an earlier automatic switch-off is forgotten. Off: no terrain (the next scene
 	// Update releases every terrain BLAS), no textures, no dispatch.
-	settings.ReflectionsMode = std::clamp(settings.ReflectionsMode, 0, 2);  // (48d) + Gap Fill
+	settings.ReflectionsMode = 0;  // (48k) RT reflections hidden: always Off ((48d) was 0 - 2)
 	if (settings.ReflectionsMode != 0 && !reflectRequested) {
 		backend.ClearReflectFault();
 		reflectOffReason.clear();
@@ -1600,7 +1605,14 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.PointBeamSmooth = read("PointBeamSmooth", defaults.PointBeamSmooth);  // (48a)
 		settings.PointStickyJitterFix = read("PointStickyJitterFix", defaults.PointStickyJitterFix);  // (48c)
 		settings.PointExtraSlots = read("PointExtraSlots", defaults.PointExtraSlots);
-		settings.ReflectionsMode = std::clamp(read("ReflectionsMode", defaults.ReflectionsMode), 0, 2);
+		settings.PointNoiseFix = read("PointNoiseFix", defaults.PointNoiseFix);  // (48k)
+		settings.PointNoiseDecorrelate = read("PointNoiseDecorrelate", defaults.PointNoiseDecorrelate);
+		settings.PointNoiseStable = read("PointNoiseStable", defaults.PointNoiseStable);
+		settings.PointNoiseCloseBlur = read("PointNoiseCloseBlur", defaults.PointNoiseCloseBlur);
+		settings.PointNoiseDarkSide = read("PointNoiseDarkSide", defaults.PointNoiseDarkSide);
+		// (48k) RT reflections hidden: the saved mode is only kept for writing back; the renderer always runs Off.
+		reflectionsModeSaved = std::clamp(read("ReflectionsMode", defaults.ReflectionsMode), 0, 2);
+		settings.ReflectionsMode = 0;
 		settings.ReflectionsTerrain = read("ReflectionsTerrain", defaults.ReflectionsTerrain);
 		// (48d)
 		settings.ReflectionsRoughStart = std::clamp(read("ReflectionsRoughStart", defaults.ReflectionsRoughStart), 0.0f, 0.95f);
@@ -1802,7 +1814,12 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["PointBeamSmooth"] = settings.PointBeamSmooth;  // (48a)
 	o_json["PointStickyJitterFix"] = settings.PointStickyJitterFix;  // (48c)
 	o_json["PointExtraSlots"] = settings.PointExtraSlots;
-	o_json["ReflectionsMode"] = settings.ReflectionsMode;
+	o_json["PointNoiseFix"] = settings.PointNoiseFix;  // (48k)
+	o_json["PointNoiseDecorrelate"] = settings.PointNoiseDecorrelate;
+	o_json["PointNoiseStable"] = settings.PointNoiseStable;
+	o_json["PointNoiseCloseBlur"] = settings.PointNoiseCloseBlur;
+	o_json["PointNoiseDarkSide"] = settings.PointNoiseDarkSide;
+	o_json["ReflectionsMode"] = reflectionsModeSaved;  // (48k) as loaded (the runtime value is always 0)
 	o_json["ReflectionsTerrain"] = settings.ReflectionsTerrain;
 	o_json["ReflectionsRoughStart"] = settings.ReflectionsRoughStart;  // (48d)
 	o_json["ReflectionsRoughEnd"] = settings.ReflectionsRoughEnd;
@@ -1988,6 +2005,8 @@ void RayTracing::ClearShaderCache()
 	pointDenoiseBeamCS = nullptr;  // (48a)
 	pointDenoiseWideCS = nullptr;
 	pointDenoiseWideBeamCS = nullptr;
+	for (auto& fixShader : pointDenoiseFixCS)  // (48k)
+		fixShader = nullptr;
 	aoNormalReflectCS = nullptr;
 	reflectDebugCS = nullptr;
 	aoNormalReflectAsync.Reset();  // (48e) compiled again in the background on the next request
@@ -2033,6 +2052,14 @@ void RayTracing::PrecompileShaders()
 			PointDenoiseShader(false, true);
 		if (wideK)
 			PointDenoiseShader(true, beam);
+		// (48k) Point Lights: Noise Fix: its twins of the same variants (the plain one always).
+		if (settings.PointNoiseFix && (settings.PointNoiseDecorrelate || settings.PointNoiseStable || settings.PointNoiseCloseBlur) && !pointNoiseFixFailed) {
+			PointDenoiseShader(false, false, true);
+			if (beam)
+				PointDenoiseShader(false, true, true);
+			if (wideK)
+				PointDenoiseShader(true, beam, true);
+		}
 	}
 	if (settings.AO) {
 		// (46t) The RTAO filter of the current switches (the others compile when first switched on).
@@ -2063,10 +2090,18 @@ void RayTracing::PrecompileShaders()
 	}
 }
 
-ID3D11ComputeShader* RayTracing::PointDenoiseShader(bool a_wide, bool a_beam)
+ID3D11ComputeShader* RayTracing::PointDenoiseShader(bool a_wide, bool a_beam, bool a_fix)
 {
 	// (48a) The plain variant is the 47z shader; the others compile their extra code in only when it can run this frame.
 	const wchar_t* kPath = L"Data\\Shaders\\RayTracing\\PointDenoiseCS.hlsl";
+	if (a_fix) {
+		// (48k) Point Lights: Noise Fix: the same variants with PL_FIX (without it the fix's code folds away: the 48j shaders).
+		static constexpr const char* kFixDefines[4] = { "PL_FIX", "PL_WIDE,PL_FIX", "PL_BEAM,PL_FIX", "PL_WIDE,PL_BEAM,PL_FIX" };
+		static constexpr const char* kFixNames[4] = { "PointDenoiseCS (noise fix)", "PointDenoiseCS (slots 4-5, noise fix)", "PointDenoiseCS (beam edges, noise fix)",
+			"PointDenoiseCS (slots 4-5, beam edges, noise fix)" };
+		const int index = (a_wide ? 1 : 0) | (a_beam ? 2 : 0);
+		return GetShaderDefined(pointDenoiseFixCS[index], kPath, kFixNames[index], kFixDefines[index]);
+	}
 	if (a_wide && a_beam)
 		return GetShaderDefined(pointDenoiseWideBeamCS, kPath, "PointDenoiseCS (slots 4-5, beam edges)", "PL_WIDE,PL_BEAM");
 	if (a_wide)
@@ -5218,6 +5253,12 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 		flags |= kPointFlagBeamSmooth;
 	if (extra)  // (48c)
 		flags |= kPointFlagExtra;
+	if (settings.PointNoiseFix) {  // (48k) master off: neither bit (48j)
+		if (settings.PointNoiseDecorrelate)
+			flags |= kPointFlagNoiseDecorrelate;
+		if (settings.PointNoiseDarkSide)
+			flags |= kPointFlagNoiseDarkSide;
+	}
 	// (47z) Stable Light Choice When the Camera Moves: last trace's camera -> this frame's camera-relative positions to last trace's clip
 	// space, one matrix (last view-projection x the translation by the camera's move), appended to the sources (Backend). The trace
 	// reads its copy of last frame's PLIdx there. Without a last camera: 47y (the same pixel).
@@ -5324,7 +5365,22 @@ void RayTracing::FinishPointLights()
 	// and without beams the plain 47z shader runs). A variant that fails to compile falls back to the plain one (its extras off).
 	bool wide = pointWideThisFrame && backend.PointWideSRV() && pointWide[0].texture && pointWide[1].texture;
 	bool beamSmooth = settings.PointBeamSmooth && pointBeamMask != 0 && pointBeamTan > 0.0f;
-	ID3D11ComputeShader* shader = (wide || beamSmooth) ? PointDenoiseShader(wide, beamSmooth) : nullptr;
+	// (48k) Point Lights: Noise Fix: the PL_FIX twin of the variant below while a denoiser part is on; it failing to compile = the 48j variants
+	// from then on this session (the trace parts stay as set).
+	const bool noiseFixWanted = settings.PointNoiseFix && (settings.PointNoiseDecorrelate || settings.PointNoiseStable || settings.PointNoiseCloseBlur);
+	bool noiseFix = false;
+	ID3D11ComputeShader* shader = nullptr;
+	if (noiseFixWanted && !pointNoiseFixFailed) {
+		shader = PointDenoiseShader(wide, beamSmooth, true);
+		if (shader) {
+			noiseFix = true;
+		} else {
+			pointNoiseFixFailed = true;
+			logger::warn("[RayTracing] PointDenoiseCS (noise fix) did not compile: the point-light denoiser runs without the noise fix this session");
+		}
+	}
+	if (!shader)
+		shader = (wide || beamSmooth) ? PointDenoiseShader(wide, beamSmooth) : nullptr;
 	if (!shader && wide && beamSmooth) {
 		// (48c) Keep slots 4 - 5 without the beam edges when only the combined variant failed.
 		shader = PointDenoiseShader(true, false);
@@ -5367,6 +5423,10 @@ void RayTracing::FinishPointLights()
 	                            (settings.PointSmoothEdges ? kPointDenoiseSmooth : 0u) |  // (47x)
 	                            (motionSRV ? kPointDenoiseMotion : 0u) | (settings.MovingSmoothNoHistory ? kPointDenoiseNoHistorySmooth : 0u) |  // (47y)
 	                            (beamSmooth ? kPointDenoiseBeamSmooth : 0u);  // (48a)
+	// (48k) The noise fix's denoiser parts (only read by the PL_FIX variant; 0 with the master off).
+	if (noiseFix)
+		flags |= (settings.PointNoiseDecorrelate ? kPointDenoiseNoiseDecorrelate : 0u) | (settings.PointNoiseStable ? kPointDenoiseNoiseStable : 0u) |
+		         (settings.PointNoiseCloseBlur ? kPointDenoiseNoiseCloseBlur : 0u);
 	// (48a) Lights per pixel 5 - 6: their history only when last frame denoised them too and the main history is valid.
 	const bool wideHistory = wide && pointWideHistoryValid && (flags & kPointDenoiseHistory);
 	flags |= (wide ? kPointDenoiseWide : 0u) | (wideHistory ? kPointDenoiseWideHistory : 0u);
@@ -8385,6 +8445,51 @@ void RayTracing::DrawPointLightPage()
 				ImGui::Text("  The ray against characters starts 2 units out instead of 6 (still 6 where the light only grazes the surface).");
 				ImGui::Text("  Risk: small dark speckles of a character shadowing itself. Off: as 47w. The sun is not affected.");
 			}
+			// (48k) Point Lights: Noise Fix: one master switch and four parts, each on by default; master off = 48j exactly.
+			ImGui::Checkbox("Point Lights: Noise Fix", &settings.PointNoiseFix);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): cleans up the regular dotted / halftone grain in lamp shadows (soft edges, hair on faces, the dark side");
+				ImGui::Text("  of round objects), with the four parts below. Changes the picture (smoother, steadier shadow edges).");
+				ImGui::Text("Off: exactly as 48j (for A/B: Debug View \"Point Lights: Denoised\" under Diagnostics on the Ray Tracing entry).");
+				if (pointNoiseFixFailed)
+					ImGui::Text("Its denoiser variant did not compile this session: only the ray parts (Decorrelated Sampling, Consistent Dark Side) act.");
+			}
+			ImGui::Indent();
+			ImGui::BeginDisabled(!settings.PointNoiseFix);
+			ImGui::Checkbox("Decorrelated Sampling", &settings.PointNoiseDecorrelate);
+			ImGui::EndDisabled();
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): each pixel picks its point on the lamp's flame from its own pattern that moves on every frame, and the");
+				ImGui::Text("  clean-up scatters its samples independently of that pattern (before, both used the same pattern, so the clean-up");
+				ImGui::Text("  kept a fixed dotted grid). No extra cost. Off: the 48j sampling.");
+			}
+			ImGui::BeginDisabled(!settings.PointNoiseFix);
+			ImGui::Checkbox("Stable Penumbra", &settings.PointNoiseStable);
+			ImGui::EndDisabled();
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): the soft edge of every lamp shadow gets the clean-up the window beams got in 48a: blurred wherever it");
+				ImGui::Text("  is still settling (not only where the nearest pixels disagree), at least 2 px wide, and the last frames are kept");
+				ImGui::Text("  within a range that fits the edge instead of snapping to fully lit / fully dark (isolated specks). Still lamps keep");
+				ImGui::Text("  more history; moving lamps and shadows that had to be corrected as before. About 0.1-0.3 ms. Off: as 48j.");
+			}
+			ImGui::BeginDisabled(!settings.PointNoiseFix);
+			ImGui::Checkbox("Close Blockers: Minimum Blur", &settings.PointNoiseCloseBlur);
+			ImGui::EndDisabled();
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): where the shadow comes from something very close to the surface (hair strands on a face or shoulder,");
+				ImGui::Text("  a contact shadow) and the nearest pixels disagree, the clean-up blurs at least 3 px instead of 1 px, so ray-traced");
+				ImGui::Text("  hair no longer leaves a halftone pattern. Hair stays in the rays. Contact shadows get slightly softer. Off: as 48j.");
+			}
+			ImGui::BeginDisabled(!settings.PointNoiseFix);
+			ImGui::Checkbox("Consistent Dark Side", &settings.PointNoiseDarkSide);
+			ImGui::EndDisabled();
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): where a ray-traced object (vase, bowl, body) turns away from a lamp, its dark side counts as shadowed");
+				ImGui::Text("  at once instead of a ray that sometimes slips past the surface: no saw-tooth along the line between lit and");
+				ImGui::Text("  dark side. Uses the smoothed surface direction, so bumpy (normal-mapped) surfaces facing the lamp are not darkened;");
+				ImGui::Text("  grass, leaves and other surfaces the rays do not see keep their rays. No extra cost. Off: as 48j.");
+			}
+			ImGui::Unindent();
 			// (47z) Light choice: two switches, each on by default, off = 47y.
 			ImGui::Checkbox("Window Beams: Respect Their Range", &settings.PointBeamRange);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
@@ -8819,15 +8924,12 @@ void RayTracing::DrawDiagnostics()
 	                           backend.PointWideBytes() + backend.ReflectBytes();  // (48a)
 
 	// Summary for players: where the settings are, what is on, what it costs.
-	ImGui::TextWrapped("The settings are on the Sun Shadows, Point Light Shadows, Ambient Occlusion and Reflections pages (below this one in the list).");
+	ImGui::TextWrapped("The settings are on the Sun Shadows, Point Light Shadows and Ambient Occlusion pages (below this one in the list).");
 	if (settings.Enabled) {
-		// (48i) + reflections (Off / Trace Only / the Quality preset).
-		const std::string reflText = settings.ReflectionsMode == 0 ? std::string("Off") :
-		                             settings.ReflectionsMode == 1 ? std::string("Trace Only") :
-		                                                             std::string(kReflectionQualityNames[std::clamp(settings.ReflectionsQuality, 0, kReflectionCustom)]);
-		ImGui::Text("In use: sun shadows %s, point-light shadows %s, ambient occlusion %s, reflections %s",
+		// (48k) RT reflections are hidden and always Off: no "reflections" part in this line any more (48i showed its preset).
+		ImGui::Text("In use: sun shadows %s, point-light shadows %s, ambient occlusion %s",
 			settings.SunShadows ? kQualityNames[std::clamp(settings.QualityLevel, 0, 5)] : "Off", settings.PointLights ? kTierNames[std::clamp(settings.PointQuality, 0, kTierCustom) + 1] : "Off",
-			settings.AO ? kTierNames[std::clamp(settings.AOQuality, 0, kTierCustom) + 1] : "Off", reflText.c_str());
+			settings.AO ? kTierNames[std::clamp(settings.AOQuality, 0, kTierCustom) + 1] : "Off");
 		if (status == Status::Active || status == Status::Inactive || status == Status::Waiting)
 			ImGui::Text("Cost: %.1f ms on the graphics card, %s of video memory", rt.smoothedGpuMs, Megabytes(vram).c_str());
 		if (auto _tt = Util::HoverTooltipWrapper())
@@ -8874,7 +8976,7 @@ void RayTracing::DrawDiagnostics()
 			ImGui::Text("  Terrain shadows are applied later by the lighting and are not shown.");
 			ImGui::Text("RT vs Shadow Map: inside the ray-traced area, red = only RT sees a shadow, blue = only the shadow map does.");
 			ImGui::Text("  While this view is on, the shadow map keeps every caster so the two can be compared.");
-			ImGui::Text("BLAS Coverage: green = the surface is in the ray-traced scene, magenta = it is not (character, leaves, grass, terrain (green with RT reflections + Terrain in RT Scene), skipped object),");
+			ImGui::Text("BLAS Coverage: green = the surface is in the ray-traced scene, magenta = it is not (character, leaves, grass, terrain, skipped object),");
 			ImGui::Text("  yellow/orange = the ray-traced scene has a surface up to a few metres IN FRONT of the depth the game wrote here:");
 			ImGui::Text("  something the game does not draw (faded out, switched off), a part that moved since capture, or a surface");
 			ImGui::Text("  missing from the depth buffer (seen through alpha-tested cut-outs). Small yellow seams along edges are harmless.");
@@ -9159,34 +9261,13 @@ std::string RayTracing::DescribeForProfile() const
 	// (48a)
 	text += std::format(", window beams: smooth edges {}, lights per pixel this frame {}{}", settings.PointBeamSmooth ? "on" : "off",
 		pointThisFrame ? pointK : 0u, pointWideThisFrame ? " (slots 4-5 in use)" : "");
-	{
-		const auto& sc = scene.GetStats();
-		text += std::format(", RT reflections {}, quality {}{} (terrain in RT scene {}: {} of {} cells built, {:.1f} MB; reflection textures {:.1f} MB)",
-			settings.ReflectionsMode == 2 ? "gap fill" : (settings.ReflectionsMode == 1 ? "trace only" : "off"),
-			kReflectionQualityNames[std::clamp(settings.ReflectionsQuality, 0, kReflectionCustom)],  // (48i)
-			reflectOffReason.empty() ? "" : " (switched off: " + reflectOffReason + ")", settings.ReflectionsTerrain ? "on" : "off", sc.terrainBuilt, sc.terrainCells,
-			static_cast<double>(sc.terrainBytes) / (1024.0 * 1024.0), static_cast<double>(backend.ReflectBytes()) / (1024.0 * 1024.0));
-		// (48d)
-		text += std::format(", reflection pixels: {} (rough fade {:.2f}-{:.2f}), beyond SSR distance {}, rough rays leaves solid {}, best candidate {}, gap fill: "
-							"direction check {}, cubemap position check {}, real hit distance {}, cubemap warm-up fix {}; prepare behind loading screens {}{}",
-			settings.ReflectionsFullRange ? "full roughness range" : "importance", settings.ReflectionsRoughStart, settings.ReflectionsRoughEnd,
-			settings.ReflectionsBeyondSSR ? "on" : "off", settings.ReflectionsRoughSolid ? "on" : "off", settings.ReflectionsBestCandidate ? "on" : "off",
-			settings.ReflectionsLobeCheck ? "on" : "off", settings.ReflectionsCubemapMatch ? "on" : "off", settings.ReflectionsHitDistance ? "on" : "off",
-			settings.ReflectionsCubemapWarmUp ? "on" : "off", settings.ReflectionsLoadingPrep ? "on" : "off",
-			settings.ReflectionsMode == 2 && !GapFillConsumer() ? " (no consumer: SSRT specular / its cubemap fallback off)" : "");
-		// (48f)
-		const auto& ms = backend.GetMaterialStats();
-		text += std::format(", capture materials {}{} ({} materials, {} textures copied / {} pending, attributes {:.1f} of {:.0f} MB, textures {:.1f} MB)",
-			settings.ReflectionsMaterials ? "on" : "off", settings.ReflectionsMaterials && !MaterialsWanted() ? " (not available)" : "", ms.materials, ms.texturesReady,
-			ms.texturesPending, static_cast<double>(ms.attrBytesUsed) / (1024.0 * 1024.0), static_cast<double>(ms.attrBytes) / (1024.0 * 1024.0),
-			static_cast<double>(ms.textureBytes) / (1024.0 * 1024.0));
-		// (48g)
-		text += std::format(", characters {}, off-screen hit color {} (brightness {:.2f}, sun shadow ray {}, lamps {}, glow {}, prefer brighter cubemap {}{})",
-			settings.ReflectionsCharacterMaterials ? "on" : "off", settings.ReflectionsOffscreenColor == 1 ? "material" : "cubemap approx",
-			settings.ReflectionsOffscreenBrightness, settings.ReflectionsSunRay ? "on" : "off", settings.ReflectionsShadeLights ? "on" : "off",
-			settings.ReflectionsShadeGlow ? "on" : "off", settings.ReflectionsPreferBrightCubemap ? "on" : "off",  // (48h)
-			shadeRatioSmoothed > 0.0f ? std::format("; measured shading / screen {:.2f} (2 s average)", shadeRatioSmoothed) : std::string());
-	}
+	// (48k) Point Lights: Noise Fix (the parts are listed as set; they only act with the master on).
+	text += std::format(", point lights noise fix {} (decorrelated sampling {}, stable penumbra {}, close blockers minimum blur {}, consistent dark side {}){}",
+		settings.PointNoiseFix ? "on" : "off", settings.PointNoiseDecorrelate ? "on" : "off", settings.PointNoiseStable ? "on" : "off",
+		settings.PointNoiseCloseBlur ? "on" : "off", settings.PointNoiseDarkSide ? "on" : "off",
+		pointNoiseFixFailed ? " (its denoiser variant did not compile: denoiser parts off)" : "");
+	// (48k) RT reflections are hidden and always Off (48a - 48j listed their settings here).
+	text += ", RT reflections off (hidden)";
 	// (46f)
 	static constexpr const char* kAOModes[] = { "RTAO (keeps SSGI contact AO)", "darker of RTAO and SSGI AO" };
 	static constexpr const char* kAOViews[] = { "off", "raw", "filtered", "split", "raw detail", "filtered detail", "final", "normal confidence", "normal Ns", "normal Ng",
@@ -9288,6 +9369,9 @@ nlohmann::json RayTracing::DescribeJson() const
 	j["point_beam_range"] = settings.PointBeamRange;
 	j["point_sticky_reproject"] = settings.PointStickyReproject;
 	j["point_beam_smooth"] = settings.PointBeamSmooth;  // (48a)
+	j["point_noise_fix"] = { { "on", settings.PointNoiseFix }, { "decorrelated_sampling", settings.PointNoiseDecorrelate },  // (48k)
+		{ "stable_penumbra", settings.PointNoiseStable }, { "close_blockers_min_blur", settings.PointNoiseCloseBlur },
+		{ "consistent_dark_side", settings.PointNoiseDarkSide }, { "denoiser_variant_failed", pointNoiseFixFailed } };
 	j["point_k_this_frame"] = pointThisFrame ? pointK : 0u;
 	j["point_wide_slots"] = { { "in_use", pointWideThisFrame }, { "allocated", backend.PointWideReady() },
 		{ "mb", static_cast<double>(backend.PointWideBytes() + pointWideD3D11Bytes) / (1024.0 * 1024.0) } };

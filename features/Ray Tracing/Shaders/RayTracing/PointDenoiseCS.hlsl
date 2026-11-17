@@ -110,6 +110,41 @@ static const bool kVariantBeam = true;
 #else
 static const bool kVariantBeam = false;
 #endif
+// (48k) PL_FIX = Point Lights: Noise Fix on (RayTracing.cpp picks the PL_FIX twin of the variant). Without it the fix's code folds away: the
+// 48j shaders, byte for byte. Its parts (runtime flags, each 0 with the master off):
+//   kPLFlagFixDecorrelate "Decorrelated Sampling": the taps' rotation from a hash of (pixel, frame) instead of IGN(pixel, frame), the IGN the
+//     trace sampled the emitter disc with (48j: the rotation was nearly a fixed function of the pixel's own sample: a dotted lattice);
+//   kPLFlagFixStable "Stable Penumbra": every point slot (not the soft window beams: they keep Window Beams: Smooth Edges) takes the 48a beam
+//     path: the wide pass where the 3x3 disagrees or the history is partial (kBeamHistLo .. kBeamHistHi), at least kFixMinRadiusPx, radius
+//     from the point-light penumbra formula (a probe of kPoissonTaps taps when the 3x3 has no blocked sample), history clamp to the filtered
+//     mean +- kBeamClampK sigma, a static light (HistoryDrop 0) whose history lies in that band weighs this frame kBeamStaticWeight (0.1);
+//     the plane test stays the normal one (not the beams' tighter one);
+//   kPLFlagFixCloseBlur "Close Blockers: Minimum Blur": a slot whose 3x3 disagrees and whose blocked samples' distance ratio q is under
+//     kFixCloseQ (blocker within ~12 % of the light distance: hair on a face, contact shadows) is filtered at least kFixCloseRadiusPx wide
+//     (the formula gave 1 px there: 3x3 + history only).
+#if defined(PL_FIX)
+static const bool kVariantFix = true;
+#else
+static const bool kVariantFix = false;
+#endif
+static const uint kPLFlagFixDecorrelate = 256u;
+static const uint kPLFlagFixStable = 512u;
+static const uint kPLFlagFixCloseBlur = 1024u;
+static const float kFixMinRadiusPx = 2.0;
+static const float kFixCloseRadiusPx = 3.0;
+static const float kFixCloseQ = 0.35;
+
+// (48k) Decorrelated Sampling: a uniform [0, 1) value per (pixel, frame) from the PCG hash (independent of the trace's patterns).
+uint FixPcg(uint a_v)
+{
+	const uint state = a_v * 747796405u + 2891336453u;
+	const uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+	return (word >> 22u) ^ word;
+}
+float FixHash(uint2 a_p, uint a_frame)
+{
+	return float(FixPcg(a_p.x + FixPcg(a_p.y + FixPcg(a_frame))) >> 8) * (1.0 / 16777216.0);
+}
 
 float InterleavedGradientNoise(float2 a_p, uint a_frame)
 {
@@ -222,6 +257,15 @@ bool SoftBeam(uint a_id)
 	return ((word >> (s & 31u)) & 1u) != 0u;
 }
 
+// (48k) Stable Penumbra: a point slot's penumbra radius in px from its blocked samples' distance ratio q (the 46b formula of step 2).
+float FixPointRadius(uint a_id, float a_q, float a_footprint)
+{
+	const float q = clamp(a_q, 0.0, 0.95);
+	const float emitter = BigEmitter(a_id) ? asfloat(PLEmitter.z) : PLParams.x;
+	const float width = 2.0 * emitter * q / (1.0 - q);
+	return clamp(0.5 * width / a_footprint, 1.0, PLParams.w);
+}
+
 // The history taps at prevPos (last frame's pixel, centre at +0.5): bilinear, each tap checked against the distance it should have, its
 // slot found by the source id ((47y) split out: the camera and the motion candidate share it). Returns the bilinear weight of the taps
 // that passed the distance test (whatever their sources). (48a) a_wideHistory: last frame's slots 4 - 5 (HistWide) are searched too.
@@ -288,6 +332,12 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw)
 	[unroll] for (uint b = 0u; b < 4u; ++b)
 		beamSlot[b] = beamSmooth && SoftBeam(ids[b]);
 	const float beamPlaneTolerance = planeTolerance * kBeamPlaneScale;
+	// (48k) Noise fix: Stable Penumbra's slots (every point slot that is not a soft window beam) and Close Blockers: Minimum Blur.
+	const bool fixStable = kVariantFix && (flags & kPLFlagFixStable) != 0u;
+	const bool fixClose = kVariantFix && (flags & kPLFlagFixCloseBlur) != 0u;
+	bool4 fixSlot = false;
+	[unroll] for (uint fb = 0u; fb < 4u; ++fb)
+		fixSlot[fb] = fixStable && ids[fb] != 0u && !SoftBeam(ids[fb]);
 
 	// 1. 3x3: matching samples, their range and the blocked ones' distance ratio. (48a) + the sum of squared weights (beam slots' clamp).
 	float4 sum = 0.0, weights = 0.0, lo = 2.0, hi = -1.0, qSum = 0.0, qCount = 0.0, weights2 = 0.0;
@@ -356,6 +406,28 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw)
 				}
 			}
 		}
+		else if (fixSlot[s])
+		{
+			// (48k) Stable Penumbra: the beam path's conditions with the point-light radius, at least kFixMinRadiusPx (a penumbra pixel whose
+			// 3x3 happened to agree is filtered too instead of its history snapping to 0 / 1).
+			const bool disagree = hi[s] > lo[s];
+			const float hMean = hw[s] >= 0.05 ? hv[s] / hw[s] : -1.0;
+			const bool partial = hMean > kBeamHistLo && hMean < kBeamHistHi;
+			if (disagree || partial) {
+				if (qCount[s] > 0.0) {
+					const float q = qSum[s] / qCount[s];
+					beamRadius[s] = max(FixPointRadius(ids[s], q, footprint), min(kFixMinRadiusPx, PLParams.w));
+					if (disagree) {
+						if (fixClose && q < kFixCloseQ)
+							beamRadius[s] = max(beamRadius[s], min(kFixCloseRadiusPx, PLParams.w));
+						if ((flags & kPLFlagNoHistorySmooth) && hw[s] < 0.05)
+							beamRadius[s] = max(beamRadius[s], min(kNoHistoryRadiusPx, PLParams.w));
+					}
+				} else {
+					beamProbe[s] = true;  // 3x3 all lit, partial history: the blocker distance from a wider look
+				}
+			}
+		}
 		else if (ids[s] != 0u && hi[s] > lo[s])
 		{
 			[branch] if (SoftBeam(ids[s]))
@@ -372,6 +444,9 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw)
 				const float emitter = BigEmitter(ids[s]) ? asfloat(PLEmitter.z) : PLParams.x;  // (46x)
 				const float width = 2.0 * emitter * q / (1.0 - q);
 				radiusPx[s] = clamp(0.5 * width / footprint, 1.0, PLParams.w);
+				// (48k) Close Blockers: Minimum Blur (Stable Penumbra off: this path).
+				if (fixClose && q < kFixCloseQ)
+					radiusPx[s] = max(radiusPx[s], min(kFixCloseRadiusPx, PLParams.w));
 			}
 			// (47y) Smooth When No History: every slot (the beams keep their 4 px) at least kNoHistoryRadiusPx where no history came.
 			if ((flags & kPLFlagNoHistorySmooth) && hw[s] < 0.05)
@@ -380,11 +455,13 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw)
 		spatial[s] = weights[s] > 0.0 ? sum[s] / max(weights[s], 1e-6) : Lit(raw[s]);
 	}
 	// The per-pixel rotation of the taps (per frame), and the fixed one (47y Smooth When No History).
+	// (48k) Decorrelated Sampling: both from the hash instead (not the trace's IGN).
+	const bool fixDecorrelate = kVariantFix && (flags & kPLFlagFixDecorrelate) != 0u;
 	float sn, cs;
-	sincos(6.2831853 * InterleavedGradientNoise(float2(p), PLEmitter.w), sn, cs);
+	sincos(6.2831853 * (fixDecorrelate ? FixHash(uint2(p), PLEmitter.w) : InterleavedGradientNoise(float2(p), PLEmitter.w)), sn, cs);
 	float snStill = sn, csStill = cs;
 	[branch] if (flags & kPLFlagNoHistorySmooth)
-		sincos(6.2831853 * InterleavedGradientNoise(float2(p), 0u), snStill, csStill);
+		sincos(6.2831853 * (fixDecorrelate ? FixHash(uint2(p), 0x9E3779B9u) : InterleavedGradientNoise(float2(p), 0u)), snStill, csStill);
 	const float maxRadius = max(max(radiusPx.x, radiusPx.y), max(radiusPx.z, radiusPx.w));
 	[branch] if ((flags & kPLFlagSmooth) && maxRadius > 1.5)
 	{
@@ -456,10 +533,12 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw)
 
 	// (48a) Window Beams: Smooth Edges: the beam slots' own pass (independent of Smoother Shadow Edges).
 	float4 beamNeff = weights2 > 0.0 ? weights * weights / max(weights2, 1e-6) : 1.0;  // effective sample count of the mean in spatial
-	[branch] if (any(beamSlot))
+	// (48k) Stable Penumbra's slots take this pass too (their own radius, the normal plane test).
+	[branch] if (any(beamSlot) || any(fixSlot))
 	{
 		[unroll] for (uint s = 0u; s < 4u; ++s)
 		{
+			const float slotPlaneTolerance = (kVariantFix && fixSlot[s]) ? planeTolerance : beamPlaneTolerance;
 			// The probe: kPoissonTaps taps at kBeamProbeRadiusPx; the blocked ones' distance ratio gives the radius (none: no wide pass).
 			[branch] if (beamProbe[s])
 			{
@@ -473,7 +552,7 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw)
 					const float dq = abs(DepthMask[q]);
 					[branch] if (!RTIsSky(dq))
 					{
-						const float wPlane = exp(-abs(dot(N, RTPosition(q, dq) - P)) / beamPlaneTolerance);
+						const float wPlane = exp(-abs(dot(N, RTPosition(q, dq) - P)) / slotPlaneTolerance);
 						float rq;
 						if (wPlane >= 0.05 && MatchWide(Ids(PLIdx[q]), PLVis[q], WideAt(q, flags), ids[s], rq)) {
 							if (rq < 0.999) {
@@ -484,8 +563,13 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw)
 						}
 					}
 				}
-				if (pqCount > 0.0)
-					beamRadius[s] = clamp(saturate(pqSum / pqCount) * kBeamBlockerRange * PLExtra.w / footprint, 1.0, kBeamMaxRadiusPx);
+				if (pqCount > 0.0) {
+					// (48k) Stable Penumbra's slots: the point-light radius, at least kFixMinRadiusPx.
+					if (kVariantFix && fixSlot[s])
+						beamRadius[s] = max(FixPointRadius(ids[s], pqSum / pqCount, footprint), min(kFixMinRadiusPx, PLParams.w));
+					else
+						beamRadius[s] = clamp(saturate(pqSum / pqCount) * kBeamBlockerRange * PLExtra.w / footprint, 1.0, kBeamMaxRadiusPx);
+				}
 			}
 			[branch] if (beamRadius[s] >= 1.5)
 			{
@@ -506,7 +590,7 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw)
 					const float dq = abs(DepthMask[q]);
 					[branch] if (any(o != 0) && !RTIsSky(dq))
 					{
-						const float wPlane = exp(-abs(dot(N, RTPosition(q, dq) - P)) / beamPlaneTolerance);
+						const float wPlane = exp(-abs(dot(N, RTPosition(q, dq) - P)) / slotPlaneTolerance);
 						float rq;
 						if (wPlane >= 0.05 && MatchWide(Ids(PLIdx[q]), PLVis[q], WideAt(q, flags), ids[s], rq)) {
 							const float w = wPlane * exp(-1.5 * dot(r, r) * invR2);
@@ -529,7 +613,7 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw)
 		if (ids[sh] != 0u && hw[sh] >= 0.05) {
 			const float drop = HistoryDrop(ids[sh]);
 			float lo3, hi3, current;
-			if (beamSlot[sh]) {
+			if (beamSlot[sh] || (kVariantFix && fixSlot[sh])) {  // (48k) Stable Penumbra's slots alike
 				// (48a) The filtered mean +- k sigma of that mean (binary samples: sigma^2 = m (1 - m)); static beams keep more history,
 				// but only while it lies inside that band (a history that had to be clamped, e.g. a character's shadow moving over the
 				// floor, is replaced at the normal rate: no longer trails).

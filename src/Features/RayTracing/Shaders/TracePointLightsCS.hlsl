@@ -126,6 +126,17 @@ static const uint kFlagBeamSmooth = 65536u;
 // the pixel traced the light last frame (no flipping at the threshold). Off: exactly 48b (the ranking stops at K).
 static const uint kFlagExtra = 131072u;
 static const float kExtraShare = 0.07;
+// (48k) Point Lights: Noise Fix, the trace's two parts (off: exactly 48j).
+// kFlagNoiseDecorrelate "Decorrelated Sampling": every slot's disc sample comes from BeamSample (the 48a beam pattern: static per pixel, stepped
+// along R2 per frame), not from IGN(p, frame), the same IGN that rotated the denoiser's taps (the filter's tap set was a fixed function of the
+// pixel's own sample: a regular dotted lattice survived the denoiser). The water rays keep n0 / n1.
+// kFlagNoiseDarkSide "Consistent Dark Side": a ray toward a point light whose direction the pixel's ranking normal (NRank: the smoothed one with
+// Trace Lights on Curved Surfaces Reliably, else the depth normal) faces away from counts as blocked at once, but only on a traced caster (the
+// surface probe: kFlagRtSurface's result, else one probe ray per such pixel): a closed traced object facing away from the light is in its own
+// shadow; before, the ray from P + N x bias sometimes slipped past the grazing facets (lit specks, a saw-tooth along the terminator). Surfaces
+// the rays do not see (grass, culled leaves) keep their rays: no wrongly darkened backlit cut-outs. Not for beam-like sources (Beam Smooth).
+static const uint kFlagNoiseDecorrelate = 262144u;
+static const uint kFlagNoiseDarkSide = 524288u;
 static const uint kTracedPixelWord = 3u;     // (48c) RayCounter words (kFlagExtra only): [3] pixels with a traced light,
 static const uint kExtraPixelWord = 4u;      //   [4] of which with at least one extra rank traced,
 static const uint kExtraWideWantWord = 5u;   //   [5] pixels where an extra rank 4 - 5 passed its cut (traced, or not for want of PLWide)
@@ -234,7 +245,7 @@ float InterleavedGradientNoise(float2 p, uint frame)
 	return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715))));
 }
 
-// (48a, kFlagBeamSmooth) The window beams' disc sample: a static spatial pattern (IGN with swapped axes plus an offset whose x / y differ, so
+// (48a, kFlagBeamSmooth; (48k) kFlagNoiseDecorrelate: every slot) The window beams' disc sample: a static spatial pattern (IGN with swapped axes plus an offset whose x / y differ, so
 // it never equals the denoiser's IGN(p, frame), which slides both axes equally) plus the frame times the 2D R2 step; slot k a further
 // fixed offset. u.x: radius (sqrt), u.y: angle.
 float2 BeamSample(float2 p, uint frame, uint k)
@@ -710,6 +721,10 @@ groupshared uint gsMask[2];
 	const bool beamSample = ((p.x & 3) | (p.y & 3)) == 0;  // (46g) 1 of 16 pixels feeds the beam counters
 	uint rays = ((flags & kFlagRtSurface) && !probeShared) ? 1u : 0u;  // (46y) the surface probe above
 	const bool beamSmooth = (flags & kFlagBeamSmooth) != 0u;  // (48a)
+	const bool noiseDecorrelate = (flags & kFlagNoiseDecorrelate) != 0u;  // (48k)
+	const bool darkSide = (flags & kFlagNoiseDarkSide) != 0u;              // (48k)
+	bool darkProbed = false;   // (48k) Consistent Dark Side: the traced-caster test made for this pixel (lazily, once)
+	bool darkTraced = false;   // ... its result
 	// (48a) Six slots (4 - 5 only with K > 4: otherwise bestIdx is 0 there and the slot is skipped at once).
 	float visA[6] = { 1.0, 1.0, 1.0, 1.0, 1.0, 1.0 };
 	uint idxA[6] = { 0u, 0u, 0u, 0u, 0u, 0u };
@@ -751,7 +766,8 @@ groupshared uint gsMask[2];
 		float u1 = frac(n0 + float(k) * 0.7548776662);
 		float u2 = frac(n1 + float(k) * 0.5698402910);
 		// (48a) Window Beams: Smooth Edges: the beam's disc sample from its own static pattern stepped along R2 per frame.
-		[branch] if (beamSmooth && softBeam)
+		// (48k) Decorrelated Sampling: every slot takes the beam pattern.
+		[branch] if ((beamSmooth && softBeam) || noiseDecorrelate)
 		{
 			const float2 u = BeamSample(float2(p), uint(C.Params.y), k);
 			u1 = u.x;
@@ -772,7 +788,25 @@ groupshared uint gsMask[2];
 		idxA[k] = bestIdx[k];
 		// (48a) Window Beams: Smooth Edges: a beam ray into the surface it starts from (depth normal facing away from it) is blocked there,
 		// with no ray (47z traced it: front faces culled for beams, the character ray's first units skipped, so it often came out lit).
-		const bool intoSurface = beamSmooth && beamLike && dot(N, dir) <= 0.0;
+		bool intoSurface = beamSmooth && beamLike && dot(N, dir) <= 0.0;
+		// (48k) Consistent Dark Side: the smoothed surface faces away from this sample of the light -> blocked, on traced casters only (not
+		// inside the fixture clearance: lit there as before).
+		[branch] if (darkSide && !beamLike && tMax > 1.0 && dot(NRank, dir) <= 0.0)
+		{
+			if (!darkProbed) {
+				darkProbed = true;
+				[branch] if (flags & kFlagRtSurface)
+				{
+					darkTraced = rtSurface;
+				}
+				else
+				{
+					darkTraced = SurfaceProbe(P, V, N, dist);
+					rays += 1u;
+				}
+			}
+			intoSurface = darkTraced;
+		}
 		if (tMax <= 1.0 && !intoSurface)
 			continue;  // the surface is inside the clearance: lit
 		float tHit = 0.0;
