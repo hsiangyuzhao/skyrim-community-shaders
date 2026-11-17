@@ -7642,9 +7642,10 @@ void RayTracing::DrawReflectionsPage()
 				ImGui::Text("  RT after it waits for it like for everything else. Off: as 48d (at most 4 cells of ground per frame, after the switch).");
 			}
 			{
-				const char* kViews[7] = { "Off", "Hit Type", "Hit Distance", "Normal Confidence", "RT Reflection Use", "RT Albedo", "RT Shading vs Screen" };
+				const char* kViews[] = { "Off", "Hit Type", "Hit Distance", "Normal Confidence", "RT Reflection Use", "RT Albedo", "RT Shading vs Screen" };
+				static_assert(IM_ARRAYSIZE(kViews) == static_cast<int>(ReflectDebugView::Count));  // (48j) one name per view
 				int view = static_cast<int>(reflectDebugView);
-				if (ImGui::Combo("Reflection Debug View", &view, kViews, 7))
+				if (ImGui::Combo("Reflection Debug View", &view, kViews, IM_ARRAYSIZE(kViews)))
 					reflectDebugView = static_cast<ReflectDebugView>(std::clamp(view, 0, static_cast<int>(ReflectDebugView::Count) - 1));
 				if (auto _tt = Util::HoverTooltipWrapper()) {
 					ImGui::Text("Not saved. Hit Type: green building / static, orange object, cyan leaves / cut-out, purple character, brown terrain,");

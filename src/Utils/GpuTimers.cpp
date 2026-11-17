@@ -19,7 +19,7 @@ namespace Util
 		};
 
 		// Indexed by GpuBucket. Labels are the overlay row names (the overlay appends ':').
-		constexpr BucketInfo kBucketInfo[static_cast<int>(GpuBucket::Count)] = {
+		constexpr BucketInfo kBucketInfo[] = {  // (48j) unsized: the static_assert below now catches a missing entry
 			{ "SSRT Depth Pyramid",
 				"GPU time for SSRT's depth preparation, shared by its diffuse and specular parts." },
 			{ "SSRT Trace Diffuse",
@@ -168,6 +168,9 @@ namespace Util
 			{ "RT Reflections: Wait for Trace",
 				"With RT Reflections = Gap Fill: how long the game's GPU queue stood still waiting for the reflection rays, right before "
 				"the screen-space reflection pass (on the GPU; the CPU does not wait). Ideally about 0. F7 column rt_refl_sync_gpu_ms." },
+			{ "RT Reflections: Shading",
+				"With Off-screen Hit Color = Material: GPU time of the off-screen hits' shaded colours (ReflectShadeCS), right before the screen-space "
+				"reflection pass. F7 column rt_refl_shade_gpu_ms." },  // (48j) missing since 48g: a null label crashed the F10 overlay
 		};
 
 		static_assert(sizeof(kBucketInfo) / sizeof(kBucketInfo[0]) == static_cast<size_t>(GpuBucket::Count),
@@ -468,6 +471,8 @@ namespace Util
 			if (!bucket.everActive || !bucket.hasSample)
 				continue;
 			if (frameIndex - bucket.lastActiveFrame > static_cast<uint64_t>(kActiveTimeoutFrames))
+				continue;
+			if (!kBucketInfo[i].label)  // (48j) never hand the overlay a null name
 				continue;
 			a_callback(BucketReport{ kBucketInfo[i].label, kRowIdBase + i, bucket.smoothedMs,
 				bucket.lastSampleIntervals, kBucketInfo[i].tooltip });
