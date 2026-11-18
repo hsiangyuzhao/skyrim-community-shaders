@@ -8,6 +8,7 @@
 #include "ShaderCache.h"
 #include "State.h"
 #include "Features/DynamicSnow.h"
+#include "Features/RayTracing.h"  // (49b) Hitch fix F switch
 #include "Features/WetSkin.h"
 #include "Utils/FrameTrace.h"
 #include "Utils/PerfOptions.h"
@@ -1595,8 +1596,21 @@ void Skin::SetupExtraTexture(RE::BSLightingShaderMaterialBase const* material, R
 	// (SE 1.5.97: BSShaderTextureSet 0x1412E5390, BGSTextureSet 0x1402D1B90 -> 0x141295C30), i.e. through the game's BSA / loose
 	// file system (MO2's virtual Data). A missing file gives the engine's small default texture, never null. (49a: verified by
 	// disassembly; the "never loaded" reading of community-shaders #2940 does not hold for this code.)
-	inTextureSet->SetTexture(RE::BSTextureSet::Texture::kEnvironment, workingExtraPtr.rfaosTexture);
-	inTextureSet->SetTexture(RE::BSTextureSet::Texture::kMultilayer, workingExtraPtr.wetnessTexture);
+	// (49b) Hitch fix F: a path already found missing this session is not looked up again (each new character with the same skin repeated the
+	// failed VFS lookup); it gets the black default, which the Lighting shader treats like the engine's small default (no texture).
+	const bool skipMissing = globals::features::rayTracing.HitchSkinMissing();
+	if (skipMissing && KnownMissingSkinModTexture(0, workingExtraPtr.extraTexturePath)) {
+		workingExtraPtr.rfaosTexture = stateData.defaultTextureBlack;
+		++skinModLookupsSkipped;
+	} else {
+		inTextureSet->SetTexture(RE::BSTextureSet::Texture::kEnvironment, workingExtraPtr.rfaosTexture);
+	}
+	if (skipMissing && KnownMissingSkinModTexture(1, workingExtraPtr.wetnessTexturePath)) {
+		workingExtraPtr.wetnessTexture = stateData.defaultTextureBlack;
+		++skinModLookupsSkipped;
+	} else {
+		inTextureSet->SetTexture(RE::BSTextureSet::Texture::kMultilayer, workingExtraPtr.wetnessTexture);
+	}
 	NoteSkinModTexture(0, workingExtraPtr.extraTexturePath, workingExtraPtr.rfaosTexture);
 	NoteSkinModTexture(1, workingExtraPtr.wetnessTexturePath, workingExtraPtr.wetnessTexture);
 
@@ -1639,6 +1653,16 @@ void Skin::NoteSkinModTexture(int a_kind, const std::string& a_path, const RE::N
 		logger::debug("[Advanced Skin] {} texture {}: not found (none shipped)", kind, a_path);
 	logger::info("[Advanced Skin] Skin mod textures so far: _wet {} found / {} missing, _rfaos {} found / {} missing",
 		skinModTextureFound[1], skinModTextureMissing[1], skinModTextureFound[0], skinModTextureMissing[0]);
+}
+
+bool Skin::KnownMissingSkinModTexture(int a_kind, const std::string& a_path) const
+{
+	if (a_kind < 0 || a_kind > 1 || a_path.empty())
+		return false;
+	std::string key = a_path;
+	std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+	const auto it = skinModTexturePaths[a_kind].find(key);
+	return it != skinModTexturePaths[a_kind].end() && !it->second;
 }
 
 uint32_t Skin::Fix49aShaderFlags() const

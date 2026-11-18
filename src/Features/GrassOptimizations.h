@@ -62,12 +62,17 @@ public:
 		bool EnableFarLOD = true;
 		float FarLODPixelSize = 4.0f;
 		float MeshLODBandPixels = 3.0f;
+		// (49b) Hitch fix A "Spread Grass Rebuilds After Loading": at most about 2 ms of bucket rebuilds and 16 MB of new GPU memory per visible frame
+		// (no limit while a loading screen or its fade is up); the rest follows on the next frames. Off = the 47l behaviour (all at once).
+		bool SpreadLoadWork = true;
 		// (44h) removed DeferredCompaction / UploadBudget / UploadBudgetMB / MaxGrowthsPerFrame / GrowthHeadroom
 		// (44e load-spike toggles, see reviews/diag-grass-opt-frame-spikes-2026-10.md), now fixed: deferred
 		// compaction on, no upload / growth budget, no growth headroom.
 	};
 
 	Settings settings;
+	// (49b) Hitch fix A: the current spread (frames with uploads put off, uploads put off in all) and the last finished one.
+	uint32_t spreadFrames = 0, spreadDeferred = 0, lastSpreadFrames = 0, lastSpreadDeferred = 0;
 
 	/** @brief Draws the ImGui settings panel for grass optimizations configuration. */
 	virtual void DrawSettings() override;

@@ -304,6 +304,29 @@ bool GrassBucketStore::CompactBucketScratch(GrassBucket& b, ID3D11Device* device
 void GrassBucketStore::UploadDirtyBuckets(ID3D11Device* device, ID3D11DeviceContext* ctx)
 {
 	uint32_t gapCompactions = 0;
+	// (49b) Hitch fix A: the rebuilds / appends of one frame stop at the time and memory budget (the first one always runs); the buckets left keep
+	// their dirty / new-slice state and go on the next frames. Their new slices are not resident until then (culling only reads resident slices).
+	const bool budgeted = frameParams.uploadBudgetMs > 0.0f || frameParams.allocBudgetBytes > 0;
+	LARGE_INTEGER freq{}, start{};
+	if (budgeted) {
+		QueryPerformanceFrequency(&freq);
+		QueryPerformanceCounter(&start);
+	}
+	uint32_t uploadsDone = 0;
+	const auto overBudget = [&]() {
+		if (!budgeted || uploadsDone == 0)
+			return false;
+		if (frameParams.allocBudgetBytes > 0 && lastApply.allocatedBytes >= frameParams.allocBudgetBytes)
+			return true;
+		if (frameParams.uploadBudgetMs > 0.0f) {
+			LARGE_INTEGER now{};
+			QueryPerformanceCounter(&now);
+			const double ms = static_cast<double>(now.QuadPart - start.QuadPart) * 1000.0 / static_cast<double>(std::max<LONGLONG>(freq.QuadPart, 1));
+			if (ms >= frameParams.uploadBudgetMs)
+				return true;
+		}
+		return false;
+	};
 
 	for (auto& [key, b] : buckets) {
 		if (b.needsCompact) {
@@ -335,6 +358,11 @@ void GrassBucketStore::UploadDirtyBuckets(ID3D11Device* device, ID3D11DeviceCont
 		const bool wantsUpload = b.dirty || b.firstNewSlice != UINT32_MAX;
 		if (!wantsUpload)
 			continue;
+		if (overBudget()) {
+			++lastApply.uploadsDeferred;
+			continue;
+		}
+		++uploadsDone;
 
 		if (b.dirty) {
 			RebuildBucket(b, device, ctx);

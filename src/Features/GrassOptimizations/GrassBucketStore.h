@@ -236,6 +236,10 @@ public:
 		bool enableMidLOD = false;
 		bool enableFarLOD = false;
 		float fadeStart = 0.0f;  // stamped on newly captured slices as their fade-in start
+		// (49b) Hitch fix A "Spread Grass Rebuilds After Loading": render-thread ms per frame for bucket rebuilds / appends and GPU MB newly
+		// allocated per frame (0 = no limit: the 47l behaviour). The rest waits for the next frames (its grass appears a few frames later).
+		float uploadBudgetMs = 0.0f;
+		uint64_t allocBudgetBytes = 0;
 		// (44h) removed deferredCompaction / uploadBudgetBytes / maxGrowthsPerFrame / growthHeadroom, now fixed:
 		// deferred compaction always (44e fix A: removals leave gaps; a type is compacted only when new grass
 		// would not fit behind its last instance, or when gaps exceed half its capacity, at most one gap-only
@@ -254,6 +258,7 @@ public:
 		uint64_t allocatedBytes = 0;       ///< GPU memory newly allocated
 		uint64_t uploadedBytes = 0;        ///< CPU -> GPU bytes
 		uint64_t copiedBytes = 0;          ///< GPU -> GPU bytes (compaction / growth)
+		uint32_t uploadsDeferred = 0;      ///< (49b) buckets whose rebuild / append was put off by the budget this frame
 	};
 	ApplyStats lastApply;
 

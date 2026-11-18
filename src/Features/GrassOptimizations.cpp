@@ -30,7 +30,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	MidLODPixelSize,
 	EnableFarLOD,
 	FarLODPixelSize,
-	MeshLODBandPixels)
+	MeshLODBandPixels,
+	SpreadLoadWork)
 
 namespace
 {
@@ -95,6 +96,18 @@ void GrassOptimizations::DrawSettings()
 		else if (!shadersReady)
 			ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Compiling optimized grass shaders; grass is drawn by the game until they are ready.");
 	}
+
+	// (49b) Hitch Fixes (49b): the grass part (the Ray Tracing ones are on Ray Tracing's main page under the same heading).
+	ImGui::SeparatorText("Hitch Fixes (49b)");
+	ImGui::Checkbox("Spread Grass Rebuilds After Loading", &settings.SpreadLoadWork);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text(
+			"On (default): when many grass types load at once (fast travel), at most about 2 ms of grass rebuilds and 16 MB of new\n"
+			"memory go into one visible frame; the rest follows over the next frames (some grass appears a few frames later).\n"
+			"While a loading screen or its fade is up there is no limit. Off: all at once (one long frame, 47l).");
+	}
+	if (lastSpreadFrames > 0)
+		ImGui::TextDisabled("Last spread: %u frames, %u uploads put off", lastSpreadFrames, lastSpreadDeferred);
 
 	ImGui::SeparatorText("Culling & LOD");
 
@@ -365,7 +378,17 @@ void GrassOptimizations::UpdateGrass()
 	maxGrassDistance = settings.RenderDistanceOverride > 0.0f ? settings.RenderDistanceOverride : vanillaMaxDistance;
 	maxDistSq = maxGrassDistance * maxGrassDistance;
 
-	bucketStore.BeginFrame({ settings.EnableMeshLOD, settings.EnableMidLOD, settings.EnableFarLOD, timeAccum });
+	{
+		// (49b) Hitch fix A: budgets on visible frames only (a loading screen or its fade: as much as possible while the screen is dark).
+		GrassBucketStore::FrameParams params{ settings.EnableMeshLOD, settings.EnableMidLOD, settings.EnableFarLOD, timeAccum };
+		auto* ui = globals::game::ui;
+		const bool dark = ui && (ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME) || ui->IsMenuOpen(RE::FaderMenu::MENU_NAME));
+		if (settings.SpreadLoadWork && !dark) {
+			params.uploadBudgetMs = 2.0f;
+			params.allocBudgetBytes = 16ull << 20;
+		}
+		bucketStore.BeginFrame(params);
+	}
 
 	// Captures are folded in and uploaded whether or not the optimized path is on, so switching it on
 	// mid-session finds every loaded cell already bucketed. This only does work on frames where grass
@@ -378,6 +401,18 @@ void GrassOptimizations::UpdateGrass()
 		QueryPerformanceCounter(&t1);
 		QueryPerformanceFrequency(&freq);
 		NoteApplyPending(static_cast<float>(static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 / static_cast<double>(freq.QuadPart)));
+		// (49b) Hitch fix A: one log line per finished spread.
+		const uint32_t deferred = bucketStore.lastApply.uploadsDeferred;
+		Util::FrameTrace::OnGrassSpread(static_cast<int>(deferred));
+		if (deferred > 0) {
+			++spreadFrames;
+			spreadDeferred += deferred;
+		} else if (spreadFrames > 0) {
+			lastSpreadFrames = spreadFrames + 1;
+			lastSpreadDeferred = spreadDeferred;
+			logger::info("[GRASS OPTIMIZATIONS] Hitch fix A: load work spread over {} frames ({} bucket uploads put off to a later frame)", lastSpreadFrames, lastSpreadDeferred);
+			spreadFrames = spreadDeferred = 0;
+		}
 	}
 
 	for (auto& [key, b] : bucketStore.buckets)
@@ -1005,9 +1040,9 @@ void GrassOptimizations::NoteApplyPending(float a_ms)
 	lastSpikeTime = now;
 	++spikeCount;
 	logger::info("[GRASS OPTIMIZATIONS] Load spike {:.2f} ms: removed {} shapes, added {}, compacted {} types ({} put off), rebuilt {}, grew {}, "
-		"allocated {:.1f} MB, uploaded {:.1f} MB, GPU-copied {:.1f} MB",
+		"allocated {:.1f} MB, uploaded {:.1f} MB, GPU-copied {:.1f} MB, {} uploads put off to the next frames (spread {})",
 		a_ms, a.removals, a.captures, a.compactions, a.compactionsDeferred, a.rebuilds, a.growths,
-		mb, static_cast<double>(a.uploadedBytes) / 1048576.0, static_cast<double>(a.copiedBytes) / 1048576.0);
+		mb, static_cast<double>(a.uploadedBytes) / 1048576.0, static_cast<double>(a.copiedBytes) / 1048576.0, a.uploadsDeferred, settings.SpreadLoadWork ? "on" : "off");
 }
 
 void GrassOptimizations::DrawOverlayStats()

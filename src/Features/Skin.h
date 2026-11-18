@@ -370,6 +370,9 @@ struct Skin : Feature
 	uint32_t skinModTextureFound[2] = { 0, 0 };
 	uint32_t skinModTextureMissing[2] = { 0, 0 };
 	void NoteSkinModTexture(int a_kind, const std::string& a_path, const RE::NiSourceTexturePtr& a_texture);
+	/// (49b) Hitch fix F: this path was looked up before and is missing.
+	[[nodiscard]] bool KnownMissingSkinModTexture(int a_kind, const std::string& a_path) const;
+	uint64_t skinModLookupsSkipped = 0;
 	/// (49a) The kFix49a bits for wetCharParams[11].y.
 	uint32_t Fix49aShaderFlags() const;
 
