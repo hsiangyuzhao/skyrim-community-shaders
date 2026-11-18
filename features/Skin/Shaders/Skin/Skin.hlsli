@@ -412,6 +412,35 @@ namespace Skin
 #if defined(SKIN)
 	Texture2D<float4> TexSkinDetailNormal : register(t72);
 
+	// (49a) Advanced Skin fixes, one bit per menu switch (Skin.cpp Fix49aShaderFlags writes them to wetCharParams[11].y, a slot
+	// the 47o cleanup left unused; every bit 0 = the 48n shader exactly).
+	static const uint kFix49aPore = 1u;         // "Pore Detail Follows the Skin": tangent frame from the texture uv, proper detail blend
+	static const uint kFix49aShading = 2u;      // "Skin Shading Fixes": fuzz energy, indirect diffuse weight, grey _wet detection
+	static const uint kFix49aNoDirectAO = 4u;   // "No Extra AO on Direct Light"
+	bool Fix49a(uint a_bit)
+	{
+		return (uint(max(wetCharParams[11].y, 0.0) + 0.5) & a_bit) != 0u;
+	}
+
+	/// (49a) The surface's tangent frame from the texture uv (upstream community-shaders 353f8087 "feat(skin): skin editor (#3154)",
+	/// Skin::SurfaceBasis), from screen derivatives taken in uniform control flow by the caller. Rows (tangent, bitangent, normal):
+	/// mul(basis, v) takes a world vector to tangent space. Mirrored uv keeps its handedness; a degenerate uv falls back to any
+	/// tangent around the normal.
+	float3x3 SurfaceBasisFromDerivatives(float3 dx, float3 dy, float2 du, float2 dv, float3 normal)
+	{
+		float determinant = du.x * dv.y - du.y * dv.x;
+		float signUV = determinant < 0 ? -1.0f : 1.0f;
+		float3 tangent = (dx * dv.y - dy * du.y) * signUV;
+		tangent -= normal * dot(normal, tangent);
+		float3 fallbackAxis = abs(normal.z) < 0.999f ? float3(0, 0, 1) : float3(0, 1, 0);
+		if (abs(determinant) < 1e-12f || dot(tangent, tangent) < 1e-12f)
+			tangent = cross(fallbackAxis, normal);
+		tangent = normalize(tangent);
+		float3 bitangent = (dy * du.x - dx * dv.x) * signUV;
+		float handedness = dot(cross(normal, tangent), bitangent) < 0 ? -1.0f : 1.0f;
+		return float3x3(tangent, cross(normal, tangent) * handedness, normal);
+	}
+
 	struct SkinSurfaceProperties
 	{
 		float RoughnessPrimary;
@@ -573,7 +602,10 @@ namespace Skin
 		float VdotL = dot(V, L);
 		float oVdotH = VdotH;
 
-		light.LightColor *= ApproximateDirectOcculusion(skin.AO, NdotL);
+		// (49a) "No Extra AO on Direct Light" (upstream #3154 removed it): the skin AO (detail texture alpha, _rfaos blue) only
+		// darkens the ambient / reflections then.
+		if (!Fix49a(kFix49aNoDirectAO))
+			light.LightColor *= ApproximateDirectOcculusion(skin.AO, NdotL);
 
 		float averageRoughness = lerp(skin.RoughnessPrimary, skin.RoughnessSecondary, skin.SecondarySpecIntensity);
 
@@ -593,6 +625,13 @@ namespace Skin
 			float2 fuzzSpecularBRDF = BRDF::EnvBRDFApproxLazarov(skin.FuzzRoughness, NdotV);
 			fuzzSpecular *= 1 + skin.FuzzColor * (1 / (fuzzSpecularBRDF.x + fuzzSpecularBRDF.y) - 1);
 
+			// (49a) "Skin Shading Fixes": the light the fuzz layer reflects no longer also reaches the skin below (upstream #3154),
+			// so the rim is not lit twice.
+			if (Fix49a(kFix49aShading)) {
+				const float3 retainedEnergy = 1.0 - saturate(BRDF::F_Schlick(FuzzF0, VdotH) * skin.FuzzWeight);
+				diffuse *= retainedEnergy;
+				specular *= retainedEnergy;
+			}
 			specular += fuzzSpecular * skin.FuzzWeight;
 		}
 
@@ -663,7 +702,12 @@ namespace Skin
 			waterTransmission = lerp(1.0, 1.0 - (WATER_F0 * wetSpecularBRDF.x + wetSpecularBRDF.y), saturate(wetnessEnergy));
 		}
 
-		diffuseWeight = skin.Albedo * (1.0 - specularWeight.x - specularWeight.y) * waterTransmission;
+		// (49a) "Skin Shading Fixes": the diffuse keeps what the specular lobe (per channel, at most all of it) leaves (upstream #3154);
+		// 48n subtracted the specular's red and green channels, i.e. twice the specular of grey skin.
+		if (Fix49a(kFix49aShading))
+			diffuseWeight = skin.Albedo * (1.0 - saturate(specularWeight)) * waterTransmission;
+		else
+			diffuseWeight = skin.Albedo * (1.0 - specularWeight.x - specularWeight.y) * waterTransmission;
 		specularWeight *= waterTransmission;
 		specularWeight *= 1 + skin.F0 * (1 / (specularBRDF.x + specularBRDF.y) - 1);
 		specularWeight += wetSpecular;

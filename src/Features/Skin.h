@@ -70,6 +70,11 @@ struct Skin : Feature
 		float FuzzStrength = 1.0f;
 		float FuzzRoughness = 0.35f;
 		float FuzzF0 = 0.045f;
+		// (49a) Fixes (Skin.hlsli kFix49a*; all off + UseSkinModTextures on = the 48n look).
+		bool UseSkinModTextures = true;  // bind the skin mod's _rfaos / _wet textures (off: none, as for a skin without them)
+		bool FixPoreDetail = true;       // tangent frame of the pore detail from the texture uv, proper detail blend
+		bool SkinShadingFixes = true;    // fuzz energy, indirect diffuse weight, grey _wet detection
+		bool NoDirectLightAO = false;    // the skin AO only on ambient / reflections
 		// (44a) Extra wetness, the Perlin wetness parameters, the film strength and the 43b
 		// coverage options moved to the Wet Skin page (WetSkin.h). (47o) StartSweat / FullSweat /
 		// UseDynamicWetness (moved there in 47i) are no longer kept here (WetSkin reads the raw JSON).
@@ -357,6 +362,15 @@ struct Skin : Feature
 
 	/// @brief Drop the least recently drawn entries if the map is over maxSkinExtraTextures.
 	void PruneSkinExtraTextures();
+
+	/// (49a) What the engine resolved for each distinct _rfaos / _wet path (lower case): true = a real texture (over 32 texels, what
+	/// the Lighting shader accepts), false = missing (the engine's small default). Render thread only (SetupExtraTexture).
+	std::unordered_map<std::string, bool> skinModTexturePaths[2];
+	uint32_t skinModTextureFound[2] = { 0, 0 };
+	uint32_t skinModTextureMissing[2] = { 0, 0 };
+	void NoteSkinModTexture(int a_kind, const std::string& a_path, const RE::NiSourceTexturePtr& a_texture);
+	/// (49a) The kFix49a bits for wetCharParams[11].y.
+	uint32_t Fix49aShaderFlags() const;
 
 	eastl::unique_ptr<Texture2D> texSkinDetail = nullptr;
 	std::unordered_map<uint32_t, ExtraTextures> skinExtraTextures;

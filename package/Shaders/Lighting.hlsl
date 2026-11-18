@@ -2055,7 +2055,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	}
 	if (hasSkinWetness && skinEnabled) {
 		skinWetnessSample = TexSkinWetnessSampler.SampleBias(SampColorSampler, uv, SharedData::MaterialMipBias());
-		if ((skinWetnessSample.y == 0 && skinWetnessSample.z == 0) || (skinWetnessSample.x == skinWetnessSample.y && skinWetnessSample.y == skinWetnessSample.z && skinWetnessSample.w >= 0.99f)) {
+		// (49a) "Skin Shading Fixes": a grey (height / mask) _wet texture is also recognised after block compression (BC7 leaves
+		// its channels a few 1/255 apart: 48n then read the grey as a normal map, mask 1).
+		const float wetGreySpread = max(abs(skinWetnessSample.x - skinWetnessSample.y), abs(skinWetnessSample.y - skinWetnessSample.z));
+		const bool wetGrey = Skin::Fix49a(Skin::kFix49aShading) ? (wetGreySpread <= 3.0 / 255.0) : (skinWetnessSample.x == skinWetnessSample.y && skinWetnessSample.y == skinWetnessSample.z);
+		if ((skinWetnessSample.y == 0 && skinWetnessSample.z == 0) || (wetGrey && skinWetnessSample.w >= 0.99f)) {
 			skinWetMask = skinWetnessSample.x;
 			skinWetnessNormal.xyz = Skin::CalculateNormalFromHeight(skinWetMask, SharedData::skinData.wetParams.w * 0.0001, uv) * 0.5 + 0.5;
 		} else {
@@ -2414,7 +2418,10 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		float2 detailUV = input.TexCoord0.xy * SharedData::skinData.skinDetailParams.x * SharedData::skinData.skinDetailParams.y;
 #		endif  // FACEGEN
 #		if defined(MODELSPACENORMALS)
-		const float3x3 tbnTr = Skin::ReconstructTBN(input.WorldPosition.xyz, worldNormal, screenUV);
+		// (49a) "Pore Detail Follows the Skin": the frame from the texture uv (upstream 353f8087, #3154); 48n built it from the
+		// screen uv, so the detail turned with the camera. The derivatives are the ones taken above in uniform control flow
+		// (wetUV is uv times a constant: same directions).
+		const float3x3 tbnTr = Skin::Fix49a(Skin::kFix49aPore) ? Skin::SurfaceBasisFromDerivatives(wetdPdx, wetdPdy, wetdUVdx, wetdUVdy, normalize(worldNormal.xyz)) : Skin::ReconstructTBN(input.WorldPosition.xyz, worldNormal, screenUV);
 		const float3x3 tbn = transpose(tbnTr);
 		const float3 tangentNormal = mul(tbnTr, worldNormal.xyz);
 #		else
@@ -2427,8 +2434,20 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			skinAO *= skinDetailSample.w;
 		else
 			skinAO *= Skin::TexSkinDetailNormal.SampleBias(SampNormalSampler, detailUV, SharedData::MaterialMipBias()).w;
-		detailNormal = (detailNormal * 2.0 - 1.0) * SharedData::skinData.skinDetailParams.z;
-		float3 combinedTangentNormal = normalize(float3(Skin::ReorientNormal(detailNormal, tangentNormal).xy, tangentNormal.z));
+		float3 combinedTangentNormal;
+		[branch] if (Skin::Fix49a(Skin::kFix49aPore))
+		{
+			// (49a) A unit detail normal (z rebuilt from xy, tilt scaled by Skin Detail Strength) laid on the base normal in the
+			// order the function expects (base first, as upstream #3154); 48n passed them swapped with a zero z.
+			const float2 detailXY = skinDetailSample.xy * 2.0 - 1.0;
+			const float3 detailUnit = normalize(float3(detailXY * SharedData::skinData.skinDetailParams.z, max(sqrt(saturate(1.0 - dot(detailXY, detailXY))), 1e-4)));
+			combinedTangentNormal = normalize(Skin::ReorientNormal(normalize(tangentNormal), detailUnit));
+		}
+		else
+		{
+			detailNormal = (detailNormal * 2.0 - 1.0) * SharedData::skinData.skinDetailParams.z;
+			combinedTangentNormal = normalize(float3(Skin::ReorientNormal(detailNormal, tangentNormal).xy, tangentNormal.z));
+		}
 		float3 combinedNormal = normalize(mul(tbn, combinedTangentNormal));
 		if (SharedData::skinData.skinDetailParams.w > 0.0f)
 			worldNormal.xyz = combinedNormal;

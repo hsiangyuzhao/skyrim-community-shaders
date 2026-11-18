@@ -38,7 +38,11 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	UseSSS,
 	FuzzStrength,
 	FuzzRoughness,
-	FuzzF0);
+	FuzzF0,
+	UseSkinModTextures,
+	FixPoreDetail,
+	SkinShadingFixes,
+	NoDirectLightAO);
 
 void Skin::DrawSettings()
 {
@@ -139,6 +143,36 @@ void Skin::DrawSettings()
 	ImGui::SliderFloat("Body Tiling Multiplier", &settings.BodyTilingMultiplier, 0.5f, 5.0f, "%.1f");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("Multiply the tiling for the body to match the face");
+	}
+
+	// (49a) Fixes, each its own switch (all off + the textures on = 48n).
+	ImGui::Spacing();
+	ImGui::SeparatorText("Fixes (49a)");
+	ImGui::Checkbox("Use Skin Mod _wet / _rfaos Textures", &settings.UseSkinModTextures);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("Use the extra textures a skin mod ships next to its specular / normal map (xxx_wet.dds, xxx_rfaos.dds).");
+		ImGui::BulletText("On = as before (48n already loaded them through the game's file system).");
+		ImGui::BulletText("Off = draw every skin as if it had none (for comparing).");
+		ImGui::BulletText("The _wet mask is only read by the Legacy wetness model; Physical ignores it.");
+	}
+	ImGui::TextDisabled("Found in your mods: _wet %u (missing %u), _rfaos %u (missing %u)",
+		skinModTextureFound[1], skinModTextureMissing[1], skinModTextureFound[0], skinModTextureMissing[0]);
+	ImGui::Checkbox("Pore Detail Follows the Skin", &settings.FixPoreDetail);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("Bodies and hands (model-space normal maps): the pore detail no longer slides when the camera turns.");
+		ImGui::BulletText("The detail's direction now comes from the texture, not the screen; the detail and base normals are blended in the right order.");
+	}
+	ImGui::Checkbox("Skin Shading Fixes", &settings.SkinShadingFixes);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("Small corrections from upstream:");
+		ImGui::BulletText("the light the fuzz layer reflects is taken off the skin below (edges slightly less bright);");
+		ImGui::BulletText("ambient light on skin no longer loses twice the reflected share (ambient slightly brighter, most at the edges);");
+		ImGui::BulletText("Legacy wetness: a compressed grey _wet texture is read as a mask, not a normal map.");
+	}
+	ImGui::Checkbox("No Extra AO on Direct Light", &settings.NoDirectLightAO);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("The skin's own occlusion (detail texture, _rfaos) darkens only ambient light and reflections, not sun / lamps.");
+		ImGui::BulletText("Taste: upstream removed it. Off = as before.");
 	}
 
 	// (47m) In a "Tools" node, closed by default.
@@ -1587,8 +1621,15 @@ void Skin::SetupExtraTexture(RE::BSLightingShaderMaterialBase const* material, R
 
 	inTextureSet->SetTexturePath(RE::BSTextureSet::Texture::kEnvironment, workingExtraPtr.extraTexturePath.c_str());
 	inTextureSet->SetTexturePath(RE::BSTextureSet::Texture::kMultilayer, workingExtraPtr.wetnessTexturePath.c_str());
+	// Despite its CommonLib name, BSTextureSet vfunc 26 ("SetTexture") is the engine's texture-set loader: it reads the slot's
+	// path and loads it into the out pointer with BSShaderManager::GetTexture(path, demand = true, out, slot == kHeight)
+	// (SE 1.5.97: BSShaderTextureSet 0x1412E5390, BGSTextureSet 0x1402D1B90 -> 0x141295C30), i.e. through the game's BSA / loose
+	// file system (MO2's virtual Data). A missing file gives the engine's small default texture, never null. (49a: verified by
+	// disassembly; the "never loaded" reading of community-shaders #2940 does not hold for this code.)
 	inTextureSet->SetTexture(RE::BSTextureSet::Texture::kEnvironment, workingExtraPtr.rfaosTexture);
 	inTextureSet->SetTexture(RE::BSTextureSet::Texture::kMultilayer, workingExtraPtr.wetnessTexture);
+	NoteSkinModTexture(0, workingExtraPtr.extraTexturePath, workingExtraPtr.rfaosTexture);
+	NoteSkinModTexture(1, workingExtraPtr.wetnessTexturePath, workingExtraPtr.wetnessTexture);
 
 	workingExtraPtr.hasExtraTexture = workingExtraPtr.rfaosTexture != nullptr && !workingExtraPtr.extraTexturePath.empty() && workingExtraPtr.rfaosTexture != stateData.defaultTextureBlack;
 	workingExtraPtr.hasWetnessTexture = workingExtraPtr.wetnessTexture != nullptr && !workingExtraPtr.wetnessTexturePath.empty() && workingExtraPtr.wetnessTexture != stateData.defaultTextureBlack;
@@ -1603,6 +1644,42 @@ void Skin::SetupExtraTexture(RE::BSLightingShaderMaterialBase const* material, R
 	// point, so it is the only place the size can grow, and pruning here means the check costs
 	// nothing on the hot path (BSLightingShader_SetupMaterial, per draw call).
 	PruneSkinExtraTextures();
+}
+
+void Skin::NoteSkinModTexture(int a_kind, const std::string& a_path, const RE::NiSourceTexturePtr& a_texture)
+{
+	if (a_kind < 0 || a_kind > 1 || a_path.empty())
+		return;
+	std::string key = a_path;
+	std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+	if (skinModTexturePaths[a_kind].contains(key))
+		return;
+	// The Lighting shader's own test (TexSkinExtraSampler / TexSkinWetnessSampler wider and taller than 32 texels).
+	D3D11_TEXTURE2D_DESC desc{};
+	bool found = false;
+	if (a_texture && a_texture->rendererTexture && a_texture->rendererTexture->texture) {
+		a_texture->rendererTexture->texture->GetDesc(&desc);
+		found = desc.Width > 32 && desc.Height > 32;
+	}
+	skinModTexturePaths[a_kind].emplace(std::move(key), found);
+	(found ? skinModTextureFound : skinModTextureMissing)[a_kind]++;
+	const char* kind = a_kind == 0 ? "_rfaos" : "_wet";
+	if (found)
+		logger::info("[Advanced Skin] {} texture {}: {}x{}, DXGI format {}", kind, a_path, desc.Width, desc.Height, static_cast<uint32_t>(desc.Format));
+	else
+		logger::debug("[Advanced Skin] {} texture {}: not found (none shipped)", kind, a_path);
+	logger::info("[Advanced Skin] Skin mod textures so far: _wet {} found / {} missing, _rfaos {} found / {} missing",
+		skinModTextureFound[1], skinModTextureMissing[1], skinModTextureFound[0], skinModTextureMissing[0]);
+}
+
+uint32_t Skin::Fix49aShaderFlags() const
+{
+	// Skin.hlsli kFix49aPore / kFix49aShading / kFix49aNoDirectAO.
+	uint32_t f = 0;
+	f |= settings.FixPoreDetail ? 1u : 0u;
+	f |= settings.SkinShadingFixes ? 2u : 0u;
+	f |= settings.NoDirectLightAO ? 4u : 0u;
+	return f;
 }
 
 // (batch 16, item 4) See Skin::maxSkinExtraTextures for why eviction is safe here.
@@ -1664,8 +1741,13 @@ void Skin::BSLightingShader_SetupMaterial(RE::BSLightingShaderMaterialBase const
 	// that should be evicted.
 	workingExtraPtr.lastUsed = std::chrono::steady_clock::now().time_since_epoch().count();
 
-	if (workingExtraPtr.hasExtraTexture || workingExtraPtr.hasWetnessTexture) {
-		skinExtendedRendererState.SetExtraSkinPSTexture(workingExtraPtr.rfaosTexture->rendererTexture, workingExtraPtr.wetnessTexture->rendererTexture);
+	// (49a) "Use Skin Mod _wet / _rfaos Textures" off: as a skin without them. A null texture binds the black default (the engine
+	// never hands back null, see SetupExtraTexture; this only keeps a surprise from crashing the render thread).
+	if (settings.UseSkinModTextures && (workingExtraPtr.hasExtraTexture || workingExtraPtr.hasWetnessTexture)) {
+		auto* black = graphicsState->GetRuntimeData().defaultTextureBlack->rendererTexture;
+		auto* rfaos = workingExtraPtr.rfaosTexture ? workingExtraPtr.rfaosTexture->rendererTexture : black;
+		auto* wet = workingExtraPtr.wetnessTexture ? workingExtraPtr.wetnessTexture->rendererTexture : black;
+		skinExtendedRendererState.SetExtraSkinPSTexture(rfaos, wet);
 	} else {
 		skinExtendedRendererState.SetExtraSkinPSTexture(graphicsState->GetRuntimeData().defaultTextureBlack->rendererTexture, graphicsState->GetRuntimeData().defaultTextureBlack->rendererTexture);
 	}
@@ -1759,6 +1841,8 @@ void Skin::BSLightingShader_SetupGeometry(RE::BSRenderPass* a_pass)
 			perGeometryData.wetCharParams[i] = wetCharParamsCache[i];
 		// (47p) The performance switches the Lighting shader reads (Lighting.hlsl Perf47p; a slot the 47o cleanup left unused).
 		perGeometryData.wetCharParams[11].x = static_cast<float>(PerfShaderFlags());
+		// (49a) The Advanced Skin fix switches (Skin.hlsli Fix49a; another slot the 47o cleanup left unused).
+		perGeometryData.wetCharParams[11].y = static_cast<float>(Fix49aShaderFlags());
 		// (47f) Physical: this character's look. (47i) Its water amounts, bead parameters and swim height profile in
 		// wetPhysParams / wetPhysBands; a few look values ride in the frame's parameters (Skin.hlsli).
 		if (lastWetState && wetSkin.IsPhysical() && lastWetState->phys.valid) {
