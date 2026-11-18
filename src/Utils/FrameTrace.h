@@ -196,14 +196,9 @@ namespace Util::FrameTrace
 		int windFrozenUnlearned = -1, windSharedCatchups = -1;
 		// (47u) Start Sun Trace Earlier: 1 = RTAO's normal prep ran behind the ready signal, 0 = before it (47t order), -1 = none / off.
 		// Skip Updates That Cannot Affect the Image (-1 = off): plant refits skipped, plants refit late (reachable after all), NPCs
-		// culled, 1 = this frame's characters were redone without culling. Spatial Static Chunks: 1 on, 0 off.
+		// culled, 1 = this frame's characters were redone without culling. (48o) Both always on.
 		int earlyNormal = -1;
 		int relWindCulled = -1, relWindLate = -1, relNpcCulled = -1, relFallback = -1;
-		int spatialChunks = -1;
-		// (47w) Adaptive skip (-1 = off): engine shadow maps left out this frame, kept because RT does not fully cover their light, and the
-		// largest uncovered share (percent of the pixels such a light lights) in the newest read-back.
-		int smNativeSkipped = -1, smNativeRestored = -1;
-		float smUncoveredMaxPct = -1.0f;
 		// (48a) RT reflections step 1 (trace only): GPU ms of the reflection rays (in the RTAO list; -1 = not traced this frame) and the share
 		// of the render pixels they traced (percent, read back a few frames late; -1 = not traced).
 		float reflGpuMs = -1.0f, reflTracedPct = -1.0f;

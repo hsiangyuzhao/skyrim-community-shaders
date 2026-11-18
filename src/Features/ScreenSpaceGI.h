@@ -118,8 +118,8 @@ public:
 		float ContactRadius = 15.f;  // centimetres
 		float ContactStrength = 1.f;
 		// (47n) contactAo.cs.hlsl: a depth disocclusion test on the history (its own last-frame view depth, texContactDepth) and a
-		// 4-frame window instead of 8 (SSGICB ContactFlags bit 0). Off = 47m.
-		bool ContactGhostFix = true;
+		// 4-frame window instead of 8 (SSGICB ContactFlags bit 0). (48o) Always on (the key is ignored).
+		static constexpr bool ContactGhostFix = true;
 	} settings;
 
 	struct alignas(16) SSGICB

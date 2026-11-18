@@ -59,7 +59,6 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     NoiseScale,
     NoiseThreshold,
     NoiseVelocity,
-    MatchWeatherFogBrightness,
     OffIndoors)
 
 namespace
@@ -89,8 +88,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     WeatherMode,
     ClearFogFar,
     FullFogFar,
-    TakeoverScaleHeight,
-    PhysicalFogBrightness)
+    TakeoverScaleHeight)
 
 void ExponentialHeightFog::RestoreDefaultSettings()
 {
@@ -994,15 +992,7 @@ void ExponentialHeightFog::DrawSettings()
             "Every mode but Off also fixes the height fog's colour being dimmed twice. The distant physical-sky haze\n"
             "steps back behind the weather's fog.");
     // (47m) "EHF Restores Room Fog" (indoors the cell's own fog stays under the height fog) is permanent.
-    // (47g)
-    ImGui::Checkbox("Physical Fog Brightness", &vanillaFog.PhysicalFogBrightness);
-    if (auto _tt = Util::HoverTooltipWrapper())
-        ImGui::Text(
-            "Outdoors with Physical Sky. On (default): the fog is as bright as the light that reaches it - the clear\n"
-            "sky's light and the sun through the fog above - and the weather's fog colour only gives its tint.\n"
-            "Applies where the fog takes the fog colour (Use Dynamic Cubemaps for Inscattering off) and to the\n"
-            "3D fog's Match Weather Fog Brightness, so Volumetric Fog on and off match. With dynamic cubemaps on\n"
-            "the height fog keeps the cubemap's colour. Off: the fog colour's own brightness, as in 47f.");
+    // (47g) "Physical Fog Brightness" (48o) is always on (no switch).
     if (const float skyLight = globals::features::physicalSky.horizonFixCbData.fogSkyLight; skyLight > 0.0f)
         ImGui::Text("Clear sky light on the fog: %.3f", skyLight);
     {
@@ -1086,17 +1076,7 @@ void ExponentialHeightFog::DrawSettings()
         ImGui::SliderFloat("Local Light Scattering Intensity", &volumetric.LocalLightIntensity, 0.0f, 10.0f, "%.2f");
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text("Glow of torches, lanterns and other lights in the fog (needs Light Limit Fix).");
-        // (47e)
-        ImGui::Checkbox("Match Weather Fog Brightness", &volumetric.MatchWeatherFogBrightness);
-        if (auto _tt = Util::HoverTooltipWrapper())
-            ImGui::Text(
-                "Only with \"EHF Follows Weather\" = CS Fog Takes Over, outdoors in foggy weather.\n"
-                "On (default): the weather's fog inside the 3D fog is as bright as the game's own fog. The weather's\n"
-                "fog colour already holds the light bounced around inside the fog; the 3D fog only lit it once, with\n"
-                "the sun mostly taken out by the fog above, so it came out about half as bright (looked thinner).\n"
-                "Lit fog now matches Volumetric Fog off, plus the glow toward the sun; fog in shadow keeps the sun's\n"
-                "share out, so shafts stay. With this on the Scattering Intensities can go back to about 1.\n"
-                "Off: as in 47d.");
+        // (47e) "Match Weather Fog Brightness" (48o) is always on (no switch).
         {
             const bool built = lastBuildFrame != UINT32_MAX && globals::state->frameCount - lastBuildFrame <= 1u;
             if (built && volumetricDebug && volumetricDebug->valid && volumetricDebug->weather[3] > 0.0f) {

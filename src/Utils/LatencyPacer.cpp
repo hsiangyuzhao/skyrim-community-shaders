@@ -560,12 +560,12 @@ namespace Util::LatencyPacer
 			// The previous frame finishes about `pending` GPU periods after the last completion.
 			const double periodTicks = static_cast<double>(period) * static_cast<double>(g_qpf) / 1000.0;
 			const int64_t raw = lastDone + static_cast<int64_t>(periodTicks * pending);
-			// (46p) The same from the median phase of the recent completions (shown always; used with Smooth GPU Phase).
+			// (46p) The same from the median phase of the recent completions (shown only: (48o) Smooth GPU Phase is gone).
 			const int64_t smoothed = doneCount > 0 && doneTimes[doneCount - 1] == lastDone ?
 			                             SmoothedCompletion(doneTimes.data(), doneIndex.data(), doneCount, newestIndex, periodTicks, raw) :
 			                             raw;
 			info.phaseShiftMs = static_cast<float>(ToMs(smoothed - raw));
-			const int64_t predicted = a_options.smoothPhase ? smoothed : raw;
+			const int64_t predicted = raw;
 			info.predictedMs = static_cast<float>(std::max(0.0, ToMs(predicted - start)));
 			if (a_enabled && lead >= 0.0f) {
 				const double reserveMs = static_cast<double>(leadUsed) + static_cast<double>(a_marginMs);

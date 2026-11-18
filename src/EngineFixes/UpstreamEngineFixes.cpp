@@ -93,11 +93,12 @@ namespace UpstreamEngineFixes
 		/** @brief The poll's "flush" immediate (r9b = 1), 0 when the code did not verify. */
 		std::uintptr_t sunPollFlushByte = 0;
 
+		/// (48o) Always on: the poll's flush flag is cleared once at install.
 		void ApplySunPoll()
 		{
 			if (!sunPollFlushByte)
 				return;
-			const std::uint8_t wanted = settings.SunOcclusionNoFlush ? 0 : 1;
+			constexpr std::uint8_t wanted = 0;
 			if (*reinterpret_cast<const std::uint8_t*>(sunPollFlushByte) != wanted)
 				REL::safe_write(sunPollFlushByte, &wanted, 1);
 		}
@@ -177,7 +178,7 @@ namespace UpstreamEngineFixes
 
 			static void thunk(RE::BSShaderPropertyLightData* a_this, RE::BSLight* a_light)
 			{
-				if (settings.LightListSearch && a_this->lightListFence == FenceUnset) {
+				if (a_this->lightListFence == FenceUnset) {
 					const auto& lights = a_this->lights;
 					if (ContainsPointer(reinterpret_cast<const void* const*>(lights.data()), lights.size(), a_light))
 						return;
@@ -271,7 +272,7 @@ namespace UpstreamEngineFixes
 		{
 			std::uint32_t mask = 0;
 			const auto* state = globals::game::smState;
-			if (sunMaskReady && settings.SunShadowMask && state) {
+			if (sunMaskReady && state) {
 				const auto* shadowSceneNode = state->shadowSceneNode[0];
 				if (shadowSceneNode && !state->interior && !*sunShadowSkipped) {
 					const auto& runtimeData = shadowSceneNode->GetRuntimeData();
@@ -319,7 +320,7 @@ namespace UpstreamEngineFixes
 						// Atomic so this worker write cannot drop bits the render thread's cascade cull sets concurrently.
 						std::atomic_ref<std::uint32_t>(a_property->lightData->unk1C).fetch_or(mask);
 				}
-				if (overlayReady && settings.EmptyOverlayCull && a_geometry && IsEmptyOverlay(a_property, a_geometry)) {
+				if (overlayReady && a_geometry && IsEmptyOverlay(a_property, a_geometry)) {
 					ClearPasses(a_property->renderPassList);
 					return &a_property->renderPassList;
 				}
@@ -385,28 +386,10 @@ namespace UpstreamEngineFixes
 			lodRing.sliding = false;
 		}
 
-		/** @brief Hands the ring back to the engine: its own grid center, the game-time lerp finished. */
-		void ReleaseLodRing()
-		{
-			if (!lodRing.hasCenter)
-				return;
-			if (lodRing.sliding)
-				EndSlide();
-			if (auto* state = globals::game::smState) {
-				state->oldGridArrayCenter = state->gridArrayCenter = RE::NiPoint2(lodRing.gridCenter.x, lodRing.gridCenter.y);
-				state->gridArrayLerpStart = 0.0f;
-			}
-			lodRing.hasCenter = false;
-		}
-
 		void UpdateLodRing()
 		{
 			if (!lodRing.blendInProgress)
 				return;
-			if (!settings.LODBlendRing) {
-				ReleaseLodRing();
-				return;
-			}
 			auto* tes = RE::TES::GetSingleton();
 			auto* player = RE::PlayerCharacter::GetSingleton();
 			if (!tes || !player || tes->interiorCell || !tes->GetRuntimeData2().worldSpace || !globals::game::smState) {
@@ -458,37 +441,30 @@ namespace UpstreamEngineFixes
 			lodRingStatus = Status::Installed;
 		}
 
+		/// (48o) Each fix is always on; what did not install goes to the log (no menu any more).
 		struct Item
 		{
-			bool Settings::*field;
-			const char* key;
-			const char* label;
+			const char* name;
 			Status* status;
-			const char* tooltip;
 		};
 
 		constexpr Item kItems[] = {
-			{ &Settings::SunOcclusionNoFlush, "SunOcclusionNoFlush", "Sun glare check: no mid-frame GPU flush", &sunPollStatus,
-				"The game checks every frame whether the sun is hidden (for the sun glare). When the answer is not ready yet it\n"
-				"used to push the queued GPU work out early, which can unsettle frame pacing. Now it just asks again next frame:\n"
-				"the glare may react one frame later. (official CS #2901)" },
-			{ &Settings::LightListSearch, "LightListSearch", "Faster light list search (AVX2)", &lightListStatus,
-				"When the game attaches lights to objects it checks each light against the object's list one by one. This\n"
-				"answers the common \"already attached\" case with a vectorised search. Saves CPU in towns and lit interiors.\n"
-				"No visible change. (official CS #3031)" },
-			{ &Settings::EmptyOverlayCull, "EmptyOverlayCull", "Skip empty RaceMenu overlay slots", &overlayStatus,
-				"RaceMenu adds every overlay slot (tattoos, paint) as a full copy of the body, even when the slot is empty; the\n"
-				"empty ones still ran the full lighting shader and blended to nothing. Those are now skipped. No visible change.\n"
-				"(official CS #3050)" },
-			{ &Settings::SunShadowMask, "SunShadowMask", "No one-frame full-sunlit flash on new objects", &sunMaskStatus,
-				"Objects that come into view could be drawn for one frame without the sun shadow (shadow map and ray-traced\n"
-				"sun shadow alike): a brief bright flash when turning the camera. They now get the sun shadow from the first\n"
-				"frame. (official CS #2925)" },
-			{ &Settings::LODBlendRing, "LODBlendRing", "Distant terrain blend ring follows the frame clock", &lodRingStatus,
-				"The ring where near terrain blends into distant LOD terrain moved on game time: it stuck when time was\n"
-				"frozen and jumped at midnight or when crossing cells. It now slides smoothly (0.25 s) and leans toward you.\n"
-				"(official CS #2894)" },
+			{ "Sun Occlusion Poll Fix (official CS #2901)", &sunPollStatus },
+			{ "Light List Search Fix (official CS #3031)", &lightListStatus },
+			{ "Empty Overlay Cull Fix (official CS #3050)", &overlayStatus },
+			{ "Sun Shadow Mask Fix (official CS #2925)", &sunMaskStatus },
+			{ "LOD Blend Ring Fix (official CS #2894)", &lodRingStatus },
 		};
+
+		void LogStatus()
+		{
+			for (const auto& item : kItems) {
+				if (*item.status == Status::Installed)
+					logger::info("[Engine Fixes] {}: active", item.name);
+				else
+					logger::warn("[Engine Fixes] {}: {}", item.name, StatusText(*item.status));
+			}
+		}
 	}
 
 	void Install()
@@ -503,7 +479,7 @@ namespace UpstreamEngineFixes
 		InstallLightList();
 		InstallRenderPassHook();
 		InstallLodRing();
-		logger::info("[Engine Fixes] (48n) {}", Describe());
+		LogStatus();
 	}
 
 	void OnFrame()
@@ -511,57 +487,5 @@ namespace UpstreamEngineFixes
 		if (sunMaskReady)
 			UpdateSunMask();
 		UpdateLodRing();
-	}
-
-	void Load(const json& a_json)
-	{
-		settings = {};
-		if (a_json.is_object()) {
-			for (const auto& item : kItems)
-				if (a_json.contains(item.key) && a_json[item.key].is_boolean())
-					settings.*item.field = a_json[item.key].get<bool>();
-		}
-		ApplySunPoll();
-	}
-
-	json Save()
-	{
-		json j;
-		for (const auto& item : kItems)
-			j[item.key] = settings.*item.field;
-		return j;
-	}
-
-	std::string Describe()
-	{
-		std::string s;
-		for (const auto& item : kItems) {
-			if (!s.empty())
-				s += " ";
-			s += std::format("{}{}{}", item.key, settings.*item.field ? "+" : "-", *item.status == Status::Installed ? "" : "(n/a)");
-		}
-		return s;
-	}
-
-	void DrawMenu()
-	{
-		ImGui::Spacing();
-		ImGui::SeparatorText("Engine Fixes (48n)");
-		ImGui::TextWrapped("Small engine fixes ported from the official Community Shaders. Each works on its own and takes effect at once.");
-		for (const auto& item : kItems) {
-			bool value = settings.*item.field;
-			const bool installed = *item.status == Status::Installed;
-			if (ImGui::Checkbox(item.label, &value)) {
-				settings.*item.field = value;
-				if (item.field == &Settings::SunOcclusionNoFlush)
-					ApplySunPoll();
-			}
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted(item.tooltip);
-			if (!installed) {
-				ImGui::SameLine();
-				ImGui::TextDisabled("(%s)", StatusText(*item.status));
-			}
-		}
 	}
 }

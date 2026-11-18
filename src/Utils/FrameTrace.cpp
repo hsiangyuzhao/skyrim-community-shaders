@@ -14,8 +14,6 @@
 #include "Utils/EngineTiming.h"
 #include "Utils/GpuTimers.h"
 #include "Utils/LatencyPacer.h"
-#include "Utils/PerfOptions.h"
-#include "EngineFixes/UpstreamEngineFixes.h"
 #include "Utils/WorldTiming.h"
 
 #include <d3d12.h>  // (46p) TagVram on D3D12 objects
@@ -922,8 +920,6 @@ namespace Util::FrameTrace
 				out << "# (45j) ray tracing at start: " << a_rayTracing << "\n";
 				out << "# (46e) rendering at start: " << a_rendering << "\n";
 				out << "# (46w) frame generation at start: " << a_headerFG << "\n";
-				out << "# (47p) performance switches when written: " << PerfOptions::Describe() << "\n";
-				out << "# (48n) engine fixes when written: " << UpstreamEngineFixes::Describe() << "\n";
 				out << "# (45j) rt_* = Ray Tracing CPU split (ms, -1 = not run): scene update (grid diff, cell capture, filter registration, objects of which new\n";
 				out << "#   captures), TLAS instances, missed-caster check, characters, D3D12 record+submit (of which BLAS creation, skinning), D3D11 passes,\n";
 				out << "#   end of frame, engine references dropped; counts: recaptures, objects captured, misses examined, references waiting, TLAS instances,\n";
@@ -1034,7 +1030,7 @@ namespace Util::FrameTrace
 				out << "#   pacer_spike_skip = 1 when the previous frame's wait was not learned (a GPU frame over 1.5 periods finished since the submit\n";
 				out << "#   before it or was running then: that frame and the next); pacer_done_interval_ms = the last GPU completion interval the\n";
 				out << "#   waiter saw (per frame); pacer_phase_shift_ms = smoothed minus raw predicted completion (median phase of the last 6\n";
-				out << "#   completions; used for pacer_pred_ms only with Smooth GPU Phase on, shown always).\n";
+				out << "#   completions; shown only, pacer_pred_ms is the raw prediction).\n";
 				out << "#   vram_<group>_new_mb / _freed_mb = bytes created / destroyed this frame (estimates from the descriptions) by: ours (RT D3D12\n";
 				out << "#   BLAS / TLAS / scratch / character pools / other, our D3D11 textures and buffers, our shared interop textures), engine (D3D11\n";
 				out << "#   created by SkyrimSE.exe), other (other modules: plugins, Streamline, drivers), sysmem (upload / read-back heaps, staging);\n";
@@ -1071,11 +1067,9 @@ namespace Util::FrameTrace
 				out << "#   it (47t order: first frames, size changes), -1 = no normal prep / switch off. rt_rel_* = Skip Updates That Cannot Affect the\n";
 				out << "#   Image (-1 = off): rt_rel_wind_culled = plant refits skipped (no ray could reach them), rt_rel_wind_late = plants culled at the\n";
 				out << "#   frame start that this frame's rays reach after all (refit before the TLAS), rt_rel_npc_culled = NPCs not posed, rt_rel_fallback\n";
-				out << "#   = 1 when a culled NPC was reachable after all (the frame's characters redone without culling). rt_chunk_spatial = Spatial\n";
-				out << "#   Static Chunks on (1) / off (0); with it rt_chunk_overlap is the new packing's.\n";
-				out << "# (47w) rt_sm_native_skipped / rt_sm_native_restored = Adaptive skip (-1 = off): the game shadow maps left out this frame / kept\n";
-				out << "#   because ray tracing does not shadow every pixel their light lights; rt_sm_uncovered_max_pct = the largest such uncovered share\n";
-				out << "#   (percent of a light's lit pixels, newest read-back, -1 = none).\n";
+				out << "#   = 1 when a culled NPC was reachable after all (the frame's characters redone without culling). (48o) Both are\n";
+				out << "#   always on; rt_chunk_spatial (Spatial Static Chunks, fixed off) and the 47w rt_sm_native_* / rt_sm_uncovered_max_pct\n";
+				out << "#   (Adaptive skip, fixed off) are dropped.\n";
 				out << "# (48a) rt_refl_gpu_ms = RT reflections: GPU ms of the reflection rays (D3D12 queue, between its timestamps, so it includes D3D11\n";
 				out << "#   work running in between: wall time, not their cost; the cost is the gpu_work A/B; -1 = not traced); rt_refl_traced_pct = the share\n";
 				out << "#   of the render pixels that traced one ((48d) the importance-selected pixels; -1 = not traced). (48d) Their own list and fence.\n";
@@ -1196,8 +1190,7 @@ namespace Util::FrameTrace
 					   "gpu_spike_ms,jobs,"  // (47p)
 					   "rt_npc_body_only,rt_npc_refit_skipped,rt_skip_tiny_face,rt_wind_catchup,rt_chunk_cells,rt_chunks_per_cell,rt_chunk_overlap,"  // (47q)
 					   "rt_wind_frozen_unlearned,rt_wind_shared,"  // (47r)
-					   "rt_early_normal,rt_rel_wind_culled,rt_rel_wind_late,rt_rel_npc_culled,rt_rel_fallback,rt_chunk_spatial,"  // (47u)
-					   "rt_sm_native_skipped,rt_sm_native_restored,rt_sm_uncovered_max_pct,"  // (47w)
+					   "rt_early_normal,rt_rel_wind_culled,rt_rel_wind_late,rt_rel_npc_culled,rt_rel_fallback,"  // (47u) (48o) rt_chunk_spatial, 47w rt_sm_* dropped
 					   "rt_refl_gpu_ms,rt_refl_traced_pct,"  // (48a)
 					   "rt_pl_extra_pct,"  // (48c)
 					   "rt_refl_fill,rt_refl_sync_gpu_ms,"  // (48d)
@@ -1398,12 +1391,8 @@ namespace Util::FrameTrace
 					extra += std::format(",{},{}\n", r.rt.windFrozenUnlearned, r.rt.windSharedCatchups);
 					// (47u) after rt_wind_shared (the old last column; 47v removed 47r's pacer_repeat_fed and 47s / 47t's rt_ac_* / rt_omm_*).
 					extra.pop_back();
-					extra += std::format(",{},{},{},{},{},{}\n", r.rt.earlyNormal, r.rt.relWindCulled, r.rt.relWindLate, r.rt.relNpcCulled, r.rt.relFallback,
-						r.rt.spatialChunks);
-					// (47w) Adaptive skip, after rt_chunk_spatial (the old last column).
-					extra.pop_back();
-					extra += std::format(",{},{},{:.2f}\n", r.rt.smNativeSkipped, r.rt.smNativeRestored, r.rt.smUncoveredMaxPct);
-					// (48a) RT reflections step 1, after rt_sm_uncovered_max_pct (the old last column).
+					extra += std::format(",{},{},{},{},{}\n", r.rt.earlyNormal, r.rt.relWindCulled, r.rt.relWindLate, r.rt.relNpcCulled, r.rt.relFallback);
+					// (48a) RT reflections step 1, after rt_rel_fallback ((48o) rt_chunk_spatial and the 47w rt_sm_* columns are gone).
 					extra.pop_back();
 					extra += std::format(",{:.3f},{:.1f}\n", r.rt.reflGpuMs, r.rt.reflTracedPct);
 					// (48c) Extra Lights Where Crowded, after rt_refl_traced_pct (the old last column).

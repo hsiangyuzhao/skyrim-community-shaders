@@ -60,7 +60,6 @@ namespace Util::LatencyPacer
 		bool enabled = false;        ///< sleep (else measure only)
 		float marginMs = 1.0f;
 		bool paused = false;         ///< (46o) game paused / loading screen / map open: the samples are cleared when it ends
-		bool smoothPhase = false;    ///< (46p) "Smooth GPU Phase": the predicted completion from the median phase of the last completions
 	};
 
 	/// Main thread, in Main::Update before the Reflex sleep. Sleeps only when a_options.enabled.

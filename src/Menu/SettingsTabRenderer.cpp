@@ -16,8 +16,6 @@
 #include "ShaderCache.h"
 #include "ThemeManager.h"
 #include "Util.h"
-#include "EngineFixes/UpstreamEngineFixes.h"
-#include "Utils/PerfOptions.h"
 
 using json = nlohmann::json;
 
@@ -63,7 +61,7 @@ void SettingsTabRenderer::RenderGeneralSettings(
 	const std::function<const char*(uint32_t)>& keyIdToString)
 {
 	if (ImGui::BeginTabBar("##GeneralTabBar", ImGuiTabBarFlags_None)) {
-		RenderPerformanceTab();  // (47p)
+		// (48o) The Performance tab (47p presets and switches, 48n Engine Fixes) is gone: all fixed.
 		RenderShadersTab();
 		RenderKeybindingsTab(state, keyIdToString);
 		RenderInterfaceTab();
@@ -185,15 +183,6 @@ void SettingsTabRenderer::RenderKeybindingsTab(
 			}
 		}
 
-		ImGui::EndTabItem();
-	}
-}
-
-void SettingsTabRenderer::RenderPerformanceTab()
-{
-	if (BeginTabItemWithFont("Performance", Menu::FontRole::Heading)) {
-		PerfOptions::DrawMenu();
-		UpstreamEngineFixes::DrawMenu();  // (48n)
 		ImGui::EndTabItem();
 	}
 }

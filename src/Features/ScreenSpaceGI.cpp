@@ -51,8 +51,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	DistanceNormalisation,
 	EnableContactAo,
 	ContactRadius,
-	ContactStrength,
-	ContactGhostFix)
+	ContactStrength)
 
 ////////////////////////////////////////////////////////////////////////////////////
 
@@ -344,16 +343,6 @@ void ScreenSpaceGI::DrawSettings()
 				std::vector<std::string> tooltipLines = {
 					"How dark contact shadows get. 1.0 is already strong; higher is rarely needed.",
 					"0 hides them but still costs performance; use the checkbox above to turn them off."
-				};
-				Util::DrawMultiLineTooltip(tooltipLines);
-			}
-
-			// (47n) Less ghosting: an uncovered-area (depth) test on the history and 4 frames instead of 8.
-			ImGui::Checkbox("Contact AO: Uncovered-Area Test, 4-Frame History", &settings.ContactGhostFix);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				std::vector<std::string> tooltipLines = {
-					"On (default): the contact AO's history is dropped where the surface was just uncovered (behind a walking character)",
-					"and it averages 4 frames instead of 8: less dark fringe behind moving things, a little more grain. Off: as in 47m."
 				};
 				Util::DrawMultiLineTooltip(tooltipLines);
 			}
@@ -915,7 +904,7 @@ void ScreenSpaceGI::UpdateSB()
 		// had before. Every subsequent frame carries the real value.
 		data.PrevFrameDim = (prevFrameDim.x > 0.0f && prevFrameDim.y > 0.0f) ? prevFrameDim : dynres;
 		// (47n) Contact AO: bit 0 the uncovered-area test + 4-frame window, bit 1 last frame's contact depth is there to test against.
-		data.ContactFlags = (settings.ContactGhostFix ? 1u : 0u) | (settings.ContactGhostFix && contactDepthValid ? 2u : 0u);
+		data.ContactFlags = 1u | (contactDepthValid ? 2u : 0u);  // (48o) ContactGhostFix always on
 		data.ssgiPad0 = 0.0f;
 	}
 

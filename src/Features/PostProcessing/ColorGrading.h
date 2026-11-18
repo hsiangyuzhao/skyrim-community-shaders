@@ -54,7 +54,6 @@ struct ColorGrading : public PostProcessFeature
     {
         bool useToDInterior = false;
         bool skipLDR = false;
-        bool lutHalfTexelFix = false;  // (47r) upstream 350c6fe82: the LUT baked and sampled at the same coordinates (default off: slightly darker)
         std::array<ColorProfile, 8> profiles = {};
         std::string currentTonemapper = "GT7";
         std::array<float4, 2> tonemapParams = { float4{ 1.f, 2.f, 0.f, 0.f }, float4{ 0.f, 0.f, 0.f, 0.f } };

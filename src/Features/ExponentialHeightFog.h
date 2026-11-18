@@ -95,7 +95,8 @@ struct ExponentialHeightFog : Feature
 		float3 NoiseVelocity = { 0.0f, 0.0f, 0.0f };
 		/// (47e) CS Fog Takes Over: the weather's part of the volume also gets the light scattered many times that the
 		/// weather's fog colour already holds, so it is as bright as the game's fog (VolumetricFogLightScatteringCS).
-		bool MatchWeatherFogBrightness = true;
+		/// (48o) Always on: no switch, the old key is ignored.
+		static constexpr bool MatchWeatherFogBrightness = true;
 		/// (47j) "Skip Volumetric Fog Indoors" (was "Volumetric Fog: Off Indoors"): no volumetric fog passes in interior cells
 		/// (and nothing of them applied there), saves about 1 ms; its history starts over outside. Exteriors unchanged.
 		/// (47m) Default off (the fog is built indoors too); settings saved before 47m are switched off once (OffIndoors47m).
@@ -130,7 +131,8 @@ struct ExponentialHeightFog : Feature
 		/// (47g) "Physical Fog Brightness": the fog's brightness from what lights it (the clear physical sky and the sun through
 		/// the weather layer), the fog colour giving only its hue. Where the fog takes the fog colour (not Dynamic Cubemaps)
 		/// and in Match Weather Fog Brightness; needs Physical Sky outdoors. Off = 47f. (47m) Kept until the Physical Sky repair.
-		bool PhysicalFogBrightness = true;
+		/// (48o) Always on: no switch, the old key is ignored.
+		static constexpr bool PhysicalFogBrightness = true;
 	} vanillaFog;
 
 	/// (47b) The current weight and what it was computed from (also the menu readout).

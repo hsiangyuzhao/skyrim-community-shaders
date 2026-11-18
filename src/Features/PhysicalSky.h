@@ -131,13 +131,12 @@ struct PhysicalSky final : public Feature
 		/// (47a) "Sky Fixes": one switch for the batch 47a sky (timing from the climate, sky brightness
 		/// following the ground, ozone 10-40 km, midpoint LUTs, ground bounce fix, 64x64 aerial
 		/// perspective, stars fading with the sky, the vanilla sun by its true height, glare hidden by
-		/// ridges, dither, earlier moonlight retreat). Off = 46y exactly. Saved outside the NLOHMANN
-		/// macro (see LoadSettings).
-		bool skyFixes = true;
+		/// ridges, dither, earlier moonlight retreat). (48o) Always on: no switch, the old skyFixes key is ignored.
+		static constexpr bool skyFixes = true;
 		/// (47b) "Sky Precision": upstream's LUT precision work (Bruneton transmittance LUT with analytic planet
 		/// occlusion, nonuniform midpoint quadrature, sky-view rows around the true horizon, quadratic aerial
-		/// perspective slices). Off = 47a2 exactly. Saved outside the NLOHMANN macro.
-		bool skyPrecision = true;
+		/// perspective slices). (48o) Always on: no switch, the old skyPrecision key is ignored.
+		static constexpr bool skyPrecision = true;
 		// (47m) "Horizon Fix" (47f) removed: fixed off (the old horizonFix key is ignored on load).
 		/// (47b) "Aerosol": AerosolPreset. Applied at upload; the saved aerosol values are never changed.
 		int aerosolPreset = 0;
@@ -202,8 +201,9 @@ struct PhysicalSky final : public Feature
 		/// (48b) Its strength, 0-3. 1: Masser full and high on a clear night keeps about 40% of the Milky Way's light.
 		float moonStarFadeStrength = 1.f;
 		/// (48b) "Moon Planetshine": a faint grey fill on the unlit side of each moon disc (strongest at crescent, none at
-		/// full or new moon), so in front of the Milky Way it reads as a dim disc instead of a hole. Off = 48a exactly.
-		bool moonPlanetshine = true;
+		/// full or new moon), so in front of the Milky Way it reads as a dim disc instead of a hole. (48o) Always on (its
+		/// strength slider stays); the old moonPlanetshine key is ignored.
+		static constexpr bool moonPlanetshine = true;
 		/// (48b) Its strength, 0-0.5: the fill's opacity at a thin crescent / 0.75.
 		float moonPlanetshineStrength = 0.1f;
 

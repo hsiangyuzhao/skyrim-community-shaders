@@ -44,7 +44,6 @@
 #include "Utils/FrameTrace.h"
 #include "Utils/LatencyPacer.h"
 #include "Utils/Screenshot.h"
-#include "Utils/OcclusionDryRun.h"
 #include "Utils/UI.h"
 #include <nlohmann/json.hpp>
 
@@ -199,7 +198,6 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	SectionGrass,
 	SectionVram,
 	SectionView,
-	SectionOcclusion,
 	SectionShadows,
 	SectionCpuWait,
 	SectionAdvanced,
@@ -499,8 +497,7 @@ void PerformanceOverlay::SaveSettings(json& j)
 {
 	// Persist all overlay settings to JSON
 	j = this->settings;  // uses NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT
-	// (batch 37a) The occlusion dry run's knobs live with the overlay that shows its numbers.
-	Util::OcclusionDryRun::Save(j["OcclusionDryRun"]);
+	// (48o) The occlusion dry run (batch 37a) is gone; its old "OcclusionDryRun" block is ignored on load and not written.
 }
 
 void PerformanceOverlay::LoadSettings(json& j)
@@ -535,13 +532,10 @@ void PerformanceOverlay::LoadSettings(json& j)
 		s.SectionGrass = false;
 		s.SectionVram = false;
 		s.SectionView = false;
-		s.SectionOcclusion = false;
 		s.SectionShadows = false;
 		s.SectionCpuWait = false;
 		s.OverlayLayoutVersion = Settings::kOverlayLayoutVersion;
 	}
-	if (j.is_object() && j.contains("OcclusionDryRun"))
-		Util::OcclusionDryRun::Load(j["OcclusionDryRun"]);
 	// Ensure history buffers match loaded size
 	this->state.frameTimeHistory.Resize(this->settings.FrameHistorySize);
 	this->state.postFGFrameTimeHistory.Resize(this->settings.FrameHistorySize);
@@ -590,8 +584,6 @@ void PerformanceOverlay::PostPostLoad()
 	// Hooks that only bracket engine calls with a timeline scope; they cost one branch per
 	// call while the overlay table is closed.
 	Util::GpuPhaseTimeline::InstallHooks();
-	// (batch 37a) Occlusion culling phase 0: counts only, never culls. SE 1.5.97 flat only.
-	Util::OcclusionDryRun::Install();
 }
 
 void PerformanceOverlay::DrawOverlay()
@@ -780,9 +772,6 @@ void PerformanceOverlay::DrawOverlay()
 					"How the sun shadow is set up this frame: cascade count and distances, character and lamp shadow maps. "
 					"Their cost is in the Shadows rows of \"GPU time per engine stage\"."))
 				DrawShadowInfo();
-			if (Section("Details: Occlusion dry run (counting only)##PerfSecOcclusion", this->settings.SectionOcclusion,
-					"How many objects an occlusion cull could skip here. Counting only: nothing is ever hidden."))
-				Util::OcclusionDryRun::DrawPanel(menu->IsEnabled);
 			if (Section("Details: SSRT denoiser per pass (ms)##PerfSecDenoiser", this->settings.SectionDenoiser,
 					"Every pass of the SSRT denoiser chain, timed on its own. Only measured while this section is open."))
 				DrawDenoiserTable(viewCfg);
@@ -2015,12 +2004,6 @@ namespace
 					{ P::Transparent, "Transparent & effects",
 						"See-through things drawn after the solid pass:\n"
 						"glass, particles, spell effects, fire, smoke, rain." },
-					// (47h) Diagnostic Split Transparent Pass by Shader (only with it on).
-					{ P::TransparentLighting, "Transparent: objects (Lighting)", "Blended objects drawn with the Lighting shader (glass, blended meshes), not hair or eyes." },
-					{ P::TransparentHair, "Transparent: hair", "Blended hair (the Lighting shader's hair technique)." },
-					{ P::TransparentEye, "Transparent: eyes", "Blended eyes (the Lighting shader's eye technique)." },
-					{ P::TransparentEffect, "Transparent: effects", "Effect-shader meshes: spell effects, fire, smoke, glows, fog cards." },
-					{ P::TransparentOther, "Transparent: other", "Particles and anything else in the blended pass." },
 					{ P::WorldOther, "Other world work", "Main scene work that could not be assigned to any row here." },
 					{ P::FirstPerson, "First person", "Your hands and weapon in first person." },
 				} },
@@ -2271,14 +2254,6 @@ void PerformanceOverlay::DrawEngineGpuTable()
 	float totalMs = 0.0f;
 	table.DisplayValue(kEngineTotalRowId, cfg, totalMs);
 
-	// (47h) Diagnostic, not saved.
-	ImGui::Checkbox("Split Transparent Pass by Shader (diagnostic)", &splitTransparentDiag);
-	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::TextUnformatted(
-			"Off (default): one \"Transparent & effects\" row. On: split into objects / hair / eyes / effects / other, with a GPU\n"
-			"timestamp at every change of shader during that pass (also in the F12 snapshot). The blended pass is sorted back to\n"
-			"front, so this adds many timestamps: frames that run out of them are dropped from the table. Not saved.");
-	}
 	ImGui::TextDisabled("(hover for how to read this)");
 	if (ImGui::IsItemHovered()) {
 		if (auto _tt = Util::HoverTooltipWrapper()) {
@@ -5368,9 +5343,6 @@ nlohmann::json PerformanceOverlay::BuildFrameJson(const PerfView::ViewConfig& a_
 		sh["other"] = stage(Util::GpuPhase::ShadowOther);
 		j["shadows"] = std::move(sh);
 	}
-
-	// ---- occlusion dry run ----
-	j["occlusion"] = Util::OcclusionDryRun::ToJson();
 
 	// ---- (batch 39, items 1-4) reflection cubemap + depth prepass breakdowns, switches ----
 	j["engine"] = Batch39Engine::DiagnosticsJson();

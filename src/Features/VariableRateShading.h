@@ -49,7 +49,7 @@ struct VariableRateShading : Feature
 		bool Enabled = false;
 		float Quality = 0.5f;       // 0..1, higher keeps more tiles at full rate
 		float MotionPixels = 8.0f;  // speed (px/frame) at which the threshold doubles, 0 = off
-		bool DebugOverlay = false;
+		bool DebugOverlay = false;  // (48o) not saved: always starts off
 		// (44h) removed RateMode, CoarsestRate, ProtectNormals, IncludeGrass, IncludeAlphaTested, PeripheryRadius
 		// and CoarsenFrames, now fixed: Adaptive mode (screen-edge modes gone), coarsest rate 2x2, normal detail
 		// protected, grass included, other cut-out objects excluded (they left holes), coarsen delay 8 frames.

@@ -620,7 +620,7 @@ namespace Batch39Engine
 			{ "shader_flags", ShaderFlags() },
 		};
 		j["hooks"] = { { "render_pass", g_passHookInstalled }, { "depth_prepass", g_depthHookInstalled }, { "ps_samplers", g_samplerHookInstalled } };
-		j["small_caster_cull"] = { { "on", PerfOptions::settings.SmallCasterCull }, { "culled_last_frame", g_smallCulledLast }, { "slope", kSmallCasterSlope } };  // (47p)
+		j["small_caster_cull"] = { { "culled_last_frame", g_smallCulledLast }, { "slope", kSmallCasterSlope } };  // (47p)
 
 		j["engine_ini"] = {
 			{ "fCubeMapRefreshRate:Water_seconds", ReadEngineFloat("fCubeMapRefreshRate:Water", -1.0f) },

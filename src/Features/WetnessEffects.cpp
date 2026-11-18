@@ -389,13 +389,6 @@ void WetnessEffects::DrawSettings()
 			};
 			Util::DrawMultiLineTooltip(tooltipLines);
 		}
-		ImGui::Checkbox("Rain Animation: Real-Time Speed", &preciseRainTimer);  // (48n)
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text(
-				"On (default): the rain clock (drops, splashes, ripples) advances once per frame with sub-millisecond\n"
-				"precision, at the speed the effect was designed for (official CS #3064).\n"
-				"Off: the old clock, which advanced 3-5 times per frame and dropped the fraction of a millisecond each\n"
-				"time, so rain animated several times too fast (and a little slower again at high frame rates).");
 		if (ImGui::TreeNodeEx("Raindrops")) {
 			ImGui::BulletText(
 				"At every interval, a raindrop is placed within each grid cell.\n"
@@ -831,15 +824,8 @@ WetnessEffects::PerFrame WetnessEffects::GetCommonBufferData() const
 		}
 	}
 
-	// (48n) Precise: microseconds, advanced once per frame in Reset (official CS #3064). Legacy (A/B): whole milliseconds,
-	// advanced here, i.e. once per feature-buffer rebuild (3-5 times per frame), the fraction dropped each time.
-	if (preciseRainTimer) {
-		data.Time = static_cast<float>(static_cast<double>(rainTimerUs) / 1000000.0);
-	} else {
-		if (!globals::game::ui->GameIsPaused())
-			legacyRainTimerMs += (uint64_t)(RE::GetSecondsSinceLastFrame() * 1000);  // BSTimer::delta is always 0 for some reason
-		data.Time = legacyRainTimerMs / 1000.f;
-	}
+	// (48n) Microseconds, advanced once per frame in Reset (official CS #3064). (48o) The old millisecond clock is gone.
+	data.Time = static_cast<float>(static_cast<double>(rainTimerUs) / 1000000.0);
 
 	data.settings = settings;
 	data.settings.MaxShoreWetness = settings.EnableWetnessEffects ? settings.MaxShoreWetness : 0.0f;
@@ -903,7 +889,7 @@ void WetnessEffects::LoadSettings(json& o_json)
 	if (o_json.contains("DebugSettings")) {
 		debugSettings = o_json["DebugSettings"].get<DebugSettings>();
 	}
-	preciseRainTimer = !(o_json.contains("PreciseRainTimer") && o_json["PreciseRainTimer"].is_boolean()) || o_json["PreciseRainTimer"].get<bool>();  // (48n)
+	// (48o) The 48n "PreciseRainTimer" key is ignored (Rain Animation: Real-Time Speed is always on).
 }
 
 void WetnessEffects::SaveSettings(json& o_json)
@@ -911,14 +897,12 @@ void WetnessEffects::SaveSettings(json& o_json)
 	o_json = settings;
 
 	o_json["DebugSettings"] = debugSettings;
-	o_json["PreciseRainTimer"] = preciseRainTimer;  // (48n)
 }
 
 
 void WetnessEffects::RestoreDefaultSettings()
 {
 	settings = {};
-	preciseRainTimer = true;  // (48n)
 	climatePreset = defaultPreset;
 
 	// Apply the default climate preset to ensure settings reflect the preset values

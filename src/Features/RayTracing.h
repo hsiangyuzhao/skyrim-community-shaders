@@ -169,9 +169,9 @@ public:
 		int PointLightsPerPixelInterior = 4;    // K indoors: 1, 2 or 4
 		bool PointLightsWindowBeams = true;     // Window Shadows Ultimate's window beams traced (their shadow mask channel written)
 		// The engine does not draw shadow maps for lights fully handled by RT (interiors); (47m) default on; (47x) default off again.
-		bool PointLightsSkipShadowMaps = false;
+		static constexpr bool PointLightsSkipShadowMaps = false;  // (48o) fixed off (no switch, key ignored)
 		// (47w) Adaptive: a light's shadow map is skipped only while its traced shadow covers (nearly) every pixel it lights; off = 47v.
-		bool PointLightsAdaptiveSkip = true;
+		static constexpr bool PointLightsAdaptiveSkip = false;  // (48o) fixed off (no switch, key ignored)
 		// (46d)
 		bool PointLightsPlayer = true;          // the player's own lights (torch in hand, Quick Light, light spells) cast RT shadows (not of the player)
 		bool PointLightsEffects = true;         // spell / effect lights without an owner (Magelight, projectiles) cast RT shadows
@@ -256,7 +256,7 @@ public:
 		int AOQuality = 1;     // Medium
 		// (47n) RTAO ghosting: "RTAO: Tight History Near Moving Things" (AODynamicFlag): pixels whose AO rays hit a character or a moving
 		// object (this frame or last) keep at most 1 frame of Temporal v2 history and a tight 3x3 clamp.
-		bool AODynamicFlag = true;
+		static constexpr bool AODynamicFlag = true;  // (48o) fixed (no switch, key ignored)
 		// (47l) Outside the settings macro too. FoliageSway "Sway in RT Shadows" (under Foliage): with Foliage ray traced / Both, tree-
 		// animated leaves, bushes and branches are traced with the game's wind (a wind BLAS per mesh, posed and refit every frame).
 		// Off = 47k (frozen at their rest pose). No effect with Foliage = Shadow map.
@@ -272,89 +272,89 @@ public:
 		// of 35 ms or more (under ~28.6 real fps, typical with frame generation): leaves on screen and their RT shadow freeze until the
 		// frames get shorter. On: for the swaying plants in reach, the frozen timers are advanced as the game would (each plant's own
 		// learned rate), before anything is drawn, so leaves, their shadow maps and the RT shadow keep moving. Off: as the game.
-		bool FoliageKeepMoving = true;
+		static constexpr bool FoliageKeepMoving = true;  // (48o) fixed (no switch, key ignored)
 		// (47r) Outside the settings macro. Each on by default; off = 47q exactly.
 		// AOPostTracedOnly "RTAO: Filter Only Where Traced": the RTAO filter / history passes skip the 8x8 tiles that are far from every
 		// traced pixel (sky, beyond the fade end, outside the traced area; a tile mask with the reach each pass needs), and the
 		// history pass works in 16x16 groups. The traced pixels get exactly the 47q values.
-		bool AOPostTracedOnly = true;
+		static constexpr bool AOPostTracedOnly = true;  // (48o) fixed (no switch, key ignored)
 		// SunCombineTiles "Sun: Fast Path for Uniform Tiles": Combine skips the per-pixel statistics where the denoiser's 5x5 tiles are
 		// all fully lit or all fully shadowed (Penumbra denoiser only). Exact.
-		bool SunCombineTiles = true;
+		static constexpr bool SunCombineTiles = true;  // (48o) fixed (no switch, key ignored)
 		// SSSTileMask "Screen Space Shadows: Tile Mask for RT Casters": the contact-shadow pass reads a per-tile summary of the traced-
 		// caster mask (all traced / none traced) and the per-pixel mask only in mixed tiles. Exact.
-		bool SSSTileMask = true;
+		static constexpr bool SSSTileMask = true;  // (48o) fixed (no switch, key ignored)
 		// PointProbeShareAll "Point Lights: Reuse the Sun's Surface Probe Everywhere": the point pass's non-alpha variant (Low / Medium
 		// outdoors) reuses the sun's probe too where it means the same (no hit, or a hit on a forced-opaque instance). Exact.
-		bool PointProbeShareAll = true;
+		static constexpr bool PointProbeShareAll = true;  // (48o) fixed (no switch, key ignored)
 		// FoliageLearnAnyFrame "Keep Leaves Moving: Learn on Any Frame": a plant's leaf rate is learned from every advance the game
 		// makes (any frame time), and a plant that never learned uses the rate shared by the others once they agree. Off = 47q.
-		bool FoliageLearnAnyFrame = true;
+		static constexpr bool FoliageLearnAnyFrame = true;  // (48o) fixed (no switch, key ignored)
 		// (47u) Outside the settings macro. Each off = 47t exactly (for these paths the same as 47r; 47v removed 47s / 47t).
 		// SunTraceEarly "RT: Start Sun Trace Earlier": RTAO's normal prep no longer runs between the depth prepass and the signal the sun
 		// trace waits for, but right behind it (beside the traces), reading last frame's depth from its own copy. Exact.
-		bool SunTraceEarly = true;
+		static constexpr bool SunTraceEarly = true;  // (48o) fixed (no switch, key ignored)
 		// SkipIrrelevantUpdates "RT: Skip Updates That Cannot Affect the Image": swaying plants and NPCs whose (swaying / posed) bounds no
 		// ray of the frame can reach (outside the view extruded toward the sun, the point lights' reach and the near rays) are not posed /
 		// refit; checked again against the frame's exact rays before the trace (anything reachable is refit that same frame first).
-		bool SkipIrrelevantUpdates = true;
+		static constexpr bool SkipIrrelevantUpdates = true;  // (48o) fixed (no switch, key ignored)
 		// SpatialStaticChunks "RT: Spatial Static Chunks": a captured cell's statics are packed into their 131k-triangle chunks in spatial
 		// (Morton) order instead of reference order, and outdoors one- and two-sided shapes share chunks (no ray there culls faces).
 		// A change re-captures the scene. Default from the offline traversal test (47u as built).
-		bool SpatialStaticChunks = false;
+		static constexpr bool SpatialStaticChunks = false;  // (48o) fixed off (no switch, key ignored)
 		// (47x) Outside the settings macro. Jagged point-light shadows on characters; each on by default, off = 47w exactly.
 		// PointSmoothEdges "Smoother Shadow Edges": PointDenoiseCS's wide pass takes 12 Poisson-disc taps per slot at that slot's own
 		// penumbra radius, rotated per pixel and per frame (47w: one fixed 5x5 grid whose step came from the largest radius of the 4 slots).
-		bool PointSmoothEdges = true;
+		static constexpr bool PointSmoothEdges = true;  // (48o) fixed (no switch, key ignored)
 		// PointCurvedRanking "Trace Lights on Curved Surfaces Reliably": TracePointLightsCS ranks the lights with a normal fitted over 1-
 		// and 2-pixel neighbours and a wrapped facing term (N.L > -0.4), so faceted skin / hair pixels whose depth normal turns just away
 		// still trace the lights their shading normal is lit by. The 47w coverage count takes the same contribution.
-		bool PointCurvedRanking = true;
+		static constexpr bool PointCurvedRanking = true;  // (48o) fixed (no switch, key ignored)
 		// PointCloseContact "Close-Contact Shadows on Characters": the point lights' character ray starts 2 units out instead of 6 (6 kept
 		// where the light grazes or faces away from the depth normal: the terminator). The sun's character ray is unchanged.
-		bool PointCloseContact = true;
+		static constexpr bool PointCloseContact = true;  // (48o) fixed (no switch, key ignored)
 		// (47y) Outside the settings macro. Grainy RT shadows on moving characters; each on by default, off = 47x exactly.
 		// MovingKeepHistory "Moving Characters: Keep Shadow History" (sun and point lights): where the camera-only reprojection finds no
 		// valid history (a moving surface), the denoisers also try last frame's motion vectors at constant velocity (the trace runs
 		// before this frame's G-buffer), accepted only where the stored history distance matches. Clamp and character cap kept.
-		bool MovingKeepHistory = true;
+		static constexpr bool MovingKeepHistory = true;  // (48o) fixed (no switch, key ignored)
 		// MovingSmoothNoHistory "Moving Characters: Smooth When No History" (sun and point lights): pixels still without history are
 		// smoothed a little instead of showing one frame's raw rays (point: every slot at least 2.5 px, the Poisson taps not rotated per
 		// frame there; sun: a 5x5 plane-weighted mean of this frame's spatial result blended in).
-		bool MovingSmoothNoHistory = true;
+		static constexpr bool MovingSmoothNoHistory = true;  // (48o) fixed (no switch, key ignored)
 		// SunSmoothTileRadius "Smooth Blur Width Between Tiles" (Penumbra denoiser): the per-8x8-tile penumbra radius is interpolated per
 		// pixel between the neighbouring tile centres (never below half its own tile's), so the blur width has no tile blocks.
-		bool SunSmoothTileRadius = true;
+		static constexpr bool SunSmoothTileRadius = true;  // (48o) fixed (no switch, key ignored)
 		// (47z) Outside the settings macro. Each on by default, off = 47y exactly.
 		// KeepBuildingsInSunMap "Keep Buildings in the Game's Sun Shadow Map" (Sun Shadows > Advanced): the large casters the ray tracer
 		// covers (statics, landscape, doors, movable statics, non-foliage cut-outs; bound radius >= 128) are drawn into a second copy of
 		// the two near sun cascades instead of being left out; the forward readers (glass, blended arches and banners, particles, water,
 		// fog) sample the merge of both, the engine's shadow mask (every opaque surface) keeps the cascades without them (CasterFilter.h).
-		bool KeepBuildingsInSunMap = true;
+		static constexpr bool KeepBuildingsInSunMap = true;  // (48o) fixed (no switch, key ignored)
 		// PointBeamRange "Window Beams: Respect Their Range" (Point Light Shadows > Advanced): a window beam ranks 0 past its radius (the
 		// engine's spot lights nothing there; the per-tile sphere test already used that radius) and does not count in the share cut's
 		// total (a full-strength beam no longer pushes the other lights of the pixel under the minimum share).
-		bool PointBeamRange = true;
+		static constexpr bool PointBeamRange = true;  // (48o) fixed (no switch, key ignored)
 		// PointStickyReproject "Stable Light Choice When the Camera Moves" (Point Light Shadows > Advanced): the sticky selection reads
 		// last frame's traced lights where this surface was last frame (camera reprojection into a copy of last frame's PLIdx), not at
 		// the same screen pixel.
-		bool PointStickyReproject = true;
+		static constexpr bool PointStickyReproject = true;  // (48o) fixed (no switch, key ignored)
 		// (48a) Outside the settings macro. PointBeamSmooth "Window Beams: Smooth Edges" (Point Lights > Indoors, under Window Beam Softness):
 		// soft window-beam slots get their own denoiser path (wide pass wherever the penumbra can be, radius up to 24 px, clamp to the
 		// filtered mean +- 2 sigma, more history for static beams, tighter plane test) and the trace samples their disc with a static
 		// pattern stepped along R2 per frame (not the denoiser's sliding IGN), a beam ray into its own surface counting as blocked.
 		// Off = 47z exactly.
-		bool PointBeamSmooth = true;
+		static constexpr bool PointBeamSmooth = true;  // (48o) fixed (no switch, key ignored)
 		// (48c) Outside the settings macro. Each on by default, off = 48b exactly.
 		// PointStickyJitterFix "Stable Light Choice: Jitter Fix" (Point Light Shadows > Advanced, under Stable Light Choice When the Camera
 		// Moves): the reprojection takes the upscaler's jitter of both frames out (last frame's jittered view-projection, shifted by this
 		// frame's jitter minus last frame's), so a still camera reads last frame's lights at the same pixel (48b: up to 1 px off, about 40 %
 		// of the frames a neighbour's lights: the light choice between two similar lights crawled).
-		bool PointStickyJitterFix = true;
+		static constexpr bool PointStickyJitterFix = true;  // (48o) fixed (no switch, key ignored)
 		// PointExtraSlots "Extra Lights Where Crowded" (Point Light Shadows > Advanced, under the lights-per-pixel controls): with fewer than
 		// 6 lights per pixel the trace still ranks the top 6 and traces ranks K..5 where that light holds at least 7 % of the pixel's point
 		// light (3.5 % where it was traced there last frame), into slots K..5 (4 - 5: the 48a slot textures, kept while such pixels exist).
-		bool PointExtraSlots = true;
+		static constexpr bool PointExtraSlots = true;  // (48o) fixed (no switch, key ignored)
 		// (48k) Outside the settings macro. PointNoiseFix "Point Lights: Noise Fix" (Point Light Shadows > Point Lights > Advanced, after
 		// Close-Contact Shadows on Characters): the master switch of four parts, each on by default; master off = 48j exactly.
 		//   PointNoiseDecorrelate "Decorrelated Sampling": every slot's emitter-disc sample is the 48a beam pattern (a static per-pixel
@@ -366,11 +366,11 @@ public:
 		//     shadows) is filtered at least 3 px wide (the penumbra formula gave 1 px: 3x3 + history only, halftone specks).
 		//   PointNoiseDarkSide "Consistent Dark Side": a ray toward a point light from a traced surface whose smoothed normal faces away
 		//     from it counts as blocked at once (as the 48a beam rays do): no random escapes along the shading terminator.
-		bool PointNoiseFix = true;
-		bool PointNoiseDecorrelate = true;
-		bool PointNoiseStable = true;
-		bool PointNoiseCloseBlur = true;
-		bool PointNoiseDarkSide = true;
+		static constexpr bool PointNoiseFix = true;  // (48o) fixed (no switch, key ignored)
+		static constexpr bool PointNoiseDecorrelate = true;  // (48o) fixed (no switch, key ignored)
+		static constexpr bool PointNoiseStable = true;  // (48o) fixed (no switch, key ignored)
+		static constexpr bool PointNoiseCloseBlur = true;  // (48o) fixed (no switch, key ignored)
+		static constexpr bool PointNoiseDarkSide = true;  // (48o) fixed (no switch, key ignored)
 		// (48m) PointMovingCleanHistory "Moving Characters: Clean Shadow History" (Point Lights > Advanced, right above the Noise Fix master,
 		// independent of it; replaces 48l's Fast Shadow History, JSON "PointNoiseFastHistory" read as a fallback). PointDenoiseCS PL_CLEAN on
 		// every path (46b, window beams, Stable Penumbra): a moving receiver (last frame's motion vectors disagree with the camera
@@ -378,7 +378,7 @@ public:
 		// agrees, weighs this frame at least 0.5, filters at most 3 px with a strict plane test, no partial-history wide pass; a static
 		// receiver under a moving caster drops a history far from this frame's 3x3 mean. The motion vectors are bound for it whatever
 		// MovingKeepHistory says. Off: 48k exactly (48j with the Noise Fix master off too).
-		bool PointMovingCleanHistory = true;
+		static constexpr bool PointMovingCleanHistory = true;  // (48o) fixed (no switch, key ignored)
 		// (48a) Outside the settings macro. RT reflections step 1 ((48i) Ray Tracing > Reflections page): ReflectionsMode 0 Off (47z
 		// exactly: no terrain, no textures, no dispatch), 1 Trace Only (reflection rays in the RTAO batch, no shading, debug views and F7
 		// only; needs RTAO). ReflectionsTerrain "Terrain in RT Scene (reflections only)": with the rays on, the landscape of the captured
@@ -472,7 +472,7 @@ public:
 		NormalConfidence,  // (47k) Smooth Normals: green = used (by its confidence), red = fell back, blue = no data
 		NormalNs,          // (47k) the normal the AO hemisphere is built around (RGB = xyz * 0.5 + 0.5)
 		NormalNg,          // (47k) the depth (facet) normal
-		History,           // (47n) Temporal v2: red = history rejected, green = clamp active, blue = history length / 32, white dots = moving-occluder flag
+		// (48o) History (47n "Temporal v2: History") removed.
 		Count
 	};
 	Settings settings;
@@ -985,7 +985,6 @@ private:
 	std::array<RayTracingPointLights::GpuSource, RayTracingPointLights::kMaxSources> pointSources{};
 	RayTracingRT::PointLightInput pointInput{};
 	bool pointThisFrame = false;      // the point-light trace was submitted with this frame's trace
-	bool pointSplit = false;          // debug A/B: RT point-light shadows on the left half only (not persisted)
 	bool pointWaterOn = true;         // (47o) Point Light Shadows on Water (permanent): false only after its resources failed this session
 	bool pointRequested = false;
 	std::string pointOffReason;       // why they were switched off automatically

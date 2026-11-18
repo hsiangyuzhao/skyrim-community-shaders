@@ -552,7 +552,6 @@ struct PerformanceOverlay : OverlayFeature
 		bool SectionGrass = false;
 		bool SectionVram = false;
 		bool SectionView = false;
-		bool SectionOcclusion = false;  // (batch 37a) "Occlusion (dry run)"
 		bool SectionShadows = false;    // (batch 37a) "Shadow maps"
 		// (46u) Every "Details: ..." section sits inside "Advanced"; the summary's GPU top list is collapsible too. Both collapsed by default.
 		bool SectionAdvanced = false;
@@ -578,9 +577,6 @@ struct PerformanceOverlay : OverlayFeature
 		float TraceSeconds = 20.0f;
 	};
 	Settings settings;
-	/// (47h) Diagnostic "Split Transparent Pass by Shader" (not saved, default off): GpuPhaseTimeline splits the Transparent row by
-	/// shader / Lighting technique (a timestamp at every change). Off: one row, no extra timestamps.
-	bool splitTransparentDiag = false;
 
 	/// (batch 36e) Display state of every table. Not saved.
 	struct ViewState

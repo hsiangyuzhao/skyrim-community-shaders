@@ -168,11 +168,8 @@ private:
 
 	bool splashesOfStormsLoaded = false;
 
-	/// (48n) Rain clock in microseconds, advanced once per frame in Reset (official CS #3064). The old clock (whole
-	/// milliseconds, advanced in GetCommonBufferData, which runs 3-5 times per frame) stays for the A/B switch.
+	/// (48n) Rain clock in microseconds, advanced once per frame in Reset (official CS #3064).
 	uint64_t rainTimerUs = 0;
-	mutable uint64_t legacyRainTimerMs = 0;
-	bool preciseRainTimer = true;  ///< JSON "PreciseRainTimer", not in Settings (that struct is the shader cbuffer)
 
 	// Weather wetness calculation result for debug display
 	struct WeatherWetnessResult

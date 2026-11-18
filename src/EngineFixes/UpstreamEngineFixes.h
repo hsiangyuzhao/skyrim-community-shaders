@@ -14,32 +14,14 @@
  *  - LOD Blend Ring Fix (#2894): the terrain LOD blend ring follows the frame clock (0.25 s eased slide, leaning toward
  *    the player) instead of game time, so it no longer sticks at timescale 0 or jumps at midnight / cell changes.
  *
- * Every fix is a runtime switch (General > Performance > Engine Fixes), default on, saved under Advanced."Engine Fixes".
- * Each one verifies the engine code it touches and stays off (status shown in the menu) when it does not match.
+ * (48o) Every fix is always on (the 48n switches and the Advanced."Engine Fixes" block are gone; an old block is ignored).
+ * Each one still verifies the engine code it touches and stays off when it does not match; the log says which.
  * Flat runtimes only: in VR nothing is installed.
  */
 namespace UpstreamEngineFixes
 {
-	struct Settings
-	{
-		bool SunOcclusionNoFlush = true;
-		bool LightListSearch = true;
-		bool EmptyOverlayCull = true;
-		bool SunShadowMask = true;
-		bool LODBlendRing = true;
-	};
-
-	inline Settings settings;
-
-	/** @brief Installs every fix whose code matches. kPostPostLoad. */
+	/** @brief Installs every fix whose code matches and logs each one's status. kPostPostLoad. */
 	void Install();
 	/** @brief Per-frame work (sun shadow mask cache, LOD ring). State::Reset, once per frame. */
 	void OnFrame();
-
-	void Load(const json& a_json);
-	json Save();
-	/** @brief The "Engine Fixes (48n)" section of General > Performance. */
-	void DrawMenu();
-	/** @brief One line for logs / trace headers. */
-	std::string Describe();
 }

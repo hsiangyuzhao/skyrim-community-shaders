@@ -45,8 +45,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     outputColorSpace,
 	colorSpaceTransform,
 	invColorSpaceTransform,
-	tonemapHDR,
-	lutHalfTexelFix
+	tonemapHDR
 )
 
 template <int num = 3>
@@ -544,15 +543,8 @@ void ColorGrading::DrawSettings()
         ImGui::Text("Saturation, Brightness and Contrast.");
     ImGui::SliderFloat("Fade Blend", &settings.gameFadeBlend, 0.f, 1.f, "%.3f");
     ImGui::SliderFloat("Tint Blend", &settings.gameTintBlend, 0.f, 1.f, "%.3f");
-    // (47r) Upstream 350c6fe82 as a switch (it changes the look).
-    ImGui::SeparatorText("Lookup Table");
-    ImGui::Checkbox("LUT Half-Texel Fix", &settings.lutHalfTexelFix);
-    if (auto _tt = Util::HoverTooltipWrapper()) {
-        ImGui::TextUnformatted("The grading is baked into a 64x64x64 lookup table. Until now it was baked half a step off from where it is read,");
-        ImGui::TextUnformatted("which made the whole picture slightly brighter (about +0.1 stop at mid grey, +0.2 at the brightest).");
-        ImGui::TextUnformatted("On: baked and read at the same points (upstream's fix): the picture gets that much darker, the curve exactly as set.");
-        ImGui::TextUnformatted("Off (default): as before, so your current look does not change.");
-    }
+    // (47r) Upstream 350c6fe82 "LUT Half-Texel Fix": (48o) removed, never adopted (the LUT stays baked half a texel off; the
+    // lutHalfTexelFix key is ignored).
     ImGui::SeparatorText("Color Space Transform");
     ImGui::Checkbox("Enable Color Space Transform", &settings.enableColorSpaceTransform);
     if (settings.enableColorSpaceTransform) {
@@ -988,7 +980,7 @@ void ColorGrading::Draw(TextureInfo& inout_tex)
 		for (int r = 0; r < 3; ++r)
 			colorCBData.hdrOutputTransform[r] = cachedOutputTransform[r];
 	}
-	colorCBData.hdrParams2.w = settings.lutHalfTexelFix ? 1.0f : 0.0f;  // (47r) LUT Half-Texel Fix (SDR and HDR)
+	colorCBData.hdrParams2.w = 0.0f;  // (47r) LUT Half-Texel Fix (SDR and HDR): (48o) removed, always off
 	colorCB->Update(colorCBData);
 
 	ID3D11Buffer* cb = colorCB->CB();
@@ -1192,8 +1184,8 @@ void ColorGrading::DrawCurvePreview()
 		return;
 	}
 	// Input of texel i: the LUT's log shaper (CSLUTGen), 14 stops around 0.18.
-	// (47r) With the LUT Half-Texel Fix texel i is baked at i / 63 (else (i + 0.5) / 63).
-	const float texelOffset = settings.lutHalfTexelFix ? 0.0f : 0.5f;
+	// (47r) Texel i is baked at (i + 0.5) / 63 ((48o) the LUT Half-Texel Fix is gone).
+	const float texelOffset = 0.5f;
 	auto inputOf = [texelOffset](int i) {
 		const auto logToLinear = [](float v) { return std::exp2((v - 444.0f / 1023.0f) * 14.0f) * 0.18f; };
 		return logToLinear((static_cast<float>(i) + texelOffset) / static_cast<float>(LUTDim - 1)) - logToLinear(0.0f);

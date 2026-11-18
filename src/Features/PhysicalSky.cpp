@@ -121,13 +121,11 @@ void PhysicalSky::LoadSettings(json& o_json)
 		settings.moonCloudLight = o_json.value("moonCloudLight", defaults.moonCloudLight);
 		settings.moonCloudStrength = o_json.value("moonCloudStrength", defaults.moonCloudStrength);
 		settings.moonCloudHalo = o_json.value("moonCloudHalo", defaults.moonCloudHalo);
-		settings.skyFixes = o_json.value("skyFixes", defaults.skyFixes);  // (47a)
-		settings.skyPrecision = o_json.value("skyPrecision", defaults.skyPrecision);  // (47b)
+		// (48o) skyFixes (47a), skyPrecision (47b) and moonPlanetshine (48b) are always on; their keys are ignored.
 		// (47m) horizonFix (47f) removed; the old key is ignored.
 		settings.aerosolPreset = o_json.value("aerosolPreset", defaults.aerosolPreset);  // (47b)
 		settings.moonFadesStars = o_json.value("moonFadesStars", defaults.moonFadesStars);  // (48b)
 		settings.moonStarFadeStrength = o_json.value("moonStarFadeStrength", defaults.moonStarFadeStrength);
-		settings.moonPlanetshine = o_json.value("moonPlanetshine", defaults.moonPlanetshine);
 		settings.moonPlanetshineStrength = o_json.value("moonPlanetshineStrength", defaults.moonPlanetshineStrength);
 	}
 	settings.aerosolPreset = std::clamp(settings.aerosolPreset, 0, kAerosolPresetCount - 1);
@@ -270,12 +268,9 @@ void PhysicalSky::SaveSettings(json& o_json)
 	o_json["moonCloudLight"] = settings.moonCloudLight;
 	o_json["moonCloudStrength"] = settings.moonCloudStrength;
 	o_json["moonCloudHalo"] = settings.moonCloudHalo;
-	o_json["skyFixes"] = settings.skyFixes;  // (47a)
-	o_json["skyPrecision"] = settings.skyPrecision;  // (47b)
 	o_json["aerosolPreset"] = settings.aerosolPreset;  // (47b)
 	o_json["moonFadesStars"] = settings.moonFadesStars;  // (48b)
 	o_json["moonStarFadeStrength"] = settings.moonStarFadeStrength;
-	o_json["moonPlanetshine"] = settings.moonPlanetshine;
 	o_json["moonPlanetshineStrength"] = settings.moonPlanetshineStrength;
 }
 
@@ -309,35 +304,7 @@ void PhysicalSky::GetUploadedAerosol(float3& a_scatter, float3& a_absorption, fl
 
 void PhysicalSky::DrawSettings()
 {
-	// (47a) The one switch of batch 47a, above everything else.
-	ImGui::Checkbox("Sky Fixes", &settings.skyFixes);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text(
-			"Dawn and dusk that follow the game's own weather timing, a sky as bright as the ground around it,\n"
-			"and a set of physics and look fixes:\n"
-			"- the sun rises when the weather turns to sunrise colours (-12 deg as night colours start to fade,\n"
-			"  0 deg at the peak of the sunrise colours, +12 deg when the day colours are full; noon unchanged);\n"
-			"- at dawn and dusk the sky's scattered sun and moon light is raised (up to 32x) to keep the day's\n"
-			"  sky-to-ground brightness ratio; full day and full night are unchanged;\n"
-			"- ozone layer at 10-40 km (same colour and amount), more accurate sky tables, ground bounce fixed,\n"
-			"  finer distant-haze table;\n"
-			"- stars and the Milky Way fade as the sky behind them brightens (moonlight, dawn), faint parts first;\n"
-			"- the game's sun and its glare follow the sun's real height, the glare hides behind ridges, no\n"
-			"  banding in the glare and the sky;\n"
-			"- moonlight on the ground fades out from 8 deg before sunrise.\n"
-			"Day/Night Exposure, the adaptation angles and Twilight Length are not used while this is on.\n"
-			"Off = exactly as before.");
-	// (47m) "Horizon Fix" (47f) removed (fixed off).
-	// (47b)
-	ImGui::Checkbox("Sky Precision", &settings.skyPrecision);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text(
-			"More accurate sky tables (upstream's precision work): the sunlight-through-air table spends its detail\n"
-			"near the ground and the horizon, the planet hides the sun smoothly over the sun's own width, the sky\n"
-			"table puts its rows around the true horizon (sharper from high places) and the distant-haze table\n"
-			"is finer close to you. Mostly visible at sunrise and sunset: a sun on the horizon and the haze in\n"
-			"front of it are a little darker and redder. Off = exactly as before.");
-	ImGui::Separator();
+	// (48o) "Sky Fixes" (47a) and "Sky Precision" (47b) are always on (no switches).
 
 	if (ImGui::BeginTabBar("##PHYSSKY")) {
 		if (ImGui::BeginTabItem("General")) {
@@ -416,23 +383,8 @@ void PhysicalSky::SettingsGeneral()
 
 	ImGui::SeparatorText("Post Processing");
 	{
-		// (47a) Taken over by Sky Fixes (treated as 1 / off); the saved values are kept. (47m) Shown, in a
-		// collapsed node, only while Sky Fixes is off.
-		if (!SkyFixesActive() && ImGui::TreeNode("Exposure (used only with Sky Fixes off)")) {
-			ImGui::InputFloat("Day Exposure", &settings.dayExposure);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("Brightness of the sky and sun/moon light by day. Higher = brighter.");
-			ImGui::InputFloat("Night Exposure", &settings.nightExposure);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("Same, but at night. Higher = brighter nights.");
-			ImGui::SliderAngle("Adaptation Start", &settings.adaptationStart, -90.f, 0.f);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("Sun angle below the horizon where the switch from Day to Night Exposure begins.");
-			ImGui::SliderAngle("Adaptation End", &settings.adaptationEnd, -90.f, 0.f);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("Sun angle below the horizon where Night Exposure is fully reached.");
-			ImGui::TreePop();
-		}
+		// (47a) Day / Night Exposure and the adaptation angles are taken over by Sky Fixes (treated as 1 / off; the saved values are
+		// kept). (48o) Sky Fixes is always on: their collapsed "Exposure" node is gone.
 		// As before: kept positive whenever this tab is drawn, open or not.
 		settings.dayExposure = std::max(1e-10f, settings.dayExposure);
 		settings.nightExposure = std::max(1e-10f, settings.nightExposure);
@@ -656,16 +608,7 @@ void PhysicalSky::SettingsCelestials()
 			"Fades out as the sun climbs from 6 degrees below the horizon to 4 above.\n"
 			"0 = off (exactly as before). Default 0.2.");
 	// (44h) removed "Sky Uses True Sun Height": fixed on (47m: in the code).
-	// (47a) Taken over by Sky Fixes (treated as 1). (47m) Shown, in a collapsed node, only while Sky Fixes is off.
-	if (!SkyFixesActive() && ImGui::TreeNode("Twilight (used only with Sky Fixes off)")) {
-		ImGui::SliderFloat("Twilight Length", &settings.twilightLength, 1.f, 3.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text(
-				"Stretches dawn and dusk in the sky only: with 2, a sun 12 degrees below the horizon lights the sky\n"
-				"like one 6 degrees below, so the sky starts to brighten earlier and stays lit longer after sunset.\n"
-				"Does not change the sun or moon light on the ground. 1 = real twilight (default).");
-		ImGui::TreePop();
-	}
+	// (47a) Twilight Length is taken over by Sky Fixes (treated as 1). (48o) Sky Fixes is always on: its "Twilight" node is gone.
 
 	ImGui::SeparatorText("Masser");
 	{
@@ -727,22 +670,15 @@ void PhysicalSky::SettingsCelestials()
 				"Now: Masser %.4f, Secunda %.4f (0 = no effect; before clouds).",
 				moonStarFadeAmount[0], moonStarFadeAmount[1]);
 	}
-	ImGui::Checkbox("Moon Planetshine", &settings.moonPlanetshine);
+	// (48o) "Moon Planetshine" (48b) is always on; its strength stays.
+	ImGui::SliderFloat("Planetshine Strength", &settings.moonPlanetshineStrength, 0.f, 0.5f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text(
 			"A faint grey glow on the dark side of each moon, strongest at a thin crescent, none at full moon.\n"
-			"Without it the dark side is see-through and shows as a starless hole in front of the Milky Way;\n"
-			"with it the whole disc reads as a moon. The lit side is not changed; gone by day.\n"
-			"Off: exactly as before.");
-	if (settings.moonPlanetshine) {
-		ImGui::SliderFloat("Planetshine Strength", &settings.moonPlanetshineStrength, 0.f, 0.5f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text(
-				"How visible the dark side is. Default 0.10: at a thin crescent the dark side gets a grey of\n"
-				"about 7%% of the lit side's brightness on top of the sky behind it.\n"
-				"Now: Masser %.3f, Secunda %.3f.",
-				moonPlanetshineAmount[0], moonPlanetshineAmount[1]);
-	}
+			"How visible the dark side is. Default 0.10: at a thin crescent the dark side gets a grey of\n"
+			"about 7%% of the lit side's brightness on top of the sky behind it.\n"
+			"Now: Masser %.3f, Secunda %.3f.",
+			moonPlanetshineAmount[0], moonPlanetshineAmount[1]);
 
 	// (44h) removed the "New Moon" section ("Hide New Moon Disc"): fixed on (47m: in the code).
 }

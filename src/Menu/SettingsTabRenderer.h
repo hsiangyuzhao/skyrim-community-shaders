@@ -24,7 +24,6 @@ public:
 		const std::function<const char*(uint32_t)>& keyIdToString);
 
 private:
-	static void RenderPerformanceTab();  // (47p)
 	static void RenderShadersTab();
 	static void RenderKeybindingsTab(
 		SettingsState& state,

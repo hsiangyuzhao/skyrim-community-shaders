@@ -15,52 +15,35 @@ void CloudShadows::DrawSettings()
 			"Higher values make cloud shadows darker.");
 	}
 
-	// (48n) official CS PR #3166
-	ImGui::Checkbox("Capture Clouds from the Main View", &captureFromView);
-	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text(
-			"Cloud shadows come from a small picture of the clouds around you. The game only draws it while water with\n"
-			"a live reflection is nearby; elsewhere the cloud shadows froze in place (or were missing after a load).\n"
-			"On (default): when the game did not draw it this frame, the clouds you see are redrawn into it.\n"
-			"Off: the old behaviour (water reflection pass only).");
-	}
-
+	// (48o) Capture Clouds from the Main View (48n, official CS PR #3166) is always on. The capture status shows only when the
+	// cloud picture is stale: one orange line.
 	const uint32_t age = FramesSinceCapture();
-	const bool viewWasLast = lastViewCaptureFrame != UINT32_MAX && lastViewCaptureFrame == lastCaptureFrame;
-	if (age == UINT32_MAX)
-		ImGui::TextDisabled("Last capture: none yet");
-	else if (age <= kCaptureMaxAgeFrames)
-		ImGui::Text("Last capture: %u frames ago (%s) - cloud shadows are live", age, viewWasLast ? "main view" : "water reflection pass");
-	else
-		ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "Last capture: %u frames ago (%s) - %s", age, viewWasLast ? "main view" : "water reflection pass",
-			captureFromView ? "cloud shadows off until the next capture" : "cloud shadows are frozen");
-	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text(
-			"How many frames ago the cloud picture was last updated, and by which pass.\n"
-			"Outdoors in the full sky this should stay at 0-6 frames. Indoors, in menus and under a sky without clouds it\n"
-			"grows; that is expected.");
+	if (age != UINT32_MAX && age > kCaptureMaxAgeFrames) {
+		ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "Cloud shadows are off: the cloud picture is %u frames old", age);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text(
+				"The cloud picture the shadows come from was not updated for a while, so cloud shadows are off until the next update.\n"
+				"Indoors, in menus and under a sky without clouds that is expected. Outdoors under clouds it should not stay.");
+		}
 	}
-	if (viewCaptureShaderMissing && captureFromView)
+	if (viewCaptureShaderMissing)
 		ImGui::TextDisabled("Main-view capture: waiting for its shader to compile");
 }
 
 void CloudShadows::LoadSettings(json& o_json)
 {
+	// (48o) The 48n "CaptureFromView" key is ignored (the capture is always on); it is dropped on the next save.
 	settings = o_json;
-	// (48n)
-	captureFromView = !(o_json.contains("CaptureFromView") && o_json["CaptureFromView"].is_boolean()) || o_json["CaptureFromView"].get<bool>();
 }
 
 void CloudShadows::SaveSettings(json& o_json)
 {
 	o_json = settings;
-	o_json["CaptureFromView"] = captureFromView;  // (48n)
 }
 
 void CloudShadows::RestoreDefaultSettings()
 {
 	settings = {};
-	captureFromView = true;
 }
 
 uint32_t CloudShadows::FramesSinceCapture() const
@@ -147,7 +130,7 @@ void CloudShadows::ModifySky(RE::BSRenderPass* Pass)
 
 	// (48n) A main-view cloud layer: capture it when the reflection pass did not capture this frame.
 	const auto state = globals::state;
-	if (!captureFromView || globals::game::isVR || !state->inWorld || lastReflectionsCaptureFrame == state->frameCount)
+	if (globals::game::isVR || !state->inWorld || lastReflectionsCaptureFrame == state->frameCount)
 		return;
 	if (mapMenuCheckedFrame != state->frameCount) {
 		mapMenuCheckedFrame = state->frameCount;
@@ -281,14 +264,6 @@ void CloudShadows::EarlyPrepass()
 		return;
 
 	auto context = globals::d3d::context;
-
-	if (!captureFromView) {
-		// The old binding: the live occlusion (only the reflection pass writes it, before this).
-		ID3D11ShaderResourceView* srv = texCubemapCloudOcc->srv.get();
-		context->PSSetShaderResources(25, 1, &srv);
-		context->CSSetShaderResources(25, 1, &srv);
-		return;
-	}
 
 	// (48n) The main view writes the live occlusion later this frame (the sky draws after the opaque pass), so this
 	// frame's draws read a copy; an occlusion older than kCaptureMaxAgeFrames belongs to another sky and is not bound.

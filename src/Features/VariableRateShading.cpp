@@ -19,8 +19,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	VariableRateShading::Settings,
 	Enabled,
 	Quality,
-	MotionPixels,
-	DebugOverlay)
+	MotionPixels)
+// (48o) DebugOverlay is not saved or loaded: it always starts off (an old saved key is ignored).
 
 namespace
 {
@@ -773,7 +773,7 @@ void VariableRateShading::DrawSettings()
 	if (ImGui::TreeNodeEx("Debug")) {
 		ImGui::Checkbox("Show Shading Rate Overlay", &settings.DebugOverlay);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Tints each 16x16 block by how coarsely it is shaded, so you can see where detail is being saved.");
+			ImGui::Text("Tints each 16x16 block by how coarsely it is shaded, so you can see where detail is being saved. Not saved: off again after a restart.");
 		}
 		if (settings.DebugOverlay) {
 			const int legend[] = { 3, 1, 4 };

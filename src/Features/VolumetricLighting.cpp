@@ -24,8 +24,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	InteriorQuality,
 	InteriorCustomSize,
 	WorldShadowPower,
-	NightIntensity,
-	BlurDepthReject);
+	NightIntensity);
 
 void VolumetricLighting::DrawSettings()
 {
@@ -70,12 +69,7 @@ void VolumetricLighting::DrawBatch37bSettings()
 			"1 = old behaviour. 0.5 = half (default). 0 = no moonlight shafts. Needs Sky Sync.\n"
 			"Does not change the moonlight itself.");
 
-	ImGui::Checkbox("Blur: No Ghosts Above Trees and Walls", &settings.BlurDepthReject);  // (48n)
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text(
-			"On (default): the shaft blur only mixes pixels at a similar distance (official CS #2880).\n"
-			"Off: the old test, which let a distant tree line or wall top blend with the sky and left faint copies\n"
-			"of it a few pixels above (more visible with DLSS at lower quality presets).");
+	// (48o) "Blur: No Ghosts Above Trees and Walls" (48n, official CS #2880) is always on (its BlurDepthReject key is ignored).
 
 	// (44h) "Linearize Shaft Color" removed, now fixed on (CommonBufferData::LinearizeColor).
 }
@@ -336,7 +330,7 @@ void VolumetricLighting::EarlyPrepass()
 	vlData.screenY = height;
 	vlData.screenXMin1 = width - 1;
 	vlData.screenYMin1 = height - 1;
-	vlData.relativeDepthReject = settings.BlurDepthReject ? 1u : 0u;  // (48n)
+	vlData.relativeDepthReject = 1u;  // (48n) (48o) always on
 	vlDataCB->Update(vlData);
 
 	const auto interiorCell = RE::TES::GetSingleton()->interiorCell;

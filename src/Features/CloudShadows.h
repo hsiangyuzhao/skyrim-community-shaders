@@ -42,7 +42,6 @@ public:
 	// With none in range nothing was captured: the cloud shadows froze (or stayed empty after a load). On frames the
 	// reflection pass did not capture, each main-view cloud layer is redrawn into two faces of the occlusion cube with
 	// a CLOUD_SHADOWS_CAPTURE variant of the sky vertex shader (a whole cube every three frames).
-	bool captureFromView = true;  ///< JSON "CaptureFromView"; not in Settings (that struct is in SharedData)
 	static constexpr uint32_t kCaptureFacesPerFrame = 2;
 	static constexpr uint32_t kCaptureFramesPerCube = 6 / kCaptureFacesPerFrame;
 	/// The occlusion is bound only while the last capture is at most this many frames old (the reflection pass draws one

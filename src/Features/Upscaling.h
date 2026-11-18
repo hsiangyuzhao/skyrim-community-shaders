@@ -224,11 +224,10 @@ public:
 		// placement only when the engine probes are missing) and the GPU-aware frame-start pacer runs.
 		// Extra CPU time the pacer keeps in hand (ms). More = safer for frame rate, less = lower lag.
 		float reflexPacerMarginMs = 1.0f;
-		// (46p) The predicted completion from the median phase of the last GPU completions instead of the last one alone. Off = 46o.
+		// (46p) "Pacer: Smooth GPU Phase" (the median phase of the last GPU completions) was removed in 48o, fixed off (46o).
 		// (47m) The other pacer switches (46n GPU waits to frame start, 46o hidden waits / backstop, 46p never over-sleep) are
 		// always on now, as are all of 46p/46q "Save GPU Memory" (render-resolution buffers, resident memory, RR / SSGI / mask
 		// textures only when used, shared NRD scratch, render-rect copies, lazy-shader precompile); DLSS-G memory is always retained.
-		bool reflexPacerSmoothPhase = false;
 
 		NeuralRenderingSettings neuralRendering;
 	};

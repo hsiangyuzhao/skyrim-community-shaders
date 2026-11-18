@@ -21,7 +21,6 @@
 #include "ShaderCache.h"
 #include "TruePBR.h"
 #include "Utils/Batch39Engine.h"
-#include "Utils/PerfOptions.h"
 #include "Utils/FileSystem.h"
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
@@ -388,10 +387,7 @@ void State::Load(ConfigMode a_configMode, bool a_allowReload)
 				frameAnnotations = advanced["Frame Annotations"];
 			if (advanced.contains("Engine"))
 				Batch39Engine::Load(advanced["Engine"]);
-			if (advanced.contains("Performance"))
-				PerfOptions::Load(advanced["Performance"]);  // (47p)
-			if (advanced.contains("Engine Fixes"))
-				UpstreamEngineFixes::Load(advanced["Engine Fixes"]);  // (48n)
+			// (48o) The "Performance" (47p) and "Engine Fixes" (48n) blocks are ignored: those switches are fixed now.
 			if (advanced.contains("Window Compatibility"))
 				WndProcPseudoHandleFix::Load(advanced["Window Compatibility"]);
 		}
@@ -541,8 +537,6 @@ void State::Save(ConfigMode a_configMode)
 	advanced["Use FileWatcher"] = shaderCache->UseFileWatcher();
 	advanced["Frame Annotations"] = frameAnnotations;
 	advanced["Engine"] = Batch39Engine::Save();
-	advanced["Performance"] = PerfOptions::Save();  // (47p)
-	advanced["Engine Fixes"] = UpstreamEngineFixes::Save();  // (48n)
 	advanced["Window Compatibility"] = WndProcPseudoHandleFix::Save();
 	settings["Advanced"] = advanced;
 

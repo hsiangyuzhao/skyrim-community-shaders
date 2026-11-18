@@ -69,7 +69,6 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	reflexMode,
 	reflexFrameLimit,
 	reflexPacerMarginMs,
-	reflexPacerSmoothPhase,
 	neuralRendering);
 
 decltype(&D3D11CreateDeviceAndSwapChain) ptrD3D11CreateDeviceAndSwapChainUpscaling;
@@ -613,14 +612,7 @@ void Upscaling::DrawAdvancedSettings()
 		ImGui::TextUnformatted("Takes effect after a restart.");
 	}
 
-	if (!globals::game::isVR && streamline.featureReflex) {
-		// (46p) Kept as an A/B switch in Advanced (47m); the other frame-pacing and Save GPU Memory switches are always on now.
-		ImGui::Checkbox("Pacer: Smooth GPU Phase", &settings.reflexPacerSmoothPhase);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::TextUnformatted("Off (default). On: predicts when the graphics card finishes a frame from the last several finishes instead of");
-			ImGui::TextUnformatted("only the last one, so the pacer's sleep jitters less from frame to frame.");
-		}
-	}
+	// (46p) "Pacer: Smooth GPU Phase" (48o) removed, fixed off (its reflexPacerSmoothPhase key is ignored).
 
 	if (ImGui::TreeNodeEx("Diagnostics")) {
 		if (!globals::game::isVR && streamline.featureReflex) {
@@ -1731,7 +1723,7 @@ std::string Upscaling::DescribeLatencyForTrace()
 		streamline.featureReflex ? "yes" : "no", streamline.reflexFunctionsReady ? "yes" : "no", streamline.pclFunctionsReady ? "yes" : "no",
 		modeName(std::min(settings.reflexMode, 2u)), modeName(modeApplied), settings.reflexFrameLimit, GetEffectiveReflexFrameLimit(),
 		reflexFrameLimitApplied == UINT_MAX ? -1 : static_cast<int>(reflexFrameLimitApplied),
-		IsLatencyPacerEnabled() ? "on" : "off", settings.reflexPacerMarginMs, settings.reflexPacerSmoothPhase ? "on" : "off",
+		IsLatencyPacerEnabled() ? "on" : "off", settings.reflexPacerMarginMs, "off",
 		WantsReflexMarkersAtRenderStart() ? "on" : "off",
 		Util::EngineTiming::ProbesInstalled() ? "installed" : Util::EngineTiming::ProbeStatus(),
 		stateOk ? (state.lowLatencyAvailable ? "yes" : "no") : "?", stateOk ? (state.latencyReportAvailable ? "yes" : "no") : "?",
