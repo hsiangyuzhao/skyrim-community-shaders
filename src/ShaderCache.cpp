@@ -268,10 +268,15 @@ namespace SIE
 				}
 			}
 
-			uint32_t flags = descriptor >> 8;
+			// (48n) The capture bit is not the deferred pass; no descriptor the game sends has it, so every existing key keeps its defines.
+			constexpr auto captureFlag = static_cast<uint32_t>(ShaderCache::SkyShaderFlags::CloudShadowsCapture);
+			uint32_t flags = (descriptor & ~captureFlag) >> 8;
 
 			if (flags) {
 				defines[lastIndex++] = { "DEFERRED", nullptr };
+			}
+			if (descriptor & captureFlag) {
+				defines[lastIndex++] = { "CLOUD_SHADOWS_CAPTURE", nullptr };
 			}
 
 			for (auto* feature : Feature::GetFeatureList()) {

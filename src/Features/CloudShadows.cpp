@@ -1,5 +1,8 @@
 #include "CloudShadows.h"
 
+#include "ShaderCache.h"
+#include "State.h"
+
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	CloudShadows::Settings,
 	Opacity)
@@ -11,21 +14,60 @@ void CloudShadows::DrawSettings()
 		ImGui::Text(
 			"Higher values make cloud shadows darker.");
 	}
+
+	// (48n) official CS PR #3166
+	ImGui::Checkbox("Capture Clouds from the Main View", &captureFromView);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text(
+			"Cloud shadows come from a small picture of the clouds around you. The game only draws it while water with\n"
+			"a live reflection is nearby; elsewhere the cloud shadows froze in place (or were missing after a load).\n"
+			"On (default): when the game did not draw it this frame, the clouds you see are redrawn into it.\n"
+			"Off: the old behaviour (water reflection pass only).");
+	}
+
+	const uint32_t age = FramesSinceCapture();
+	const bool viewWasLast = lastViewCaptureFrame != UINT32_MAX && lastViewCaptureFrame == lastCaptureFrame;
+	if (age == UINT32_MAX)
+		ImGui::TextDisabled("Last capture: none yet");
+	else if (age <= kCaptureMaxAgeFrames)
+		ImGui::Text("Last capture: %u frames ago (%s) - cloud shadows are live", age, viewWasLast ? "main view" : "water reflection pass");
+	else
+		ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "Last capture: %u frames ago (%s) - %s", age, viewWasLast ? "main view" : "water reflection pass",
+			captureFromView ? "cloud shadows off until the next capture" : "cloud shadows are frozen");
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text(
+			"How many frames ago the cloud picture was last updated, and by which pass.\n"
+			"Outdoors in the full sky this should stay at 0-6 frames. Indoors, in menus and under a sky without clouds it\n"
+			"grows; that is expected.");
+	}
+	if (viewCaptureShaderMissing && captureFromView)
+		ImGui::TextDisabled("Main-view capture: waiting for its shader to compile");
 }
 
 void CloudShadows::LoadSettings(json& o_json)
 {
 	settings = o_json;
+	// (48n)
+	captureFromView = !(o_json.contains("CaptureFromView") && o_json["CaptureFromView"].is_boolean()) || o_json["CaptureFromView"].get<bool>();
 }
 
 void CloudShadows::SaveSettings(json& o_json)
 {
 	o_json = settings;
+	o_json["CaptureFromView"] = captureFromView;  // (48n)
 }
 
 void CloudShadows::RestoreDefaultSettings()
 {
 	settings = {};
+	captureFromView = true;
+}
+
+uint32_t CloudShadows::FramesSinceCapture() const
+{
+	if (lastReflectionsCaptureFrame == UINT32_MAX && lastViewCaptureFrame == UINT32_MAX)
+		return UINT32_MAX;
+	return globals::state->frameCount - lastCaptureFrame;
 }
 
 void CloudShadows::CheckResourcesSide(int side)
@@ -84,6 +126,7 @@ void CloudShadows::SkyShaderHacks()
 			dsv->Release();
 
 		overrideSky = false;
+		lastCaptureFrame = lastReflectionsCaptureFrame = globals::state->frameCount;  // (48n)
 	}
 }
 
@@ -93,13 +136,123 @@ void CloudShadows::ModifySky(RE::BSRenderPass* Pass)
 
 	GET_INSTANCE_MEMBER(cubeMapRenderTarget, shadowState);
 
-	if (cubeMapRenderTarget != RE::RENDER_TARGETS_CUBEMAP::kREFLECTIONS)
+	auto skyProperty = static_cast<const RE::BSSkyShaderProperty*>(Pass->shaderProperty);
+	if (skyProperty->uiSkyObjectType != RE::BSSkyShaderProperty::SkyObject::SO_CLOUDS)
 		return;
 
-	auto skyProperty = static_cast<const RE::BSSkyShaderProperty*>(Pass->shaderProperty);
-
-	if (skyProperty->uiSkyObjectType == RE::BSSkyShaderProperty::SkyObject::SO_CLOUDS) {
+	if (cubeMapRenderTarget == RE::RENDER_TARGETS_CUBEMAP::kREFLECTIONS) {
 		overrideSky = true;
+		return;
+	}
+
+	// (48n) A main-view cloud layer: capture it when the reflection pass did not capture this frame.
+	const auto state = globals::state;
+	if (!captureFromView || globals::game::isVR || !state->inWorld || lastReflectionsCaptureFrame == state->frameCount)
+		return;
+	if (mapMenuCheckedFrame != state->frameCount) {
+		mapMenuCheckedFrame = state->frameCount;
+		mapMenuOpen = globals::game::ui && globals::game::ui->IsMenuOpen(RE::MapMenu::MENU_NAME);
+	}
+	if (mapMenuOpen)
+		return;
+	viewCapturePending = true;
+	captureGeometry = Pass->geometry;
+}
+
+void CloudShadows::CaptureFromViewIfPending()
+{
+	if (!viewCapturePending)
+		return;
+	viewCapturePending = false;
+
+	auto* geometry = std::exchange(captureGeometry, nullptr);
+	auto* triShape = geometry ? geometry->AsTriShape() : nullptr;
+	if (!triShape)
+		return;
+	const UINT indexCount = 3u * triShape->GetTrishapeRuntimeData().triangleCount;
+	if (!indexCount)
+		return;
+
+	auto context = globals::d3d::context;
+	winrt::com_ptr<ID3D11Buffer> indexBuffer;
+	DXGI_FORMAT indexFormat = DXGI_FORMAT_UNKNOWN;
+	UINT indexOffset = 0;
+	context->IAGetIndexBuffer(indexBuffer.put(), &indexFormat, &indexOffset);
+	if (!indexBuffer)
+		return;
+
+	// The bound sky vertex shader's capture variant, null until the shader cache has compiled it.
+	const auto state = globals::state;
+	if (!state->currentShader || state->currentShader->shaderType.get() != RE::BSShader::Type::Sky)
+		return;
+	constexpr auto captureFlag = static_cast<uint32_t>(SIE::ShaderCache::SkyShaderFlags::CloudShadowsCapture);
+	auto* captureShader = globals::shaderCache->GetVertexShader(*state->currentShader, state->modifiedVertexDescriptor | captureFlag);
+	viewCaptureShaderMissing = captureShader == nullptr;
+	if (!captureShader)
+		return;
+	auto* captureVS = reinterpret_cast<ID3D11VertexShader*>(captureShader->shader);
+
+	const uint32_t frame = state->frameCount;
+	float black[4] = { 0, 0, 0, 0 };
+	if (viewCaptureFrame != frame) {
+		viewCaptureFrame = frame;
+		for (uint32_t i = 0; i < kCaptureFacesPerFrame; i++) {
+			const uint32_t face = (frame % kCaptureFramesPerCube) * kCaptureFacesPerFrame + i;
+			viewCaptureFaces[i] = face;
+			context->ClearRenderTargetView(cubemapCloudOccRTVs[face], black);
+		}
+	}
+
+	ID3D11RenderTargetView* savedRTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+	ID3D11DepthStencilView* savedDSV = nullptr;
+	context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, savedRTVs, &savedDSV);
+	ID3D11BlendState* savedBlendState = nullptr;
+	float savedBlendFactor[4] = {};
+	UINT savedSampleMask = 0;
+	context->OMGetBlendState(&savedBlendState, savedBlendFactor, &savedSampleMask);
+	ID3D11RasterizerState* savedRasterizerState = nullptr;
+	context->RSGetState(&savedRasterizerState);
+	D3D11_VIEWPORT savedViewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
+	UINT savedViewportCount = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+	context->RSGetViewports(&savedViewportCount, savedViewports);
+	ID3D11VertexShader* savedVS = nullptr;
+	context->VSGetShader(&savedVS, nullptr, nullptr);
+	ID3D11Buffer* savedFaceCB = nullptr;
+	context->VSGetConstantBuffers(kCaptureFaceSlot, 1, &savedFaceCB);
+
+	D3D11_TEXTURE2D_DESC desc{};
+	texCubemapCloudOcc->resource->GetDesc(&desc);
+	const D3D11_VIEWPORT viewport = { 0.0f, 0.0f, static_cast<float>(desc.Width), static_cast<float>(desc.Height), 0.0f, 1.0f };
+	context->RSSetViewports(1, &viewport);
+	context->RSSetState(captureRasterizerState.get());
+	const float blendFactor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+	context->OMSetBlendState(cloudShadowBlendState, blendFactor, 0xffffffff);
+	context->VSSetShader(captureVS, nullptr, 0);
+
+	for (const uint32_t face : viewCaptureFaces) {
+		ID3D11Buffer* faceCB = captureFaceCBs[face].get();
+		context->VSSetConstantBuffers(kCaptureFaceSlot, 1, &faceCB);
+		// The occlusion is the pixel shader's fourth target; null targets discard its other outputs.
+		ID3D11RenderTargetView* captureRTVs[4] = { nullptr, nullptr, nullptr, cubemapCloudOccRTVs[face] };
+		context->OMSetRenderTargets(4, captureRTVs, nullptr);
+		context->DrawIndexed(indexCount, 0, 0);
+	}
+	lastCaptureFrame = lastViewCaptureFrame = frame;
+
+	context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, savedRTVs, savedDSV);
+	context->OMSetBlendState(savedBlendState, savedBlendFactor, savedSampleMask);
+	context->RSSetState(savedRasterizerState);
+	context->RSSetViewports(savedViewportCount, savedViewports);
+	context->VSSetShader(savedVS, nullptr, 0);
+	context->VSSetConstantBuffers(kCaptureFaceSlot, 1, &savedFaceCB);
+
+	for (auto* rtv : savedRTVs) {
+		if (rtv)
+			rtv->Release();
+	}
+	for (IUnknown* object : std::initializer_list<IUnknown*>{ savedDSV, savedBlendState, savedRasterizerState, savedVS, savedFaceCB }) {
+		if (object)
+			object->Release();
 	}
 }
 
@@ -129,7 +282,21 @@ void CloudShadows::EarlyPrepass()
 
 	auto context = globals::d3d::context;
 
-	ID3D11ShaderResourceView* srv = texCubemapCloudOcc->srv.get();
+	if (!captureFromView) {
+		// The old binding: the live occlusion (only the reflection pass writes it, before this).
+		ID3D11ShaderResourceView* srv = texCubemapCloudOcc->srv.get();
+		context->PSSetShaderResources(25, 1, &srv);
+		context->CSSetShaderResources(25, 1, &srv);
+		return;
+	}
+
+	// (48n) The main view writes the live occlusion later this frame (the sky draws after the opaque pass), so this
+	// frame's draws read a copy; an occlusion older than kCaptureMaxAgeFrames belongs to another sky and is not bound.
+	const uint32_t age = FramesSinceCapture();
+	const bool current = age <= kCaptureMaxAgeFrames;
+	if (current)
+		context->CopyResource(texCubemapCloudOccCopy->resource.get(), texCubemapCloudOcc->resource.get());
+	ID3D11ShaderResourceView* srv = current ? texCubemapCloudOccCopy->srv.get() : nullptr;
 	context->PSSetShaderResources(25, 1, &srv);
 	context->CSSetShaderResources(25, 1, &srv);
 }
@@ -184,6 +351,32 @@ void CloudShadows::SetupResources()
 		blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
 
 		DX::ThrowIfFailed(device->CreateBlendState(&blendDesc, &cloudShadowBlendState));
+	}
+	{
+		// (48n) A face projection can flip the winding the engine culls by, so the main-view capture culls nothing.
+		D3D11_RASTERIZER_DESC rasterizerDesc = {};
+		rasterizerDesc.FillMode = D3D11_FILL_SOLID;
+		rasterizerDesc.CullMode = D3D11_CULL_NONE;
+		rasterizerDesc.DepthClipEnable = true;
+		DX::ThrowIfFailed(device->CreateRasterizerState(&rasterizerDesc, captureRasterizerState.put()));
+	}
+	{
+		// CreateBuffer reads the whole ByteWidth, which ConstantBufferDesc rounds up.
+		struct CaptureFace
+		{
+			uint32_t index;
+			uint32_t pad[15];
+		};
+		static_assert(sizeof(CaptureFace) == GetCBufferSize(sizeof(CaptureFace)));
+
+		for (uint32_t face = 0; face < 6; ++face) {
+			const CaptureFace data = { face, {} };
+			D3D11_BUFFER_DESC cbDesc = ConstantBufferDesc<CaptureFace>(false);
+			cbDesc.Usage = D3D11_USAGE_IMMUTABLE;
+			cbDesc.CPUAccessFlags = 0;
+			const D3D11_SUBRESOURCE_DATA initData = { &data, 0, 0 };
+			DX::ThrowIfFailed(device->CreateBuffer(&cbDesc, &initData, captureFaceCBs[face].put()));
+		}
 	}
 }
 

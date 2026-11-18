@@ -73,6 +73,42 @@ cbuffer PerGeometry : register(b2)
 #	endif  // !VR
 };
 
+#	if defined(CLOUD_SHADOWS_CAPTURE)
+// (48n, official CS PR #3166) Cloud Shadows' main-view capture: the cloud layer is redrawn into face CaptureFace of the
+// occlusion cube. The inverse of DynamicCubemaps' GetCubemapSamplingVector (the cube is sampled with eye-relative world
+// directions).
+cbuffer CloudShadowsCapture : register(b7)
+{
+	uint CaptureFace;
+};
+
+float4 GetCaptureClipPosition(float3 direction)
+{
+	float3 clip;
+	switch (CaptureFace) {
+	case 0:
+		clip = float3(-direction.z, direction.y, direction.x);
+		break;
+	case 1:
+		clip = float3(direction.z, direction.y, -direction.x);
+		break;
+	case 2:
+		clip = float3(direction.x, -direction.z, direction.y);
+		break;
+	case 3:
+		clip = float3(direction.x, direction.z, -direction.y);
+		break;
+	case 4:
+		clip = float3(direction.x, direction.y, direction.z);
+		break;
+	default:
+		clip = float3(-direction.x, direction.y, -direction.z);
+		break;
+	}
+	return clip.xyzz;
+}
+#	endif
+
 VS_OUTPUT main(VS_INPUT input)
 {
 	VS_OUTPUT vsout;
@@ -138,6 +174,9 @@ VS_OUTPUT main(VS_INPUT input)
 	vsout.Position = mul(WorldViewProj[eyeIndex], inputPosition).xyww;
 	vsout.WorldPosition = mul(World[eyeIndex], inputPosition);
 	vsout.PreviousWorldPosition = mul(PreviousWorld[eyeIndex], inputPosition);
+#	if defined(CLOUD_SHADOWS_CAPTURE)
+	vsout.Position = GetCaptureClipPosition(vsout.WorldPosition.xyz - EyePosition[eyeIndex].xyz);
+#	endif
 
 #	ifdef VR
 	vsout.EyeIndex = eyeIndex;
