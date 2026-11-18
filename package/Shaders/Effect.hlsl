@@ -535,6 +535,46 @@ cbuffer PerGeometry : register(b2)
 #		include "ExponentialHeightFog/ExponentialHeightFog.hlsli"
 #	endif
 
+#	if defined(LIGHTING) && defined(EXP_HEIGHT_FOG)
+// (49b) "Particles Use RT Shadows" (Ray Tracing): the volumetric fog's ray-traced froxel visibility, temporally filtered
+// (ExponentialHeightFog/RTFogVisibility.hlsli; only while the near fog grid is built). Off / unbound: every factor is 1 and no light is added.
+#		include "ExponentialHeightFog/RTFogVisibility.hlsli"
+namespace RTFogVis
+{
+	/// Near-grid volume uvw (texel centres) of a camera-relative position; false outside the near grid or without the textures.
+	bool ParticleCoords(float3 a_positionWS, uint a_eyeIndex, out float3 a_uvw)
+	{
+		a_uvw = 0.0.xxx;
+		uint w, h, d;
+		RTFogSun.GetDimensions(w, h, d);
+		const float4 clip = mul(FrameBuffer::CameraViewProj[a_eyeIndex], float4(a_positionWS, 1.0));
+		if (clip.w <= 0.0 || w == 0u || h == 0u || d == 0u)
+			return false;
+		float2 uv = clip.xy / clip.w * float2(0.5, -0.5) + 0.5;
+		if (any(uv < 0.0) || any(uv > 1.0))
+			return false;
+		uv = Stereo::ConvertToStereoUV(uv, a_eyeIndex);
+		const float z = ExponentialHeightFog::VolumetricDepthToNormalizedSlice(max(clip.w, SharedData::CameraData.y), SharedData::volumetricFogSettings.NearGridZParams.xyz,
+			SharedData::volumetricFogSettings.NearGridZParams.w);
+		if (z < 0.0 || z >= 1.0)
+			return false;
+		const float3 size = float3(w, h, d);
+		a_uvw = clamp(float3(uv, z), 0.5 / size, 1.0 - 0.5 / size);
+		return true;
+	}
+
+	/// The ray-traced sun factor of a lit effect at a camera-relative position (1 = no data or off).
+	float ParticleSun(float3 a_positionWS, uint a_eyeIndex)
+	{
+		float result = 1.0;
+		float3 uvw;
+		[branch] if ((Flags() & kParticleSun) && ParticleCoords(a_positionWS, a_eyeIndex, uvw))
+			result = SunFactor(RTFogSun.SampleLevel(SampColorSampler, uvw, 0));
+		return result;
+	}
+}
+#	endif
+
 #	if defined(PHYSICAL_SKY)
 #		include "PhysicalSky/Common.hlsli"
 #	endif
@@ -674,6 +714,10 @@ float3 GetLightingColor(float3 msPosition, float3 worldPosition, float4 screenPo
 			else
 #		endif
 				shadow = ShadowSampling::GetEffectShadow(worldPosition.xyz, normalize(worldPosition.xyz), screenPosition.xy, eyeIndex, isWorldShadow);
+#		if defined(EXP_HEIGHT_FOG)
+			// (49b) Particles Use RT Shadows: x the ray-traced sun visibility (the casters Ray Tracing took out of the shadow map / VSM).
+			shadow *= RTFogVis::ParticleSun(worldPosition.xyz, eyeIndex);
+#		endif
 			color += dirLightColor * shadow;
 			// Do not denoise world shadows
 			if (!isWorldShadow)
@@ -682,16 +726,28 @@ float3 GetLightingColor(float3 msPosition, float3 worldPosition, float4 screenPo
 			color += dirLightColor;
 		}
 	} else {
+		// (49b) Particles Use RT Shadows: the ray-traced sun visibility of this effect (1 = off / no data).
+		float rtSun = 1.0;
+#		if defined(EXP_HEIGHT_FOG)
+		[branch] if (!SharedData::InInterior && (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InWorld))
+			rtSun = RTFogVis::ParticleSun(worldPosition.xyz, eyeIndex);
+#		endif
 #		if defined(VOLUMETRIC_SHADOWS)
 		// (batch 38, A2, upstream 0f79d567a) Every other lit effect in the world: the engine hands
 		// us one colour for sun + ambient. Estimate the sun's share (upstream ExtractLighting)
 		// and take the shadowed part of it away. Fully lit = exactly the old colour.
 		[branch] if (VolumetricShadows::ParticleShadowsEnabled() && !SharedData::InInterior && (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InWorld))
 		{
-			float shadow = VolumetricShadows::GetEffectShadow(worldPosition.xyz, normalize(worldPosition.xyz), screenPosition.xy, eyeIndex);
+			float shadow = VolumetricShadows::GetEffectShadow(worldPosition.xyz, normalize(worldPosition.xyz), screenPosition.xy, eyeIndex) * rtSun;
+			rtSun = 1.0;
 			color -= EstimateEffectDirectionalPart(color) * (1.0 - shadow);
 			shadowVariance = ComputeShadowVariance(shadow);
 		}
+#		endif
+#		if defined(EXP_HEIGHT_FOG)
+		// (49b) Without the Volumetric Shadows term: the ray-traced visibility alone takes the shadowed part of the sun's share away.
+		[branch] if (rtSun < 1.0)
+			color -= EstimateEffectDirectionalPart(color) * (1.0 - rtSun);
 #		endif
 #		if defined(EXP_HEIGHT_FOG)
 		// (47d) "CS Fog Takes Over": the sun's share of the engine's colour, dimmed by the weather's fog toward the sun.
@@ -887,13 +943,42 @@ PS_OUTPUT main(PS_INPUT input)
 		if (inWorld && LightLimitFix::GetClusterIndex(screenUV, viewPosition.z, clusterIndex)) {
 			lightCount = LightLimitFix::lightGrid[clusterIndex].lightCount;
 			uint lightOffset = LightLimitFix::lightGrid[clusterIndex].offset;
+#			if defined(EXP_HEIGHT_FOG)
+			// (49b) Particles Use RT Shadows: the four point-light sources traced at this spot of the fog grid. A light among them is shadowed by
+			// its ray-traced visibility; a shadow-casting light (skipped before) lights the effect only when it is among them.
+			bool rtLights = (RTFogVis::Flags() & RTFogVis::kParticleLights) != 0u;
+			uint2 rtSlots = 0u.xx;
+			[branch] if (rtLights)
+			{
+				float3 rtUvw;
+				rtLights = RTFogVis::ParticleCoords(input.WorldPosition.xyz, eyeIndex, rtUvw);
+				uint rtW, rtH, rtD;
+				RTFogVis::RTFogLightId.GetDimensions(rtW, rtH, rtD);
+				const int4 rtCoord = int4(min(uint3(rtUvw * float3(rtW, rtH, rtD)), uint3(rtW, rtH, rtD) - 1u), 0);
+				if (rtLights)
+					rtSlots = RTFogVis::PackSlots(RTFogVis::RTFogLightId.Load(rtCoord), RTFogVis::RTFogLightVis.Load(rtCoord));
+			}
+#			endif
 			[loop] for (uint i = 0; i < lightCount; i++)
 			{
 				uint clusteredLightIndex = LightLimitFix::lightList[lightOffset + i];
 				LightLimitFix::Light light = LightLimitFix::lights[clusteredLightIndex];
-				if (LightLimitFix::IsLightIgnored(light) || light.lightFlags & LightLimitFix::LightFlags::Shadow) {
+				if (LightLimitFix::IsLightIgnored(light))
 					continue;
+				bool skipLight = (light.lightFlags & LightLimitFix::LightFlags::Shadow) != 0u;
+				float rtLightVis = 1.0;
+#			if defined(EXP_HEIGHT_FOG)
+				[branch] if (rtLights)
+				{
+					const uint rtId = RTFogVis::LightId(clusteredLightIndex);
+					bool rtFound;
+					rtLightVis = RTFogVis::LightVisibility(rtSlots, rtId, rtFound);
+					if (rtFound)
+						skipLight = false;
 				}
+#			endif
+				if (skipLight)
+					continue;
 				float3 lightDirection = light.positionWS[eyeIndex].xyz - input.WorldPosition.xyz;
 				float lightDist = length(lightDirection);
 
@@ -906,7 +991,7 @@ PS_OUTPUT main(PS_INPUT input)
 
 				const bool isPointLightLinear = light.lightFlags & LightLimitFix::LightFlags::Linear;
 				float3 lightColor = Color::PointLight(light.color.xyz, isPointLightLinear) * intensityMultiplier * 0.5 * light.fade * Color::EffectLightingMult();
-				propertyColor += lightColor;
+				propertyColor += lightColor * rtLightVis;
 			}
 		}
 	}
