@@ -155,6 +155,13 @@ namespace SIE
 					defines[lastIndex++] = { "GLINT", nullptr };
 				}
 			}
+			// (49d) Landscape Seams. Bit 5 was never set in a lighting descriptor before 49d (TruePBR's GetRenderPasses clears
+			// bits 3-5), so no existing descriptor gains this define and no cache key changes: no SHADER_CACHE_VERSION bump.
+			if ((descriptor & static_cast<uint32_t>(ShaderCache::LightingShaderFlags::LandscapeSeams)) != 0) {
+				const auto technique = static_cast<ShaderCache::LightingShaderTechniques>(GetTechnique(descriptor));
+				if (technique == ShaderCache::LightingShaderTechniques::MTLand || technique == ShaderCache::LightingShaderTechniques::MTLandLODBlend)
+					defines[lastIndex++] = { "LANDSCAPE_SEAMS", nullptr };
+			}
 
 			for (auto* feature : Feature::GetFeatureList()) {
 				if (feature->loaded && feature->HasShaderDefine(RE::BSShader::Type::Lighting)) {

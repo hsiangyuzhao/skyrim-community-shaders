@@ -1,9 +1,11 @@
 #include "Hooks.h"
 
+#include "EngineFixes/LandscapeSeamsFix.h"
 #include "EngineFixes/WndProcPseudoHandleFix.h"
 
 #include "ShaderTools/BSShaderHooks.h"
 
+#include "EngineFix.h"
 #include "Feature.h"
 #include "Globals.h"
 #include "Menu.h"
@@ -99,6 +101,8 @@ struct BSShader_LoadShaders
 		if (shaderCache->IsDiskCache() || shaderCache->IsDump()) {
 			if (shaderCache->IsDiskCache()) {
 				truePBR->GenerateShaderPermutations(shader);
+				// (49d, #2917) Landscape Seams picks its permutations per draw: compile them now, not mid-game.
+				EngineFix::GenerateAllShaderPermutations(shader);
 			}
 
 			for (const auto& entry : shader->vertexShaders) {
@@ -148,6 +152,24 @@ bool Hooks::BSShader_BeginTechnique::thunk(RE::BSShader* shader, uint32_t vertex
 		const uint32_t technique = (pixelDescriptor >> 11) & 0xF;
 		if (technique >= 1 && technique <= 7 && globals::features::lightLimitFix.loaded)  // (47m) permanent
 			return false;
+	}
+
+	// (49d) Landscape Seams: draw the normal terrain permutation while the seams one is not ready (compiling, failed, shader
+	// cache off) or the switch is off. Only the seams bit goes, so the quad keeps its own permutation (upstream #2841).
+	constexpr auto landscapeSeamsFlag = static_cast<uint32_t>(SIE::ShaderCache::LightingShaderFlags::LandscapeSeams);
+	if ((pixelDescriptor & landscapeSeamsFlag) != 0 && shader->shaderType.get() == RE::BSShader::Type::Lighting) {
+		bool seamsReady = shaderCache->IsEnabled() && state->enabledClasses[RE::BSShader::Type::Lighting - 1] && LandscapeSeamsFix::GetInstance().IsEnabled();
+		if (seamsReady) {
+			auto probeVertexDescriptor = vertexDescriptor;
+			auto probePixelDescriptor = pixelDescriptor;
+			state->ModifyShaderLookup(*shader, probeVertexDescriptor, probePixelDescriptor);
+			seamsReady = shaderCache->GetVertexShader(*shader, probeVertexDescriptor) != nullptr &&
+			             shaderCache->GetPixelShader(*shader, probePixelDescriptor) != nullptr;
+		}
+		if (!seamsReady) {
+			vertexDescriptor &= ~landscapeSeamsFlag;
+			pixelDescriptor &= ~landscapeSeamsFlag;
+		}
 	}
 
 	state->updateShader = true;
@@ -873,6 +895,8 @@ namespace Hooks
 			auto TruePBRSingleton = globals::truePBR;
 			if (TruePBRSingleton->TESObjectLAND_SetupMaterial(land)) {
 				// if PBR, we are done
+				// (49d) Landscape Seams: copy the quads' weights; the blending is built on its own worker thread.
+				LandscapeSeamsFix::GetInstance().OnLandSetup(land, true);
 				return true;
 			}
 
@@ -881,6 +905,9 @@ namespace Hooks
 			if (vanillaResult && terrainHelper.loaded) {
 				terrainHelper.TESObjectLAND_SetupMaterial(land);
 			}
+
+			if (vanillaResult)
+				LandscapeSeamsFix::GetInstance().OnLandSetup(land, false);  // (49d)
 
 			return vanillaResult;
 		}

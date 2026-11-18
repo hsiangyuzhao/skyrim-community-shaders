@@ -3,6 +3,7 @@
 #include "TruePBR/BSLightingShaderMaterialPBR.h"
 #include "TruePBR/BSLightingShaderMaterialPBRLandscape.h"
 
+#include "EngineFixes/LandscapeSeamsFix.h"
 #include "Features/InteriorSun.h"
 #include "Hooks.h"
 #include "ShaderCache.h"
@@ -476,7 +477,7 @@ namespace Permutations
 		constexpr std::array projectedUvFlags{ Deferred, AnisoLighting, DoAlphaTest, Snow };
 		constexpr std::array lodObjectsFlags{ Deferred, WorldMap, DoAlphaTest, ProjectedUV };
 		constexpr std::array treeFlags{ Deferred, AnisoLighting, Skinned, DoAlphaTest };
-		constexpr std::array landFlags{ Deferred, AnisoLighting };
+		constexpr std::array landFlags{ Deferred, AnisoLighting, LandscapeSeams };  // (49d, #2917) seams precompiled too
 
 		constexpr uint32_t defaultConstantFlags = static_cast<uint32_t>(TruePbr) | static_cast<uint32_t>(VC);
 		constexpr uint32_t projectedUvConstantFlags = static_cast<uint32_t>(TruePbr) | static_cast<uint32_t>(VC) | static_cast<uint32_t>(ProjectedUV);
@@ -649,6 +650,9 @@ struct BSLightingShaderProperty_GetRenderPasses
 
 		const auto issEnabledAndInteriorWithSun = globals::features::interiorSun.loaded && globals::features::interiorSun.isInteriorWithSun;
 
+		// (49d) Landscape Seams: this land quad has blend resources and the switch is on (one lookup per property, not per pass).
+		const bool landscapeSeams = property->flags.any(RE::BSShaderProperty::EShaderPropertyFlag::kMultiTextureLandscape) && LandscapeSeamsFix::GetInstance().ShouldTag(geometry);
+
 		bool isPbr = false;
 
 		if (property->flags.any(RE::BSShaderProperty::EShaderPropertyFlag::kVertexLighting) && (property->material->GetFeature() == RE::BSShaderMaterial::Feature::kDefault || property->material->GetFeature() == RE::BSShaderMaterial::Feature::kMultiTexLandLODBlend)) {
@@ -662,7 +666,14 @@ struct BSLightingShaderProperty_GetRenderPasses
 				auto lightingTechnique = currentPass->passEnum - LightingTechniqueStart;
 				auto lightingFlags = lightingTechnique & ~(~0u << 24);
 				auto lightingType = static_cast<SIE::ShaderCache::LightingShaderTechniques>((lightingTechnique >> 24) & 0x3F);
-				lightingFlags &= ~0b111000u;
+				// Bits 3-5 carry the engine's light count here; Community Shaders uses them as TruePbr, Deferred and (49d)
+				// LandscapeSeams, so all three are cleared and set again below (upstream clears bit 5 in its own seams hook).
+				lightingFlags &= ~(static_cast<uint32_t>(SIE::ShaderCache::LightingShaderFlags::TruePbr) |
+								   static_cast<uint32_t>(SIE::ShaderCache::LightingShaderFlags::Deferred) |
+								   static_cast<uint32_t>(SIE::ShaderCache::LightingShaderFlags::LandscapeSeams));
+				// Only the landscape techniques have a seams permutation; BeginTechnique drops the bit again while it is not ready.
+				if (landscapeSeams && (lightingType == SIE::ShaderCache::LightingShaderTechniques::MTLand || lightingType == SIE::ShaderCache::LightingShaderTechniques::MTLandLODBlend))
+					lightingFlags |= static_cast<uint32_t>(SIE::ShaderCache::LightingShaderFlags::LandscapeSeams);
 				if (isPbr) {
 					lightingFlags |= static_cast<uint32_t>(SIE::ShaderCache::LightingShaderFlags::TruePbr);
 					lightingFlags &= ~static_cast<uint32_t>(SIE::ShaderCache::LightingShaderFlags::Specular);
@@ -991,6 +1002,10 @@ struct BSLightingShader_SetupGeometry
 	{
 		const auto originalTechnique = shader->currentRawTechnique;
 
+		// (49d) Landscape Seams: the quad's weight maps, quad data and borrowed textures (t104-t111) for a seams pass.
+		if (pass != nullptr && ((pass->passEnum - 0x4800002Du) & static_cast<uint32_t>(SIE::ShaderCache::LightingShaderFlags::LandscapeSeams)) != 0)
+			LandscapeSeamsFix::GetInstance().Bind(pass->geometry);
+
 		if ((shader->currentRawTechnique & static_cast<uint32_t>(SIE::ShaderCache::LightingShaderFlags::TruePbr)) != 0) {
 			shader->currentRawTechnique |= static_cast<uint32_t>(SIE::ShaderCache::LightingShaderFlags::AmbientSpecular);
 			shader->currentRawTechnique ^= static_cast<uint32_t>(SIE::ShaderCache::LightingShaderFlags::AnisoLighting);
@@ -1030,6 +1045,27 @@ void SetupPBRLandscapeTextureParameters(BSLightingShaderMaterialPBRLandscape& ma
 	material.glintParameters[textureIndex] = textureSetData.glintParameters;
 }
 
+bool TruePBR::IsSnowLandTexture(const RE::TESLandTexture& landTexture, const RE::BGSTextureSet* textureSet)
+{
+	// (batch 39b) Dynamic Snow: is this tile snow? The vanilla landscape material takes
+	// textureIsSnow[i] from the LTEX "is snow" flag (INAM, TESLandTexture+0x3C read as
+	// shaderTextureIndex; SkyrimSE.exe 1.5.97 ID 18368 -> 0x1412C5930). The PBR material dropped
+	// it, so on PBR terrain nothing was snow. Also accepted: a snow material type (as
+	// community-shaders PR #2659 "Snow Deformation" by PppPlyr1 does) and "snow" in the diffuse
+	// path, for land texture mods that set neither. (49d) Shared with Landscape Seams' borrowed layers.
+	bool snow = landTexture.shaderTextureIndex != 0;
+	if (!snow && landTexture.materialType) {
+		const auto id = landTexture.materialType->materialID;
+		snow = id == RE::MATERIAL_ID::kSnow || id == RE::MATERIAL_ID::kSnowStairs;
+	}
+	if (!snow && textureSet != nullptr) {
+		std::string path = textureSet->textures[0].textureName.c_str();
+		std::transform(path.begin(), path.end(), path.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+		snow = path.find("snow") != std::string::npos;
+	}
+	return snow;
+}
+
 void SetupLandscapeTexture(BSLightingShaderMaterialPBRLandscape& material, RE::TESLandTexture& landTexture, uint32_t textureIndex, std::array<TruePBR::PBRTextureSetData*, BSLightingShaderMaterialPBRLandscape::NumTiles>& textureSets)
 {
 	if (textureIndex >= 6) {
@@ -1057,25 +1093,8 @@ void SetupLandscapeTexture(BSLightingShaderMaterialPBRLandscape& material, RE::T
 	}
 	material.isPbr[textureIndex] = isPbr;
 
-	// (batch 39b) Dynamic Snow: is this tile snow? The vanilla landscape material takes
-	// textureIsSnow[i] from the LTEX "is snow" flag (INAM, TESLandTexture+0x3C read as
-	// shaderTextureIndex; SkyrimSE.exe 1.5.97 ID 18368 -> 0x1412C5930). The PBR material dropped
-	// it, so on PBR terrain nothing was snow. Also accepted: a snow material type (as
-	// community-shaders PR #2659 "Snow Deformation" by PppPlyr1 does) and "snow" in the diffuse
-	// path, for land texture mods that set neither.
-	{
-		bool snow = landTexture.shaderTextureIndex != 0;
-		if (!snow && landTexture.materialType) {
-			const auto id = landTexture.materialType->materialID;
-			snow = id == RE::MATERIAL_ID::kSnow || id == RE::MATERIAL_ID::kSnowStairs;
-		}
-		if (!snow) {
-			std::string path = textureSet->textures[0].textureName.c_str();
-			std::transform(path.begin(), path.end(), path.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-			snow = path.find("snow") != std::string::npos;
-		}
-		material.isSnow[textureIndex] = snow;
-	}
+	// (batch 39b) Dynamic Snow: is this tile snow? See TruePBR::IsSnowLandTexture.
+	material.isSnow[textureIndex] = TruePBR::IsSnowLandTexture(landTexture, textureSet);
 
 	if (material.landscapeBaseColorTextures[textureIndex] != nullptr) {
 		material.numLandscapeTextures = std::max(material.numLandscapeTextures, textureIndex + 1);

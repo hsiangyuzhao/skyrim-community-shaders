@@ -1,5 +1,6 @@
 ﻿#include "EngineFix.h"
 
+#include "EngineFixes/LandscapeSeamsFix.h"
 #include "EngineFixes/ShadowmapCascadeCullingFix.h"
 
 const std::vector<EngineFix*>& EngineFix::GetOnPostPostLoadFixesList()
@@ -7,6 +8,7 @@ const std::vector<EngineFix*>& EngineFix::GetOnPostPostLoadFixesList()
 	static ShadowmapCascadeCullingFix shadowmapCascadeCullingFix;
 
 	static std::vector<EngineFix*> fixes = {
+		&LandscapeSeamsFix::GetInstance(),
 		&shadowmapCascadeCullingFix
 	};
 
@@ -36,4 +38,12 @@ void EngineFix::InstallOnPostPostLoadFixes()
 void EngineFix::InstallOnDataLoadedFixes()
 {
 	InstallFixes(GetOnDataLoadedFixesList());
+}
+
+void EngineFix::GenerateAllShaderPermutations(RE::BSShader* a_shader)
+{
+	for (const auto fix : GetOnPostPostLoadFixesList())
+		fix->GenerateShaderPermutations(a_shader);
+	for (const auto fix : GetOnDataLoadedFixesList())
+		fix->GenerateShaderPermutations(a_shader);
 }

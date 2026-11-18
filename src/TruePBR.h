@@ -65,6 +65,8 @@ public:
 	void ReloadTextureSetData();
 	PBRTextureSetData* GetPBRTextureSetData(const RE::TESForm* textureSet);
 	bool IsPBRTextureSet(const RE::TESForm* textureSet);
+	/** @brief (batch 39b) True when a land texture counts as snow for Dynamic Snow: LTEX INAM flag, snow material type, or "snow" in its diffuse path. (49d) Also used by Landscape Seams. */
+	static bool IsSnowLandTexture(const RE::TESLandTexture& landTexture, const RE::BGSTextureSet* textureSet);
 
 	void SetupDefaultPBRLandTextureSet();
 
