@@ -70,11 +70,12 @@ struct Skin : Feature
 		float FuzzStrength = 1.0f;
 		float FuzzRoughness = 0.35f;
 		float FuzzF0 = 0.045f;
-		// (49a) Fixes (Skin.hlsli kFix49a*; all off + UseSkinModTextures on = the 48n look).
-		bool UseSkinModTextures = true;  // bind the skin mod's _rfaos / _wet textures (off: none, as for a skin without them)
-		bool FixPoreDetail = true;       // tangent frame of the pore detail from the texture uv, proper detail blend
-		bool SkinShadingFixes = true;    // fuzz energy, indirect diffuse weight, grey _wet detection
-		bool NoDirectLightAO = false;    // the skin AO only on ambient / reflections
+		// (49a) Fixes (Skin.hlsli kFix49a*). (49b) Fixed on, no switches (the user's saved values; the old keys are ignored): the skin mod's
+		// _rfaos / _wet textures are bound (= 48n), pore detail frame from the texture uv, upstream shading fixes, skin AO only on ambient.
+		static constexpr bool UseSkinModTextures = true;
+		static constexpr bool FixPoreDetail = true;
+		static constexpr bool SkinShadingFixes = true;
+		static constexpr bool NoDirectLightAO = true;
 		// (44a) Extra wetness, the Perlin wetness parameters, the film strength and the 43b
 		// coverage options moved to the Wet Skin page (WetSkin.h). (47o) StartSweat / FullSweat /
 		// UseDynamicWetness (moved there in 47i) are no longer kept here (WetSkin reads the raw JSON).

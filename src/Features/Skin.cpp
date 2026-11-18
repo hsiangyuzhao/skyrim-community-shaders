@@ -38,11 +38,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	UseSSS,
 	FuzzStrength,
 	FuzzRoughness,
-	FuzzF0,
-	UseSkinModTextures,
-	FixPoreDetail,
-	SkinShadingFixes,
-	NoDirectLightAO);
+	FuzzF0);
 
 void Skin::DrawSettings()
 {
@@ -145,35 +141,8 @@ void Skin::DrawSettings()
 		ImGui::Text("Multiply the tiling for the body to match the face");
 	}
 
-	// (49a) Fixes, each its own switch (all off + the textures on = 48n).
-	ImGui::Spacing();
-	ImGui::SeparatorText("Fixes (49a)");
-	ImGui::Checkbox("Use Skin Mod _wet / _rfaos Textures", &settings.UseSkinModTextures);
-	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Use the extra textures a skin mod ships next to its specular / normal map (xxx_wet.dds, xxx_rfaos.dds).");
-		ImGui::BulletText("On = as before (48n already loaded them through the game's file system).");
-		ImGui::BulletText("Off = draw every skin as if it had none (for comparing).");
-		ImGui::BulletText("The _wet mask is only read by the Legacy wetness model; Physical ignores it.");
-	}
-	ImGui::TextDisabled("Found in your mods: _wet %u (missing %u), _rfaos %u (missing %u)",
-		skinModTextureFound[1], skinModTextureMissing[1], skinModTextureFound[0], skinModTextureMissing[0]);
-	ImGui::Checkbox("Pore Detail Follows the Skin", &settings.FixPoreDetail);
-	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Bodies and hands (model-space normal maps): the pore detail no longer slides when the camera turns.");
-		ImGui::BulletText("The detail's direction now comes from the texture, not the screen; the detail and base normals are blended in the right order.");
-	}
-	ImGui::Checkbox("Skin Shading Fixes", &settings.SkinShadingFixes);
-	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Small corrections from upstream:");
-		ImGui::BulletText("the light the fuzz layer reflects is taken off the skin below (edges slightly less bright);");
-		ImGui::BulletText("ambient light on skin no longer loses twice the reflected share (ambient slightly brighter, most at the edges);");
-		ImGui::BulletText("Legacy wetness: a compressed grey _wet texture is read as a mask, not a normal map.");
-	}
-	ImGui::Checkbox("No Extra AO on Direct Light", &settings.NoDirectLightAO);
-	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("The skin's own occlusion (detail texture, _rfaos) darkens only ambient light and reflections, not sun / lamps.");
-		ImGui::BulletText("Taste: upstream removed it. Off = as before.");
-	}
+	// (49b) The 49a fixes (pore detail, shading fixes, no direct-light AO) are fixed on; the _wet / _rfaos compare switch and its status
+	// line are gone (the textures are always used, as in 48n; the per-path log lines stay).
 
 	// (47m) In a "Tools" node, closed by default.
 	if (ImGui::TreeNode("Tools")) {
