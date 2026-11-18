@@ -1125,6 +1125,14 @@ namespace Perf47p
 #		include "ExponentialHeightFog/ExponentialHeightFog.hlsli"
 #	endif
 
+// (49d) Landscape Seams (LandscapeSeamsFix.cpp): only the landscape pixel shaders carry it.
+#	if defined(LANDSCAPE_SEAMS) && !defined(LANDSCAPE)
+#		undef LANDSCAPE_SEAMS
+#	endif
+#	if defined(LANDSCAPE_SEAMS)
+#		include "Common/LandscapeSeams.hlsli"
+#	endif
+
 PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 {
 	PS_OUTPUT psout;
@@ -1164,9 +1172,17 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 #	endif  // defined (SKINNED) || !defined (MODELSPACENORMALS)
 
+#	if defined(LANDSCAPE_SEAMS)
+	// (49d) The quad's healed weights replace the vertex weights; two borrowed layers come with them (world XY, per eye in VR).
+	LandscapeSeams::Load(input.WorldPosition.xy + FrameBuffer::CameraPosAdjust[eyeIndex].xy, input.LandBlendWeights1, input.LandBlendWeights2);
+#	endif
+
 #	if !defined(TRUE_PBR)
 #		if defined(LANDSCAPE)
 	float shininess = dot(input.LandBlendWeights1, LandscapeTexture1to4IsSpecPower) + input.LandBlendWeights2.x * LandscapeTexture5to6IsSpecPower.x + input.LandBlendWeights2.y * LandscapeTexture5to6IsSpecPower.y;
+#			if defined(LANDSCAPE_SEAMS)
+	shininess += dot(LandscapeSeams::ExtraWeights, LandscapeSeams::Data.SpecPower);
+#			endif
 #		elif defined(SPECULAR)
 	float shininess = SpecularColor.w;
 #		else
@@ -1352,6 +1368,12 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	// Normalise blend weights
 	float totalWeight = input.LandBlendWeights1.x + input.LandBlendWeights1.y + input.LandBlendWeights1.z +
 	                    input.LandBlendWeights1.w + input.LandBlendWeights2.x + input.LandBlendWeights2.y;
+#		if defined(LANDSCAPE_SEAMS)
+	// (49d) The eight layers share one total.
+	totalWeight += dot(LandscapeSeams::ExtraWeights, float2(1.0, 1.0));
+	if (totalWeight > 0.0)
+		LandscapeSeams::ExtraWeights /= totalWeight;
+#		endif
 	if (totalWeight > 0.0) {
 		input.LandBlendWeights1 /= totalWeight;
 		input.LandBlendWeights2.xy /= totalWeight;
@@ -1425,6 +1447,16 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			input.LandBlendWeights1.w = weights[3];
 			input.LandBlendWeights2.x = weights[4];
 			input.LandBlendWeights2.y = weights[5];
+#			if defined(LANDSCAPE_SEAMS)
+			// (49d) Height blending covers only the engine layers (it returns them normalised to 1): scale them back to
+			// their share beside the borrowed ones (upstream #2841).
+			const float seamsEngineWeight = dot(input.LandBlendWeights1, float4(1.0, 1.0, 1.0, 1.0)) + input.LandBlendWeights2.x + input.LandBlendWeights2.y;
+			if (seamsEngineWeight > 0.0) {
+				const float seamsEngineScale = saturate(1.0 - dot(LandscapeSeams::ExtraWeights, float2(1.0, 1.0))) / seamsEngineWeight;
+				input.LandBlendWeights1 *= seamsEngineScale;
+				input.LandBlendWeights2.xy *= seamsEngineScale;
+			}
+#			endif
 		}
 		if (SharedData::extendedMaterialSettings.EnableShadows && (parallaxShadowQuality > 0.0f || SharedData::extendedMaterialSettings.ExtendShadows)) {
 #			if defined(TERRAIN_VARIATION)
@@ -1970,6 +2002,10 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		blendedNormalRGB += landNormalRGB6 * weight;
 		blendedNormalAlpha += landNormalAlpha6 * weight;
 	}
+#		if defined(LANDSCAPE_SEAMS)
+	// (49d) The two borrowed layers (Common/LandscapeSeams.hlsli), sampled and converted like the six above.
+	LANDSCAPE_SEAMS_BLEND_EXTRAS
+#		endif
 
 	float4 rawBaseColor = float4(blendedRGB, blendedAlpha);
 	baseColor = float4(Color::Diffuse(blendedRGB), blendedAlpha);
@@ -2700,6 +2736,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #			endif
 			float snowLayerTotal = dot(snowLayerW1, float4(1, 1, 1, 1)) + snowLayerW2.x + snowLayerW2.y;
 			authoredSnow = (dot(snowLayerW1, snowLayer1) + dot(snowLayerW2, snowLayer2)) / max(snowLayerTotal, 1e-3);
+#			if defined(LANDSCAPE_SEAMS)
+			// (49d) Borrowed layers count too, so footprints and "snow only" tracks follow a borrowed snow texture.
+			authoredSnow = (dot(snowLayerW1, snowLayer1) + dot(snowLayerW2, snowLayer2) + dot(LandscapeSeams::ExtraWeights, LandscapeSeams::Data.IsSnow)) /
+			               max(snowLayerTotal + dot(LandscapeSeams::ExtraWeights, float2(1.0, 1.0)), 1e-3);
+#			endif
 #		endif
 #		if defined(PROJECTED_UV)
 			// Directional snow on rocks and mountains. The same projection also lays moss, so only

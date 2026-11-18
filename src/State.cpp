@@ -5,6 +5,7 @@
 #include <pystring/pystring.h>
 
 #include "Deferred.h"
+#include "EngineFixes/LandscapeSeamsFix.h"
 #include "EngineFixes/UpstreamEngineFixes.h"
 #include "EngineFixes/WndProcPseudoHandleFix.h"
 #include "FeatureIssues.h"
@@ -200,6 +201,8 @@ void State::Reset()
 			feature->Reset();
 	// (48n) Sun shadow mask cache and the terrain LOD blend ring, once per frame.
 	UpstreamEngineFixes::OnFrame();
+	// (49d) Landscape Seams: let go of land geometry the engine has dropped (a map walk, no allocation).
+	LandscapeSeamsFix::GetInstance().Reset();
 	if (!globals::game::ui->GameIsPaused())
 		timer += RE::GetSecondsSinceLastFrame();
 	lastModifiedPixelDescriptor = 0;
@@ -390,6 +393,8 @@ void State::Load(ConfigMode a_configMode, bool a_allowReload)
 			// (48o) The "Performance" (47p) and "Engine Fixes" (48n) blocks are ignored: those switches are fixed now.
 			if (advanced.contains("Window Compatibility"))
 				WndProcPseudoHandleFix::Load(advanced["Window Compatibility"]);
+			if (advanced.contains("Landscape Seams"))
+				LandscapeSeamsFix::GetInstance().Load(advanced["Landscape Seams"]);
 		}
 
 		if (settings["General"].is_object()) {
@@ -538,6 +543,7 @@ void State::Save(ConfigMode a_configMode)
 	advanced["Frame Annotations"] = frameAnnotations;
 	advanced["Engine"] = Batch39Engine::Save();
 	advanced["Window Compatibility"] = WndProcPseudoHandleFix::Save();
+	advanced["Landscape Seams"] = LandscapeSeamsFix::GetInstance().Save();
 	settings["Advanced"] = advanced;
 
 	json general;
@@ -718,7 +724,8 @@ void State::ModifyShaderLookup(const RE::BSShader& a_shader, uint& a_vertexDescr
 										(uint32_t)SIE::ShaderCache::LightingShaderFlags::AnisoLighting |
 										(uint32_t)SIE::ShaderCache::LightingShaderFlags::BaseObjectIsSnow |
 										(uint32_t)SIE::ShaderCache::LightingShaderFlags::Snow |
-										(uint32_t)SIE::ShaderCache::LightingShaderFlags::TruePbr);
+										(uint32_t)SIE::ShaderCache::LightingShaderFlags::TruePbr |
+										(uint32_t)SIE::ShaderCache::LightingShaderFlags::LandscapeSeams);  // (49d) pixel shader only
 
 				a_pixelDescriptor &= ~((uint32_t)SIE::ShaderCache::LightingShaderFlags::AmbientSpecular |
 									   (uint32_t)SIE::ShaderCache::LightingShaderFlags::ShadowDir |
