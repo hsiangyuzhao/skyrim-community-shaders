@@ -506,7 +506,9 @@ PS_OUTPUT main(PS_INPUT input)
 #		endif
 
 #		if defined(DITHER)
-	float2 noiseGradUv = float2(0.125, 0.125) * input.Position.xy;
+	// (48n, official CS #3104) Whole-texel per-frame offset into the 8x8 noise tile, so DLSS / TAA resolve the dither
+	// instead of keeping (and upscaling) it as a fixed grid.
+	float2 noiseGradUv = float2(0.125, 0.125) * (input.Position.xy + floor(Random::R2Sequence(SharedData::FrameCount) * 8.0));
 	float noiseGrad =
 		TexNoiseGradSampler.Sample(SampNoiseGradSampler, noiseGradUv).x * 0.03125 + -0.0078125;
 

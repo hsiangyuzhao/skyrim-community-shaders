@@ -1,4 +1,5 @@
 #include "Deferred.h"
+#include "EngineFixes/UpstreamEngineFixes.h"
 #include "EngineFixes/WndProcPseudoHandleFix.h"
 #include "Features/Skin.h"
 #include "Features/SkySync.h"
@@ -89,6 +90,7 @@ void MessageHandler(SKSE::MessagingInterface::Message* message)
 				globals::truePBR->PostPostLoad();
 				Hooks::Install();
 				EngineFix::InstallOnPostPostLoadFixes();
+				UpstreamEngineFixes::Install();  // (48n)
 				FrameAnnotations::OnPostPostLoad();
 
 				auto shaderCache = globals::shaderCache;

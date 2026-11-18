@@ -328,8 +328,10 @@ void WriteScreenSpaceShadow(DispatchParameters inParameters, int3 inGroupID, int
 		depths.x = lerp(depths.x, 1.0, (float)(depths.x == 0));  // Stencil area
 		depths.y = lerp(depths.y, 1.0, (float)(depths.y == 0));  // Stencil area
 #	else
-		depths.x = inParameters.DepthTexture.SampleLevel(inParameters.PointBorderSampler, coord, 0);
-		depths.y = inParameters.DepthTexture.SampleLevel(inParameters.PointBorderSampler, coord_with_offset, 0);
+		// (48n, official CS #3089) Under dynamic resolution (DLSS) the render area is the texture's top-left, and the border
+		// sampler only covers reads past the texture: reads past the render area are off-screen too, not last frame's depth.
+		depths.x = all(coord < inParameters.DynamicRes) ? inParameters.DepthTexture.SampleLevel(inParameters.PointBorderSampler, coord, 0) : inParameters.FarDepthValue;
+		depths.y = all(coord_with_offset < inParameters.DynamicRes) ? inParameters.DepthTexture.SampleLevel(inParameters.PointBorderSampler, coord_with_offset, 0) : inParameters.FarDepthValue;
 #	endif
 
 		// Depth thresholds (bilinear/shadow thickness) are based on a fractional ratio of the difference between sampled depth and the far clip depth

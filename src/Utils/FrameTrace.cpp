@@ -15,6 +15,7 @@
 #include "Utils/GpuTimers.h"
 #include "Utils/LatencyPacer.h"
 #include "Utils/PerfOptions.h"
+#include "EngineFixes/UpstreamEngineFixes.h"
 #include "Utils/WorldTiming.h"
 
 #include <d3d12.h>  // (46p) TagVram on D3D12 objects
@@ -922,6 +923,7 @@ namespace Util::FrameTrace
 				out << "# (46e) rendering at start: " << a_rendering << "\n";
 				out << "# (46w) frame generation at start: " << a_headerFG << "\n";
 				out << "# (47p) performance switches when written: " << PerfOptions::Describe() << "\n";
+				out << "# (48n) engine fixes when written: " << UpstreamEngineFixes::Describe() << "\n";
 				out << "# (45j) rt_* = Ray Tracing CPU split (ms, -1 = not run): scene update (grid diff, cell capture, filter registration, objects of which new\n";
 				out << "#   captures), TLAS instances, missed-caster check, characters, D3D12 record+submit (of which BLAS creation, skinning), D3D11 passes,\n";
 				out << "#   end of frame, engine references dropped; counts: recaptures, objects captured, misses examined, references waiting, TLAS instances,\n";

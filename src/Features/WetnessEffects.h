@@ -126,6 +126,8 @@ public:
 
 	virtual void Prepass() override;
 	virtual void PostPostLoad() override;
+	/// (48n) Advances the rain clock once per frame (official CS #3064).
+	virtual void Reset() override;
 
 	virtual void DrawSettings() override;
 
@@ -165,6 +167,12 @@ private:
 	void DrawWeatherAnalysis() const;
 
 	bool splashesOfStormsLoaded = false;
+
+	/// (48n) Rain clock in microseconds, advanced once per frame in Reset (official CS #3064). The old clock (whole
+	/// milliseconds, advanced in GetCommonBufferData, which runs 3-5 times per frame) stays for the A/B switch.
+	uint64_t rainTimerUs = 0;
+	mutable uint64_t legacyRainTimerMs = 0;
+	bool preciseRainTimer = true;  ///< JSON "PreciseRainTimer", not in Settings (that struct is the shader cbuffer)
 
 	// Weather wetness calculation result for debug display
 	struct WeatherWetnessResult

@@ -28,6 +28,8 @@ public:
 		// user's value; see kDensityGammaReference), LinearizeColor (on, always sent to the CB).
 		/// A3: extra multiplier on the shafts while a moon is the light source (Sky Sync).
 		float NightIntensity = 0.5f;
+		/// (48n) Blur: reject taps by relative linear depth (official CS #2880); off = the old raw-depth test.
+		bool BlurDepthReject = true;
 	};
 
 	/// (44h) A2: Linear Lighting's vlGamma acts on the shaft density only, not on the weather
@@ -177,6 +179,8 @@ private:
 		int32_t screenY;
 		int32_t screenXMin1;
 		int32_t screenYMin1;
+		uint32_t relativeDepthReject;  ///< (48n) Settings::BlurDepthReject
+		uint32_t pad0[3];
 	};
 	VLData vlData = VLData();
 	std::unique_ptr<ConstantBuffer> vlDataCB;

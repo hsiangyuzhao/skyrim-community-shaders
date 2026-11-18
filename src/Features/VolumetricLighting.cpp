@@ -24,7 +24,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	InteriorQuality,
 	InteriorCustomSize,
 	WorldShadowPower,
-	NightIntensity);
+	NightIntensity,
+	BlurDepthReject);
 
 void VolumetricLighting::DrawSettings()
 {
@@ -68,6 +69,13 @@ void VolumetricLighting::DrawBatch37bSettings()
 			"Multiplies the light shafts while a moon is the light source.\n"
 			"1 = old behaviour. 0.5 = half (default). 0 = no moonlight shafts. Needs Sky Sync.\n"
 			"Does not change the moonlight itself.");
+
+	ImGui::Checkbox("Blur: No Ghosts Above Trees and Walls", &settings.BlurDepthReject);  // (48n)
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"On (default): the shaft blur only mixes pixels at a similar distance (official CS #2880).\n"
+			"Off: the old test, which let a distant tree line or wall top blend with the sky and left faint copies\n"
+			"of it a few pixels above (more visible with DLSS at lower quality presets).");
 
 	// (44h) "Linearize Shaft Color" removed, now fixed on (CommonBufferData::LinearizeColor).
 }
@@ -328,6 +336,7 @@ void VolumetricLighting::EarlyPrepass()
 	vlData.screenY = height;
 	vlData.screenXMin1 = width - 1;
 	vlData.screenYMin1 = height - 1;
+	vlData.relativeDepthReject = settings.BlurDepthReject ? 1u : 0u;  // (48n)
 	vlDataCB->Update(vlData);
 
 	const auto interiorCell = RE::TES::GetSingleton()->interiorCell;
@@ -444,6 +453,9 @@ void VolumetricLighting::SetDimensionsCB() const
 {
 	auto cb = vlDataCB->CB();
 	globals::d3d::context->CSSetConstantBuffers(1, 1, &cb);
+	// (48n) The blur's relative depth test reads SharedData::CameraData (b5).
+	ID3D11Buffer* shared = globals::state->sharedDataCB->CB();
+	globals::d3d::context->CSSetConstantBuffers(5, 1, &shared);
 }
 
 void VolumetricLighting::SetGroupCountsHCS(uint32_t& threadGroupCountX) const

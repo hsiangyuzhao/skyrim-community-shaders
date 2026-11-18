@@ -5,6 +5,7 @@
 #include <pystring/pystring.h>
 
 #include "Deferred.h"
+#include "EngineFixes/UpstreamEngineFixes.h"
 #include "EngineFixes/WndProcPseudoHandleFix.h"
 #include "FeatureIssues.h"
 #include "Features/CloudShadows.h"
@@ -194,6 +195,8 @@ void State::Reset()
 	for (auto* feature : Feature::GetFeatureList())
 		if (feature->loaded)
 			feature->Reset();
+	// (48n) Sun shadow mask cache and the terrain LOD blend ring, once per frame.
+	UpstreamEngineFixes::OnFrame();
 	if (!globals::game::ui->GameIsPaused())
 		timer += RE::GetSecondsSinceLastFrame();
 	lastModifiedPixelDescriptor = 0;
@@ -383,6 +386,8 @@ void State::Load(ConfigMode a_configMode, bool a_allowReload)
 				Batch39Engine::Load(advanced["Engine"]);
 			if (advanced.contains("Performance"))
 				PerfOptions::Load(advanced["Performance"]);  // (47p)
+			if (advanced.contains("Engine Fixes"))
+				UpstreamEngineFixes::Load(advanced["Engine Fixes"]);  // (48n)
 			if (advanced.contains("Window Compatibility"))
 				WndProcPseudoHandleFix::Load(advanced["Window Compatibility"]);
 		}
@@ -533,6 +538,7 @@ void State::Save(ConfigMode a_configMode)
 	advanced["Frame Annotations"] = frameAnnotations;
 	advanced["Engine"] = Batch39Engine::Save();
 	advanced["Performance"] = PerfOptions::Save();  // (47p)
+	advanced["Engine Fixes"] = UpstreamEngineFixes::Save();  // (48n)
 	advanced["Window Compatibility"] = WndProcPseudoHandleFix::Save();
 	settings["Advanced"] = advanced;
 

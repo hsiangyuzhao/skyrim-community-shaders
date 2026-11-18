@@ -16,6 +16,7 @@
 #include "ShaderCache.h"
 #include "ThemeManager.h"
 #include "Util.h"
+#include "EngineFixes/UpstreamEngineFixes.h"
 #include "Utils/PerfOptions.h"
 
 using json = nlohmann::json;
@@ -192,6 +193,7 @@ void SettingsTabRenderer::RenderPerformanceTab()
 {
 	if (BeginTabItemWithFont("Performance", Menu::FontRole::Heading)) {
 		PerfOptions::DrawMenu();
+		UpstreamEngineFixes::DrawMenu();  // (48n)
 		ImGui::EndTabItem();
 	}
 }

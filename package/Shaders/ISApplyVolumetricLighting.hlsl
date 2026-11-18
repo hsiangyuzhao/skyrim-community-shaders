@@ -1,5 +1,7 @@
 #include "Common/DummyVSTexCoord.hlsl"
 #include "Common/FrameBuffer.hlsli"
+#include "Common/Random.hlsli"
+#include "Common/SharedData.hlsli"
 #include "Common/VR.hlsli"
 
 typedef VS_OUTPUT PS_INPUT;
@@ -47,7 +49,8 @@ PS_OUTPUT main(PS_INPUT input)
 	float repartition = clamp(RepartitionTex.SampleLevel(RepartitionSampler, depth, 0).x, 0, 0.9999);
 	float vl = g_IntensityX_TemporalY.x * VLTex.SampleLevel(VLSampler, float3(input.TexCoord, repartition), 0).x;
 
-	float noiseGrad = 0.03125 * NoiseGradSamplerTex.Sample(NoiseGradSamplerSampler, 0.125 * input.Position.xy).x;
+	// (48n, official CS #3104) Whole-texel per-frame offset into the 8x8 noise tile, so DLSS / TAA resolve the dither.
+	float noiseGrad = 0.03125 * NoiseGradSamplerTex.Sample(NoiseGradSamplerSampler, 0.125 * (input.Position.xy + floor(Random::R2Sequence(SharedData::FrameCount) * 8.0))).x;
 
 	float adjustedVl = max(0, noiseGrad + vl - 0.0078125);
 
