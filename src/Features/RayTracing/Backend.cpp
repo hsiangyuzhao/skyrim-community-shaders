@@ -2294,7 +2294,8 @@ namespace RayTracingRT
 		descriptorHeap_.Reset();
 		alphaPipeline_.Reset();
 		pipeline_.Reset();
-		// (45h)
+		// (45h) (49c) under the alpha lock (the loading-screen thread may be in RecordAlphaCopies)
+		std::scoped_lock alphaShutdownLock(alphaTexMutex_);
 		alphaTextures_.clear();
 		freeAlphaTextures_.clear();
 		alphaTextureIndex_.clear();
@@ -3004,6 +3005,48 @@ namespace RayTracingRT
 		return a_handle < blas_.size() && (blas_[a_handle].state == BlasState::Built || blas_[a_handle].state == BlasState::Ready);
 	}
 
+	bool Backend::WaitSubmitted(std::uint32_t a_ms)
+	{
+		// (49c) "Prepare When Arriving": the main thread waits for its own build submissions only (never for D3D11 or the game).
+		if (!fence_ || lastSubmitted_ == 0)
+			return false;
+		KickSubmits();
+		if (fence_->GetCompletedValue() >= lastSubmitted_)
+			return true;
+		HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+		if (!event)
+			return false;
+		bool done = false;
+		if (SUCCEEDED(fence_->SetEventOnCompletion(lastSubmitted_, event)))
+			done = WaitForSingleObject(event, a_ms) == WAIT_OBJECT_0;
+		CloseHandle(event);
+		return done;
+	}
+
+	std::uint32_t Backend::CompactionsDue() const
+	{
+		std::uint32_t due = 0;
+		for (const auto& blas : blas_)
+			if (blas.state == BlasState::Built && blas.postbuildSlot != UINT32_MAX)
+				++due;
+		return due;
+	}
+
+	void Backend::LogMultithreadProtection()
+	{
+		// (49c) Documentation of the loading-screen thread's D3D11 work: Community Shaders never changes this; the loading-screen thread's
+		// copies are serialised by our own gate (RayTracing::loadThreadMutex), not by the runtime.
+		static bool logged = false;
+		if (logged || !context11_)
+			return;
+		logged = true;
+		ComPtr<ID3D11Multithread> multithread;
+		if (SUCCEEDED(context11_.As(&multithread)) && multithread)
+			logger::info("[RayTracing] D3D11 multithread protection: {} (not changed by Community Shaders)", multithread->GetMultithreadProtected() ? "on" : "off");
+		else
+			logger::info("[RayTracing] D3D11 multithread protection: interface not available");
+	}
+
 	bool Backend::EnsureScratch(std::uint64_t a_bytes)
 	{
 		if (scratch_ && scratchBytes_ >= a_bytes)
@@ -3613,10 +3656,10 @@ namespace RayTracingRT
 				list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase);
 
 			const std::int64_t buildStart = QpcNow();
-			const std::uint32_t maxBuilds = a_input.maxBuilds ? a_input.maxBuilds : SettleCap(static_cast<std::uint32_t>(kMaxBuildsPerFrame), settleMaxBuilds_, a_input);  // (49b) settle window
+			const std::uint32_t maxBuilds = a_input.maxBuilds ? a_input.maxBuilds : static_cast<std::uint32_t>(kMaxBuildsPerFrame);
 			const std::int64_t buildDeadline = buildStart + MsToQpc(a_input.buildCpuMs > 0.0f ? a_input.buildCpuMs : kPlayBuildCpuMs);  // (46g)
 			recWork_ = {};  // (46p)
-			ProcessCompaction(list, completed, a_input.maxBuilds ? a_input.maxBuilds : SettleCap(kMaxCompactionsPerFrame, settleMaxCompactions_, a_input), buildDeadline);
+			ProcessCompaction(list, completed, a_input.maxBuilds ? a_input.maxBuilds : kMaxCompactionsPerFrame, buildDeadline);
 			const std::uint32_t builtNow =
 				BuildQueued(list, a_input.buildCpuMs > 0.0f ? a_input.buildTriangleBudget : StaticTriangleBudget(a_input.buildTriangleBudget), maxBuilds, buildDeadline);  // (46q)
 			frameTrisUsed_ = recWork_.buildTriangles;
@@ -4255,10 +4298,10 @@ namespace RayTracingRT
 		if (timestampHeap_)
 			list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase);
 		const std::int64_t buildStart = QpcNow();
-		const std::uint32_t maxBuilds = a_input.maxBuilds ? a_input.maxBuilds : SettleCap(static_cast<std::uint32_t>(kMaxBuildsPerFrame), settleMaxBuilds_, a_input);  // (49b) settle window
+		const std::uint32_t maxBuilds = a_input.maxBuilds ? a_input.maxBuilds : static_cast<std::uint32_t>(kMaxBuildsPerFrame);
 		const std::int64_t buildDeadline = buildStart + MsToQpc(a_input.buildCpuMs > 0.0f ? a_input.buildCpuMs : kPlayBuildCpuMs);
 		recWork_ = {};  // (46p)
-		ProcessCompaction(list, completed, a_input.maxBuilds ? a_input.maxBuilds : SettleCap(kMaxCompactionsPerFrame, settleMaxCompactions_, a_input), buildDeadline);
+		ProcessCompaction(list, completed, a_input.maxBuilds ? a_input.maxBuilds : kMaxCompactionsPerFrame, buildDeadline);
 		stats_.buildsLastFrame =
 			BuildQueued(list, a_input.buildCpuMs > 0.0f ? a_input.buildTriangleBudget : StaticTriangleBudget(a_input.buildTriangleBudget), maxBuilds, buildDeadline);  // (46q)
 		frameTrisUsed_ = recWork_.buildTriangles;
@@ -4790,7 +4833,7 @@ namespace RayTracingRT
 		constexpr double kMinTriangles = 16384.0;     // always some progress
 		const double perTri = msPerTriEma_ > 0.0 ? msPerTriEma_ : kDefaultMsPerTri;
 		const double upper = std::max(static_cast<double>(a_default), kMinTriangles);
-		const double triangles = std::clamp(static_cast<double>(kBudgetGpuMs * settleScale_) / perTri, kMinTriangles, upper);  // (49b) settle window: x settleScale_
+		const double triangles = std::clamp(static_cast<double>(kBudgetGpuMs) / perTri, kMinTriangles, upper);
 		budget_.triBudget = static_cast<std::uint32_t>(triangles);
 		return budget_.triBudget;
 	}

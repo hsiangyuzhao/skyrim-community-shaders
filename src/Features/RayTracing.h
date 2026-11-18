@@ -264,16 +264,16 @@ public:
 		// (49b) "Particles Use RT Shadows": lit effects (smoke, dust, mist sheets) take the volumetric fog's ray-traced visibility (sun and the four
 		// strongest traced point-light sources per froxel; shadow-casting engine lights then light them too). Needs the volumetric fog's near grid.
 		bool ParticlesRTShadows = true;
-		// (49b) "Hitch Fixes (49b)": master + one switch per problem (each off = the 48o behaviour exactly). B: tighter GPU-time build budgets for
-		// 5 s after the hand-off. C: wider warm-up budgets when the loading pump never ran (loading screen on another thread). D: precompile every
-		// point-denoiser variant the settings can request and keep the slot 4 - 5 textures. E: alpha record buffers at full size up front.
-		// F: Advanced Skin remembers skin-mod texture paths that do not exist (no second failed lookup per new character).
-		bool HitchFixes = true;
-		bool HitchSettleBudget = true;
-		bool HitchPumpOff = true;
-		bool HitchPrecompile = true;
-		bool HitchAlphaPrealloc = true;
-		bool HitchSkinMissing = true;
+		// (49c) "Loading Screens" (replaces 49b's Hitch Fixes): the master "Finish Loading Work Behind the Loading Screen" and its three parts.
+		// LoadPrepareArrival "Prepare When Arriving": at the teleport's end (PositionPlayer finish, main thread, the game's loading screen still up)
+		// the destination is captured and built before the loading screen closes (at most 3 s). LoadThreadCopies "Use the Loading Screen's Thread
+		// for GPU Copies": meanwhile the thread presenting the loading screen makes the cut-out texture copies and the grass uploads (D3D11).
+		// ReserveUpFront "Reserve Shaders and Memory Up Front": 49b D (point-denoiser wide variants at the main menu, slot 4 - 5 kept), E (alpha
+		// record buffers at full size), F (Advanced Skin remembers missing skin-mod textures). Master off = 48o / 49a.
+		bool LoadFinish = true;
+		bool LoadPrepareArrival = true;
+		bool LoadThreadCopies = true;
+		bool ReserveUpFront = true;
 		// (47l) Outside the settings macro too. FoliageSway "Sway in RT Shadows" (under Foliage): with Foliage ray traced / Both, tree-
 		// animated leaves, bushes and branches are traced with the game's wind (a wind BLAS per mesh, posed and refit every frame).
 		// Off = 47k (frozen at their rest pose). No effect with Foliage = Shadow map.
@@ -569,13 +569,58 @@ public:
 	[[nodiscard]] bool SpecOccCompiled() const { return loaded && settings.AOSpecOcc; }
 	/// (49a) Deferred::DeferredPasses, right before the composite dispatch: t21 (this frame's blurred bent normal or null) and b2.
 	void BindSpecOccComposite(ID3D11DeviceContext* a_context);
-	/// (49b) Main page: "Particles" (Particles Use RT Shadows) and "Hitch Fixes (49b)".
+	/// (49b) Main page: "Particles" (Particles Use RT Shadows). (49c) "Loading Screens".
 	void DrawParticlesSection();
-	void DrawHitchFixes();
-	/// (49b) Hitch fixes B / E: the backend switches of this frame.
+	void DrawLoadingScreens();
+	/// (49b) E: the backend switch of this frame.
 	void UpdateHitchState();
-	bool hitchSettleThisFrame = false;  // B: in the 5 s after a hand-off
-	bool transitionPumpOff = false;     // C: this transition's warm-up uses the pump-off budgets
+	// (49c) "Prepare When Arriving": the main thread at PositionPlayer finish, the game's loading screen still up (see ArrivalPrepare).
+	void ArrivalPrepare();
+	void ArrivalLoop();
+	static void ArrivalLoopThunk(void* a_self);
+	[[nodiscard]] bool ArrivalDone(double a_elapsedMs, std::string& o_waiting);
+	struct ArrivalLog
+	{
+		bool ran = false;
+		std::int64_t openQpc = 0;  // the loading screen it belongs to (TransitionEvents::loadingOpen)
+		std::string skipped;  // why it did not run (empty = ran or not asked)
+		double ms = 0.0;
+		std::string result;   // "done" / "time limit (waiting for ...)" / "no progress (...)" / fault
+		std::uint32_t iterations = 0, cells = 0, shapes = 0, builds = 0, characterShapes = 0, alphaQueued = 0;
+		std::uint32_t loadingPresents = 0;   // presents of the loading-screen thread while it ran (it kept animating)
+		double loadingClosedAtMs = -1.0;     // loadingOpen flipped to false during it (ms into it), -1 = still open at the end
+		double waitMs = 0.0;                 // waited for our own D3D12 submissions
+	};
+	ArrivalLog arrivalLog;
+	std::atomic<bool> arrivalActive{ false };
+	std::atomic<std::uint32_t> arrivalPresents{ 0 };
+	float arrivalTraceMs = -1.0f;            // F7 rt_arrival_ms: once, on the first world frame after it
+	// (49c) "Use the Loading Screen's Thread for GPU Copies": D3D11 work run inside the loading-screen thread's Present hook while the main
+	// thread is held in ArrivalPrepare (it then neither renders nor destroys grass). The gate opens when ArrivalPrepare starts and closes
+	// (waiting for work in flight under loadThreadMutex) before ArrivalPrepare returns, so the immediate context is never used by two threads.
+	std::atomic<bool> loadThreadGate{ false };
+	std::mutex loadThreadMutex;
+	void LoadingThreadWork();
+	void CloseLoadingThreadGate();
+	struct LoadThreadLog
+	{
+		std::uint32_t presents = 0, alphaCopies = 0, grassApplies = 0;
+		double alphaMs = 0.0, grassMs = 0.0, maxMs = 0.0;
+		std::string skipped;
+	};
+	LoadThreadLog loadThreadLog;          // written by the loading-screen thread under loadThreadMutex, read after the gate closed
+	std::atomic<std::uint32_t> loadThreadCopiesTrace{ 0 };  // F7 rt_loadthread_copies (taken by the next world frame)
+	// (49c) The hand-off waits until the destination is complete; this no-progress rule keeps it from waiting for ever.
+	mutable std::uint64_t readySignature = 0;
+	mutable std::int64_t readySignatureQpc = 0;
+	mutable std::string readyWaiting;     // what DestinationReady waited for last (logged at the hand-off)
+	mutable bool readyStalled = false;
+	std::int32_t handOffPendingTrace = -1;  // F7 rt_handoff_pending
+	// (49c) Probes.
+	std::int64_t hideMessageQpc = 0, postLoadGameQpc = 0;
+	std::uint32_t hideMessageThread = 0, postLoadGameThread = 0;
+	bool hideMessageForce = false;
+	std::vector<std::pair<std::uint32_t, std::uint32_t>> cellEventThreads;  // (thread, events) of this transition, guarded by eventsMutex
 
 	/// (49b) RT fog / particles. Exponential Height Fog publishes its near grid each frame it builds the volumes (PublishFogGrid); Ray Tracing
 	/// traces that grid in its own list after the reflection list (TraceFogCS); next frame the fog takes that result (AcquireFogTrace: a GPU
@@ -606,10 +651,17 @@ public:
 	/// (49b) The RT fog / particle source id of a light (slot + 1; 0 = none): its point-light shadow tag's slot, or for a window beam (spot
 	/// shadow lights carry no tag) the slot of its beam source. Light Limit Fix writes it per light (t53). Render thread, this frame's selection.
 	[[nodiscard]] std::uint32_t FogLightId(const RE::BSLight* a_light) const;
-	/// (49b) A Hitch Fixes switch in effect (the master and its own).
-	[[nodiscard]] bool HitchOn(bool a_item) const { return settings.HitchFixes && a_item; }
-	/// (49b) Hitch fix F (read by Advanced Skin).
-	[[nodiscard]] bool HitchSkinMissing() const { return loaded && HitchOn(settings.HitchSkinMissing); }
+	/// (49c) A "Loading Screens" part in effect (the master and its own switch).
+	[[nodiscard]] bool LoadOn(bool a_item) const { return settings.LoadFinish && a_item; }
+	/// (49c) "Reserve Shaders and Memory Up Front" (49b D, E, F).
+	[[nodiscard]] bool ReserveOn() const { return LoadOn(settings.ReserveUpFront); }
+	/// (49b) F, (49c) under "Reserve Shaders and Memory Up Front" (read by Advanced Skin).
+	[[nodiscard]] bool RememberMissingSkin() const { return loaded && ReserveOn(); }
+	/// (49c) The loading-screen thread may run the grass uploads now (Grass Optimizations asks; see LoadingThreadWork).
+	[[nodiscard]] bool LoadingThreadWorkOpen() const { return loadThreadGate.load(); }
+	/// (49c) Probes (log only): a LoadingMenu hide message and SKSE's post-load-game message, with their thread and time.
+	void NoteLoadingHideMessage(bool a_force);
+	void NotePostLoadGame();
 	/// For the fog's panel: frames the sun / light passes ran in the last second (updated by NoteFogTraced).
 	[[nodiscard]] std::string FogStatusText() const;
 	/// (48d) Deferred::DeferredPasses, right before the SSRT specular pass: the reflection debug views (Hit Type / Hit Distance / Normal
@@ -1250,6 +1302,8 @@ private:
 	// loading screen is presented; a_transition: the black screen / warm-up budget) and their shader (compiled in the background).
 	[[nodiscard]] bool MaterialsWanted() const;
 	void RunMaterialCopies(bool a_transition);
+	/// (49c) The alpha copy shader (compiled on first use, world thread only); nullptr when it cannot be compiled.
+	ID3D11ComputeShader* AlphaMaskShader();
 	winrt::com_ptr<ID3D11ComputeShader> materialCopyCS;
 	Util::AsyncComputeShader materialCopyAsync;
 	bool materialCopyFailed = false;

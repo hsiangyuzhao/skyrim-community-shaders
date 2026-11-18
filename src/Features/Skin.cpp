@@ -1598,7 +1598,7 @@ void Skin::SetupExtraTexture(RE::BSLightingShaderMaterialBase const* material, R
 	// disassembly; the "never loaded" reading of community-shaders #2940 does not hold for this code.)
 	// (49b) Hitch fix F: a path already found missing this session is not looked up again (each new character with the same skin repeated the
 	// failed VFS lookup); it gets the black default, which the Lighting shader treats like the engine's small default (no texture).
-	const bool skipMissing = globals::features::rayTracing.HitchSkinMissing();
+	const bool skipMissing = globals::features::rayTracing.RememberMissingSkin();
 	if (skipMissing && KnownMissingSkinModTexture(0, workingExtraPtr.extraTexturePath)) {
 		workingExtraPtr.rfaosTexture = stateData.defaultTextureBlack;
 		++skinModLookupsSkipped;

@@ -73,6 +73,8 @@ namespace Util::FrameTrace
 	void OnGrassApply(float a_ms);
 	/// (49b) Hitch fix A: grass bucket uploads put off to later frames this frame.
 	void OnGrassSpread(int a_deferred);
+	/// (49c) Grass bucket buffer sets taken from the pool / created this frame.
+	void OnGrassPool(int a_hits, int a_misses);
 	/// (45) Ray Tracing this frame: D3D12 GPU ms of the last completed submission, CPU ms, BLAS builds (-1 = off).
 	void OnRayTracing(float a_gpuMs, float a_cpuMs, uint32_t a_builds);
 	// ---- (46p) what the RT D3D12 prep submission did (the one whose GPU time is rt_prep_gpu_ms) ---------------------
@@ -225,6 +227,11 @@ namespace Util::FrameTrace
 		int hitchMode = -1;
 		int buildsWaiting = -1;
 		int fogSun = -1, fogLights = -1;
+		// (49c) "Finish Loading Work Behind the Loading Screen": ms of "Prepare When Arriving" (on the first world frame after it, else -1), alpha copies
+		// made on the loading-screen thread since the last world frame, items still pending at the hand-off (on the hand-off frame, else -1).
+		float arrivalMs = -1.0f;
+		int loadThreadCopies = -1;
+		int handOffPending = -1;
 	};
 	void OnRayTracingDetail(const RayTracingDetail& a_detail);
 

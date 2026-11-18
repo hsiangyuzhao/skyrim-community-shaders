@@ -1,6 +1,7 @@
 #include "Deferred.h"
 #include "EngineFixes/UpstreamEngineFixes.h"
 #include "EngineFixes/WndProcPseudoHandleFix.h"
+#include "Features/RayTracing.h"  // (49c) post-load-game probe
 #include "Features/Skin.h"
 #include "Features/SkySync.h"
 #include "Features/Upscaling.h"
@@ -114,6 +115,9 @@ void MessageHandler(SKSE::MessagingInterface::Message* message)
 	case SKSE::MessagingInterface::kPostLoadGame:
 	case SKSE::MessagingInterface::kNewGame:
 		{
+			// (49c) Probe (log only): when this arrives against the loading screen of a save load.
+			if (errors.empty() && message->type == SKSE::MessagingInterface::kPostLoadGame && globals::features::rayTracing.loaded)
+				globals::features::rayTracing.NotePostLoadGame();
 			// (46d) Per-character snow (Advanced Skin) starts afresh with the loaded game.
 			if (errors.empty() && globals::features::skin.loaded)
 				globals::features::skin.OnGameLoaded();

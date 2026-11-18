@@ -5,6 +5,7 @@
 #include "Features/RayTracing/Wind.h"
 #include "Features/DynamicCubemaps.h"
 #include "Features/ExponentialHeightFog.h"  // (49b) Particles Use RT Shadows needs its volumetric fog grid
+#include "Features/GrassOptimizations.h"  // (49c) the loading-screen thread's grass uploads, the grass staging probe
 #include "Features/LightLimitFix.h"  // (48g) the hit shading reads its light list
 #include "Features/Skylighting.h"    // (48g) and its probes
 #include "Features/ScreenSpaceGI.h"
@@ -205,8 +206,17 @@ namespace
 	constexpr double kLateHoldMs = 4000.0;  // items not ready at the hand-off wait at most this long for the late batch
 	constexpr double kWarmUpTimeoutMs = 5000.0;
 	constexpr double kFadeInMs = 500.0;
-	constexpr double kSettleWindowMs = 5000.0;  // (49b) Hitch fix B: the tighter build budgets this long after the hand-off
 	constexpr std::uint32_t kAlphaCopiesPerFrame = 16;  // (45h) 256x256 alpha copies made per frame (5 small dispatches each)
+	// (49c) "Finish Loading Work Behind the Loading Screen".
+	constexpr double kArrivalCapMs = 3000.0;          // "Prepare When Arriving": at most this long on the main thread (loading screen up)
+	constexpr float kArrivalCaptureMs = 40.0f;        // per iteration: capture / object scan
+	constexpr float kArrivalBuildMs = 30.0f;          // per iteration: BLAS build recording (one submission each, TDR-safe size)
+	constexpr std::uint32_t kArrivalWaitMs = 50;      // longest wait for our own D3D12 submissions per iteration
+	constexpr double kArrivalNoProgressMs = 400.0;    // nothing changed and nothing in flight this long: done
+	constexpr double kLoadThreadBudgetMs = 8.0;       // the loading-screen thread's D3D11 work per present
+	constexpr std::uint32_t kLoadThreadCopiesMax = 64;  // alpha copies per present there
+	constexpr std::uint32_t kBlackAlphaCopies = 256;  // alpha copies per frame while the screen is black after the loading screen
+	constexpr double kReadyNoProgressMs = 500.0;      // the hand-off's no-progress rule
 	// (48f) Capture Materials: 128x128 texture copies per frame (one dispatch each) while playing / in the black screen and warm-up after a loading
 	// screen, each with a render-thread CPU cap (the first copy of a frame always goes).
 	constexpr std::uint32_t kMaterialCopiesPerFrame = 12, kMaterialCopiesTransition = 256;
@@ -406,6 +416,18 @@ namespace
 		}
 		static inline REL::Relocation<decltype(thunk)> func;
 	};
+	/// (49c) Probe, log only: the LoadingMenu's hide messages (time and thread). Nothing is delayed or changed; kForceHide is passed on as is.
+	struct LoadingMenuProcessMessage
+	{
+		static RE::UI_MESSAGE_RESULTS thunk(RE::LoadingMenu* a_menu, RE::UIMessage& a_message)
+		{
+			const auto type = a_message.type.get();
+			if ((type == RE::UI_MESSAGE_TYPE::kHide || type == RE::UI_MESSAGE_TYPE::kForceHide) && globals::features::rayTracing.loaded)
+				globals::features::rayTracing.NoteLoadingHideMessage(type == RE::UI_MESSAGE_TYPE::kForceHide);
+			return func(a_menu, a_message);
+		}
+		static inline REL::Relocation<decltype(thunk)> func;
+	};
 	/// The shadow mask channel of a shadow light (UINT32_MAX when unreadable).
 	std::uint32_t ReadShadowChannel(RE::BSShadowLight* a_light)
 	{
@@ -484,6 +506,10 @@ void RayTracing::OnLoadingScreen(bool a_open)
 			events = {};
 			events.loadingOpen = now;
 			events.pending = true;
+			// (49c) Probes of this transition.
+			cellEventThreads.clear();
+			hideMessageQpc = postLoadGameQpc = 0;
+			hideMessageThread = postLoadGameThread = 0;
 		} else if (events.pending) {
 			events.loadingClose = now;
 		}
@@ -492,10 +518,34 @@ void RayTracing::OnLoadingScreen(bool a_open)
 		scene.RequestFlush();
 		characters.RequestFlush();  // (45i)
 		loadingOpen.store(true);
+		if (globals::features::grassOptimizations.loaded)
+			globals::features::grassOptimizations.bucketStore.ResetStaging();  // (49c) log-only grass staging times
 	} else {
 		loadingOpen.store(false);
 		loadingClosed.store(true);
+		// (49c) Safety: the loading-screen thread's D3D11 work ends with the loading screen (normally already closed by ArrivalPrepare).
+		if (loadThreadGate.load())
+			CloseLoadingThreadGate();
 	}
+}
+
+void RayTracing::NoteLoadingHideMessage(bool a_force)
+{
+	// (49c) Probe (log only): when the LoadingMenu is told to hide, on which thread (save loads have no teleport end to prepare at).
+	std::scoped_lock lock(eventsMutex);
+	if (hideMessageQpc != 0)
+		return;
+	hideMessageQpc = Qpc();
+	hideMessageThread = static_cast<std::uint32_t>(GetCurrentThreadId());
+	hideMessageForce = a_force;
+}
+
+void RayTracing::NotePostLoadGame()
+{
+	// (49c) Probe (log only): SKSE's post-load-game message.
+	std::scoped_lock lock(eventsMutex);
+	postLoadGameQpc = Qpc();
+	postLoadGameThread = static_cast<std::uint32_t>(GetCurrentThreadId());
 }
 
 void RayTracing::OnFader(bool a_open)
@@ -517,6 +567,15 @@ void RayTracing::OnCellFullyLoaded(const RE::TESObjectCELL* a_cell)
 		}
 		if (cellEvents.size() < kMaxQueuedCellEvents)
 			cellEvents.emplace_back(a_cell, now);
+		// (49c) Probe: which threads deliver the cell events (per transition).
+		if (events.pending && events.loadingOpen != 0) {
+			const auto thread = static_cast<std::uint32_t>(GetCurrentThreadId());
+			auto it = std::find_if(cellEventThreads.begin(), cellEventThreads.end(), [&](const auto& a_entry) { return a_entry.first == thread; });
+			if (it == cellEventThreads.end() && cellEventThreads.size() < 16)
+				cellEventThreads.emplace_back(thread, 1u);
+			else if (it != cellEventThreads.end())
+				++it->second;
+		}
 	}
 	PrepareOnCellEvent();  // (46n) outside the lock (the step drains the queue)
 }
@@ -665,12 +724,333 @@ float RayTracing::FadeInFactor(double a_sinceCloseMs) const
 
 void RayTracing::OnPositionPlayer(int a_stage)
 {
-	std::scoped_lock lock(eventsMutex);
-	const std::int64_t now = Qpc();
-	if (a_stage == static_cast<int>(RE::PositionPlayerEvent::EVENT_TYPE::kPre))
-		events.teleportPre = now;
-	else if (a_stage == static_cast<int>(RE::PositionPlayerEvent::EVENT_TYPE::kFinish))
-		events.teleportFinish = now;
+	const bool finish = a_stage == static_cast<int>(RE::PositionPlayerEvent::EVENT_TYPE::kFinish);
+	{
+		std::scoped_lock lock(eventsMutex);
+		const std::int64_t now = Qpc();
+		if (a_stage == static_cast<int>(RE::PositionPlayerEvent::EVENT_TYPE::kPre))
+			events.teleportPre = now;
+		else if (finish)
+			events.teleportFinish = now;
+	}
+	// (49c) The teleport's end: the game closes its loading screen 1 - 2 ms after this returns (49a log: finish +6191 / closed +6192 ms), so
+	// work done here keeps the real loading screen up (its own thread keeps animating it).
+	if (finish)
+		ArrivalPrepare();
+}
+
+ID3D11ComputeShader* RayTracing::AlphaMaskShader()
+{
+	// (49c) The 45h alpha copy shader, for the transition frames and (compiled beforehand on the main thread) the loading-screen thread.
+	static bool failed[2] = { false, false };
+	const bool rgba = backend.AlphaCopiesRgba();
+	if (alphaMaskCS && alphaMaskRgba != rgba)
+		alphaMaskCS = nullptr;
+	if (!alphaMaskCS && !failed[rgba ? 1 : 0]) {
+		std::vector<std::pair<const char*, const char*>> defines;
+		if (rgba)
+			defines.emplace_back("ALPHA_RGBA", "");
+		alphaMaskCS.attach(static_cast<ID3D11ComputeShader*>(Util::CompileShader(L"Data\\Shaders\\RayTracing\\AlphaMaskCS.hlsl", defines, "cs_5_0")));
+		alphaMaskRgba = rgba;
+		if (!alphaMaskCS)
+			failed[rgba ? 1 : 0] = true;
+	}
+	return alphaMaskCS.get();
+}
+
+void RayTracing::ArrivalPrepare()
+{
+	// (49c) "Prepare When Arriving". Main thread, inside the PositionPlayer finish event, the game's loading screen still up and presented by its
+	// own thread. Everything of the destination that needs the scene graph or D3D12 is done here: the queued cell events, the full capture, an
+	// uncapped object scan, the characters whose 3D is attached, the BLAS builds and compactions (waiting only for our own D3D12 fence), pool
+	// growth, the full-size alpha record buffers. No D3D11 immediate-context call (the loading-screen thread owns it): the cut-out copies and the
+	// grass uploads are made by that thread meanwhile (LoadingThreadWork). At most kArrivalCapMs; a fault switches the path off for the session.
+	std::int64_t openQpc = 0;
+	{
+		std::scoped_lock lock(eventsMutex);
+		openQpc = events.loadingOpen;
+	}
+	arrivalLog = {};
+	arrivalLog.openQpc = openQpc;
+	if (!loadingOpen.load())
+		return;  // a teleport without a loading screen (nothing to hide the work behind)
+	auto skip = [&](std::string a_why) {
+		arrivalLog.skipped = std::move(a_why);
+		logger::info("[RayTracing] Prepare When Arriving: not run ({})", arrivalLog.skipped);
+	};
+	if (!LoadOn(settings.LoadPrepareArrival)) {
+		arrivalLog.skipped = "switched off";
+		return;
+	}
+	const auto thread = static_cast<std::uint32_t>(GetCurrentThreadId());
+	if (renderThreadId.load() == 0 || thread != renderThreadId.load())
+		return skip(std::format("the teleport ended on thread {}, the world is rendered on thread {}", thread, renderThreadId.load()));
+	if (!RtWanted())
+		return skip("Ray Tracing off");
+	if (status == Status::Unavailable || status == Status::Failed || status == Status::Off)
+		return skip("Ray Tracing not running");
+	if (!backend.IsReady() || backend.HasFailed())
+		return skip("backend not ready");
+	if (cellEventBroken)
+		return skip(std::format("off after a fault: {}", cellEventFault));
+	if (cellEventActive)
+		return skip("a cell-event step is running");
+	if (backend.TraceWaitPending() || backend.SunWaitPending() || backend.AOWaitPending())
+		return skip("a D3D11 wait of the last world frame still pending");
+	backend.LogMultithreadProtection();
+	// The loading-screen thread's work: the alpha copy shader must exist before (never compiled there).
+	const bool threadCopies = LoadOn(settings.LoadThreadCopies);
+	if (threadCopies && (scene.AlphaWanted() || settings.Characters) && backend.AlphaAvailable())
+		AlphaMaskShader();
+	arrivalPresents.store(0);
+	arrivalActive.store(true);
+	if (threadCopies) {
+		std::scoped_lock lock(loadThreadMutex);
+		loadThreadLog = {};
+		loadThreadGate.store(true);
+	}
+	cellEventActive = true;  // a cell event during it does not start a step of its own
+	const std::int64_t start = Qpc();
+	unsigned long code = 0;
+	const bool ok = SehInvoke(&RayTracing::ArrivalLoopThunk, this, code);
+	scene.SetScanUncapped(false);
+	cellEventActive = false;
+	// The gate closes (waiting for the loading-screen thread's work in flight) before the main thread returns to the game, which renders next.
+	CloseLoadingThreadGate();
+	arrivalActive.store(false);
+	arrivalLog.ran = true;
+	arrivalLog.ms = static_cast<double>(Qpc() - start) * QpcMs();
+	arrivalLog.loadingPresents = arrivalPresents.load();
+	if (!ok) {
+		cellEventBroken = true;
+		cellEventFault = std::format("fault 0x{:08X} while preparing on arrival (preparing behind the loading screen stopped for this session)", code);
+		arrivalLog.result = cellEventFault;
+		logger::error("[RayTracing] {}", cellEventFault);
+	}
+	arrivalTraceMs = static_cast<float>(arrivalLog.ms);
+	const auto& a = arrivalLog;
+	const auto& t = loadThreadLog;  // the gate is closed: the loading-screen thread no longer writes it
+	logger::info("[RayTracing] Prepare When Arriving (main thread, the game's loading screen still up): {:.0f} ms, {}; {} rounds, {} cells, {} shapes, {} BLAS built, "
+				 "{} character shapes uploaded, waited {:.0f} ms for our own GPU work, up to {} cut-out copies queued; the loading screen was presented {} times "
+				 "meanwhile (its own thread){}; loading-screen thread: {}",
+		a.ms, a.result, a.iterations, a.cells, a.shapes, a.builds, a.characterShapes, a.waitMs, a.alphaQueued, a.loadingPresents,
+		a.loadingClosedAtMs >= 0.0 ? std::format("; the loading screen closed {:.0f} ms into it (loadingOpen flipped)", a.loadingClosedAtMs) :
+		                             std::string("; the loading screen was still open at the end"),
+		!threadCopies     ? std::string("off") :
+		t.presents == 0   ? std::string("did not present while it ran (nothing copied there)") :
+		                    std::format("{} presents with work, {} cut-out copies ({:.1f} ms), {} grass uploads ({:.1f} ms), longest present work {:.1f} ms", t.presents,
+								t.alphaCopies, t.alphaMs, t.grassApplies, t.grassMs, t.maxMs));
+}
+
+void RayTracing::ArrivalLoopThunk(void* a_self)
+{
+	auto* self = static_cast<RayTracing*>(a_self);
+	try {
+		self->ArrivalLoop();
+	} catch (const std::exception& e) {
+		self->cellEventBroken = true;
+		self->cellEventFault = std::format("exception while preparing on arrival: {}", e.what());
+		self->arrivalLog.result = self->cellEventFault;
+		logger::error("[RayTracing] {}", self->cellEventFault);
+	}
+}
+
+void RayTracing::ArrivalLoop()
+{
+	const std::int64_t start = Qpc();
+	const auto elapsedMs = [&]() { return static_cast<double>(Qpc() - start) * QpcMs(); };
+	if (status != Status::Waiting) {
+		status = Status::Waiting;
+		statusReason = "preparing behind the loading screen";
+	}
+	if (backend.HasPrepared())
+		backend.AbandonPrepared();
+	const std::uint32_t cellsBefore = scene.GetStats().cellsTracked;
+	const std::uint32_t shapesBefore = scene.GetStats().shapes;
+	const std::uint64_t buildsBefore = backend.GetStats().buildsTotal;
+	const std::uint64_t uploadsBefore = backend.SkinUploadsTotal();
+	scene.SetScanUncapped(true);
+	std::string waiting;
+	std::uint64_t lastSignature = 0;
+	std::int64_t lastProgressQpc = start;
+	bool alphaReserved = false;
+	for (;;) {
+		++arrivalLog.iterations;
+		UpdatePhase();
+		DrainTransitionEvents();
+		backend.SetTransition(true);
+		scene.SetInteriorEnabled(InteriorWanted());
+		{
+			const auto& stats = backend.GetStats();
+			overVramBudget = stats.blasBytes + stats.scratchBytes > kAccelerationBudgetBytes;
+		}
+		scene.Update(backend, overVramBudget ? 0.0f : kArrivalCaptureMs, globals::state->frameCount);
+		// Characters whose 3D is attached now (the teleport is over; the main thread, which attaches 3D, is ours). The rest come later.
+		if (settings.Characters && backend.SkinAvailable()) {
+			float world[4];
+			if (scene.GetLoadedRect(world, true)) {
+				RE::NiPoint3 eye{};
+				auto* player = RE::PlayerCharacter::GetSingleton();
+				if (player)
+					eye = player->GetPosition();
+				characters.SetRelevance(nullptr);
+				characters.Update(backend, world, 10.0, 64u, player ? &eye : nullptr);
+			}
+		}
+		// 49b E (Reserve Shaders and Memory Up Front): the alpha record buffers at full size (D3D12 upload heaps), once.
+		if (!alphaReserved && ReserveOn()) {
+			backend.PreallocateAlphaInfoBuffers();
+			alphaReserved = true;
+			// 49b D: the slot 4 - 5 textures (device calls only, no immediate context), kept for the session once made.
+			if (settings.PointLights && !pointWideDenoiseFailed && pointVis[0].texture && !pointWide[0].texture) {
+				D3D11_TEXTURE2D_DESC d{};
+				pointVis[0].texture->GetDesc(&d);
+				if (EnsurePointWide(d.Width, d.Height))
+					logger::info("[RayTracing] Reserve Up Front: slot 4 - 5 textures made behind the loading screen ({}x{})", d.Width, d.Height);
+			}
+		}
+		// The alpha copy layers may have been made just now (their format picks the shader variant): the loading-screen thread's shader is
+		// (re)compiled here, under its lock (it skips a present meanwhile).
+		if (loadThreadGate.load() && backend.AlphaAvailable() && backend.PendingAlphaCopies() > 0 && (!alphaMaskCS || alphaMaskRgba != backend.AlphaCopiesRgba())) {
+			std::scoped_lock lock(loadThreadMutex);
+			AlphaMaskShader();
+		}
+		backend.Prewarm(2.0f, settings.Characters);
+		const bool submitted = backend.BuildOnly(kLoadingBuildTriangles, kLoadingMaxBuilds, kArrivalBuildMs);
+		backend.Tick();
+		scene.EndFrame(backend);
+		characters.EndFrame(backend);
+		arrivalLog.alphaQueued = std::max(arrivalLog.alphaQueued, backend.PendingAlphaCopies());
+		const double elapsed = elapsedMs();
+		if (!loadingOpen.load() && arrivalLog.loadingClosedAtMs < 0.0)
+			arrivalLog.loadingClosedAtMs = elapsed;
+		if (ArrivalDone(elapsed, waiting)) {
+			arrivalLog.result = "done";
+			break;
+		}
+		if (elapsed >= kArrivalCapMs) {
+			arrivalLog.result = std::format("time limit {:.0f} ms reached (waiting for: {})", kArrivalCapMs, waiting);
+			break;
+		}
+		// No progress and nothing in flight for a while: done as far as it goes (the rest follows after the loading screen).
+		const auto& sc = scene.GetStats();
+		const std::uint64_t signature = (static_cast<std::uint64_t>(sc.shapes) * 0x9E3779B97F4A7C15ull) ^ (backend.GetStats().buildsTotal << 20) ^
+		                                (static_cast<std::uint64_t>(backend.PendingAlphaCopies()) << 40) ^ (backend.SkinUploadsTotal() << 8) ^
+		                                (static_cast<std::uint64_t>(sc.cellsTracked) << 50) ^ scene.ScansSinceChange() ^ (static_cast<std::uint64_t>(backend.CompactionsDue()) << 30);
+		const std::int64_t now = Qpc();
+		if (signature != lastSignature) {
+			lastSignature = signature;
+			lastProgressQpc = now;
+		} else if (static_cast<double>(now - lastProgressQpc) * QpcMs() >= kArrivalNoProgressMs && (sc.cellsUntracked == 0 || elapsed > 1500.0)) {
+			// (Cells waiting for the gate's frames -- the loading screen's own frames advance the count -- are not "no progress" in the first 1.5 s.)
+			arrivalLog.result = std::format("no progress for {:.0f} ms (waiting for: {})", kArrivalNoProgressMs, waiting);
+			break;
+		}
+		// Our own GPU work in flight (builds, compactions): wait for it, briefly. Otherwise the cells settle over the loading screen's frames.
+		if (backend.QueuedBuilds() > 0 || backend.CompactionsDue() > 0 || backend.PendingSkinUploads() > 0 || submitted) {
+			const std::int64_t waitStart = Qpc();
+			backend.WaitSubmitted(kArrivalWaitMs);
+			arrivalLog.waitMs += static_cast<double>(Qpc() - waitStart) * QpcMs();
+		} else {
+			Sleep(2);
+		}
+	}
+	scene.SetScanUncapped(false);
+	const auto& sc = scene.GetStats();
+	arrivalLog.cells = sc.cellsTracked > cellsBefore ? sc.cellsTracked - cellsBefore : sc.cellsTracked;
+	arrivalLog.shapes = sc.shapes > shapesBefore ? sc.shapes - shapesBefore : 0u;
+	arrivalLog.builds = static_cast<std::uint32_t>(backend.GetStats().buildsTotal - buildsBefore);
+	arrivalLog.characterShapes = static_cast<std::uint32_t>(backend.SkinUploadsTotal() - uploadsBefore);
+}
+
+bool RayTracing::ArrivalDone(double a_elapsedMs, std::string& o_waiting)
+{
+	// (49c) The destination as complete as it can be behind the loading screen.
+	if (scene.FlushPending()) {
+		o_waiting = "the place left still being released";
+		return false;
+	}
+	if (Util::IsInterior() && !InteriorWanted())
+		return true;
+	const auto& sc = scene.GetStats();
+	const bool sceneMatches = !(Util::IsInterior() && InteriorWanted() && RE::TES::GetSingleton() && RE::TES::GetSingleton()->interiorCell) || sc.interior;
+	std::string w;
+	const auto add = [&](std::string a_item) { w += (w.empty() ? "" : ", ") + a_item; };
+	if (!sceneMatches)
+		add("the interior not in the scene yet");
+	if (sc.cellsTracked == 0)
+		add("no cell captured yet");
+	if (sc.cellsGathering > 0)
+		add(std::format("{} cells capturing", sc.cellsGathering));
+	if (sc.cellsUntracked > 0)
+		add(std::format("{} cells not in place yet", sc.cellsUntracked));
+	if (sc.cellsNotAttached > 0 && a_elapsedMs < 1500.0)
+		add(std::format("{} grid cells not attached", sc.cellsNotAttached));
+	if (!scene.ScanPassComplete())
+		add("object scan not through every cell");
+	if (backend.QueuedBuilds() > 0)
+		add(std::format("{} BLAS queued", backend.QueuedBuilds()));
+	if (backend.CompactionsDue() > 0)
+		add(std::format("{} compactions", backend.CompactionsDue()));
+	if (backend.PendingSkinUploads() > 0)
+		add(std::format("{} character shapes", backend.PendingSkinUploads()));
+	// The loading-screen thread's copies, while it is presenting (none for 300 ms: it is not, they are made after the loading screen).
+	if (loadThreadGate.load() && backend.PendingAlphaCopies() > 0 && (arrivalPresents.load() > 0 || a_elapsedMs < 300.0))
+		add(std::format("{} cut-out copies (loading-screen thread)", backend.PendingAlphaCopies()));
+	if (loadThreadGate.load() && globals::features::grassOptimizations.loaded && globals::features::grassOptimizations.bucketStore.PendingCount() > 0 &&
+		(arrivalPresents.load() > 0 || a_elapsedMs < 300.0))
+		add("grass uploads (loading-screen thread)");
+	o_waiting = w;
+	return w.empty();
+}
+
+void RayTracing::LoadingThreadWork()
+{
+	// (49c) "Use the Loading Screen's Thread for GPU Copies". Called from the Present hook of the thread presenting the loading screen, between its
+	// frames, only while ArrivalPrepare holds the main thread (the gate). That thread owns the D3D11 immediate context during loading; the main
+	// thread makes no immediate-context call in ArrivalPrepare, and the gate closes -- waiting for this function under loadThreadMutex -- before the
+	// main thread returns to the game. Community Shaders does not change ID3D11Multithread protection (logged); this gate is the serialisation.
+	// The alpha table is shared with the main thread's capture: Backend's alpha lock guards it.
+	if (!loadThreadGate.load(std::memory_order_acquire))
+		return;
+	std::unique_lock lock(loadThreadMutex, std::try_to_lock);
+	if (!lock.owns_lock() || !loadThreadGate.load())
+		return;
+	const std::int64_t start = Qpc();
+	const auto elapsedMs = [&]() { return static_cast<double>(Qpc() - start) * QpcMs(); };
+	bool worked = false;
+	if (backend.IsReady() && !backend.HasFailed() && backend.AlphaAvailable() && alphaMaskCS && alphaMaskRgba == backend.AlphaCopiesRgba()) {
+		const std::uint32_t before = backend.PendingAlphaCopies();
+		if (before > 0) {
+			backend.RecordAlphaCopies(alphaMaskCS.get(), kLoadThreadCopiesMax);
+			const std::uint32_t after = backend.PendingAlphaCopies();
+			const std::uint32_t made = before > after ? before - after : 0u;
+			loadThreadLog.alphaCopies += made;
+			loadThreadCopiesTrace.fetch_add(made, std::memory_order_relaxed);
+			loadThreadLog.alphaMs += elapsedMs();
+			worked = true;
+		}
+	}
+	if (elapsedMs() < kLoadThreadBudgetMs && globals::features::grassOptimizations.loaded) {
+		const std::int64_t grassStart = Qpc();
+		const float ms = globals::features::grassOptimizations.ApplyFromLoadingThread();
+		if (ms >= 0.0f) {
+			++loadThreadLog.grassApplies;
+			loadThreadLog.grassMs += static_cast<double>(Qpc() - grassStart) * QpcMs();
+			worked = true;
+		}
+	}
+	if (worked) {
+		++loadThreadLog.presents;
+		loadThreadLog.maxMs = std::max(loadThreadLog.maxMs, elapsedMs());
+	}
+}
+
+void RayTracing::CloseLoadingThreadGate()
+{
+	// (49c) No new loading-screen-thread work from now; wait for the one in flight (it holds loadThreadMutex for its whole run).
+	loadThreadGate.store(false, std::memory_order_release);
+	std::scoped_lock lock(loadThreadMutex);
 }
 
 void RayTracing::OnFastTravelEnd()
@@ -767,6 +1147,16 @@ void RayTracing::MaybeLogTransitionEvents()
 			return;
 		events.pending = false;
 		line = DescribeTransitionEvents(events);
+		// (49c) Probes (log only): cell-event threads, the LoadingMenu hide message, SKSE's post-load-game message, the engine's grass hand-over.
+		const auto rel = [&](std::int64_t a_qpc) { return a_qpc ? std::format("{:+.0f}", static_cast<double>(a_qpc - events.loadingOpen) * QpcMs()) : std::string("-"); };
+		std::string threads;
+		for (const auto& [thread, count] : cellEventThreads)
+			threads += std::format("{}{} on thread {}", threads.empty() ? "" : ", ", count, thread);
+		line += std::format("; cell events {}; LoadingMenu hide message {}{} (thread {}); SKSE post-load-game {} (thread {}); main thread {}",
+			threads.empty() ? std::string("none") : threads, rel(hideMessageQpc), hideMessageForce ? " (forced)" : "", hideMessageThread, rel(postLoadGameQpc),
+			postLoadGameThread, renderThreadId.load());
+		if (globals::features::grassOptimizations.loaded)
+			line += "; " + globals::features::grassOptimizations.DescribeStaging(events.loadingOpen, events.loadingClose);
 	}
 	lastEventsSummary = line;
 	logger::info("[RayTracing] Transition events (Ray Tracing {}): {}", settings.Enabled ? "on" : "off", line);
@@ -877,8 +1267,10 @@ bool RayTracing::DestinationReady(double a_sinceCloseMs) const
 	// small worldspace -- would hold the hand-off for ever, so they count only for the first 1.5 s after the loading screen).
 	if (sc.cellsNotAttached > 0 && a_sinceCloseMs < 1500.0)
 		return false;
-	if (backend.QueuedBuilds() > 0 || backend.PendingSkinUploads() > 0)
+	if (backend.QueuedBuilds() > 0 || backend.PendingSkinUploads() > 0) {
+		readyWaiting = std::format("{} BLAS queued, {} character shapes waiting", backend.QueuedBuilds(), backend.PendingSkinUploads());
 		return false;
+	}
 	// (48e) RT reflections: the destination's terrain BLASes too (made behind the loading screen; their builds are in QueuedBuilds).
 	if (settings.ReflectionsLoadingPrep && scene.TerrainPending() > 0)
 		return false;
@@ -887,7 +1279,33 @@ bool RayTracing::DestinationReady(double a_sinceCloseMs) const
 	if (!player)
 		return false;
 	const auto position = player->GetPosition();
-	return std::isfinite(position.x) && std::isfinite(position.y) && scene.Covers(position.x, position.y);
+	if (!(std::isfinite(position.x) && std::isfinite(position.y) && scene.Covers(position.x, position.y)))
+		return false;
+	if (!settings.LoadFinish)
+		return true;  // 48o / 49a
+	// (49c) The destination complete, not only its cells: every complete cell scanned for objects (trees, doors, items), no cut-out copy left,
+	// every held item ready (BLAS built, texture copied). 49a handed off with 243 - 288 items still pending that then built in the visible
+	// frames. A no-progress rule keeps an item that never becomes ready from holding the hand-off: nothing changed for kReadyNoProgressMs.
+	const std::uint32_t alphaPending = backend.PendingAlphaCopies();
+	const auto held = scene.HeldCounts(backend);
+	const bool scanned = scene.ScanPassComplete();
+	if (scanned && alphaPending == 0 && held.pending == 0) {
+		readyStalled = false;
+		return true;
+	}
+	readyWaiting = std::format("{}{} cut-out copies, {} items not ready", scanned ? "" : "object scan not through every cell, ", alphaPending, held.pending);
+	const std::uint64_t signature = (static_cast<std::uint64_t>(sc.shapes) * 0x9E3779B97F4A7C15ull) ^ (backend.GetStats().buildsTotal << 20) ^
+	                                (static_cast<std::uint64_t>(alphaPending) << 40) ^ (static_cast<std::uint64_t>(held.pending) << 8) ^ scene.ScansSinceChange();
+	const std::int64_t now = Qpc();
+	if (signature != readySignature || readySignatureQpc == 0) {
+		readySignature = signature;
+		readySignatureQpc = now;
+		return false;
+	}
+	if (static_cast<double>(now - readySignatureQpc) * QpcMs() < kReadyNoProgressMs)
+		return false;
+	readyStalled = true;  // logged with the hand-off
+	return true;
 }
 
 void RayTracing::HandOffNow(const char* a_when)
@@ -900,12 +1318,36 @@ void RayTracing::HandOffNow(const char* a_when)
 	handOffThisFrame = true;
 	lateHold = true;
 	lateHoldUntil = now + static_cast<std::int64_t>(kLateHoldMs / std::max(QpcMs(), 1e-9));
+	handOffPendingTrace = static_cast<std::int32_t>(counts.pending);
 	handOffSummary = std::format("hand-off {:.0f} ms after the loading screen closed ({}): {} items switched to RT at once, {} pending ({} BLAS queued, "
-								 "{} cells capturing, {} character shapes waiting){}{}",
+								 "{} cells capturing, {} character shapes waiting, {} cut-out copies){}",
 		static_cast<double>(now - warmUpStart) * QpcMs(), a_when, counts.shown, counts.pending, backend.QueuedBuilds(), sc.cellsGathering,
-		backend.PendingSkinUploads(), transitionPumpOff ? "; hitch fix C: warm-up budgets widened (the loading pump did not run)" : "",
-		HitchOn(settings.HitchSettleBudget) ? "; hitch fix B: tighter build budgets for 5 s" : "");
+		backend.PendingSkinUploads(), backend.PendingAlphaCopies(),
+		!settings.LoadFinish ? std::string() :
+		readyStalled         ? std::format("; no progress for {:.0f} ms while waiting for: {} (handed off anyway)", kReadyNoProgressMs, readyWaiting) :
+		counts.pending > 0   ? std::format("; last wait: {}", readyWaiting) :
+		                       std::string());
+	readyStalled = false;
+	readySignatureQpc = 0;
 	logger::info("[RayTracing] {}", handOffSummary);
+	// (49c) The fallback: whatever is still pending now is built in visible frames at the play budgets. Say why it was not done behind the
+	// loading screen.
+	if (settings.LoadFinish && (counts.pending > 0 || std::strstr(a_when, "visible"))) {
+		std::string why;
+		std::int64_t openQpc = 0;
+		{
+			std::scoped_lock lock(eventsMutex);
+			openQpc = events.loadingOpen;
+		}
+		if (arrivalLog.openQpc != openQpc)
+			why = "no teleport end on the main thread behind this loading screen (a save load?): nothing could be prepared behind it";
+		else if (!arrivalLog.ran)
+			why = arrivalLog.skipped.empty() ? std::string("no preparation behind the loading screen this time (no teleport end on the main thread: a save load?)") :
+			                                   std::format("preparation behind the loading screen did not run ({})", arrivalLog.skipped);
+		else
+			why = std::format("preparation behind the loading screen ended: {}", arrivalLog.result);
+		logger::info("[RayTracing] Loading-screen fallback: {} items left for visible frames (hand-off {}); {}", counts.pending, a_when, why);
+	}
 }
 
 void RayTracing::TransitionFrame()
@@ -955,26 +1397,24 @@ void RayTracing::TransitionFrame()
 		}
 		lastFadeFactor = f;
 	}
-	// (49b) Hitch fix C: the loading pump never ran this transition (the loading screen is presented on another thread, so nothing was prepared
-	// behind it): the visible warm-up gets at least the 46i pump-off budgets (3 ms capture, 3 ms builds, twice the triangles, 12 characters).
-	transitionPumpOff = HitchOn(settings.HitchPumpOff) && pumpFrames == 0 && pumpForeignFrames > 0;
-	if (visible && transitionPumpOff) {
-		capture = std::max(capture, 3.0f);
-		charactersMs = std::max(charactersMs, 2.0f);
-		charactersMax = std::max(charactersMax, 12u);
-		buildMs = std::max(buildMs, 3.0f);
-		buildTriangles = std::max(buildTriangles, kBuildBudget * 2u);
+	// (49c) Cut-out texture copies of the destination before the hand-off (49a / 49b made them only once playing: no cut-out could be ready at the
+	// hand-off). Never behind the loading screen from here (the loading-screen thread does those itself, LoadingThreadWork); many while the screen
+	// is black, the play rate on visible frames (shapes captured after the loading screen: the fallback).
+	if (!loading && !inLoadingPump && settings.LoadFinish && (scene.AlphaWanted() || settings.Characters) && backend.AlphaAvailable() &&
+		backend.PendingAlphaCopies() > 0) {
+		if (auto* shader = AlphaMaskShader())
+			backend.RecordAlphaCopies(shader, (!visible || lastFadeFactor > 0.0f) ? kBlackAlphaCopies : kAlphaCopiesPerFrame);
 	}
 	// (49b) Hitch fix E: the alpha record buffers at full size now, not on the first frames with many new cut-out shapes.
-	if (HitchOn(settings.HitchAlphaPrealloc))
+	if (ReserveOn())
 		backend.PreallocateAlphaInfoBuffers();
 	// (49b) Hitch fix D: the slot 4 - 5 textures while the picture is dark (not behind the loading screen: no D3D11 work there).
-	if (!loading && (!visible || lastFadeFactor > 0.0f) && HitchOn(settings.HitchPrecompile) && settings.PointLights && !pointWideDenoiseFailed &&
+	if (!loading && (!visible || lastFadeFactor > 0.0f) && ReserveOn() && settings.PointLights && !pointWideDenoiseFailed &&
 		pointVis[0].texture && !pointWide[0].texture) {
 		D3D11_TEXTURE2D_DESC d{};
 		pointVis[0].texture->GetDesc(&d);
 		if (EnsurePointWide(d.Width, d.Height))
-			logger::info("[RayTracing] Hitch fix: slot 4 - 5 textures made in the dark part of the transition ({}x{})", d.Width, d.Height);
+			logger::info("[RayTracing] Reserve Up Front: slot 4 - 5 textures made in the dark part of the transition ({}x{})", d.Width, d.Height);
 	}
 	{
 		const auto& stats = backend.GetStats();
@@ -1602,12 +2042,10 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.AOSpecOcc = read("AOSpecOcc", defaults.AOSpecOcc);  // (49a)
 		settings.AOSpecOccStrength = std::clamp(read("AOSpecOccStrength", defaults.AOSpecOccStrength), 0.0f, 1.0f);
 		settings.ParticlesRTShadows = read("ParticlesRTShadows", defaults.ParticlesRTShadows);  // (49b)
-		settings.HitchFixes = read("HitchFixes", defaults.HitchFixes);  // (49b)
-		settings.HitchSettleBudget = read("HitchSettleBudget", defaults.HitchSettleBudget);
-		settings.HitchPumpOff = read("HitchPumpOff", defaults.HitchPumpOff);
-		settings.HitchPrecompile = read("HitchPrecompile", defaults.HitchPrecompile);
-		settings.HitchAlphaPrealloc = read("HitchAlphaPrealloc", defaults.HitchAlphaPrealloc);
-		settings.HitchSkinMissing = read("HitchSkinMissing", defaults.HitchSkinMissing);
+		settings.LoadFinish = read("LoadFinish", defaults.LoadFinish);  // (49c) (49b Hitch* keys: no longer read)
+		settings.LoadPrepareArrival = read("LoadPrepareArrival", defaults.LoadPrepareArrival);
+		settings.LoadThreadCopies = read("LoadThreadCopies", defaults.LoadThreadCopies);
+		settings.ReserveUpFront = read("ReserveUpFront", defaults.ReserveUpFront);
 		settings.PointQuality = read("PointQuality", -1);
 		settings.AOQuality = read("AOQuality", -1);
 		// (47q) The sun's size left the tiers. Saved before 47q (no key): the cone the tier in effect had -- High / Ultra 0.5, Very Low -
@@ -1834,12 +2272,10 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["AOSpecOcc"] = settings.AOSpecOcc;  // (49a)
 	o_json["AOSpecOccStrength"] = settings.AOSpecOccStrength;
 	o_json["ParticlesRTShadows"] = settings.ParticlesRTShadows;  // (49b)
-	o_json["HitchFixes"] = settings.HitchFixes;
-	o_json["HitchSettleBudget"] = settings.HitchSettleBudget;
-	o_json["HitchPumpOff"] = settings.HitchPumpOff;
-	o_json["HitchPrecompile"] = settings.HitchPrecompile;
-	o_json["HitchAlphaPrealloc"] = settings.HitchAlphaPrealloc;
-	o_json["HitchSkinMissing"] = settings.HitchSkinMissing;
+	o_json["LoadFinish"] = settings.LoadFinish;  // (49c)
+	o_json["LoadPrepareArrival"] = settings.LoadPrepareArrival;
+	o_json["LoadThreadCopies"] = settings.LoadThreadCopies;
+	o_json["ReserveUpFront"] = settings.ReserveUpFront;
 }
 
 void RayTracing::RestoreDefaultSettings()
@@ -1870,6 +2306,8 @@ void RayTracing::PostPostLoad()
 	// (Ray Tracing does not run in VR).
 	if (hooksInstalled || REL::Module::IsVR())
 		return;
+	// (49c) Log-only probe of the LoadingMenu's hide message (IMenu::ProcessMessage, slot 4).
+	stl::write_vfunc<0x4, LoadingMenuProcessMessage>(RE::VTABLE_LoadingMenu[0]);
 	stl::write_vfunc<0xA, FrustumLightRenderShadowmaps>(RE::VTABLE_BSShadowFrustumLight[0]);
 	stl::write_vfunc<0xA, ParabolicLightRenderShadowmaps>(RE::VTABLE_BSShadowParabolicLight[0]);
 	hooksInstalled = true;
@@ -2027,7 +2465,7 @@ void RayTracing::PrecompileShaders()
 		// (48a) The variants the current settings can use (window beams are indoor-only; K > 4 per the tier).
 		const PointTierParams pt = ResolvePointTier();
 		// (49b) Hitch fix D: Extra Lights Where Crowded (always on since 48o, K < 6) can ask for slots 4 - 5 at any tier: their variants too.
-		const bool wideK = pt.k > 4 || (settings.PointLightsInteriors && pt.kInterior > 4) || HitchOn(settings.HitchPrecompile);
+		const bool wideK = pt.k > 4 || (settings.PointLightsInteriors && pt.kInterior > 4) || ReserveOn();
 		const bool beam = settings.PointLightsInteriors && settings.PointLightsWindowBeams;  // (48o) Window Beams: Smooth Edges always on
 		if (beam)
 			PointDenoiseShader(false, true);
@@ -2044,7 +2482,7 @@ void RayTracing::PrecompileShaders()
 			if (wideK)
 				PointDenoiseShader(true, beam, fix, clean);
 			// (49b) Hitch fix D: the wide variant without beam edges too (outdoors the beam mask is empty, so a beam setting does not pick it there).
-			if (wideK && beam && HitchOn(settings.HitchPrecompile))
+			if (wideK && beam && ReserveOn())
 				PointDenoiseShader(true, false, fix, clean);
 		}
 	}
@@ -2598,16 +3036,12 @@ bool RayTracing::EnsureDebugColor()
 // Frame
 // ---------------------------------------------------------------------------------------------
 
-// (49b) Hitch fixes B and E: the backend's per-frame switches (before the early prep records any build).
+// (49b) Hitch fix E: the backend's per-frame switch (before the early prep records any build). (49c) B removed.
 void RayTracing::UpdateHitchState()
 {
-	const bool settle = HitchOn(settings.HitchSettleBudget) && handedOff && handOffQpc != 0 && phase == Phase::Play &&
-	                    static_cast<double>(Qpc() - handOffQpc) * QpcMs() < kSettleWindowMs;
-	hitchSettleThisFrame = settle;
 	if (!backend.IsReady())
 		return;
-	backend.SetSettle(settle);
-	backend.SetAlphaPrealloc(HitchOn(settings.HitchAlphaPrealloc));
+	backend.SetAlphaPrealloc(ReserveOn());
 }
 
 void RayTracing::LatchFrame()
@@ -2990,6 +3424,10 @@ void RayTracing::Reset()
 			logger::warn("[RayTracing] The loading screen is presented on thread {}, the world on thread {}: the loading pump does not run there", thread,
 				renderThreadId.load());
 		}
+		// (49c) This is the loading-screen thread: while "Prepare When Arriving" holds the main thread, it makes the D3D11 copies.
+		if (arrivalActive.load())
+			arrivalPresents.fetch_add(1, std::memory_order_relaxed);
+		LoadingThreadWork();
 		return;
 	}
 	if (!RtWanted()) {
@@ -3455,13 +3893,19 @@ void RayTracing::PublishCpuSplit()
 	// (49b) Hitch fixes in effect, the build queue, and the RT fog passes of this frame (F7 rt_hitch_mode, rt_builds_waiting, rt_fog_*).
 	if (backend.IsReady()) {
 		const auto& fs = backend.GetStats();
-		detail.hitchMode = settings.HitchFixes ? ((hitchSettleThisFrame ? 1 : 0) | (transitionPumpOff && inTransition ? 2 : 0) | (settings.HitchPrecompile ? 4 : 0) |
-		                                             (settings.HitchAlphaPrealloc ? 8 : 0) | (settings.HitchSkinMissing ? 16 : 0))
-		                                       : 0;
+		// (49c) Bits: 4 / 8 / 16 Reserve Shaders and Memory Up Front (49b D / E / F), 32 Prepare When Arriving, 64 the loading-screen thread's copies.
+		detail.hitchMode = (ReserveOn() ? (4 | 8 | 16) : 0) | (LoadOn(settings.LoadPrepareArrival) ? 32 : 0) | (LoadOn(settings.LoadThreadCopies) ? 64 : 0);
 		detail.buildsWaiting = static_cast<int>(backend.QueuedBuilds());
 		detail.fogSun = fs.fogTracedLastFrame && fs.fogSunLastFrame ? 1 : 0;
 		detail.fogLights = fs.fogTracedLastFrame && fs.fogLightsLastFrame ? 1 : 0;
 	}
+	// (49c) Loading Screens columns (once each).
+	detail.arrivalMs = arrivalTraceMs;
+	arrivalTraceMs = -1.0f;
+	if (const std::uint32_t copies = loadThreadCopiesTrace.exchange(0); copies > 0)
+		detail.loadThreadCopies = static_cast<int>(copies);
+	detail.handOffPending = handOffPendingTrace;
+	handOffPendingTrace = -1;
 	Util::FrameTrace::OnRayTracingDetail(detail);
 	{
 		// (46q) Submit on a Worker Thread / Budget Builds by GPU Time.
@@ -3889,7 +4333,7 @@ void RayTracing::RunFrame()
 			}
 		}
 		if (alphaMaskCS)
-			backend.RecordAlphaCopies(alphaMaskCS.get(), hitchSettleThisFrame ? kAlphaCopiesPerFrame / 4 : kAlphaCopiesPerFrame);  // (49b) B: a quarter in the settle window
+			backend.RecordAlphaCopies(alphaMaskCS.get(), kAlphaCopiesPerFrame);
 	}
 	RunMaterialCopies(false);  // (48f) Capture Materials: texture copies (D3D11, per-frame budget)
 
@@ -5206,7 +5650,7 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 		pointWideIdleFrames = 0;
 	} else if (backend.PointWideReady() || pointWide[0].texture) {
 		// (49b) Hitch fix D: kept for the session once made (no free / re-create churn: +15.8 MB at most).
-		if (!HitchOn(settings.HitchPrecompile) && ++pointWideIdleFrames >= kPointWideIdleFrames) {
+		if (!ReserveOn() && ++pointWideIdleFrames >= kPointWideIdleFrames) {
 			logger::info("[RayTracing] Lights per pixel above 4: unused for {} frames, slot 4 - 5 textures freed", kPointWideIdleFrames);
 			ReleasePointWide();
 		}
@@ -7637,7 +8081,7 @@ void RayTracing::DrawSettings()
 	// (47y) Moving Characters: Keep Shadow History / Smooth When No History: (48o) fixed on (no switches).
 	DrawObjectRows();  // (47n) one per-kind choice for the sun, the point lights and RTAO
 	DrawParticlesSection();  // (49b)
-	DrawHitchFixes();        // (49b)
+	DrawLoadingScreens();    // (49c)
 	DrawDiagnostics();
 	ImGui::PopID();
 }
@@ -7662,42 +8106,39 @@ void RayTracing::DrawParticlesSection()
 	}
 }
 
-void RayTracing::DrawHitchFixes()
+void RayTracing::DrawLoadingScreens()
 {
-	// (49b) Hitch Fixes (49b): a master switch and one per problem; each off = the 48o behaviour.
-	ImGui::SeparatorText("Hitch Fixes (49b)");
-	ImGui::Checkbox("Hitch Fixes (49b)", &settings.HitchFixes);
+	// (49c) "Loading Screens" (replaces 49b's Hitch Fixes): the master and three parts; master off = 48o / 49a.
+	ImGui::SeparatorText("Loading Screens");
+	ImGui::Checkbox("Finish Loading Work Behind the Loading Screen", &settings.LoadFinish);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("On (default): the fixes below for the stutter after fast travel and loading screens. Off: all of them off (as 48o).");
-		ImGui::Text("The grass one is on Grass Optimizations' page (same heading).");
+		ImGui::Text("On (default): after fast travel or a door, Ray Tracing's preparation of the new place is done while the game's own loading");
+		ImGui::Text("  screen is still showing, instead of in the first seconds you can see. The loading screen may stay up about 0.5 - 1.5 s longer;");
+		ImGui::Text("  at most 3 s. Ray Tracing takes over from the shadow map once the place is complete (objects, trees and cut-outs included).");
+		ImGui::Text("Not only Ray Tracing: grass buffers are reused from the place left (Grass Optimizations) and, with the second part, grass is");
+		ImGui::Text("  uploaded behind the loading screen too.");
+		ImGui::Text("Save loads have no point to prepare at behind the loading screen: they work as before (the log says so).");
+		ImGui::Text("Off: everything below off (48o / 49a).");
 	}
-	ImGui::BeginDisabled(!settings.HitchFixes);
+	ImGui::BeginDisabled(!settings.LoadFinish);
 	ImGui::Indent();
-	ImGui::Checkbox("Gentler Scene Building After Arriving", &settings.HitchSettleBudget);
+	ImGui::Checkbox("Prepare When Arriving", &settings.LoadPrepareArrival);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("For 5 s after Ray Tracing takes over from the shadow map, it builds new objects at half the graphics-card time per frame");
-		ImGui::Text("  (fewer builds, compactions and new character shapes each frame). Those items keep the shadow map a little longer.");
-		ImGui::Text("Fixes the 15-25 ms frames in the first seconds after arriving. F7 column rt_hitch_mode bit 1.");
+		ImGui::Text("When the teleport ends (the loading screen is still up), the new place's buildings, objects, trees and characters are");
+		ImGui::Text("  captured and their ray-tracing structures built before the game closes the loading screen (at most 3 s, then the rest");
+		ImGui::Text("  follows as before). Logged: \"Prepare When Arriving ...\". F7 column rt_arrival_ms.");
 	}
-	ImGui::Checkbox("Prepare More When the Loading Screen Cannot Help", &settings.HitchPumpOff);
+	ImGui::Checkbox("Use the Loading Screen's Thread for GPU Copies", &settings.LoadThreadCopies);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("On this PC the loading screen is shown on another thread, so Ray Tracing cannot prepare behind it. Then the frames before");
-		ImGui::Text("  Ray Tracing takes over get bigger preparation budgets (3 ms scene, 3 ms builds, 12 characters). Logged per loading screen.");
+		ImGui::Text("Meanwhile the thread that draws the loading screen also makes the leaf / fence cut-out copies and the grass uploads between");
+		ImGui::Text("  its frames (about 8 ms each), so they are not made in the first visible frames. Needs Prepare When Arriving.");
+		ImGui::Text("  F7 column rt_loadthread_copies.");
 	}
-	ImGui::Checkbox("No Shader Compiles or Texture Churn for Crowded Lights", &settings.HitchPrecompile);
+	ImGui::Checkbox("Reserve Shaders and Memory Up Front", &settings.ReserveUpFront);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Point-light shadows: every filter variant that can be needed is compiled at the main menu (not on the first crowded");
-		ImGui::Text("  frame), and the extra-light textures stay once made (made in the dark part of a loading screen when possible). +16 MB.");
-	}
-	ImGui::Checkbox("Reserve Cut-out Records Up Front", &settings.HitchAlphaPrealloc);
-	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("The buffers listing leaves, fences and other cut-out shapes are made at full size once (about 3 MB each, 8 of them),");
-		ImGui::Text("  not regrown on several frames in a row after arriving outside.");
-	}
-	ImGui::Checkbox("Remember Missing Skin Textures", &settings.HitchSkinMissing);
-	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Advanced Skin looks for optional _wet / _rfaos textures next to each skin. A file that is not there is not searched for again");
-		ImGui::Text("  for every new character with the same skin. Same picture.");
+		ImGui::Text("Point-light shadows: every filter variant that can be needed is compiled at the main menu and the extra-light textures stay");
+		ImGui::Text("  once made (+16 MB). The cut-out record buffers are made at full size once (about 3 MB each, 8 of them). Advanced Skin does");
+		ImGui::Text("  not search again for optional _wet / _rfaos textures it already found missing. Same picture.");
 	}
 	ImGui::Unindent();
 	ImGui::EndDisabled();

@@ -118,6 +118,7 @@ namespace RayTracingRT
 
 	void Backend::CollectAlphaRetired(std::uint64_t a_completed)
 	{
+		std::scoped_lock alphaLock(alphaTexMutex_);  // (49c) also used from the loading-screen thread
 		std::erase_if(retiredAlphaLayers_, [&](const DeferredFree& a_entry) {
 			if (a_entry.fence > a_completed)
 				return false;
@@ -261,6 +262,7 @@ namespace RayTracingRT
 
 	AlphaTexture Backend::AcquireAlphaTexture(ID3D11Texture2D* a_texture, ID3D11ShaderResourceView* a_view)
 	{
+		std::scoped_lock alphaLock(alphaTexMutex_);  // (49c) also used from the loading-screen thread
 		if (!AlphaAvailable() || !a_texture || !a_view)
 			return kInvalidAlphaTexture;
 		if (const auto it = alphaTextureIndex_.find(a_texture); it != alphaTextureIndex_.end()) {
@@ -318,6 +320,7 @@ namespace RayTracingRT
 
 	void Backend::ReleaseAlphaTexture(AlphaTexture a_texture)
 	{
+		std::scoped_lock alphaLock(alphaTexMutex_);  // (49c) also used from the loading-screen thread
 		if (a_texture >= alphaTextures_.size() || !alphaTextures_[a_texture].live)
 			return;
 		auto& entry = alphaTextures_[a_texture];
@@ -335,11 +338,13 @@ namespace RayTracingRT
 
 	bool Backend::IsAlphaTextureReady(AlphaTexture a_texture) const
 	{
+		std::scoped_lock alphaLock(alphaTexMutex_);  // (49c) also used from the loading-screen thread
 		return a_texture < alphaTextures_.size() && alphaTextures_[a_texture].live && alphaTextures_[a_texture].ready;
 	}
 
 	void Backend::RecordAlphaCopies(ID3D11ComputeShader* a_shader, std::uint32_t a_max)
 	{
+		std::scoped_lock alphaLock(alphaTexMutex_);  // (49c) also used from the loading-screen thread
 		if (!a_shader || alphaCopyQueue_.empty() || !alphaLayers11_ || !alphaCopyCB_ || !alphaCopySampler_ || !context11_)
 			return;
 		auto* context = context11_.Get();
@@ -406,6 +411,7 @@ namespace RayTracingRT
 
 	std::uint32_t Backend::CreateAlphaInfoAt(std::uint32_t a_uvOffset, std::uint32_t a_triangles, AlphaTexture a_texture, const AlphaMaterial& a_material)
 	{
+		std::scoped_lock alphaLock(alphaTexMutex_);  // (49c) also used from the loading-screen thread
 		if (!AlphaAvailable() || a_uvOffset == UINT32_MAX || a_triangles == 0 || a_texture >= alphaTextures_.size() || !alphaTextures_[a_texture].live)
 			return kInvalidAlphaInfo;
 		std::uint32_t slot;
@@ -525,6 +531,7 @@ namespace RayTracingRT
 
 	void Backend::ReleaseAlphaResources()
 	{
+		std::scoped_lock alphaLock(alphaTexMutex_);  // (49c) also used from the loading-screen thread
 		if (!AlphaIdle())
 			return;
 		if (!alphaUv_ && !alphaLayers12_ && alphaInfos_.empty())

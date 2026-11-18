@@ -236,10 +236,6 @@ public:
 		bool enableMidLOD = false;
 		bool enableFarLOD = false;
 		float fadeStart = 0.0f;  // stamped on newly captured slices as their fade-in start
-		// (49b) Hitch fix A "Spread Grass Rebuilds After Loading": render-thread ms per frame for bucket rebuilds / appends and GPU MB newly
-		// allocated per frame (0 = no limit: the 47l behaviour). The rest waits for the next frames (its grass appears a few frames later).
-		float uploadBudgetMs = 0.0f;
-		uint64_t allocBudgetBytes = 0;
 		// (44h) removed deferredCompaction / uploadBudgetBytes / maxGrowthsPerFrame / growthHeadroom, now fixed:
 		// deferred compaction always (44e fix A: removals leave gaps; a type is compacted only when new grass
 		// would not fit behind its last instance, or when gaps exceed half its capacity, at most one gap-only
@@ -258,9 +254,33 @@ public:
 		uint64_t allocatedBytes = 0;       ///< GPU memory newly allocated
 		uint64_t uploadedBytes = 0;        ///< CPU -> GPU bytes
 		uint64_t copiedBytes = 0;          ///< GPU -> GPU bytes (compaction / growth)
-		uint32_t uploadsDeferred = 0;      ///< (49b) buckets whose rebuild / append was put off by the budget this frame
+		uint32_t poolHits = 0;             ///< (49c) bucket buffer sets taken from the pool (no CreateBuffer)
+		uint32_t poolMisses = 0;           ///< (49c) bucket buffer sets that had to be created
 	};
 	ApplyStats lastApply;
+
+	/** @brief (49c) Staged captures / removals not applied yet (any thread). */
+	[[nodiscard]] size_t PendingCount();
+
+	/** @brief (49c) Captures staged since a_sinceQpc: count, first / last QPC and the thread of the last one (log only). */
+	struct StagingStats
+	{
+		std::atomic<uint32_t> count{ 0 };
+		std::atomic<int64_t> firstQpc{ 0 }, lastQpc{ 0 };
+		std::atomic<uint32_t> lastThread{ 0 };
+	};
+	StagingStats staging;
+	void ResetStaging();
+
+	/** @brief (49c) Bucket buffer pool: emptied / outgrown buckets park their instance, origin and cull-scratch buffers here (at most
+	 * kPoolMaxBytes) so the next load reuses them instead of creating and growing new ones. */
+	static constexpr uint64_t kPoolMaxBytes = 96ull << 20;
+	/** @brief (49c) Under Ray Tracing's "Finish Loading Work Behind the Loading Screen" (off = 48o: emptied buckets are destroyed). */
+	bool poolEnabled = true;
+	[[nodiscard]] uint64_t PoolBytes() const { return poolBytes; }
+	[[nodiscard]] size_t PoolSets() const { return pool.size(); }
+	/** @brief Releases every parked buffer set. Caller holds bucketMutex. */
+	void ReleasePool();
 
 	void BeginFrame(const FrameParams& params) { frameParams = params; }
 
@@ -340,6 +360,35 @@ private:
 	static bool ResidentEnd(const GrassBucket& b, uint32_t sliceCount, uint32_t& o_end);
 	/** @brief (44e) Instances in slices [from, end). */
 	static uint32_t InstancesFrom(const GrassBucket& b, uint32_t from);
+
+	/** @brief (49c) A bucket's capacity-sized buffers (instance / origin sources and cull scratch), parked in or taken from the pool. */
+	struct PooledSet
+	{
+		uint32_t capacity = 0;
+		ID3D11Buffer* instanceBuf = nullptr;
+		ID3D11ShaderResourceView* instanceSRV = nullptr;
+		ID3D11Buffer* originBuf = nullptr;
+		ID3D11ShaderResourceView* originSRV = nullptr;
+		ID3D11Buffer* compactedBuf = nullptr;
+		ID3D11UnorderedAccessView* compactedUAV = nullptr;
+		ID3D11Buffer* extrasBuf = nullptr;
+		ID3D11UnorderedAccessView* extrasUAV = nullptr;
+		ID3D11ShaderResourceView* extrasSRV = nullptr;
+		[[nodiscard]] bool Complete() const
+		{
+			return capacity && instanceBuf && instanceSRV && originBuf && originSRV && compactedBuf && compactedUAV && extrasBuf && extrasUAV && extrasSRV;
+		}
+		[[nodiscard]] uint64_t Bytes() const;
+		void Release();
+	};
+	/** @brief Moves the capacity-sized buffers out of a bucket (its pointers become null). */
+	static PooledSet DetachSet(GrassBucket& b);
+	/** @brief Parks a set in the pool (or releases it when it is incomplete or the pool is full). */
+	void ParkSet(PooledSet&& a_set);
+	/** @brief The smallest parked set holding at least a_needed instances (moved into b); false when none. */
+	bool TakeSet(GrassBucket& b, uint32_t a_needed);
+	std::vector<PooledSet> pool;
+	uint64_t poolBytes = 0;
 
 	// (44e, fix A) Shared compaction scratch: grow-only, instance records and origins.
 	winrt::com_ptr<ID3D11Buffer> scratchInstance;

@@ -467,7 +467,7 @@ namespace RayTracingRT
 		skinStats_.groupsLastFrame = skinStats_.groupBuildsLastFrame = skinStats_.groupRefitsLastFrame = skinStats_.groupKeptLastFrame = 0;
 		skinStats_.groupShapesLastFrame = skinStats_.dispatchesLastFrame = 0;
 		skinGroupFrame_.clear();
-		UploadSkinShapes(a_list, a_input.skinUploadCpuMs > 0.0f ? a_input.skinUploadCpuMs : kPlaySkinUploadCpuMs * settleScale_);  // (49b) settle window
+		UploadSkinShapes(a_list, a_input.skinUploadCpuMs > 0.0f ? a_input.skinUploadCpuMs : kPlaySkinUploadCpuMs);
 		if (!skinFault_.empty() || failed_) {
 			if (!skinGroups_.empty())
 				ReleaseSkinGroups();
@@ -572,7 +572,7 @@ namespace RayTracingRT
 		// (46q) Builds budgeted by GPU time: merged builds this frame and the triangles the whole budget allows.
 		std::uint32_t groupBuildsNow = 0;
 		const double groupPerTri = msPerTriEma_ > 0.0 ? msPerTriEma_ : 8.0e-6;
-		const std::uint64_t groupTriBudget = static_cast<std::uint64_t>(std::max(16384.0, static_cast<double>(kBudgetGpuMs * settleScale_) / groupPerTri));
+		const std::uint64_t groupTriBudget = static_cast<std::uint64_t>(std::max(16384.0, static_cast<double>(kBudgetGpuMs) / groupPerTri));
 		for (auto& group : skinGroups_)
 			group.seen = false;
 		skinGroupDraws_.clear();

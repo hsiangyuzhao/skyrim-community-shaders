@@ -605,6 +605,8 @@ namespace RayTracingScene
 		meshes_.clear();
 		scanList_.clear();
 		scanCursor_ = 0;
+		scanListActive_ = false;  // (49c)
+		scansSinceChange_ = 0;
 		RayTracingCasterFilter::Clear();
 		cellsReady_ = 0;
 		validationCursor_ = 0;
@@ -1911,9 +1913,16 @@ namespace RayTracingScene
 		// (45j) 512 -> 128 references per frame: the scan never stops (items dropped later are found by
 		// it), so its cost is paid every frame.
 		constexpr std::size_t kScanPerFrame = 128;
+		// (49c) Uncapped while preparing on arrival (behind the loading screen): only the time budget limits it.
+		const std::size_t scanLimit = scanUncapped_ ? SIZE_MAX : kScanPerFrame;
 		std::size_t scanned = 0;
-		while (scanned < kScanPerFrame && Qpc() < a_deadline) {
+		while (scanned < scanLimit && Qpc() < a_deadline) {
 			if (scanCursor_ >= scanList_.size()) {
+				// (49c) The cell scanned last is done (the scan-pass bookkeeping the hand-off waits for).
+				if (scanListActive_) {
+					scanListActive_ = false;
+					++scansSinceChange_;
+				}
 				scanList_.clear();
 				scanCursor_ = 0;
 				// Next complete cell (round robin).
@@ -1928,8 +1937,11 @@ namespace RayTracingScene
 				if (!next)
 					break;
 				CollectCellRefs(next->cell, next->x, next->y, scanList_, nullptr);
-				if (scanList_.empty())
+				if (scanList_.empty()) {
+					++scansSinceChange_;  // (49c) nothing to scan in it: done
 					break;
+				}
+				scanListActive_ = true;
 			}
 			const auto& refPtr = scanList_[scanCursor_++];
 			++scanned;
@@ -2417,6 +2429,12 @@ namespace RayTracingScene
 				++cellsReady_;
 		}
 
+		// (49c) A cell completed or left: the scan pass starts over.
+		if (stats_.cellsComplete != scanLastComplete_ || cells_.size() != scanLastCells_) {
+			scanLastComplete_ = stats_.cellsComplete;
+			scanLastCells_ = cells_.size();
+			scansSinceChange_ = 0;
+		}
 		const std::int64_t objectsStart = Qpc();
 		times_.registration = static_cast<float>(static_cast<double>(objectsStart - registrationStart) * QpcMs());
 		// 6. (45e) Objects with their own instances (doors, items, trees): validation, scan, filter.

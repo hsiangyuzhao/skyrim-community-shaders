@@ -52,7 +52,8 @@ namespace Util::FrameTrace
 			uint32_t firstSeen = 0;
 			uint32_t fgPresented = 0;
 			float grassApplyMs = -1.0f;
-			int grassDeferred = -1;  // (49b) Hitch fix A: grass bucket uploads put off this frame (-1 = not run)
+			int grassDeferred = -1;  // (49b) Hitch fix A (removed in 49c: always -1)
+			int grassPoolHits = -1, grassPoolMisses = -1;  // (49c) grass bucket buffer sets reused / created this frame (-1 = grass not updated)
 			float rtGpuMs = -1.0f;  // (45) Ray Tracing: D3D12 GPU ms (last completed), CPU ms, BLAS builds
 			float rtCpuMs = -1.0f;
 			uint32_t rtBuilds = 0;
@@ -502,7 +503,8 @@ namespace Util::FrameTrace
 			float playerSpeed = 0.0f;
 			uint32_t fgPresented = 0;
 			float grassApplyMs = -1.0f;
-			int grassDeferred = -1;  // (49b) Hitch fix A: grass bucket uploads put off this frame (-1 = not run)
+			int grassDeferred = -1;  // (49b) Hitch fix A (removed in 49c: always -1)
+			int grassPoolHits = -1, grassPoolMisses = -1;  // (49c) grass bucket buffer sets reused / created this frame (-1 = grass not updated)
 			float rtGpuMs = -1.0f;
 			float rtCpuMs = -1.0f;
 			uint32_t rtBuilds = 0;
@@ -1089,6 +1091,13 @@ namespace Util::FrameTrace
 				out << "#   Hitch fixes in effect (bits: 1 build budgets tightened after the hand-off (B), 2 widened warm-up budgets, the loading pump did not\n";
 				out << "#   run (C), 4 point variants precompiled / slot 4 - 5 kept (D), 8 full-size alpha records (E), 16 skin missing-texture cache (F));\n";
 				out << "#   rt_builds_waiting = BLAS builds still queued; rt_fog_sun / rt_fog_lights = RT fog passes traced this frame (1 / 0; -1 = RT not running).\n";
+				out << "# (49c) grass_deferred: always -1 (49b fix A removed). rt_hitch_mode bits now: 4 point variants precompiled / slot 4 - 5 kept, 8 full-size\n";
+				out << "#   alpha records, 16 skin missing-texture cache (all three = Reserve Shaders and Memory Up Front), 32 Prepare When Arriving on, 64 the\n";
+				out << "#   loading-screen thread's GPU copies on (bits 1 / 2 = 49b B / C, removed). rt_arrival_ms = ms of Prepare When Arriving (main thread, the\n";
+				out << "#   game's loading screen still up), on the first world frame after it (-1 otherwise); rt_loadthread_copies = cut-out copies made on the\n";
+				out << "#   loading-screen thread since the last world frame (-1 = none / off); rt_handoff_pending = items still pending at the hand-off (on the\n";
+				out << "#   hand-off frame, -1 otherwise); grass_pool_hits / grass_pool_misses = grass bucket buffer sets reused from / created outside the\n";
+				out << "#   pool by this frame's grass work, loading-screen thread included (-1 = grass not updated).\n";
 				out << "# (48c) rt_pl_extra_pct = Extra Lights Where Crowded: percent of the pixels with a ray-traced point light that also traced a light past\n";
 				out << "#   the lights-per-pixel count (read back a few frames late; -1 = switch off, 6 lights per pixel, or not known).\n";
 				out << "#   rt_pw_* = the work of the RT D3D12 prep submission whose GPU time is rt_prep_gpu_ms on the same row (1 = valid; early =\n";
@@ -1203,7 +1212,8 @@ namespace Util::FrameTrace
 					   "rt_refl_mat_copies,rt_refl_mat_pending,rt_refl_mat_textures,rt_refl_attr_mb,"  // (48f)
 					   "rt_refl_shade_gpu_ms,rt_refl_shade_mat_pct,rt_refl_shade_ratio,"  // (48g)
 					   "rt_refl_shade_ratio_smoothed,"  // (48h)
-					   "grass_deferred,rt_hitch_mode,rt_builds_waiting,rt_fog_sun,rt_fog_lights\n";  // (49b) the last one
+					   "grass_deferred,rt_hitch_mode,rt_builds_waiting,rt_fog_sun,rt_fog_lights,"  // (49b)
+					   "rt_arrival_ms,rt_loadthread_copies,rt_handoff_pending,grass_pool_hits,grass_pool_misses\n";  // (49c) the last one
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
 					std::string s = std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{},{}", t.scene,
@@ -1420,6 +1430,9 @@ namespace Util::FrameTrace
 					// (49b) Hitch fixes and RT fog, after rt_refl_shade_ratio_smoothed (the old last column).
 					extra.pop_back();
 					extra += std::format(",{},{},{},{},{}\n", r.grassDeferred, r.rt.hitchMode, r.rt.buildsWaiting, r.rt.fogSun, r.rt.fogLights);
+					// (49c) Loading Screens and the grass buffer pool, after rt_fog_lights (the old last column).
+					extra.pop_back();
+					extra += std::format(",{:.1f},{},{},{},{}\n", r.rt.arrivalMs, r.rt.loadThreadCopies, r.rt.handOffPending, r.grassPoolHits, r.grassPoolMisses);
 					if (it == a_reflex.end()) {
 						out << (r.reflexFrame == UINT32_MAX ? std::string("-1") : std::to_string(r.reflexFrame)) << ",-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" << engineColumns(r) << extra;
 						continue;
@@ -2236,6 +2249,11 @@ namespace Util::FrameTrace
 	void OnFramesPresented(uint32_t a_count) { g_frame.fgPresented = a_count; }
 	void OnGrassApply(float a_ms) { g_frame.grassApplyMs = a_ms; }
 	void OnGrassSpread(int a_deferred) { g_frame.grassDeferred = a_deferred; }
+	void OnGrassPool(int a_hits, int a_misses)
+	{
+		g_frame.grassPoolHits = a_hits;
+		g_frame.grassPoolMisses = a_misses;
+	}
 	void OnRayTracing(float a_gpuMs, float a_cpuMs, uint32_t a_builds)
 	{
 		g_frame.rtGpuMs = a_gpuMs;
@@ -2630,6 +2648,8 @@ namespace Util::FrameTrace
 				r.fgPresented = g_frame.fgPresented;
 				r.grassApplyMs = g_frame.grassApplyMs;
 				r.grassDeferred = g_frame.grassDeferred;
+				r.grassPoolHits = g_frame.grassPoolHits;  // (49c)
+				r.grassPoolMisses = g_frame.grassPoolMisses;
 				r.rtGpuMs = g_frame.rtGpuMs;
 				r.rtCpuMs = g_frame.rtCpuMs;
 				r.rtBuilds = g_frame.rtBuilds;

@@ -1080,15 +1080,18 @@ namespace RayTracingRT
 		bool WaitForFog(std::uint64_t a_value);
 		[[nodiscard]] std::uint64_t FogBytes() const { return fogBytes_; }
 		[[nodiscard]] const std::string& FogFault() const { return fogFault_; }
-		/// (49b) Hitch fix B: the settle window after a hand-off (on: the GPU-time build budget x 0.5, at most 16 builds and 8 compactions per frame,
-		/// new character shapes at half the CPU time). Only where the caller left the play defaults (no explicit transition budgets).
-		void SetSettle(bool a_on)
+		/// (49c) Alpha copies still to be made (D3D11, RecordAlphaCopies).
+		[[nodiscard]] std::uint32_t PendingAlphaCopies() const
 		{
-			settleScale_ = a_on ? 0.5f : 1.0f;
-			settleMaxBuilds_ = a_on ? 16u : 0u;
-			settleMaxCompactions_ = a_on ? 8u : 0u;
+			std::scoped_lock lock(alphaTexMutex_);
+			return static_cast<std::uint32_t>(alphaCopyQueue_.size());
 		}
-		[[nodiscard]] bool SettleOn() const { return settleScale_ < 1.0f; }
+		/// (49c) Waits (CPU, at most a_ms) until the last D3D12 submission is complete. False on a time-out or no fence.
+		bool WaitSubmitted(std::uint32_t a_ms);
+		/// (49c) BLASes built whose compaction is still to come (compaction size not read back / not compacted yet).
+		[[nodiscard]] std::uint32_t CompactionsDue() const;
+		/// (49c) Logs once whether the D3D11 device has multithread protection on (ID3D11Multithread).
+		void LogMultithreadProtection();
 		/// (49b) Hitch fix E: per-context alpha record buffers are made at full size (kAlphaMaxInfos) and never regrown; PreallocateAlphaInfoBuffers
 		/// makes the missing ones (backend start, black screen).
 		void SetAlphaPrealloc(bool a_on) { alphaPrealloc_ = a_on; }
@@ -2051,14 +2054,11 @@ namespace RayTracingRT
 		std::uint64_t reflectFenceValue_ = 0;
 		std::uint64_t pendingReflectWait_ = 0;
 		bool EnsureReflectFence();
-		// (49b) Hitch fixes B and E.
-		float settleScale_ = 1.0f;
-		std::uint32_t settleMaxBuilds_ = 0, settleMaxCompactions_ = 0;
+		// (49b) Hitch fix E (49c: part of "Reserve Shaders and Memory Up Front").
 		bool alphaPrealloc_ = false;
-		[[nodiscard]] static std::uint32_t SettleCap(std::uint32_t a_default, std::uint32_t a_cap, const FrameInput& a_input)
-		{
-			return (a_cap != 0 && a_input.buildCpuMs <= 0.0f) ? std::min(a_default, a_cap) : a_default;
-		}
+		// (49c) The alpha texture table, its copy queue and the copy layers' free lists: also used by the loading-screen thread
+		// (RecordAlphaCopies there while the main thread captures in "Prepare When Arriving"). Recursive: the guarded functions call each other.
+		mutable std::recursive_mutex alphaTexMutex_;
 		// (49b) RT fog.
 		ComPtr<ID3D12RootSignature> fogRootSignature_;
 		ComPtr<ID3D12PipelineState> fogSunPipeline_, fogSunAlphaPipeline_, fogLightPipeline_, fogLightAlphaPipeline_;

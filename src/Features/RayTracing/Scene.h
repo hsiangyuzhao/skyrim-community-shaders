@@ -353,6 +353,11 @@ namespace RayTracingScene
 		/// global switch per transition instead of objects popping from the shadow map to RT one by one). Off: an item
 		/// is handed off as soon as it is ready (a whole cell at once), as while walking outdoors.
 		void SetHold(bool a_hold) { hold_ = a_hold; }
+		/// (49c) "Prepare When Arriving": the object scan takes as many references per call as its time budget allows (normally 128).
+		void SetScanUncapped(bool a_on) { scanUncapped_ = a_on; }
+		/// (49c) Every complete cell has been scanned for objects since the last cell completed or left (the hand-off waits for it).
+		[[nodiscard]] bool ScanPassComplete() const { return stats_.cellsComplete > 0 && scansSinceChange_ >= stats_.cellsComplete + 1; }
+		[[nodiscard]] std::uint32_t ScansSinceChange() const { return scansSinceChange_; }
 		[[nodiscard]] bool Held() const { return hold_; }
 		struct HandOffCounts
 		{
@@ -840,6 +845,12 @@ namespace RayTracingScene
 		std::vector<RE::NiPointer<RE::TESObjectREFR>> scanList_;  // the cell being scanned for objects
 		std::size_t scanCursor_ = 0;
 		std::size_t scanCell_ = 0;
+		// (49c) Scan pass bookkeeping: cell scans finished since the set of complete cells last changed.
+		bool scanUncapped_ = false;
+		bool scanListActive_ = false;
+		std::uint32_t scansSinceChange_ = 0;
+		std::uint32_t scanLastComplete_ = 0;
+		std::size_t scanLastCells_ = 0;
 		std::atomic<bool> flushRequested_{ false };
 		// (46g) Hand-off hold and the cells of the place being left.
 		bool hold_ = false;

@@ -143,6 +143,8 @@ void GrassBucketStore::ApplyRemovals(const std::vector<RE::BSMultiStreamInstance
 			// reaching it, so destroying the bucket here is safe.
 			std::unique_lock lk(shapeBucketMutex);
 			std::erase_if(shapeBucketId, [dying = &b](const auto& entry) { return entry.second == dying; });
+			// (49c) Its capacity-sized buffers go to the pool: the grass of the place arrived at reuses them (no CreateBuffer / growth there).
+			ParkSet(DetachSet(b));
 			it = buckets.erase(it);
 			continue;
 		}
@@ -304,29 +306,6 @@ bool GrassBucketStore::CompactBucketScratch(GrassBucket& b, ID3D11Device* device
 void GrassBucketStore::UploadDirtyBuckets(ID3D11Device* device, ID3D11DeviceContext* ctx)
 {
 	uint32_t gapCompactions = 0;
-	// (49b) Hitch fix A: the rebuilds / appends of one frame stop at the time and memory budget (the first one always runs); the buckets left keep
-	// their dirty / new-slice state and go on the next frames. Their new slices are not resident until then (culling only reads resident slices).
-	const bool budgeted = frameParams.uploadBudgetMs > 0.0f || frameParams.allocBudgetBytes > 0;
-	LARGE_INTEGER freq{}, start{};
-	if (budgeted) {
-		QueryPerformanceFrequency(&freq);
-		QueryPerformanceCounter(&start);
-	}
-	uint32_t uploadsDone = 0;
-	const auto overBudget = [&]() {
-		if (!budgeted || uploadsDone == 0)
-			return false;
-		if (frameParams.allocBudgetBytes > 0 && lastApply.allocatedBytes >= frameParams.allocBudgetBytes)
-			return true;
-		if (frameParams.uploadBudgetMs > 0.0f) {
-			LARGE_INTEGER now{};
-			QueryPerformanceCounter(&now);
-			const double ms = static_cast<double>(now.QuadPart - start.QuadPart) * 1000.0 / static_cast<double>(std::max<LONGLONG>(freq.QuadPart, 1));
-			if (ms >= frameParams.uploadBudgetMs)
-				return true;
-		}
-		return false;
-	};
 
 	for (auto& [key, b] : buckets) {
 		if (b.needsCompact) {
@@ -358,11 +337,6 @@ void GrassBucketStore::UploadDirtyBuckets(ID3D11Device* device, ID3D11DeviceCont
 		const bool wantsUpload = b.dirty || b.firstNewSlice != UINT32_MAX;
 		if (!wantsUpload)
 			continue;
-		if (overBudget()) {
-			++lastApply.uploadsDeferred;
-			continue;
-		}
-		++uploadsDone;
 
 		if (b.dirty) {
 			RebuildBucket(b, device, ctx);
@@ -443,9 +417,132 @@ bool GrassBucketStore::StageCapture(RE::BSMultiStreamInstanceTriShape* shape, co
 		pc.localMax = lmx;
 	}
 
-	std::scoped_lock lk(pendingMutex);
-	pendingCaptures.push_back(std::move(pc));
+	{
+		std::scoped_lock lk(pendingMutex);
+		pendingCaptures.push_back(std::move(pc));
+	}
+	// (49c) Log-only probe: when (and on which thread) the engine hands grass over during a transition.
+	{
+		LARGE_INTEGER now{};
+		QueryPerformanceCounter(&now);
+		int64_t expected = 0;
+		staging.firstQpc.compare_exchange_strong(expected, now.QuadPart);
+		staging.lastQpc.store(now.QuadPart);
+		staging.lastThread.store(GetCurrentThreadId());
+		staging.count.fetch_add(1);
+	}
 	return true;
+}
+
+size_t GrassBucketStore::PendingCount()
+{
+	std::scoped_lock lk(pendingMutex);
+	return pendingCaptures.size() + pendingRemoves.size();
+}
+
+void GrassBucketStore::ResetStaging()
+{
+	staging.count.store(0);
+	staging.firstQpc.store(0);
+	staging.lastQpc.store(0);
+	staging.lastThread.store(0);
+}
+
+uint64_t GrassBucketStore::PooledSet::Bytes() const
+{
+	// Instance records, origins (float4), compacted records, extras (2 x float4).
+	return (uint64_t)capacity * (kGrassStride + 4 * sizeof(float) + kGrassStride + 2 * 4 * sizeof(float));
+}
+
+void GrassBucketStore::PooledSet::Release()
+{
+	auto rel = [](auto*& p) { if (p) { p->Release(); p = nullptr; } };
+	rel(instanceSRV);
+	rel(instanceBuf);
+	rel(originSRV);
+	rel(originBuf);
+	rel(compactedUAV);
+	rel(compactedBuf);
+	rel(extrasSRV);
+	rel(extrasUAV);
+	rel(extrasBuf);
+	capacity = 0;
+}
+
+GrassBucketStore::PooledSet GrassBucketStore::DetachSet(GrassBucket& b)
+{
+	PooledSet s;
+	s.capacity = b.capacityInstances;
+	std::swap(s.instanceBuf, b.instanceBuf);
+	std::swap(s.instanceSRV, b.instanceSRV);
+	std::swap(s.originBuf, b.originBuf);
+	std::swap(s.originSRV, b.originSRV);
+	std::swap(s.compactedBuf, b.compactedBuf);
+	std::swap(s.compactedUAV, b.compactedUAV);
+	std::swap(s.extrasBuf, b.extrasBuf);
+	std::swap(s.extrasUAV, b.extrasUAV);
+	std::swap(s.extrasSRV, b.extrasSRV);
+	return s;
+}
+
+void GrassBucketStore::ParkSet(PooledSet&& a_set)
+{
+	if (!poolEnabled || !a_set.Complete()) {
+		a_set.Release();
+		return;
+	}
+	const uint64_t bytes = a_set.Bytes();
+	// Full: the smallest parked sets go first (the large ones are the expensive ones to create).
+	while (!pool.empty() && poolBytes + bytes > kPoolMaxBytes) {
+		auto smallest = std::min_element(pool.begin(), pool.end(), [](const PooledSet& l, const PooledSet& r) { return l.capacity < r.capacity; });
+		if (smallest->capacity >= a_set.capacity)
+			break;
+		poolBytes -= std::min(poolBytes, smallest->Bytes());
+		smallest->Release();
+		pool.erase(smallest);
+	}
+	if (poolBytes + bytes > kPoolMaxBytes) {
+		a_set.Release();
+		return;
+	}
+	poolBytes += bytes;
+	pool.push_back(a_set);
+	a_set = {};
+}
+
+bool GrassBucketStore::TakeSet(GrassBucket& b, uint32_t a_needed)
+{
+	if (!poolEnabled)
+		return false;
+	auto best = pool.end();
+	for (auto it = pool.begin(); it != pool.end(); ++it)
+		if (it->capacity >= a_needed && (best == pool.end() || it->capacity < best->capacity))
+			best = it;
+	// A set much larger than needed stays for a larger type (at most 4x the need).
+	if (best == pool.end() || (uint64_t)best->capacity > 4ull * std::max<uint32_t>(a_needed, 4096))
+		return false;
+	PooledSet s = *best;
+	poolBytes -= std::min(poolBytes, s.Bytes());
+	pool.erase(best);
+	b.capacityInstances = s.capacity;
+	b.instanceBuf = s.instanceBuf;
+	b.instanceSRV = s.instanceSRV;
+	b.originBuf = s.originBuf;
+	b.originSRV = s.originSRV;
+	b.compactedBuf = s.compactedBuf;
+	b.compactedUAV = s.compactedUAV;
+	b.extrasBuf = s.extrasBuf;
+	b.extrasUAV = s.extrasUAV;
+	b.extrasSRV = s.extrasSRV;
+	return true;
+}
+
+void GrassBucketStore::ReleasePool()
+{
+	for (auto& s : pool)
+		s.Release();
+	pool.clear();
+	poolBytes = 0;
 }
 
 void GrassBucketStore::CacheBucketTypeParams(GrassBucket& b, RE::BSMultiStreamInstanceTriShape* shape)
@@ -636,48 +733,48 @@ bool GrassBucketStore::EnsureBucketCapacity(GrassBucket& b, uint32_t needed, ID3
 
 	// Hold the old instance/origin buffers across the reallocation so the data up to preserve can be copied to the new buffers on the GPU.
 	const uint32_t preserve = std::min(preserveInstances, b.capacityInstances);
-	struct OldBuffers
-	{
-		ID3D11Buffer* instance;
-		ID3D11Buffer* origin;
-		~OldBuffers()
-		{
-			if (instance)
-				instance->Release();
-			if (origin)
-				origin->Release();
-		}
-	} old{ b.instanceBuf, b.originBuf };
-
-	b.instanceBuf = nullptr;
-	b.originBuf = nullptr;
+	// (49c) Culling jobs check instanceBuf through shapeBucketId (ClaimQueueSlot): the buffer swap happens under that lock, so no job sees the
+	// bucket half-swapped (a null buffer for a moment, which drew its shapes twice for one frame).
+	std::unique_lock shapeLock(shapeBucketMutex);
+	PooledSet old = DetachSet(b);
 
 	b.ReleaseResources();
 
-	if (!CreateBucketSourceBuffers(b, cap, device) ||
-		!CreateBucketCullScratch(b, cap, device) ||
+	// (49c) A parked set from the pool first (no CreateBuffer); otherwise new buffers as before.
+	const bool fromPool = TakeSet(b, cap);
+	if (fromPool)
+		cap = b.capacityInstances;
+	if ((!fromPool && (!CreateBucketSourceBuffers(b, cap, device) || !CreateBucketCullScratch(b, cap, device))) ||
 		!CreateBucketArgsBuffer(b, device)) {
 		b.ReleaseResources();
 		b.capacityInstances = 0;
 		// Ensure buffer offset is reset, so the next rebuild will not start from a stale offset. The rebuild will re-upload the whole bucket, so the offsets will be set correctly.
 		for (auto& s : b.slices)
 			s.bufferOffset = UINT32_MAX;
+		ParkSet(std::move(old));
 		return false;
 	}
 
 	// Carry the unchanged head across on the GPU, so the caller still uploads only the tail.
 	if (preserve && ctx) {
-		if (old.instance && b.instanceBuf) {
+		if (old.instanceBuf && b.instanceBuf) {
 			const D3D11_BOX box{ 0, 0, 0, preserve * kGrassStride, 1, 1 };
-			ctx->CopySubresourceRegion(b.instanceBuf, 0, 0, 0, 0, old.instance, 0, &box);
+			ctx->CopySubresourceRegion(b.instanceBuf, 0, 0, 0, 0, old.instanceBuf, 0, &box);
 		}
-		if (old.origin && b.originBuf) {
+		if (old.originBuf && b.originBuf) {
 			const D3D11_BOX box{ 0, 0, 0, preserve * 4 * (UINT)sizeof(float), 1, 1 };
-			ctx->CopySubresourceRegion(b.originBuf, 0, 0, 0, 0, old.origin, 0, &box);
+			ctx->CopySubresourceRegion(b.originBuf, 0, 0, 0, 0, old.originBuf, 0, &box);
 		}
 	}
+	// (49c) The outgrown set goes to the pool for a smaller type (the GPU copy above is queued before any later reuse writes it).
+	ParkSet(std::move(old));
 
-	lastApply.allocatedBytes += (uint64_t)cap * (kGrassStride + 4 * sizeof(float) + 64);
+	if (fromPool)
+		++lastApply.poolHits;
+	else {
+		++lastApply.poolMisses;
+		lastApply.allocatedBytes += (uint64_t)cap * (kGrassStride + 4 * sizeof(float) + 64);
+	}
 	lastApply.copiedBytes += (uint64_t)preserve * (kGrassStride + 4 * sizeof(float));
 	b.capacityInstances = cap;
 	b.dirty = true;
