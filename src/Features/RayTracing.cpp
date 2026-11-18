@@ -322,7 +322,8 @@ namespace
 	// Decorrelated Sampling (taps rotated by a hash), Stable Penumbra (the beam path for every point slot), Close Blockers: Minimum Blur.
 	constexpr std::uint32_t kPointFlagNoiseDecorrelate = 262144u, kPointFlagNoiseDarkSide = 524288u;
 	constexpr std::uint32_t kPointDenoiseNoiseDecorrelate = 256u, kPointDenoiseNoiseStable = 512u, kPointDenoiseNoiseCloseBlur = 1024u;
-	constexpr std::uint32_t kPointDenoiseNoiseFast = 2048u;  // (48l) PointDenoiseCS PL_FIX_FAST: Moving Characters: Fast Shadow History (t6 bound)
+	// (48m) PointDenoiseCS PL_CLEAN: Moving Characters: Clean Shadow History used / its moving test runs (t6 bound; also for the debug views).
+	constexpr std::uint32_t kPointDenoiseClean = 4096u, kPointDenoiseCleanDetect = 8192u;
 	// (47w) Adaptive skip thresholds (per frame, read back). Bad: more than 1 % of its lit pixels uncovered (and at least 32 pixels, so a
 	// light lighting a handful of pixels does not flip on noise), or 4096 uncovered pixels whatever the share. Good: under 0.25 % and
 	// under 1024 pixels. Skip again after kCoverageEnterFrames good frames (first time) or kCoverageRestoreFrames (after a bad frame);
@@ -1611,7 +1612,8 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.PointNoiseStable = read("PointNoiseStable", defaults.PointNoiseStable);
 		settings.PointNoiseCloseBlur = read("PointNoiseCloseBlur", defaults.PointNoiseCloseBlur);
 		settings.PointNoiseDarkSide = read("PointNoiseDarkSide", defaults.PointNoiseDarkSide);
-		settings.PointNoiseFastHistory = read("PointNoiseFastHistory", defaults.PointNoiseFastHistory);  // (48l)
+		// (48m) Clean Shadow History replaces 48l's Fast Shadow History (its key read when the new one is missing).
+		settings.PointMovingCleanHistory = read("PointMovingCleanHistory", read("PointNoiseFastHistory", defaults.PointMovingCleanHistory));
 		// (48k) RT reflections hidden: the saved mode is only kept for writing back; the renderer always runs Off.
 		reflectionsModeSaved = std::clamp(read("ReflectionsMode", defaults.ReflectionsMode), 0, 2);
 		settings.ReflectionsMode = 0;
@@ -1821,7 +1823,7 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["PointNoiseStable"] = settings.PointNoiseStable;
 	o_json["PointNoiseCloseBlur"] = settings.PointNoiseCloseBlur;
 	o_json["PointNoiseDarkSide"] = settings.PointNoiseDarkSide;
-	o_json["PointNoiseFastHistory"] = settings.PointNoiseFastHistory;  // (48l)
+	o_json["PointMovingCleanHistory"] = settings.PointMovingCleanHistory;  // (48m)
 	o_json["ReflectionsMode"] = reflectionsModeSaved;  // (48k) as loaded (the runtime value is always 0)
 	o_json["ReflectionsTerrain"] = settings.ReflectionsTerrain;
 	o_json["ReflectionsRoughStart"] = settings.ReflectionsRoughStart;  // (48d)
@@ -2010,6 +2012,8 @@ void RayTracing::ClearShaderCache()
 	pointDenoiseWideBeamCS = nullptr;
 	for (auto& fixShader : pointDenoiseFixCS)  // (48k)
 		fixShader = nullptr;
+	for (auto& cleanShader : pointDenoiseCleanCS)  // (48m)
+		cleanShader = nullptr;
 	aoNormalReflectCS = nullptr;
 	reflectDebugCS = nullptr;
 	aoNormalReflectAsync.Reset();  // (48e) compiled again in the background on the next request
@@ -2056,13 +2060,15 @@ void RayTracing::PrecompileShaders()
 		if (wideK)
 			PointDenoiseShader(true, beam);
 		// (48k) Point Lights: Noise Fix: its twins of the same variants (the plain one always).
-		if (PointNoiseFixDenoiserWanted() && !pointNoiseFixFailed) {
-			const bool fast = settings.PointNoiseFastHistory;  // (48l) the PL_FIX_FAST ones while Fast Shadow History is on
-			PointDenoiseShader(false, false, true, fast);
+		// (48m) + Moving Characters: Clean Shadow History: the PL_CLEAN twins of what runs.
+		const bool fix = PointNoiseFixDenoiserWanted() && !pointNoiseFixFailed;
+		const bool clean = settings.PointMovingCleanHistory && !pointCleanFailed;
+		if (fix || clean) {
+			PointDenoiseShader(false, false, fix, clean);
 			if (beam)
-				PointDenoiseShader(false, true, true, fast);
+				PointDenoiseShader(false, true, fix, clean);
 			if (wideK)
-				PointDenoiseShader(true, beam, true, fast);
+				PointDenoiseShader(true, beam, fix, clean);
 		}
 	}
 	if (settings.AO) {
@@ -2096,22 +2102,36 @@ void RayTracing::PrecompileShaders()
 
 bool RayTracing::PointNoiseFixDenoiserWanted() const
 {
-	return settings.PointNoiseFix && (settings.PointNoiseDecorrelate || settings.PointNoiseStable || settings.PointNoiseCloseBlur || settings.PointNoiseFastHistory);
+	return settings.PointNoiseFix && (settings.PointNoiseDecorrelate || settings.PointNoiseStable || settings.PointNoiseCloseBlur);
 }
 
-ID3D11ComputeShader* RayTracing::PointDenoiseShader(bool a_wide, bool a_beam, bool a_fix, bool a_fast)
+bool RayTracing::PointDenoiserDebugView() const
+{
+	return (debugView >= DebugView::PLCandidates && debugView <= DebugView::PLDenoised) || debugView == DebugView::PLMoving ||
+	       debugView == DebugView::PLFilterPath;  // (48m) + its two views
+}
+
+ID3D11ComputeShader* RayTracing::PointDenoiseShader(bool a_wide, bool a_beam, bool a_fix, bool a_clean)
 {
 	// (48a) The plain variant is the 47z shader; the others compile their extra code in only when it can run this frame.
 	const wchar_t* kPath = L"Data\\Shaders\\RayTracing\\PointDenoiseCS.hlsl";
+	if (a_clean) {
+		// (48m) Moving Characters: Clean Shadow History: PL_CLEAN with any of the others (without it its code is not compiled).
+		static constexpr const char* kCleanDefines[8] = { "PL_CLEAN", "PL_WIDE,PL_CLEAN", "PL_BEAM,PL_CLEAN", "PL_WIDE,PL_BEAM,PL_CLEAN", "PL_FIX,PL_CLEAN",
+			"PL_WIDE,PL_FIX,PL_CLEAN", "PL_BEAM,PL_FIX,PL_CLEAN", "PL_WIDE,PL_BEAM,PL_FIX,PL_CLEAN" };
+		static constexpr const char* kCleanNames[8] = { "PointDenoiseCS (clean history)", "PointDenoiseCS (slots 4-5, clean history)",
+			"PointDenoiseCS (beam edges, clean history)", "PointDenoiseCS (slots 4-5, beam edges, clean history)", "PointDenoiseCS (noise fix, clean history)",
+			"PointDenoiseCS (slots 4-5, noise fix, clean history)", "PointDenoiseCS (beam edges, noise fix, clean history)",
+			"PointDenoiseCS (slots 4-5, beam edges, noise fix, clean history)" };
+		const int index = (a_wide ? 1 : 0) | (a_beam ? 2 : 0) | (a_fix ? 4 : 0);
+		return GetShaderDefined(pointDenoiseCleanCS[index], kPath, kCleanNames[index], kCleanDefines[index]);
+	}
 	if (a_fix) {
 		// (48k) Point Lights: Noise Fix: the same variants with PL_FIX (without it the fix's code folds away: the 48j shaders).
-		// (48l) + PL_FIX_FAST: Moving Characters: Fast Shadow History (without it: the 48k PL_FIX shaders).
-		static constexpr const char* kFixDefines[8] = { "PL_FIX", "PL_WIDE,PL_FIX", "PL_BEAM,PL_FIX", "PL_WIDE,PL_BEAM,PL_FIX", "PL_FIX,PL_FIX_FAST",
-			"PL_WIDE,PL_FIX,PL_FIX_FAST", "PL_BEAM,PL_FIX,PL_FIX_FAST", "PL_WIDE,PL_BEAM,PL_FIX,PL_FIX_FAST" };
-		static constexpr const char* kFixNames[8] = { "PointDenoiseCS (noise fix)", "PointDenoiseCS (slots 4-5, noise fix)", "PointDenoiseCS (beam edges, noise fix)",
-			"PointDenoiseCS (slots 4-5, beam edges, noise fix)", "PointDenoiseCS (noise fix, fast history)", "PointDenoiseCS (slots 4-5, noise fix, fast history)",
-			"PointDenoiseCS (beam edges, noise fix, fast history)", "PointDenoiseCS (slots 4-5, beam edges, noise fix, fast history)" };
-		const int index = (a_wide ? 1 : 0) | (a_beam ? 2 : 0) | (a_fast ? 4 : 0);
+		static constexpr const char* kFixDefines[4] = { "PL_FIX", "PL_WIDE,PL_FIX", "PL_BEAM,PL_FIX", "PL_WIDE,PL_BEAM,PL_FIX" };
+		static constexpr const char* kFixNames[4] = { "PointDenoiseCS (noise fix)", "PointDenoiseCS (slots 4-5, noise fix)", "PointDenoiseCS (beam edges, noise fix)",
+			"PointDenoiseCS (slots 4-5, beam edges, noise fix)" };
+		const int index = (a_wide ? 1 : 0) | (a_beam ? 2 : 0);
 		return GetShaderDefined(pointDenoiseFixCS[index], kPath, kFixNames[index], kFixDefines[index]);
 	}
 	if (a_wide && a_beam)
@@ -4099,7 +4119,7 @@ void RayTracing::RunNoSunFrame(ID3D11ShaderResourceView* a_depth, ID3D11ShaderRe
 	} else {
 		std::memcpy(cb.PrevViewProj, &fb.GetCameraViewProj(0), sizeof(cb.PrevViewProj));
 	}
-	const bool debug = debugView >= DebugView::PLCandidates && debugView <= DebugView::PLDenoised;
+	const bool debug = PointDenoiserDebugView();  // (48m) the point views, + Moving Pixels / Filter Path
 	cb.Size[0] = a_width;
 	cb.Size[1] = a_height;
 	cb.Size[2] = static_cast<std::uint32_t>(debugView);
@@ -5380,13 +5400,26 @@ void RayTracing::FinishPointLights()
 	// (48k) Point Lights: Noise Fix: the PL_FIX twin of the variant below while a denoiser part is on; it failing to compile = the 48j variants
 	// from then on this session (the trace parts stay as set).
 	const bool noiseFixWanted = PointNoiseFixDenoiserWanted();
-	// (48l) Moving Characters: Fast Shadow History: the PL_FIX_FAST twin, with last frame's motion vectors bound (whatever Keep Shadow History says).
+	// (48m) Moving Characters: Clean Shadow History (independent of the noise fix): the PL_CLEAN twin, with last frame's motion vectors bound
+	// (whatever Keep Shadow History says). Also while one of its two debug views is shown (then only the moving test runs, unused, if the
+	// toggle is off). It failing to compile = without it from then on this session.
 	ID3D11ShaderResourceView* const motionTargetSRV = globals::game::renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGET::kMOTION_VECTOR].SRV;
-	const bool noiseFast = noiseFixWanted && settings.PointNoiseFastHistory && motionTargetSRV;
+	const bool cleanViews = debugView == DebugView::PLMoving || debugView == DebugView::PLFilterPath;
+	bool clean = (settings.PointMovingCleanHistory || cleanViews) && motionTargetSRV && !pointCleanFailed;
 	bool noiseFix = false;
 	ID3D11ComputeShader* shader = nullptr;
-	if (noiseFixWanted && !pointNoiseFixFailed) {
-		shader = PointDenoiseShader(wide, beamSmooth, true, noiseFast);
+	if (clean) {
+		shader = PointDenoiseShader(wide, beamSmooth, noiseFixWanted && !pointNoiseFixFailed, true);
+		if (shader) {
+			noiseFix = noiseFixWanted && !pointNoiseFixFailed;
+		} else {
+			clean = false;
+			pointCleanFailed = true;
+			logger::warn("[RayTracing] PointDenoiseCS (clean history) did not compile: Moving Characters: Clean Shadow History is off this session");
+		}
+	}
+	if (!shader && noiseFixWanted && !pointNoiseFixFailed) {
+		shader = PointDenoiseShader(wide, beamSmooth, true);
 		if (shader) {
 			noiseFix = true;
 		} else {
@@ -5427,12 +5460,11 @@ void RayTracing::FinishPointLights()
 	auto* context = globals::d3d::context;
 	auto* timers = Util::GpuPassTimers::GetSingleton();
 	const std::uint32_t write = pointWrite, read = pointWrite ^ 1u;
-	const bool plDebug = debugView >= DebugView::PLCandidates && debugView <= DebugView::PLDenoised && debugColorUAV;
+	const bool plDebug = PointDenoiserDebugView() && debugColorUAV;  // (48m) + Moving Pixels / Filter Path
 	// (47y) Moving Characters: Keep Shadow History: last frame's motion vectors (the G-buffer of this frame is not drawn yet; StartDeferred
 	// clears the target later), as RTAO's normal prep reads them. The shader validates its guess against the stored history distance.
-	// (48l) Also bound for Fast Shadow History (the PL_FIX_FAST variant ran this frame); its kPointDenoiseMotion stays Keep Shadow History's.
-	const bool fastThisFrame = noiseFix && noiseFast;
-	ID3D11ShaderResourceView* motionSRV = (settings.MovingKeepHistory || fastThisFrame) ? motionTargetSRV : nullptr;
+	// (48m) Also bound for Clean Shadow History (the PL_CLEAN variant runs this frame); kPointDenoiseMotion stays Keep Shadow History's.
+	ID3D11ShaderResourceView* motionSRV = (settings.MovingKeepHistory || clean) ? motionTargetSRV : nullptr;
 	PointDenoiseCB cb{};
 	cb.Params[0] = settings.PointLightsSize;
 	cb.Params[1] = kPointHistoryWeight;
@@ -5443,7 +5475,10 @@ void RayTracing::FinishPointLights()
 	// (48k) The noise fix's denoiser parts (only read by the PL_FIX variant; 0 with the master off).
 	if (noiseFix)
 		flags |= (settings.PointNoiseDecorrelate ? kPointDenoiseNoiseDecorrelate : 0u) | (settings.PointNoiseStable ? kPointDenoiseNoiseStable : 0u) |
-		         (settings.PointNoiseCloseBlur ? kPointDenoiseNoiseCloseBlur : 0u) | (fastThisFrame ? kPointDenoiseNoiseFast : 0u);  // (48l)
+		         (settings.PointNoiseCloseBlur ? kPointDenoiseNoiseCloseBlur : 0u);
+	// (48m) Moving Characters: Clean Shadow History (only read by the PL_CLEAN variant).
+	if (clean)
+		flags |= kPointDenoiseCleanDetect | (settings.PointMovingCleanHistory ? kPointDenoiseClean : 0u);
 	// (48a) Lights per pixel 5 - 6: their history only when last frame denoised them too and the main history is valid.
 	const bool wideHistory = wide && pointWideHistoryValid && (flags & kPointDenoiseHistory);
 	flags |= (wide ? kPointDenoiseWide : 0u) | (wideHistory ? kPointDenoiseWideHistory : 0u);
@@ -7104,7 +7139,7 @@ void RayTracing::RunInteriorFrame()
 	} else {
 		std::memcpy(cb.PrevViewProj, &fb.GetCameraViewProj(0), sizeof(cb.PrevViewProj));
 	}
-	const bool debug = debugView >= DebugView::PLCandidates && debugView <= DebugView::PLDenoised;
+	const bool debug = PointDenoiserDebugView();  // (48m) the point views, + Moving Pixels / Filter Path
 	cb.Size[0] = width;
 	cb.Size[1] = height;
 	cb.Size[2] = static_cast<std::uint32_t>(debugView);
@@ -8462,6 +8497,18 @@ void RayTracing::DrawPointLightPage()
 				ImGui::Text("  The ray against characters starts 2 units out instead of 6 (still 6 where the light only grazes the surface).");
 				ImGui::Text("  Risk: small dark speckles of a character shadowing itself. Off: as 47w. The sun is not affected.");
 			}
+			// (48m) Moving Characters: Clean Shadow History: independent of the noise fix (any of its states), default on; off = 48k / 48j.
+			ImGui::Checkbox("Moving Characters: Clean Shadow History", &settings.PointMovingCleanHistory);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): on a character that moves (found with the game's motion vectors) the lamp and window-light shadows");
+				ImGui::Text("  only reuse that same spot of the body from the last frame (or nothing), follow a change at once, and are not blurred");
+				ImGui::Text("  together with the floor, the background or another limb: no grey patches lingering on a body walking into or out");
+				ImGui::Text("  of a window beam. A shadow moving over a still floor no longer trails. Works with Point Lights: Noise Fix on or off and");
+				ImGui::Text("  whether or not \"Moving Characters: Keep Shadow History\" is on. About 0 ms. Off: as 48k.");
+				ImGui::Text("Check with Debug View \"Point Lights: Moving Pixels\" (Diagnostics on the Ray Tracing entry).");
+				if (pointCleanFailed)
+					ImGui::Text("Its shader variant did not compile this session: off.");
+			}
 			// (48k) Point Lights: Noise Fix: one master switch and four parts, each on by default; master off = 48j exactly.
 			ImGui::Checkbox("Point Lights: Noise Fix", &settings.PointNoiseFix);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
@@ -8506,16 +8553,7 @@ void RayTracing::DrawPointLightPage()
 				ImGui::Text("  dark side. Uses the smoothed surface direction, so bumpy (normal-mapped) surfaces facing the lamp are not darkened;");
 				ImGui::Text("  grass, leaves and other surfaces the rays do not see keep their rays. No extra cost. Off: as 48j.");
 			}
-			// (48l)
-			ImGui::BeginDisabled(!settings.PointNoiseFix);
-			ImGui::Checkbox("Moving Characters: Fast Shadow History", &settings.PointNoiseFastHistory);
-			ImGui::EndDisabled();
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On (default): on a character that moves (found with the game's motion vectors) the lamp and window-beam shadows");
-				ImGui::Text("  follow the body instead of keeping old frames from another spot: no large dark blotches on a body walking into or");
-				ImGui::Text("  out of a window beam. A shadow moving over a still floor (someone walking through the beam) no longer trails.");
-				ImGui::Text("  Works whether or not \"Moving Characters: Keep Shadow History\" is on. About 0 ms. Off: as 48k.");
-			}
+
 			ImGui::Unindent();
 			// (47z) Light choice: two switches, each on by default, off = 47y.
 			ImGui::Checkbox("Window Beams: Respect Their Range", &settings.PointBeamRange);
@@ -8991,7 +9029,7 @@ void RayTracing::DrawDiagnostics()
 	if (ImGui::TreeNodeEx("Diagnostics")) {
 		const char* views[] = { "Off", "Shadow Source", "RT vs Shadow Map", "BLAS Coverage", "Raw RT Visibility", "RT Hit vs Depth", "Penumbra Radius",
 			"History Length", "Adaptive Rays", "SSS: RT Casters", "Distance Quality", "Character Rays", "Point Lights: Candidates", "Point Lights: Traced Lights",
-			"Point Lights: Raw Rays", "Point Lights: Denoised", "Point Lights: SSPLS Coverage" };
+			"Point Lights: Raw Rays", "Point Lights: Denoised", "Point Lights: SSPLS Coverage", "Point Lights: Moving Pixels", "Point Lights: Filter Path" };  // (48m) + 2
 		static_assert(IM_ARRAYSIZE(views) == static_cast<int>(DebugView::Count));
 		int view = static_cast<int>(debugView);
 		if (ImGui::Combo("Debug View", &view, views, IM_ARRAYSIZE(views)))
@@ -9027,6 +9065,11 @@ void RayTracing::DrawDiagnostics()
 			ImGui::Text("  orange = screen-space and / or the game's shadow map only (the light is not traced here: not a source, more lights than");
 			ImGui::Text("  traced per pixel, outside the traced area), red = no shadow at all (also a light whose game shadow map Skip the Game's");
 			ImGui::Text("  Shadow Maps left out, where the pixel did not trace it: it shines unshadowed there). Dark grey = no point light.");
+			// (48m)
+			ImGui::Text("Point Lights: Moving Pixels: where the lamp-shadow clean-up sees a moving surface (game motion vectors): red = it took that");
+			ImGui::Text("  surface's own last frame, yellow = none usable (this frame only), magenta = moving but Clean Shadow History is off.");
+			ImGui::Text("Point Lights: Filter Path: the strongest traced light per pixel. Even rows: red = window beam path, green = Stable Penumbra,");
+			ImGui::Text("  blue = standard path, brighter = wider blur (full at 12 px). Odd rows: how much of this frame goes in (dark = 10 %, white = all).");
 			// (47h)
 			ImGui::Text("Note: see-through surfaces drawn after the solid pass (glass, blended arches and banners, water, particles) are drawn");
 			ImGui::Text("  over these views: the colours there describe what lies behind them, not the see-through surface itself.");
@@ -9289,11 +9332,13 @@ std::string RayTracing::DescribeForProfile() const
 	text += std::format(", window beams: smooth edges {}, lights per pixel this frame {}{}", settings.PointBeamSmooth ? "on" : "off",
 		pointThisFrame ? pointK : 0u, pointWideThisFrame ? " (slots 4-5 in use)" : "");
 	// (48k) Point Lights: Noise Fix (the parts are listed as set; they only act with the master on).
-	text += std::format(", point lights noise fix {} (decorrelated sampling {}, stable penumbra {}, close blockers minimum blur {}, consistent dark side {}, "
-						"moving characters fast shadow history {}){}",
+	text += std::format(", point lights noise fix {} (decorrelated sampling {}, stable penumbra {}, close blockers minimum blur {}, consistent dark side {}){}",
 		settings.PointNoiseFix ? "on" : "off", settings.PointNoiseDecorrelate ? "on" : "off", settings.PointNoiseStable ? "on" : "off",
-		settings.PointNoiseCloseBlur ? "on" : "off", settings.PointNoiseDarkSide ? "on" : "off", settings.PointNoiseFastHistory ? "on" : "off",  // (48l)
+		settings.PointNoiseCloseBlur ? "on" : "off", settings.PointNoiseDarkSide ? "on" : "off",
 		pointNoiseFixFailed ? " (its denoiser variant did not compile: denoiser parts off)" : "");
+	// (48m) Moving Characters: Clean Shadow History.
+	text += std::format(", moving characters clean shadow history {}{}", settings.PointMovingCleanHistory ? "on" : "off",
+		pointCleanFailed ? " (its denoiser variant did not compile: off)" : "");
 	// (48k) RT reflections are hidden and always Off (48a - 48j listed their settings here).
 	text += ", RT reflections off (hidden)";
 	// (46f)
@@ -9399,7 +9444,8 @@ nlohmann::json RayTracing::DescribeJson() const
 	j["point_beam_smooth"] = settings.PointBeamSmooth;  // (48a)
 	j["point_noise_fix"] = { { "on", settings.PointNoiseFix }, { "decorrelated_sampling", settings.PointNoiseDecorrelate },  // (48k)
 		{ "stable_penumbra", settings.PointNoiseStable }, { "close_blockers_min_blur", settings.PointNoiseCloseBlur },
-		{ "consistent_dark_side", settings.PointNoiseDarkSide }, { "fast_shadow_history", settings.PointNoiseFastHistory },  // (48l)
+		{ "consistent_dark_side", settings.PointNoiseDarkSide }, { "clean_shadow_history", settings.PointMovingCleanHistory },  // (48m)
+		{ "clean_variant_failed", pointCleanFailed },
 		{ "denoiser_variant_failed", pointNoiseFixFailed } };
 	j["point_k_this_frame"] = pointThisFrame ? pointK : 0u;
 	j["point_wide_slots"] = { { "in_use", pointWideThisFrame }, { "allocated", backend.PointWideReady() },

@@ -83,6 +83,8 @@ public:
 		PLRaw,           // this frame's rays (all traced lights multiplied)
 		PLDenoised,      // after the denoiser
 		PLSsplsCoverage, // (46y) drawn by Lighting.hlsl: per pixel, which shadows its point lights get (RT, SSPLS, both)
+		PLMoving,        // (48m) PointDenoiseCS PL_CLEAN: moving receivers (motion-vector history taken / none / detection only)
+		PLFilterPath,    // (48m) PointDenoiseCS PL_CLEAN: slot 0's denoise path, wide-pass radius and history weight
 		Count
 	};
 
@@ -369,12 +371,14 @@ public:
 		bool PointNoiseStable = true;
 		bool PointNoiseCloseBlur = true;
 		bool PointNoiseDarkSide = true;
-		// (48l) PointNoiseFastHistory "Moving Characters: Fast Shadow History" (5th part, PointDenoiseCS PL_FIX_FAST): a moving receiver (last
-		// frame's motion vectors disagree with the camera reprojection) takes the motion-vector history first with a tighter distance test, and
-		// on the band paths (Stable Penumbra, Window Beams: Smooth Edges) no partial-history wide pass, the 3x3 +- 0.1 clamp, this frame at
-		// least 0.35; a static receiver under a moving caster keeps 0.1 only while the history is near the filtered mean, and a history far
-		// from the 3x3 mean takes the 3x3 clamp. The motion vectors are bound for it whatever MovingKeepHistory says. Off: exactly 48k.
-		bool PointNoiseFastHistory = true;
+		// (48m) PointMovingCleanHistory "Moving Characters: Clean Shadow History" (Point Lights > Advanced, right above the Noise Fix master,
+		// independent of it; replaces 48l's Fast Shadow History, JSON "PointNoiseFastHistory" read as a fallback). PointDenoiseCS PL_CLEAN on
+		// every path (46b, window beams, Stable Penumbra): a moving receiver (last frame's motion vectors disagree with the camera
+		// reprojection) takes only the motion-vector history (strict distance test; none otherwise), clamps it to the 3x3 exactly where that
+		// agrees, weighs this frame at least 0.5, filters at most 3 px with a strict plane test, no partial-history wide pass; a static
+		// receiver under a moving caster drops a history far from this frame's 3x3 mean. The motion vectors are bound for it whatever
+		// MovingKeepHistory says. Off: 48k exactly (48j with the Noise Fix master off too).
+		bool PointMovingCleanHistory = true;
 		// (48a) Outside the settings macro. RT reflections step 1 ((48i) Ray Tracing > Reflections page): ReflectionsMode 0 Off (47z
 		// exactly: no terrain, no textures, no dispatch), 1 Trace Only (reflection rays in the RTAO batch, no shading, debug views and F7
 		// only; needs RTAO). ReflectionsTerrain "Terrain in RT Scene (reflections only)": with the rays on, the landscape of the captured
@@ -1019,11 +1023,15 @@ private:
 	// (48a) Variants: Window Beams: Smooth Edges (PL_BEAM; only on frames with soft beam slots), slots 4 - 5 (PL_WIDE; K > 4), both.
 	winrt::com_ptr<ID3D11ComputeShader> pointDenoiseBeamCS, pointDenoiseWideCS, pointDenoiseWideBeamCS;
 	// (48k) Point Lights: Noise Fix (PL_FIX): the same four variants with the fix compiled in, index (wide ? 1 : 0) | (beam ? 2 : 0);
-	// (48l) + 4 with PL_FIX_FAST (Moving Characters: Fast Shadow History).
-	winrt::com_ptr<ID3D11ComputeShader> pointDenoiseFixCS[8];
-	ID3D11ComputeShader* PointDenoiseShader(bool a_wide, bool a_beam, bool a_fix = false, bool a_fast = false);
+	winrt::com_ptr<ID3D11ComputeShader> pointDenoiseFixCS[4];
+	// (48m) Moving Characters: Clean Shadow History (PL_CLEAN): the eight above with it compiled in, index wide 1 | beam 2 | fix 4.
+	winrt::com_ptr<ID3D11ComputeShader> pointDenoiseCleanCS[8];
+	ID3D11ComputeShader* PointDenoiseShader(bool a_wide, bool a_beam, bool a_fix = false, bool a_clean = false);
 	/// (48l) The noise fix's denoiser variant is wanted (master on and a denoiser part on).
 	bool PointNoiseFixDenoiserWanted() const;
+	/// (48m) The point denoiser's debug views (PointDenoiseCS writes them).
+	bool PointDenoiserDebugView() const;
+	bool pointCleanFailed = false;  // (48m) a PL_CLEAN variant did not compile this session: Clean Shadow History off
 	/// Turns the point lights off (not the rest of Ray Tracing) with a reason for the page.
 	void SwitchOffPointLights(std::string a_reason);
 	void UpdatePointLights();
