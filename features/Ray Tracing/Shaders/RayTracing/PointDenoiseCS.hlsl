@@ -133,6 +133,31 @@ static const uint kPLFlagFixCloseBlur = 1024u;
 static const float kFixMinRadiusPx = 2.0;
 static const float kFixCloseRadiusPx = 3.0;
 static const float kFixCloseQ = 0.35;
+// (48l) PL_FIX_FAST (only with PL_FIX) = "Moving Characters: Fast Shadow History" on (kPLFlagFixFast: the motion vectors are bound at t6, whatever
+// Moving Characters: Keep Shadow History says). Without the define its code is not compiled: the 48k PL_FIX shaders, byte for byte.
+//   Moving receiver: last frame's motion vectors reprojection (started at this pixel, two fixed-point steps) lands more than
+//     max(kFastResidualPx, kFastResidualShare x the camera's own motion) away from the camera-only reprojection. 1.5 px, not less: the camera
+//     reprojection is jittered, the motion vectors are not, their difference alone reaches ~1.4 px on static surfaces. The relative term keeps
+//     camera acceleration (the motion vectors are a frame old) from flagging static surfaces while the camera turns.
+//     There: the history distance test is kFastTolScale x distance + kFastTolBase (48k: 0.02 x + 8, which let a walking body take the camera
+//     reprojection's history from another point of itself); the motion-vector candidate is taken whenever it has kMotionTryBelow valid weight
+//     or more than the camera's; the band paths (Window Beams: Smooth Edges, Stable Penumbra) neither widen on partial history nor keep 0.1:
+//     the 3x3 min / max +- 0.1 clamp and this frame weighs at least kFastWeight (the 46b path keeps its own clamp, at least kFastWeight too).
+//   Static receiver, moving caster (a character walking through a beam, its shadow on the floor): on the band paths the history weight rises
+//     from 0.1 toward Params.y as the history leaves the inner half of the band, and a history more than kFastStrongChange from this frame's
+//     3x3 mean takes the 3x3 clamp and kFastWeight (no trailing ghost of the shadow's old position).
+// Its code is inside #if defined(PL_FIX_FAST) blocks: the preprocessed source of the other variants is the 48k one.
+#if defined(PL_FIX_FAST) && !defined(PL_FIX)
+#error PL_FIX_FAST needs PL_FIX
+#endif
+static const uint kPLFlagFixFast = 2048u;
+static const float kFastResidualPx = 1.5;
+static const float kFastResidualShare = 0.25;
+static const float kFastTolScale = 0.01;
+static const float kFastTolBase = 4.0;
+static const float kFastMotionTol = 4.0;  // the receiver's own motion along the view ray (the motion-vector candidate)
+static const float kFastWeight = 0.35;
+static const float kFastStrongChange = 0.5;
 
 // (48k) Decorrelated Sampling: a uniform [0, 1) value per (pixel, frame) from the PCG hash (independent of the trace's patterns).
 uint FixPcg(uint a_v)
@@ -313,6 +338,9 @@ struct PixelFrame
 	float footprint;
 	float planeTolerance;
 	uint flags;
+#if defined(PL_FIX_FAST)
+	bool moving;  // (48l) a moving receiver
+#endif
 };
 
 // Steps 1, 2 and 3b for four slots (ids, raw: this frame's; hv / hw: their history taps). (48a) Called for slots 0 - 3 and, with K > 4,
@@ -338,6 +366,11 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw)
 	bool4 fixSlot = false;
 	[unroll] for (uint fb = 0u; fb < 4u; ++fb)
 		fixSlot[fb] = fixStable && ids[fb] != 0u && !SoftBeam(ids[fb]);
+	// (48l) Moving Characters: Fast Shadow History: on, and this pixel's receiver moving.
+#if defined(PL_FIX_FAST)
+	const bool fastOn = (flags & kPLFlagFixFast) != 0u;
+	const bool fastMoving = fastOn && a_px.moving;
+#endif
 
 	// 1. 3x3: matching samples, their range and the blocked ones' distance ratio. (48a) + the sum of squared weights (beam slots' clamp).
 	float4 sum = 0.0, weights = 0.0, lo = 2.0, hi = -1.0, qSum = 0.0, qCount = 0.0, weights2 = 0.0;
@@ -391,7 +424,11 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw)
 			// (48a) Window Beams: Smooth Edges.
 			const bool disagree = hi[s] > lo[s];
 			const float hMean = hw[s] >= 0.05 ? hv[s] / hw[s] : -1.0;
+#if defined(PL_FIX_FAST)
+			const bool partial = !fastMoving && hMean > kBeamHistLo && hMean < kBeamHistHi;  // (48l) not on a moving receiver
+#else
 			const bool partial = hMean > kBeamHistLo && hMean < kBeamHistHi;
+#endif
 			if (disagree || partial) {
 				if (qCount[s] > 0.0) {
 					const float qb = saturate(qSum[s] / qCount[s]);
@@ -412,7 +449,11 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw)
 			// 3x3 happened to agree is filtered too instead of its history snapping to 0 / 1).
 			const bool disagree = hi[s] > lo[s];
 			const float hMean = hw[s] >= 0.05 ? hv[s] / hw[s] : -1.0;
+#if defined(PL_FIX_FAST)
+			const bool partial = !fastMoving && hMean > kBeamHistLo && hMean < kBeamHistHi;  // (48l) not on a moving receiver
+#else
 			const bool partial = hMean > kBeamHistLo && hMean < kBeamHistHi;
+#endif
 			if (disagree || partial) {
 				if (qCount[s] > 0.0) {
 					const float q = qSum[s] / qCount[s];
@@ -454,6 +495,9 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw)
 		}
 		spatial[s] = weights[s] > 0.0 ? sum[s] / max(weights[s], 1e-6) : Lit(raw[s]);
 	}
+#if defined(PL_FIX_FAST)
+	const float4 spatial3 = spatial;  // (48l) this frame's 3x3 mean (Fast Shadow History's strong-change test)
+#endif
 	// The per-pixel rotation of the taps (per frame), and the fixed one (47y Smooth When No History).
 	// (48k) Decorrelated Sampling: both from the hash instead (not the trace's IGN).
 	const bool fixDecorrelate = kVariantFix && (flags & kPLFlagFixDecorrelate) != 0u;
@@ -623,12 +667,34 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw)
 				hi3 = m + band;
 				const float hRaw = hv[sh] / hw[sh];
 				const bool inBand = hRaw >= lo3 && hRaw <= hi3;
+#if defined(PL_FIX_FAST)
+				float weight = drop > 0.0 || !inBand ? PLParams.y : kBeamStaticWeight;
+				[branch] if (fastOn)
+				{
+					// (48l) Moving Characters: Fast Shadow History. A moving receiver, or a history far from this frame's 3x3 mean (a moving
+					// caster): the 3x3 clamp and at least kFastWeight. Otherwise the 0.1 only while the history lies in the band's inner half.
+					if (fastMoving || abs(hRaw - spatial3[sh]) > kFastStrongChange) {
+						lo3 = (lo[sh] <= 1.0 ? lo[sh] : spatial[sh]) - 0.1;
+						hi3 = (hi[sh] >= 0.0 ? hi[sh] : spatial[sh]) + 0.1;
+						weight = max(PLParams.y, kFastWeight);
+					} else if (drop <= 0.0 && inBand) {
+						weight = lerp(kBeamStaticWeight, PLParams.y, saturate(abs(hRaw - m) / band * 2.0 - 1.0));
+					}
+				}
+				current = lerp(weight, 1.0, drop);
+#else
 				current = lerp(drop > 0.0 || !inBand ? PLParams.y : kBeamStaticWeight, 1.0, drop);
+#endif
 			} else {
 				lo3 = (lo[sh] <= 1.0 ? lo[sh] : spatial[sh]) - 0.1;
 				hi3 = (hi[sh] >= 0.0 ? hi[sh] : spatial[sh]) + 0.1;
 				// (46d) A moving source (a carried torch) keeps less history: its shadows move with it, nothing smears.
+				// (48l) Fast Shadow History: a moving receiver weighs this frame at least kFastWeight here too.
+#if defined(PL_FIX_FAST)
+				current = lerp(fastMoving ? max(PLParams.y, kFastWeight) : PLParams.y, 1.0, drop);
+#else
 				current = lerp(PLParams.y, 1.0, drop);
+#endif
 			}
 			result[sh] = lerp(clamp(hv[sh] / hw[sh], lo3, hi3), spatial[sh], current);
 		}
@@ -664,6 +730,9 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw)
 		px.P = RTPosition(p, depth);
 		dist = length(px.P);
 		px.maxP = int2(Size.xy) - 1;
+#if defined(PL_FIX_FAST)
+		px.moving = false;  // (48l) set with the history below
+#endif
 		const float3 P = px.P;
 		const int2 maxP = px.maxP;
 
@@ -695,7 +764,29 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw)
 			const float4 prevClip = mul(PrevViewProj, float4(P + CameraDelta.xyz, 1.0));
 			const float2 prevUv = prevClip.w > 1e-4 ? float2(prevClip.x / prevClip.w * 0.5 + 0.5, 0.5 - prevClip.y / prevClip.w * 0.5) : float2(-1.0, -1.0);
 			const float expected = length(P + CameraDelta.xyz);
+#if defined(PL_FIX_FAST)
+			// (48l) Moving Characters: Fast Shadow History: is the receiver moving (motion vectors vs the camera reprojection)?
+			bool moving = false;
+			float2 movingPrevUv = 0.0;
+			[branch] if ((flags & kPLFlagFixFast) && all(prevUv >= 0.0) && all(prevUv < 1.0))
+			{
+				const float2 uv = (float2(p) + 0.5) / float2(Size.xy);
+				float2 m = uv;  // from this pixel (the camera guess may lie off a moving body: its background's vector would hide the motion)
+				[unroll] for (int i = 0; i < 2; ++i)
+				{
+					const int2 q = int2(clamp(m, 0.0, 0.999999) * float2(Size.xy));
+					m = uv + PrevMotion[q];
+				}
+				const float residualPx = length((m - prevUv) * float2(Size.xy));
+				const float cameraPx = length((prevUv - uv) * float2(Size.xy));
+				moving = residualPx > max(kFastResidualPx, kFastResidualShare * cameraPx);
+				movingPrevUv = m;
+			}
+			px.moving = moving;
+			const float tolerance = moving ? expected * kFastTolScale + kFastTolBase : expected * 0.02 + 8.0;
+#else
 			const float tolerance = expected * 0.02 + 8.0;
+#endif
 			histExpected = expected;
 			float tapWeight = 0.0;
 			[branch] if (all(prevUv >= 0.0) && all(prevUv < 1.0))
@@ -705,6 +796,23 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw)
 				histTaken = true;
 				tapWeight = HistoryTaps(histPos, expected, tolerance, ids, wideHistory, maxP, hv, hw);
 			}
+#if defined(PL_FIX_FAST)
+			// (48l) A moving receiver: the motion-vector candidate wins with kMotionTryBelow valid weight, or more than the camera's.
+			[branch] if (moving && all(movingPrevUv >= 0.0) && all(movingPrevUv < 1.0))
+			{
+				float4 mv, mw;
+				const float2 motionPos = movingPrevUv * float2(Size.xy) - 0.5;
+				const float motionWeight = HistoryTaps(motionPos, expected, tolerance + kFastMotionTol, ids, wideHistory, maxP, mv, mw);
+				if (motionWeight >= kMotionTryBelow || motionWeight > tapWeight) {
+					hv = mv;
+					hw = mw;
+					histPos = motionPos;
+					histTolerance = tolerance + kFastMotionTol;
+					histTaken = true;
+					tapWeight = motionWeight;
+				}
+			}
+#endif
 			// (47y) Moving Characters: Keep Shadow History: the camera found (almost) no valid taps -> last frame's motion vectors at
 			// constant velocity (two fixed-point steps from the camera guess); the candidate with more valid taps wins.
 			[branch] if ((flags & kPLFlagMotion) && tapWeight < kMotionTryBelow)
