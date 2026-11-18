@@ -23,11 +23,17 @@
  * Differences from upstream:
  *  - No hooks of its own. TESObjectLAND::SetupMaterial (Hooks.cpp), BSLightingShaderProperty::GetRenderPasses and
  *    BSLightingShader::SetupGeometry (TruePBR.cpp) already have one detour each in this fork; they call in here.
- *  - All weight work (border healing, the 17x17x8 weight maps, the quad data buffer, loading the borrowed textures)
- *    runs on one worker thread of its own, fed by the land setup hook. The setup hook only copies the quad's weights
- *    and slots (a few KB). Until the worker has built a quad's resources the quad draws as normal terrain.
+ *  - The land setup hook only copies: the quad's weights and slots (a few KB) and, per slot, the texture pointers and
+ *    PBR values the engine / True PBR just put into the quad's material (no texture lookup or load of ours). The weight
+ *    work (border healing, the 17x17x8 weight maps, the quad data buffer, the D3D11 resources: the device is
+ *    free-threaded, as for the shader cache's compile threads) runs on one worker thread of its own. The worker calls no
+ *    engine function and never drops the last reference to an engine object: replaced resources and texture
+ *    references go to a release list emptied by Reset (render thread). Until the worker has built a quad's resources
+ *    the quad draws as normal terrain.
+ *  - Borrowed textures come only from loaded neighbours (an unloaded quad keeps its border weights, not its textures,
+ *    so no texture stays resident because of us).
  *  - Runtime switch "Blend Terrain Seams" (Advanced > PBR Settings). Off: the seams bit is never set, which draws
- *    exactly what 49b drew. The worker still prepares quads while off so that switching on is instant.
+ *    exactly what 49c drew. The worker still prepares quads while off so that switching on is instant.
  *  - Slots t104-t111 (upstream t104 before jiayev moved them to t117 for his physical sky, which this fork does not have).
  */
 struct LandscapeSeamsFix : EngineFix
@@ -96,9 +102,26 @@ struct LandscapeSeamsFix : EngineFix
 		std::array<std::array<RE::NiSourceTexturePtr, TexturesPerExtra>, MaxExtraLayers> extras;
 	};
 
+	/** One engine slot of a loaded quad, copied from its material by the setup hook (what a neighbour may borrow). */
+	struct SlotInfo
+	{
+		RE::NiSourceTexturePtr color;
+		RE::NiSourceTexturePtr normal;
+		RE::NiSourceTexturePtr rmaos;
+		float4 pbrParams{ 1.0f, 1.0f, 0.04f, 0.0f };  // roughness scale, displacement scale, specular level
+		float4 glintParams{};
+		float isSnow = 0.0f;         // True PBR rule (TruePBR::IsSnowLandTexture)
+		float isSnowVanilla = 0.0f;  // the vanilla material's rule (LTEX INAM)
+		float specPower = 0.0f;      // vanilla specular power (LTEX SNAM)
+		bool isPbr = false;          // the slot's texture set is a True PBR set
+		bool glint = false;
+		bool valid = false;  // textures present (loaded quad with a known material)
+	};
+
 	struct Quad
 	{
 		std::array<RE::TESLandTexture*, EngineLayers> slots{};
+		std::array<SlotInfo, EngineLayers> info{};
 		Border border{};
 		std::unique_ptr<WeightGrid> grid;
 		RE::BSGeometry* geometry = nullptr;
@@ -114,7 +137,7 @@ struct LandscapeSeamsFix : EngineFix
 		bool active = false;
 		bool pbr = false;
 		uint32_t extraCount = 0;
-		std::array<RE::TESLandTexture*, MaxExtraLayers> extras{};
+		std::array<SlotInfo, MaxExtraLayers> extras{};
 		std::array<std::array<uint8_t, GridVertices>, MaxLayers> weights{};
 	};
 
@@ -153,6 +176,11 @@ private:
 	std::unordered_map<RE::BSGeometry*, QuadKey> loadedQuads;
 	std::vector<RE::BSGeometry*> retiredGeometry;
 	uint32_t currentWorldSpace = 0;
+
+	// Engine references the worker lets go of; released by Reset on the render thread.
+	std::mutex releaseMutex;
+	std::vector<std::shared_ptr<Resources>> releaseResources;
+	std::vector<RE::NiSourceTexturePtr> releaseTextures;
 
 	// Worker: keys waiting for Rebuild, coalesced.
 	std::mutex queueMutex;

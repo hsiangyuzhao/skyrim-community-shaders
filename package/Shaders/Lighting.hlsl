@@ -456,9 +456,16 @@ SamplerState SampWorldMapOverlaySnowSampler : register(s13);
 
 #	endif
 
-#	if defined(LOD_LAND_BLEND)
+#	if defined(LOD_LAND_BLEND) && !defined(LANDSCAPE_SEAMS)
 SamplerState SampLandLodBlend1Sampler : register(s13);
 SamplerState SampLandLodBlend2Sampler : register(s15);
+#	elif defined(LANDSCAPE_SEAMS)  // (49d) Landscape Seams. Its code only goes into #elif branches added to existing chains, so the
+// other permutations preprocess to the 49c text (fxc emits a blank line per active directive: new #if blocks would shift them all).
+#		if defined(LOD_LAND_BLEND)
+SamplerState SampLandLodBlend1Sampler : register(s13);
+SamplerState SampLandLodBlend2Sampler : register(s15);
+#		endif
+#		include "Common/LandscapeSeams.hlsli"
 #	elif defined(LODLANDNOISE)
 SamplerState SampLandLodNoiseSampler : register(s15);
 #	endif
@@ -1125,14 +1132,6 @@ namespace Perf47p
 #		include "ExponentialHeightFog/ExponentialHeightFog.hlsli"
 #	endif
 
-// (49d) Landscape Seams (LandscapeSeamsFix.cpp): only the landscape pixel shaders carry it.
-#	if defined(LANDSCAPE_SEAMS) && !defined(LANDSCAPE)
-#		undef LANDSCAPE_SEAMS
-#	endif
-#	if defined(LANDSCAPE_SEAMS)
-#		include "Common/LandscapeSeams.hlsli"
-#	endif
-
 PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 {
 	PS_OUTPUT psout;
@@ -1172,17 +1171,9 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 #	endif  // defined (SKINNED) || !defined (MODELSPACENORMALS)
 
-#	if defined(LANDSCAPE_SEAMS)
-	// (49d) The quad's healed weights replace the vertex weights; two borrowed layers come with them (world XY, per eye in VR).
-	LandscapeSeams::Load(input.WorldPosition.xy + FrameBuffer::CameraPosAdjust[eyeIndex].xy, input.LandBlendWeights1, input.LandBlendWeights2);
-#	endif
-
 #	if !defined(TRUE_PBR)
 #		if defined(LANDSCAPE)
 	float shininess = dot(input.LandBlendWeights1, LandscapeTexture1to4IsSpecPower) + input.LandBlendWeights2.x * LandscapeTexture5to6IsSpecPower.x + input.LandBlendWeights2.y * LandscapeTexture5to6IsSpecPower.y;
-#			if defined(LANDSCAPE_SEAMS)
-	shininess += dot(LandscapeSeams::ExtraWeights, LandscapeSeams::Data.SpecPower);
-#			endif
 #		elif defined(SPECULAR)
 	float shininess = SpecularColor.w;
 #		else
@@ -1352,8 +1343,19 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	bool useSnowSpecular = false;
 #	endif  // SNOW
 
-#	if defined(SPARKLE) || !defined(PROJECTED_UV)
+#	if (defined(SPARKLE) || !defined(PROJECTED_UV)) && !defined(LANDSCAPE_SEAMS)
 	bool useSnowDecalSpecular = true;
+#	elif defined(LANDSCAPE_SEAMS)
+	bool useSnowDecalSpecular = true;  // landscape: no PROJECTED_UV
+	// (49d) The quad's healed weights replace the vertex weights (world XY, per eye in VR). The borrowed weights are normalised
+	// over all eight layers here; the six engine weights are normalised by the code below and scaled to their share after
+	// height blending (diffuseUv, below), which gives every layer weight / (sum of all eight).
+	LandscapeSeams::Load(input.WorldPosition.xy + FrameBuffer::CameraPosAdjust[eyeIndex].xy, input.LandBlendWeights1, input.LandBlendWeights2);
+#		if !defined(TRUE_PBR)
+	shininess = dot(input.LandBlendWeights1, LandscapeTexture1to4IsSpecPower) + input.LandBlendWeights2.x * LandscapeTexture5to6IsSpecPower.x + input.LandBlendWeights2.y * LandscapeTexture5to6IsSpecPower.y +
+	            dot(LandscapeSeams::ExtraWeights, LandscapeSeams::Data.SpecPower);
+#		endif
+	LandscapeSeams::NormaliseExtras(input.LandBlendWeights1, input.LandBlendWeights2);
 #	else
 	bool useSnowDecalSpecular = false;
 #	endif  // defined(SPARKLE) || !defined(PROJECTED_UV)
@@ -1368,12 +1370,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	// Normalise blend weights
 	float totalWeight = input.LandBlendWeights1.x + input.LandBlendWeights1.y + input.LandBlendWeights1.z +
 	                    input.LandBlendWeights1.w + input.LandBlendWeights2.x + input.LandBlendWeights2.y;
-#		if defined(LANDSCAPE_SEAMS)
-	// (49d) The eight layers share one total.
-	totalWeight += dot(LandscapeSeams::ExtraWeights, float2(1.0, 1.0));
-	if (totalWeight > 0.0)
-		LandscapeSeams::ExtraWeights /= totalWeight;
-#		endif
 	if (totalWeight > 0.0) {
 		input.LandBlendWeights1 /= totalWeight;
 		input.LandBlendWeights2.xy /= totalWeight;
@@ -1447,16 +1443,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			input.LandBlendWeights1.w = weights[3];
 			input.LandBlendWeights2.x = weights[4];
 			input.LandBlendWeights2.y = weights[5];
-#			if defined(LANDSCAPE_SEAMS)
-			// (49d) Height blending covers only the engine layers (it returns them normalised to 1): scale them back to
-			// their share beside the borrowed ones (upstream #2841).
-			const float seamsEngineWeight = dot(input.LandBlendWeights1, float4(1.0, 1.0, 1.0, 1.0)) + input.LandBlendWeights2.x + input.LandBlendWeights2.y;
-			if (seamsEngineWeight > 0.0) {
-				const float seamsEngineScale = saturate(1.0 - dot(LandscapeSeams::ExtraWeights, float2(1.0, 1.0))) / seamsEngineWeight;
-				input.LandBlendWeights1 *= seamsEngineScale;
-				input.LandBlendWeights2.xy *= seamsEngineScale;
-			}
-#			endif
 		}
 		if (SharedData::extendedMaterialSettings.EnableShadows && (parallaxShadowQuality > 0.0f || SharedData::extendedMaterialSettings.ExtendShadows)) {
 #			if defined(TERRAIN_VARIATION)
@@ -1487,6 +1473,13 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 #	if defined(SPARKLE)
 	diffuseUv = ProjectedUVParams2.yy * (input.TexCoord0.zw + (uv - uvOriginal));
+#	elif defined(LANDSCAPE_SEAMS)
+	diffuseUv = uv;
+	// (49d) The six engine weights (normalised to 1, by the code above or by height blending) scaled to their share beside the
+	// borrowed layers (upstream #2841), then the two borrowed layers sampled like the engine layers below (Common/LandscapeSeams.hlsli;
+	// sums, so the order does not matter). Parallax height stays on the six engine layers.
+	LandscapeSeams::ScaleEngineWeights(input.LandBlendWeights1, input.LandBlendWeights2);
+	LANDSCAPE_SEAMS_BLEND_EXTRAS
 #	else
 	diffuseUv = uv;
 #	endif  // SPARKLE
@@ -2002,10 +1995,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		blendedNormalRGB += landNormalRGB6 * weight;
 		blendedNormalAlpha += landNormalAlpha6 * weight;
 	}
-#		if defined(LANDSCAPE_SEAMS)
-	// (49d) The two borrowed layers (Common/LandscapeSeams.hlsli), sampled and converted like the six above.
-	LANDSCAPE_SEAMS_BLEND_EXTRAS
-#		endif
 
 	float4 rawBaseColor = float4(blendedRGB, blendedAlpha);
 	baseColor = float4(Color::Diffuse(blendedRGB), blendedAlpha);
@@ -2131,6 +2120,10 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #	elif (defined(SNOW) && defined(LANDSCAPE))
 	normal.xyz = GetLandNormal(landSnowMask1, normal.xyz, uv, SampNormalSampler, TexNormalSampler);
 	glossiness = normal.w;
+#	elif defined(LANDSCAPE_SEAMS)
+	normal.xyz = TransformNormal(normal.xyz);
+	glossiness = normal.w;
+	glintParameters += LandscapeSeams::Glint;  // (49d) borrowed glint layers (PBR quads; glintParameters is declared after the blend)
 #	else
 	normal.xyz = TransformNormal(normal.xyz);
 	glossiness = normal.w;
@@ -2723,12 +2716,24 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		if defined(LANDSCAPE)
 			float4 snowLayerW1 = input.LandBlendWeights1;
 			float2 snowLayerW2 = input.LandBlendWeights2.xy;
-#			if defined(TRUE_PBR)
+#			if defined(TRUE_PBR) && !defined(LANDSCAPE_SEAMS)
 			// TruePBR.cpp puts each tile's "is snow" (LTEX flag / snow material / "snow" texture
 			// set) into PBRFlags bits 24..29.
 			const uint snowTiles = PBRFlags >> 24;
 			float4 snowLayer1 = float4((snowTiles >> uint4(0, 1, 2, 3)) & 1);
 			float2 snowLayer2 = float2((snowTiles >> uint2(4, 5)) & 1);
+#			elif defined(LANDSCAPE_SEAMS)
+#				if defined(TRUE_PBR)
+			const uint snowTiles = PBRFlags >> 24;
+			float4 snowLayer1 = float4((snowTiles >> uint4(0, 1, 2, 3)) & 1);
+			float2 snowLayer2 = float2((snowTiles >> uint2(4, 5)) & 1);
+#				else
+			float4 snowLayer1 = saturate(LandscapeTexture1to4IsSnow);
+			float2 snowLayer2 = saturate(LandscapeTexture5to6IsSnow.xy);
+#				endif
+			// (49d) The borrowed layers count too (footprints / "snow only" tracks follow a borrowed snow texture): folded into the
+			// 5/6 pair, which leaves the weighted mean below exact.
+			LandscapeSeams::FoldSnow(snowLayerW2, snowLayer2);
 #			else
 			// The engine's own per-layer flags (LTEX "is snow"), also outside SNOW permutations.
 			float4 snowLayer1 = saturate(LandscapeTexture1to4IsSnow);
@@ -2736,11 +2741,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #			endif
 			float snowLayerTotal = dot(snowLayerW1, float4(1, 1, 1, 1)) + snowLayerW2.x + snowLayerW2.y;
 			authoredSnow = (dot(snowLayerW1, snowLayer1) + dot(snowLayerW2, snowLayer2)) / max(snowLayerTotal, 1e-3);
-#			if defined(LANDSCAPE_SEAMS)
-			// (49d) Borrowed layers count too, so footprints and "snow only" tracks follow a borrowed snow texture.
-			authoredSnow = (dot(snowLayerW1, snowLayer1) + dot(snowLayerW2, snowLayer2) + dot(LandscapeSeams::ExtraWeights, LandscapeSeams::Data.IsSnow)) /
-			               max(snowLayerTotal + dot(LandscapeSeams::ExtraWeights, float2(1.0, 1.0)), 1e-3);
-#			endif
 #		endif
 #		if defined(PROJECTED_UV)
 			// Directional snow on rocks and mountains. The same projection also lays moss, so only

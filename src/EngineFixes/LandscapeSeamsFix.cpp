@@ -8,6 +8,7 @@
 #include "ShaderCache.h"
 #include "State.h"
 #include "TruePBR.h"
+#include "TruePBR/BSLightingShaderMaterialPBRLandscape.h"
 #include "Utils/D3D.h"
 #include "Utils/Game.h"
 #include "Utils/UI.h"
@@ -28,10 +29,6 @@ namespace
 	constexpr float MinDelta = 6.0f / 255.0f;
 	constexpr float MinLayerWeight = 4.0f / 255.0f;
 	constexpr size_t MaxFieldTextures = 56;
-
-	constexpr auto DiffuseTexture = static_cast<RE::BSTextureSet::Texture>(0);
-	constexpr auto NormalTexture = static_cast<RE::BSTextureSet::Texture>(1);
-	constexpr auto RmaosTexture = static_cast<RE::BSTextureSet::Texture>(5);
 
 	RE::TESLandTexture* GetDefaultLandTexture()
 	{
@@ -104,9 +101,55 @@ namespace
 		}
 	}
 
+	/**
+	 * @brief Copies what a neighbour may borrow from each slot: the texture pointers and PBR values the engine (vanilla land) or
+	 * True PBR (PBR land) has just put into this quad's material, plus the land texture's snow / specular values. Pointer copies
+	 * and field reads only: no texture lookup or load. Runs in the land setup hook, after both material setups.
+	 */
+	void ReadSlotInfo(RE::BSGeometry* a_geometry, LandscapeSeamsFix::Quad& a_out)
+	{
+		auto* property = netimmerse_cast<RE::BSLightingShaderProperty*>(a_geometry->GetGeometryRuntimeData().properties[RE::BSGeometry::States::kEffect].get());
+		const auto* material = property != nullptr ? property->material : nullptr;
+		const auto feature = material != nullptr ? material->GetFeature() : RE::BSShaderMaterial::Feature::kNone;
+
+		for (uint32_t slot = 0; slot < LandscapeSeamsFix::EngineLayers; ++slot) {
+			auto& info = a_out.info[slot];
+			info = {};
+			auto* landTexture = a_out.slots[slot];
+			if (landTexture == nullptr)
+				continue;
+
+			if (feature == BSLightingShaderMaterialPBRLandscape::FEATURE) {
+				const auto* pbr = static_cast<const BSLightingShaderMaterialPBRLandscape*>(material);
+				info.color = pbr->landscapeBaseColorTextures[slot];
+				info.normal = pbr->landscapeNormalTextures[slot];
+				info.isPbr = pbr->isPbr[slot];
+				if (info.isPbr) {
+					info.rmaos = pbr->landscapeRMAOSTextures[slot];
+					info.pbrParams = { pbr->roughnessScales[slot], pbr->displacementScales[slot], pbr->specularLevels[slot], 0.0f };
+					const auto& glint = pbr->glintParameters[slot];
+					info.glint = glint.enabled;
+					info.glintParams = { glint.screenSpaceScale, 40.0f - glint.logMicrofacetDensity, glint.microfacetRoughness, glint.densityRandomization };
+				}
+			} else if (feature == RE::BSShaderMaterial::Feature::kMultiTexLandLODBlend) {
+				const auto* vanilla = static_cast<const RE::BSLightingShaderMaterialLandscape*>(material);
+				info.color = slot == 0 ? vanilla->diffuseTexture : vanilla->landscapeDiffuseTexture[slot - 1];
+				info.normal = slot == 0 ? vanilla->normalTexture : vanilla->landscapeNormalTexture[slot - 1];
+			} else {
+				continue;
+			}
+
+			info.isSnow = TruePBR::IsSnowLandTexture(*landTexture, Util::GetSeasonalSwap(landTexture->textureSet)) ? 1.0f : 0.0f;
+			info.isSnowVanilla = landTexture->shaderTextureIndex != 0 ? 1.0f : 0.0f;
+			info.specPower = static_cast<float>(static_cast<uint8_t>(landTexture->specularExponent));
+			info.valid = info.color != nullptr;
+		}
+	}
+
 	struct FieldTexture
 	{
 		RE::TESLandTexture* texture = nullptr;
+		const LandscapeSeamsFix::SlotInfo* info = nullptr;  // first loaded quad slot showing this texture (null: cannot be borrowed)
 		int slot = -1;
 		std::array<float, LandscapeSeamsFix::PerimeterVertices> delta{};
 	};
@@ -116,15 +159,20 @@ namespace
 		std::array<FieldTexture, MaxFieldTextures> entries;
 		size_t count = 0;
 
-		int FindOrAdd(RE::TESLandTexture* a_texture)
+		int FindOrAdd(RE::TESLandTexture* a_texture, const LandscapeSeamsFix::SlotInfo& a_info)
 		{
+			const auto* info = a_info.valid ? &a_info : nullptr;
 			for (size_t i = 0; i < count; ++i) {
-				if (entries[i].texture == a_texture)
+				if (entries[i].texture == a_texture) {
+					if (entries[i].info == nullptr)
+						entries[i].info = info;
 					return static_cast<int>(i);
+				}
 			}
 			if (count == MaxFieldTextures)
 				return -1;
 			entries[count].texture = a_texture;
+			entries[count].info = info;
 			return static_cast<int>(count++);
 		}
 	};
@@ -186,7 +234,7 @@ void LandscapeSeamsFix::Heal(const QuadKey& a_key, const Quad& a_quad, Healed& a
 		slotTexture[slot] = -1;
 		if (a_quad.slots[slot] == nullptr)
 			continue;
-		const int index = textures.FindOrAdd(a_quad.slots[slot]);
+		const int index = textures.FindOrAdd(a_quad.slots[slot], a_quad.info[slot]);
 		slotTexture[slot] = index;
 		if (index >= 0 && textures.entries[index].slot < 0)
 			textures.entries[index].slot = static_cast<int>(slot);
@@ -250,7 +298,7 @@ void LandscapeSeamsFix::Heal(const QuadKey& a_key, const Quad& a_quad, Healed& a
 						const auto weight = neighbour.border[slot][neighbourPerimeter];
 						if (neighbour.slots[slot] == nullptr || weight == 0)
 							continue;
-						const int index = textures.FindOrAdd(neighbour.slots[slot]);
+						const int index = textures.FindOrAdd(neighbour.slots[slot], neighbour.info[slot]);
 						if (index < 0) {
 							complete = false;
 							break;
@@ -338,9 +386,9 @@ void LandscapeSeamsFix::Heal(const QuadKey& a_key, const Quad& a_quad, Healed& a
 		const auto& entry = textures.entries[i];
 		if (entry.slot >= 0) {
 			layerOf[i] = entry.slot;
-		} else if (fieldMax[i] >= MinLayerWeight && entry.texture->textureSet != nullptr) {
+		} else if (fieldMax[i] >= MinLayerWeight && entry.info != nullptr) {
 			// The vanilla terrain shader would read a PBR base color as an sRGB diffuse.
-			if (!a_out.pbr && globals::truePBR->IsPBRTextureSet(Util::GetSeasonalSwap(entry.texture->textureSet)))
+			if (!a_out.pbr && entry.info->isPbr)
 				continue;
 			candidates[candidateCount++] = static_cast<int>(i);
 		}
@@ -349,7 +397,7 @@ void LandscapeSeamsFix::Heal(const QuadKey& a_key, const Quad& a_quad, Healed& a
 
 	for (size_t i = 0; i < candidateCount && a_out.extraCount < MaxExtraLayers; ++i) {
 		layerOf[candidates[i]] = static_cast<int>(EngineLayers + a_out.extraCount);
-		a_out.extras[a_out.extraCount++] = textures.entries[candidates[i]].texture;
+		a_out.extras[a_out.extraCount++] = *textures.entries[candidates[i]].info;  // reference copies, under the shared lock
 	}
 
 	for (auto& layer : a_out.weights) {
@@ -379,7 +427,6 @@ std::shared_ptr<LandscapeSeamsFix::Resources> LandscapeSeamsFix::CreateResources
 {
 	auto resources = std::make_shared<Resources>();
 	const auto& defaults = globals::game::graphicsState->GetRuntimeData();
-	auto* truePBR = globals::truePBR;
 
 	QuadData data{};
 	data.Origin = { static_cast<float>(a_healed.key.x) * QuadSize, static_cast<float>(a_healed.key.y) * QuadSize };
@@ -392,39 +439,30 @@ std::shared_ptr<LandscapeSeamsFix::Resources> LandscapeSeamsFix::CreateResources
 
 	static_assert(MaxExtraLayers == 2, "IsSnow and SpecPower hold one component per borrowed layer");
 	for (uint32_t extra = 0; extra < a_healed.extraCount; ++extra) {
-		auto* landTexture = a_healed.extras[extra];
-		auto* textureSet = Util::GetSeasonalSwap(landTexture->textureSet);
-		if (textureSet == nullptr)
-			continue;
-
+		// Copied from the source quad's material by the setup hook: no engine call here (worker thread).
+		const auto& info = a_healed.extras[extra];
 		auto& layer = resources->extras[extra];
-		textureSet->SetTexture(DiffuseTexture, layer[0]);
-		textureSet->SetTexture(NormalTexture, layer[1]);
+		layer[0] = info.color;
+		layer[1] = info.normal;
 
 		float isSnow = 0.0f;
 		if (a_healed.pbr) {
 			// Same rule as the quad's own tiles (TruePBR.cpp, PBRFlags bits 24-29 read by Dynamic Snow).
-			isSnow = TruePBR::IsSnowLandTexture(*landTexture, textureSet) ? 1.0f : 0.0f;
-			if (const auto* pbrData = truePBR->GetPBRTextureSetData(textureSet)) {
-				textureSet->SetTexture(RmaosTexture, layer[2]);
-
+			isSnow = info.isSnow;
+			if (info.isPbr) {
+				layer[2] = info.rmaos;
 				data.Flags |= FlagPbr << extra;
-				if (pbrData->glintParameters.enabled)
+				if (info.glint)
 					data.Flags |= FlagGlint << extra;
-				data.PBRParams[extra] = { pbrData->roughnessScale, pbrData->displacementScale, pbrData->specularLevel, 0.0f };
-				data.GlintParams[extra] = {
-					pbrData->glintParameters.screenSpaceScale,
-					40.0f - pbrData->glintParameters.logMicrofacetDensity,
-					pbrData->glintParameters.microfacetRoughness,
-					pbrData->glintParameters.densityRandomization
-				};
+				data.PBRParams[extra] = info.pbrParams;
+				data.GlintParams[extra] = info.glintParams;
 				if (layer[2] == nullptr)
 					layer[2] = defaults.defaultTextureWhite;
 			}
 		} else {
 			// The vanilla material's textureIsSnow / specular power per tile (LTEX INAM / SNAM).
-			isSnow = landTexture->shaderTextureIndex != 0 ? 1.0f : 0.0f;
-			(extra == 0 ? data.SpecPower.x : data.SpecPower.y) = static_cast<float>(static_cast<uint8_t>(landTexture->specularExponent));
+			isSnow = info.isSnowVanilla;
+			(extra == 0 ? data.SpecPower.x : data.SpecPower.y) = info.specPower;
 		}
 		(extra == 0 ? data.IsSnow.x : data.IsSnow.y) = isSnow;
 
@@ -547,7 +585,23 @@ void LandscapeSeamsFix::Rebuild(const std::vector<QuadKey>& a_keys)
 				std::swap(it->second.resources, built[i]);
 		}
 	}
-	// `built` now holds the replaced resources; they are released here, on the worker.
+	// `built` now holds the replaced resources. They and the texture references taken by Heal go to the release list: the
+	// worker never drops the last reference to an engine texture (Reset releases them on the render thread).
+	{
+		const std::scoped_lock lock(releaseMutex);
+		for (auto& resources : built) {
+			if (resources)
+				releaseResources.push_back(std::move(resources));
+		}
+		for (auto& healed : pending) {
+			for (auto& extra : healed.extras) {
+				for (auto* texture : { &extra.color, &extra.normal, &extra.rmaos }) {
+					if (*texture)
+						releaseTextures.push_back(std::move(*texture));
+				}
+			}
+		}
+	}
 
 	rebuiltQuads.fetch_add(static_cast<uint32_t>(pending.size()), std::memory_order_relaxed);
 	lastRebuildMs.store(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(), std::memory_order_relaxed);
@@ -619,6 +673,7 @@ void LandscapeSeamsFix::OnLandSetup(RE::TESObjectLAND* a_land, bool a_pbr)
 			coordinates->cellY * 2 + static_cast<int32_t>(quadIndex >> 1)
 		};
 		ReadQuad(a_land, quadIndex, entry.quad);
+		ReadSlotInfo(geometry, entry.quad);
 		geometry->IncRefCount();
 		entry.quad.geometry = geometry;
 		entry.quad.pbr = a_pbr;
@@ -651,6 +706,7 @@ void LandscapeSeamsFix::OnLandSetup(RE::TESObjectLAND* a_land, bool a_pbr)
 
 			quad.slots = entry.quad.slots;
 			quad.border = entry.quad.border;
+			quad.info = std::move(entry.quad.info);
 			quad.grid = std::move(entry.quad.grid);
 			quad.geometry = entry.quad.geometry;
 			quad.pbr = entry.quad.pbr;
@@ -678,12 +734,30 @@ void LandscapeSeamsFix::OnLandSetup(RE::TESObjectLAND* a_land, bool a_pbr)
 		}
 	}
 
-	// The weight work (healing, weight maps, buffers, borrowed textures) runs on the worker, never in this thread.
+	{
+		const std::scoped_lock lock(releaseMutex);
+		for (auto& resources : staleResources) {
+			if (resources)
+				releaseResources.push_back(std::move(resources));
+		}
+	}
+
+	// The weight work (healing, weight maps, buffers) runs on the worker, never in this thread.
 	Enqueue(keys);
 }
 
 void LandscapeSeamsFix::Reset()
 {
+	// What the worker let go of (replaced resources, texture references): released here, on the render thread, at function exit.
+	std::vector<std::shared_ptr<Resources>> drainedResources;
+	std::vector<RE::NiSourceTexturePtr> drainedTextures;
+	{
+		const std::unique_lock releaseLock(releaseMutex, std::try_to_lock);
+		if (releaseLock.owns_lock()) {
+			drainedResources.swap(releaseResources);
+			drainedTextures.swap(releaseTextures);
+		}
+	}
 	std::vector<RE::BSGeometry*> released;
 	std::vector<std::shared_ptr<Resources>> releasedResources;
 	{
@@ -712,6 +786,7 @@ void LandscapeSeamsFix::Reset()
 				releasedResources.push_back(std::move(quad.resources));
 				quad.geometry = nullptr;
 				quad.grid.reset();
+				quad.info = {};  // an unloaded quad keeps its border weights, not its textures
 				++quad.generation;
 				it = loadedQuads.erase(it);
 				continue;
