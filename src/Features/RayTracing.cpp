@@ -4,6 +4,7 @@
 #include "Features/RayTracing/CasterFilter.h"
 #include "Features/RayTracing/Wind.h"
 #include "Features/DynamicCubemaps.h"
+#include "Features/ExponentialHeightFog.h"  // (49b) Particles Use RT Shadows needs its volumetric fog grid
 #include "Features/LightLimitFix.h"  // (48g) the hit shading reads its light list
 #include "Features/Skylighting.h"    // (48g) and its probes
 #include "Features/ScreenSpaceGI.h"
@@ -204,6 +205,7 @@ namespace
 	constexpr double kLateHoldMs = 4000.0;  // items not ready at the hand-off wait at most this long for the late batch
 	constexpr double kWarmUpTimeoutMs = 5000.0;
 	constexpr double kFadeInMs = 500.0;
+	constexpr double kSettleWindowMs = 5000.0;  // (49b) Hitch fix B: the tighter build budgets this long after the hand-off
 	constexpr std::uint32_t kAlphaCopiesPerFrame = 16;  // (45h) 256x256 alpha copies made per frame (5 small dispatches each)
 	// (48f) Capture Materials: 128x128 texture copies per frame (one dispatch each) while playing / in the black screen and warm-up after a loading
 	// screen, each with a render-thread CPU cap (the first copy of a frame always goes).
@@ -899,9 +901,10 @@ void RayTracing::HandOffNow(const char* a_when)
 	lateHold = true;
 	lateHoldUntil = now + static_cast<std::int64_t>(kLateHoldMs / std::max(QpcMs(), 1e-9));
 	handOffSummary = std::format("hand-off {:.0f} ms after the loading screen closed ({}): {} items switched to RT at once, {} pending ({} BLAS queued, "
-								 "{} cells capturing, {} character shapes waiting)",
+								 "{} cells capturing, {} character shapes waiting){}{}",
 		static_cast<double>(now - warmUpStart) * QpcMs(), a_when, counts.shown, counts.pending, backend.QueuedBuilds(), sc.cellsGathering,
-		backend.PendingSkinUploads());
+		backend.PendingSkinUploads(), transitionPumpOff ? "; hitch fix C: warm-up budgets widened (the loading pump did not run)" : "",
+		HitchOn(settings.HitchSettleBudget) ? "; hitch fix B: tighter build budgets for 5 s" : "");
 	logger::info("[RayTracing] {}", handOffSummary);
 }
 
@@ -951,6 +954,27 @@ void RayTracing::TransitionFrame()
 			buildCount = static_cast<std::uint32_t>(std::lround(mix(static_cast<float>(buildCount), static_cast<float>(kLoadingMaxBuilds))));
 		}
 		lastFadeFactor = f;
+	}
+	// (49b) Hitch fix C: the loading pump never ran this transition (the loading screen is presented on another thread, so nothing was prepared
+	// behind it): the visible warm-up gets at least the 46i pump-off budgets (3 ms capture, 3 ms builds, twice the triangles, 12 characters).
+	transitionPumpOff = HitchOn(settings.HitchPumpOff) && pumpFrames == 0 && pumpForeignFrames > 0;
+	if (visible && transitionPumpOff) {
+		capture = std::max(capture, 3.0f);
+		charactersMs = std::max(charactersMs, 2.0f);
+		charactersMax = std::max(charactersMax, 12u);
+		buildMs = std::max(buildMs, 3.0f);
+		buildTriangles = std::max(buildTriangles, kBuildBudget * 2u);
+	}
+	// (49b) Hitch fix E: the alpha record buffers at full size now, not on the first frames with many new cut-out shapes.
+	if (HitchOn(settings.HitchAlphaPrealloc))
+		backend.PreallocateAlphaInfoBuffers();
+	// (49b) Hitch fix D: the slot 4 - 5 textures while the picture is dark (not behind the loading screen: no D3D11 work there).
+	if (!loading && (!visible || lastFadeFactor > 0.0f) && HitchOn(settings.HitchPrecompile) && settings.PointLights && !pointWideDenoiseFailed &&
+		pointVis[0].texture && !pointWide[0].texture) {
+		D3D11_TEXTURE2D_DESC d{};
+		pointVis[0].texture->GetDesc(&d);
+		if (EnsurePointWide(d.Width, d.Height))
+			logger::info("[RayTracing] Hitch fix: slot 4 - 5 textures made in the dark part of the transition ({}x{})", d.Width, d.Height);
 	}
 	{
 		const auto& stats = backend.GetStats();
@@ -1577,6 +1601,13 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.SunShadows = read("SunShadows", defaults.SunShadows);
 		settings.AOSpecOcc = read("AOSpecOcc", defaults.AOSpecOcc);  // (49a)
 		settings.AOSpecOccStrength = std::clamp(read("AOSpecOccStrength", defaults.AOSpecOccStrength), 0.0f, 1.0f);
+		settings.ParticlesRTShadows = read("ParticlesRTShadows", defaults.ParticlesRTShadows);  // (49b)
+		settings.HitchFixes = read("HitchFixes", defaults.HitchFixes);  // (49b)
+		settings.HitchSettleBudget = read("HitchSettleBudget", defaults.HitchSettleBudget);
+		settings.HitchPumpOff = read("HitchPumpOff", defaults.HitchPumpOff);
+		settings.HitchPrecompile = read("HitchPrecompile", defaults.HitchPrecompile);
+		settings.HitchAlphaPrealloc = read("HitchAlphaPrealloc", defaults.HitchAlphaPrealloc);
+		settings.HitchSkinMissing = read("HitchSkinMissing", defaults.HitchSkinMissing);
 		settings.PointQuality = read("PointQuality", -1);
 		settings.AOQuality = read("AOQuality", -1);
 		// (47q) The sun's size left the tiers. Saved before 47q (no key): the cone the tier in effect had -- High / Ultra 0.5, Very Low -
@@ -1802,6 +1833,13 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["AOQuality"] = settings.AOQuality;
 	o_json["AOSpecOcc"] = settings.AOSpecOcc;  // (49a)
 	o_json["AOSpecOccStrength"] = settings.AOSpecOccStrength;
+	o_json["ParticlesRTShadows"] = settings.ParticlesRTShadows;  // (49b)
+	o_json["HitchFixes"] = settings.HitchFixes;
+	o_json["HitchSettleBudget"] = settings.HitchSettleBudget;
+	o_json["HitchPumpOff"] = settings.HitchPumpOff;
+	o_json["HitchPrecompile"] = settings.HitchPrecompile;
+	o_json["HitchAlphaPrealloc"] = settings.HitchAlphaPrealloc;
+	o_json["HitchSkinMissing"] = settings.HitchSkinMissing;
 }
 
 void RayTracing::RestoreDefaultSettings()
@@ -1988,7 +2026,8 @@ void RayTracing::PrecompileShaders()
 		GetShader(pointMaskCS, L"Data\\Shaders\\RayTracing\\PointMaskCS.hlsl", "PointMaskCS");
 		// (48a) The variants the current settings can use (window beams are indoor-only; K > 4 per the tier).
 		const PointTierParams pt = ResolvePointTier();
-		const bool wideK = pt.k > 4 || (settings.PointLightsInteriors && pt.kInterior > 4);
+		// (49b) Hitch fix D: Extra Lights Where Crowded (always on since 48o, K < 6) can ask for slots 4 - 5 at any tier: their variants too.
+		const bool wideK = pt.k > 4 || (settings.PointLightsInteriors && pt.kInterior > 4) || HitchOn(settings.HitchPrecompile);
 		const bool beam = settings.PointLightsInteriors && settings.PointLightsWindowBeams;  // (48o) Window Beams: Smooth Edges always on
 		if (beam)
 			PointDenoiseShader(false, true);
@@ -2004,6 +2043,9 @@ void RayTracing::PrecompileShaders()
 				PointDenoiseShader(false, true, fix, clean);
 			if (wideK)
 				PointDenoiseShader(true, beam, fix, clean);
+			// (49b) Hitch fix D: the wide variant without beam edges too (outdoors the beam mask is empty, so a beam setting does not pick it there).
+			if (wideK && beam && HitchOn(settings.HitchPrecompile))
+				PointDenoiseShader(true, false, fix, clean);
 		}
 	}
 	if (settings.AO) {
@@ -2556,8 +2598,21 @@ bool RayTracing::EnsureDebugColor()
 // Frame
 // ---------------------------------------------------------------------------------------------
 
+// (49b) Hitch fixes B and E: the backend's per-frame switches (before the early prep records any build).
+void RayTracing::UpdateHitchState()
+{
+	const bool settle = HitchOn(settings.HitchSettleBudget) && handedOff && handOffQpc != 0 && phase == Phase::Play &&
+	                    static_cast<double>(Qpc() - handOffQpc) * QpcMs() < kSettleWindowMs;
+	hitchSettleThisFrame = settle;
+	if (!backend.IsReady())
+		return;
+	backend.SetSettle(settle);
+	backend.SetAlphaPrealloc(HitchOn(settings.HitchAlphaPrealloc));
+}
+
 void RayTracing::LatchFrame()
 {
+	UpdateHitchState();  // (49b)
 	// Decided before the engine draws the sun cascades. The covered casters leave the cascades
 	// only while the trace ran last frame (so it is running), and never while the disagreement view
 	// compares against a complete shadow map.
@@ -2688,6 +2743,7 @@ void RayTracing::Prepass()
 	sunMaskWrittenThisFrame = false;  // (47h)
 	pending.active = false;
 	frameStart = Qpc();
+	UpdateHitchState();  // (49b)
 	// (46n) A step of the cell-event preparation faulted behind the loading screen: off here, on the world's frame.
 	if (!cellEventFault.empty() && status != Status::Failed && status != Status::Unavailable)
 		Disable(Status::Failed, std::exchange(cellEventFault, {}));
@@ -3396,6 +3452,16 @@ void RayTracing::PublishCpuSplit()
 				x.retiredCount, x.retire, x.early ? "yes" : "no");
 		}
 	}
+	// (49b) Hitch fixes in effect, the build queue, and the RT fog passes of this frame (F7 rt_hitch_mode, rt_builds_waiting, rt_fog_*).
+	if (backend.IsReady()) {
+		const auto& fs = backend.GetStats();
+		detail.hitchMode = settings.HitchFixes ? ((hitchSettleThisFrame ? 1 : 0) | (transitionPumpOff && inTransition ? 2 : 0) | (settings.HitchPrecompile ? 4 : 0) |
+		                                             (settings.HitchAlphaPrealloc ? 8 : 0) | (settings.HitchSkinMissing ? 16 : 0))
+		                                       : 0;
+		detail.buildsWaiting = static_cast<int>(backend.QueuedBuilds());
+		detail.fogSun = fs.fogTracedLastFrame && fs.fogSunLastFrame ? 1 : 0;
+		detail.fogLights = fs.fogTracedLastFrame && fs.fogLightsLastFrame ? 1 : 0;
+	}
 	Util::FrameTrace::OnRayTracingDetail(detail);
 	{
 		// (46q) Submit on a Worker Thread / Budget Builds by GPU Time.
@@ -3823,7 +3889,7 @@ void RayTracing::RunFrame()
 			}
 		}
 		if (alphaMaskCS)
-			backend.RecordAlphaCopies(alphaMaskCS.get(), kAlphaCopiesPerFrame);
+			backend.RecordAlphaCopies(alphaMaskCS.get(), hitchSettleThisFrame ? kAlphaCopiesPerFrame / 4 : kAlphaCopiesPerFrame);  // (49b) B: a quarter in the settle window
 	}
 	RunMaterialCopies(false);  // (48f) Capture Materials: texture copies (D3D11, per-frame budget)
 
@@ -3835,7 +3901,9 @@ void RayTracing::RunFrame()
 	// depth copy above, GPU-side). The D3D11 queue waits for the trace in FinishFrame.
 	const std::int64_t executeStart = Qpc();
 	cpuLast.d3d11 = static_cast<float>(static_cast<double>(executeStart - d3d11Start) * QpcMs());
+	PrepareFogInput(input, input.sun);  // (49b)
 	const bool traced = backend.ExecuteFrame(input);
+	NoteFogTraced(input, traced);  // (49b)
 	FlushDeferredAONormal();  // (47u) the frame never reached its ready signal: the deferred normal prep now (nothing else reads it)
 	const std::int64_t executeEnd = Qpc();
 	cpuLast.execute = static_cast<float>(static_cast<double>(executeEnd - executeStart) * QpcMs());
@@ -4085,7 +4153,9 @@ void RayTracing::RunNoSunFrame(ID3D11ShaderResourceView* a_depth, ID3D11ShaderRe
 	PrepareDepthMask(context, prepare, a_depth, a_mask, a_width, a_height, input);  // (47u) (47j) normal prep + PrepareCS
 	const std::int64_t executeStart = Qpc();
 	cpuLast.d3d11 = static_cast<float>(static_cast<double>(executeStart - d3d11Start) * QpcMs());
+	PrepareFogInput(input, input.sun);  // (49b)
 	const bool traced = backend.ExecuteFrame(input);
+	NoteFogTraced(input, traced);  // (49b)
 	FlushDeferredAONormal();  // (47u)
 	cpuLast.execute = static_cast<float>(static_cast<double>(Qpc() - executeStart) * QpcMs());
 	if (!traced && backend.HasFailed()) {
@@ -5135,7 +5205,8 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	if (wide) {
 		pointWideIdleFrames = 0;
 	} else if (backend.PointWideReady() || pointWide[0].texture) {
-		if (++pointWideIdleFrames >= kPointWideIdleFrames) {
+		// (49b) Hitch fix D: kept for the session once made (no free / re-create churn: +15.8 MB at most).
+		if (!HitchOn(settings.HitchPrecompile) && ++pointWideIdleFrames >= kPointWideIdleFrames) {
 			logger::info("[RayTracing] Lights per pixel above 4: unused for {} frames, slot 4 - 5 textures freed", kPointWideIdleFrames);
 			ReleasePointWide();
 		}
@@ -6936,6 +7007,152 @@ void RayTracing::BindSpecOccComposite(ID3D11DeviceContext* a_context)
 // (46c) Interiors
 // ---------------------------------------------------------------------------------------------
 
+// (49b) RT fog / particles (TraceFogCS on the D3D12 side, VolumetricFogRTVisibilityCS in Exponential Height Fog)
+void RayTracing::PrepareFogInput(RayTracingRT::FrameInput& a_input, bool a_sun)
+{
+	a_input.fog = nullptr;
+	if (!globals::state)
+		return;
+	const std::uint32_t frame = globals::state->frameCount;
+	const FogGridInfo g = fogGrid;
+	// The grid the fog built last frame (it builds after this prepass); a pause in its builds = no RT fog until it builds again.
+	if (g.frame == UINT32_MAX || frame - g.frame > 1u || g.x == 0 || g.y == 0 || g.z == 0)
+		return;
+	const bool sun = a_sun && g.sun;
+	const bool lights = g.lights && a_input.pointLights != nullptr;
+	if (!sun && !lights)
+		return;
+	// The textures exist once the fog created its volumes (EnsureFogResources); here only when Ray Tracing started after that (once).
+	if (!backend.FogTexturesReady(g.x, g.y, g.z) && !backend.EnsureFogTextures(g.x, g.y, g.z))
+		return;
+	auto& c = fogInput.constants;
+	std::memcpy(c.invViewProj, a_input.constants.invViewProj, sizeof(c.invViewProj));
+	c.toSun[0] = a_input.constants.toSun[0];
+	c.toSun[1] = a_input.constants.toSun[1];
+	c.toSun[2] = a_input.constants.toSun[2];
+	c.toSun[3] = kMaxRayLength;
+	const bool interior = Util::IsInterior();
+	c.grid[0] = g.x;
+	c.grid[1] = g.y;
+	c.grid[2] = g.z;
+	c.grid[3] = interior ? RayTracingRT::kFogFlagInterior : 0u;
+	c.zParams[0] = g.zParams[0];
+	c.zParams[1] = g.zParams[1];
+	c.zParams[2] = g.zParams[2];
+	c.zParams[3] = std::clamp(fade, 0.0f, 1.0f);
+	const auto cameraData = Util::GetCameraData();
+	c.camera[0] = cameraData.x;
+	c.camera[1] = cameraData.z;
+	c.camera[2] = cameraData.w;
+	c.camera[3] = static_cast<float>(frame % 65536u);
+	const auto* point = a_input.pointLights;
+	if (sun || !point)
+		std::copy_n(a_input.constants.rect, 4, c.rect);
+	else
+		std::copy_n(point->constants.rect, 4, c.rect);
+	c.lights[0] = point ? point->constants.params[0] : 0.0f;
+	c.lights[1] = kHandOffBand;
+	c.lights[2] = 2.0f;  // ray start offset (units): the froxel point is in the air, this only steps off a surface it may sit on
+	c.lights[3] = point ? point->constants.bounds[2] : 0.0f;
+	c.bounds[0] = point ? point->constants.bounds[0] : 0.0f;
+	c.bounds[1] = point ? point->constants.bounds[1] : 0.0f;
+	c.bounds[2] = c.bounds[3] = 0.0f;
+	c.renderSize[0] = static_cast<float>(a_input.renderWidth);
+	c.renderSize[1] = static_cast<float>(a_input.renderHeight);
+	c.renderSize[2] = a_input.renderWidth ? 1.0f / static_cast<float>(a_input.renderWidth) : 0.0f;
+	c.renderSize[3] = a_input.renderHeight ? 1.0f / static_cast<float>(a_input.renderHeight) : 0.0f;
+	fogInput.sun = sun;
+	fogInput.lights = lights;
+	fogInput.alpha = sun || (point && point->alpha);
+	fogInput.set = frame & 1u;
+	a_input.fog = &fogInput;
+}
+
+void RayTracing::NoteFogTraced(const RayTracingRT::FrameInput& a_input, bool a_traced)
+{
+	if (!globals::state)
+		return;
+	const auto& st = backend.GetStats();
+	const std::int64_t now = Qpc();
+	if (fogCountStart == 0)
+		fogCountStart = now;
+	if (a_traced && a_input.fog && st.fogTracedLastFrame) {
+		auto& r = fogRecord[st.fogSetLastFrame & 1u];
+		r.frame = globals::state->frameCount;
+		r.sun = st.fogSunLastFrame;
+		r.lights = st.fogLightsLastFrame;
+		r.grid[0] = a_input.fog->constants.grid[0];
+		r.grid[1] = a_input.fog->constants.grid[1];
+		r.grid[2] = a_input.fog->constants.grid[2];
+		r.fence = st.fogFenceLastFrame;
+		fogSunFrames += r.sun ? 1u : 0u;
+		fogLightFrames += r.lights ? 1u : 0u;
+	}
+	if (static_cast<double>(now - fogCountStart) * QpcMs() >= 1000.0) {
+		fogShownSun = fogSunFrames;
+		fogShownLights = fogLightFrames;
+		fogSunFrames = fogLightFrames = 0;
+		fogCountStart = now;
+	}
+}
+
+RayTracing::FogTrace RayTracing::AcquireFogTrace(std::uint32_t a_gridX, std::uint32_t a_gridY, std::uint32_t a_gridZ)
+{
+	FogTrace t;
+	if (!loaded || !settings.Enabled || !globals::state)
+		return t;
+	const std::uint32_t frame = globals::state->frameCount;
+	const std::uint32_t set = (frame - 1u) & 1u;
+	const FogRecord& r = fogRecord[set];
+	if (r.frame != frame - 1u || r.grid[0] != a_gridX || r.grid[1] != a_gridY || r.grid[2] != a_gridZ || (!r.sun && !r.lights))
+		return t;
+	if (!backend.FogTexturesReady(a_gridX, a_gridY, a_gridZ))
+		return t;
+	// GPU-side, for work submitted a frame ago (usually already taken by the guard before this frame's ready signal: then a no-op).
+	backend.WaitForFog(r.fence);
+	t.sun = r.sun;
+	t.lights = r.lights;
+	t.sunSRV = backend.FogSunSRV(set);
+	t.lightVisSRV = backend.FogLightVisSRV(set);
+	t.lightIdSRV = backend.FogLightIdSRV(set);
+	std::copy_n(r.grid, 3, t.grid);
+	return t;
+}
+
+std::uint32_t RayTracing::FogLightId(const RE::BSLight* a_light) const
+{
+	if (!a_light || !pointThisFrame)
+		return 0;
+	const std::uint32_t tag = pointSelector.TagFor(a_light) & RayTracingPointLights::kTagSourceMask;
+	if (tag != 0)
+		return tag;
+	// Window beams (spot shadow lights) are not tagged: their slot from the selector's beam table.
+	const auto& beams = pointSelector.SlotBeams();
+	for (std::uint32_t s = 0; s < RayTracingPointLights::kMaxSources; ++s)
+		if (beams[s] == a_light)
+			return s + 1;
+	return 0;
+}
+
+bool RayTracing::EnsureFogResources(std::uint32_t a_gridX, std::uint32_t a_gridY, std::uint32_t a_gridZ)
+{
+	if (!loaded || !settings.Enabled || !backend.FogAvailable())
+		return false;
+	return backend.EnsureFogTextures(a_gridX, a_gridY, a_gridZ);
+}
+
+std::string RayTracing::FogStatusText() const
+{
+	if (!loaded || !settings.Enabled)
+		return "Ray Tracing is off: the shadow map is used.";
+	if (!backend.FogAvailable())
+		return backend.FogFault().empty() ? std::string("not available (Ray Tracing has not started)") : "not available: " + backend.FogFault();
+	const bool recent = fogCountStart != 0 && static_cast<double>(Qpc() - fogCountStart) * QpcMs() < 2000.0;
+	if (!recent)
+		return "waiting for Ray Tracing";
+	return std::format("traced: sun {} / light {} frames in the last second ({:.1f} MB)", fogShownSun, fogShownLights, backend.FogBytes() / 1048576.0);
+}
+
 bool RayTracing::InteriorWanted() const
 {
 	if (!RtWanted() || !backend.IsReady())
@@ -7186,7 +7403,9 @@ void RayTracing::RunInteriorFrame()
 	PrepareDepthMask(context, prepare, depth.depthSRV, mask.SRV, width, height, input);
 	const std::int64_t executeStart = Qpc();
 	cpuLast.d3d11 = static_cast<float>(static_cast<double>(executeStart - d3d11Start) * QpcMs());
+	PrepareFogInput(input, input.sun);  // (49b)
 	const bool traced = backend.ExecuteFrame(input);
+	NoteFogTraced(input, traced);  // (49b)
 	FlushDeferredAONormal();  // (47u)
 	cpuLast.execute = static_cast<float>(static_cast<double>(Qpc() - executeStart) * QpcMs());
 	if (!traced && backend.HasFailed()) {
@@ -7417,8 +7636,71 @@ void RayTracing::DrawSettings()
 	DrawMasterHeader();
 	// (47y) Moving Characters: Keep Shadow History / Smooth When No History: (48o) fixed on (no switches).
 	DrawObjectRows();  // (47n) one per-kind choice for the sun, the point lights and RTAO
+	DrawParticlesSection();  // (49b)
+	DrawHitchFixes();        // (49b)
 	DrawDiagnostics();
 	ImGui::PopID();
+}
+
+void RayTracing::DrawParticlesSection()
+{
+	// (49b) Particles Use RT Shadows (lit effects read the volumetric fog's ray-traced visibility).
+	ImGui::SeparatorText("Particles");
+	ImGui::Checkbox("Particles Use RT Shadows", &settings.ParticlesRTShadows);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("On (default): smoke, dust and mist sheets (lit effects) take the ray-traced shadows the volumetric fog traces: they darken in the");
+		ImGui::Text("  shade of trees, characters and objects (Ray Tracing took those out of the game's shadow map), and lights that Ray Tracing");
+		ImGui::Text("  shadows (torches, fireplaces, window beams) light them only where the light is not blocked. Fireplaces and chandeliers that");
+		ImGui::Text("  cast engine shadows now light smoke too (before, such lights were skipped for effects).");
+		ImGui::Text("Needs Exponential Height Fog's Volumetric Fog (its near grid holds the data; indoors also Skip Volumetric Fog Indoors off).");
+		ImGui::Text("Flames, magic and glowing effects are not lit and do not change. Off: as before.");
+	}
+	if (settings.ParticlesRTShadows && settings.Enabled) {
+		auto& fog = globals::features::exponentialHeightFog;
+		if (!fog.loaded || !fog.VolumetricFogActive())
+			ImGui::TextColored({ 1.0f, 0.85f, 0.3f, 1.0f }, "Volumetric Fog is not built here: particles keep their old lighting.");
+	}
+}
+
+void RayTracing::DrawHitchFixes()
+{
+	// (49b) Hitch Fixes (49b): a master switch and one per problem; each off = the 48o behaviour.
+	ImGui::SeparatorText("Hitch Fixes (49b)");
+	ImGui::Checkbox("Hitch Fixes (49b)", &settings.HitchFixes);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("On (default): the fixes below for the stutter after fast travel and loading screens. Off: all of them off (as 48o).");
+		ImGui::Text("The grass one is on Grass Optimizations' page (same heading).");
+	}
+	ImGui::BeginDisabled(!settings.HitchFixes);
+	ImGui::Indent();
+	ImGui::Checkbox("Gentler Scene Building After Arriving", &settings.HitchSettleBudget);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("For 5 s after Ray Tracing takes over from the shadow map, it builds new objects at half the graphics-card time per frame");
+		ImGui::Text("  (fewer builds, compactions and new character shapes each frame). Those items keep the shadow map a little longer.");
+		ImGui::Text("Fixes the 15-25 ms frames in the first seconds after arriving. F7 column rt_hitch_mode bit 1.");
+	}
+	ImGui::Checkbox("Prepare More When the Loading Screen Cannot Help", &settings.HitchPumpOff);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("On this PC the loading screen is shown on another thread, so Ray Tracing cannot prepare behind it. Then the frames before");
+		ImGui::Text("  Ray Tracing takes over get bigger preparation budgets (3 ms scene, 3 ms builds, 12 characters). Logged per loading screen.");
+	}
+	ImGui::Checkbox("No Shader Compiles or Texture Churn for Crowded Lights", &settings.HitchPrecompile);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("Point-light shadows: every filter variant that can be needed is compiled at the main menu (not on the first crowded");
+		ImGui::Text("  frame), and the extra-light textures stay once made (made in the dark part of a loading screen when possible). +16 MB.");
+	}
+	ImGui::Checkbox("Reserve Cut-out Records Up Front", &settings.HitchAlphaPrealloc);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("The buffers listing leaves, fences and other cut-out shapes are made at full size once (about 3 MB each, 8 of them),");
+		ImGui::Text("  not regrown on several frames in a row after arriving outside.");
+	}
+	ImGui::Checkbox("Remember Missing Skin Textures", &settings.HitchSkinMissing);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("Advanced Skin looks for optional _wet / _rfaos textures next to each skin. A file that is not there is not searched for again");
+		ImGui::Text("  for every new character with the same skin. Same picture.");
+	}
+	ImGui::Unindent();
+	ImGui::EndDisabled();
 }
 
 namespace

@@ -261,6 +261,19 @@ public:
 		// with the reflection cone instead of the scalar (Lagarde) specular AO. Off = the 48n composite exactly (its RT_SPECOCC define off).
 		bool AOSpecOcc = true;
 		float AOSpecOccStrength = 1.0f;  // 0 = the scalar specular AO, 1 = the cone result where it is trusted
+		// (49b) "Particles Use RT Shadows": lit effects (smoke, dust, mist sheets) take the volumetric fog's ray-traced visibility (sun and the four
+		// strongest traced point-light sources per froxel; shadow-casting engine lights then light them too). Needs the volumetric fog's near grid.
+		bool ParticlesRTShadows = true;
+		// (49b) "Hitch Fixes (49b)": master + one switch per problem (each off = the 48o behaviour exactly). B: tighter GPU-time build budgets for
+		// 5 s after the hand-off. C: wider warm-up budgets when the loading pump never ran (loading screen on another thread). D: precompile every
+		// point-denoiser variant the settings can request and keep the slot 4 - 5 textures. E: alpha record buffers at full size up front.
+		// F: Advanced Skin remembers skin-mod texture paths that do not exist (no second failed lookup per new character).
+		bool HitchFixes = true;
+		bool HitchSettleBudget = true;
+		bool HitchPumpOff = true;
+		bool HitchPrecompile = true;
+		bool HitchAlphaPrealloc = true;
+		bool HitchSkinMissing = true;
 		// (47l) Outside the settings macro too. FoliageSway "Sway in RT Shadows" (under Foliage): with Foliage ray traced / Both, tree-
 		// animated leaves, bushes and branches are traced with the game's wind (a wind BLAS per mesh, posed and refit every frame).
 		// Off = 47k (frozen at their rest pose). No effect with Foliage = Shadow map.
@@ -556,6 +569,49 @@ public:
 	[[nodiscard]] bool SpecOccCompiled() const { return loaded && settings.AOSpecOcc; }
 	/// (49a) Deferred::DeferredPasses, right before the composite dispatch: t21 (this frame's blurred bent normal or null) and b2.
 	void BindSpecOccComposite(ID3D11DeviceContext* a_context);
+	/// (49b) Main page: "Particles" (Particles Use RT Shadows) and "Hitch Fixes (49b)".
+	void DrawParticlesSection();
+	void DrawHitchFixes();
+	/// (49b) Hitch fixes B / E: the backend switches of this frame.
+	void UpdateHitchState();
+	bool hitchSettleThisFrame = false;  // B: in the 5 s after a hand-off
+	bool transitionPumpOff = false;     // C: this transition's warm-up uses the pump-off budgets
+
+	/// (49b) RT fog / particles. Exponential Height Fog publishes its near grid each frame it builds the volumes (PublishFogGrid); Ray Tracing
+	/// traces that grid in its own list after the reflection list (TraceFogCS); next frame the fog takes that result (AcquireFogTrace: a GPU
+	/// wait on the fog fence for work submitted a frame earlier, normally already done) and filters it into its own 3D textures.
+	struct FogGridInfo
+	{
+		std::uint32_t x = 0, y = 0, z = 0;
+		float zParams[3]{};
+		std::uint32_t frame = UINT32_MAX;
+		bool sun = false;     // "RT Sun Shafts in Fog" (or particles) wants the sun pass
+		bool lights = false;  // "RT Light Shadows in Fog" (or particles) wants the point-light pass
+	};
+	struct FogTrace
+	{
+		bool sun = false;
+		bool lights = false;
+		ID3D11ShaderResourceView* sunSRV = nullptr;
+		ID3D11ShaderResourceView* lightVisSRV = nullptr;
+		ID3D11ShaderResourceView* lightIdSRV = nullptr;
+		std::uint32_t grid[3]{};
+	};
+	void PublishFogGrid(const FogGridInfo& a_info) { fogGrid = a_info; }
+	/// Last frame's trace of this grid (nothing when it was not traced, or traced for another grid).
+	FogTrace AcquireFogTrace(std::uint32_t a_gridX, std::uint32_t a_gridY, std::uint32_t a_gridZ);
+	/// Creates the shared fog textures for a grid (called when the fog creates its volumes; false = no RT fog).
+	bool EnsureFogResources(std::uint32_t a_gridX, std::uint32_t a_gridY, std::uint32_t a_gridZ);
+	[[nodiscard]] bool ParticlesUseRT() const { return loaded && settings.Enabled && settings.ParticlesRTShadows; }
+	/// (49b) The RT fog / particle source id of a light (slot + 1; 0 = none): its point-light shadow tag's slot, or for a window beam (spot
+	/// shadow lights carry no tag) the slot of its beam source. Light Limit Fix writes it per light (t53). Render thread, this frame's selection.
+	[[nodiscard]] std::uint32_t FogLightId(const RE::BSLight* a_light) const;
+	/// (49b) A Hitch Fixes switch in effect (the master and its own).
+	[[nodiscard]] bool HitchOn(bool a_item) const { return settings.HitchFixes && a_item; }
+	/// (49b) Hitch fix F (read by Advanced Skin).
+	[[nodiscard]] bool HitchSkinMissing() const { return loaded && HitchOn(settings.HitchSkinMissing); }
+	/// For the fog's panel: frames the sun / light passes ran in the last second (updated by NoteFogTraced).
+	[[nodiscard]] std::string FogStatusText() const;
 	/// (48d) Deferred::DeferredPasses, right before the SSRT specular pass: the reflection debug views (Hit Type / Hit Distance / Normal
 	/// Confidence) wait for the reflection list (third fence) and draw. No-op unless one is selected and this frame traced reflections.
 	void DrawReflectionDebugViews();
@@ -1417,6 +1473,23 @@ private:
 	std::uint32_t specOccFrame = UINT32_MAX;  // State::frameCount when specOccOut was written (the composite reads it that frame only)
 	bool specOccTracedThisFrame = false;      // PrepareAO asked the trace for the bent normal
 	std::string specOccFault;                 // why it is off this session (shader / texture failure)
+	// (49b) RT fog: the grid the fog published, this frame's input, and per texture set what was traced into it.
+	FogGridInfo fogGrid{};
+	RayTracingRT::FogInput fogInput{};
+	struct FogRecord
+	{
+		std::uint32_t frame = UINT32_MAX;
+		bool sun = false, lights = false;
+		std::uint32_t grid[3]{};
+		std::uint64_t fence = 0;
+	};
+	FogRecord fogRecord[2]{};
+	std::uint32_t fogSunFrames = 0, fogLightFrames = 0, fogShownSun = 0, fogShownLights = 0;  // passes per second (panel)
+	std::int64_t fogCountStart = 0;
+	/// Fills fogInput for this frame (a_input.fog = &fogInput, or null): the fog's grid of last frame, this frame's camera.
+	void PrepareFogInput(RayTracingRT::FrameInput& a_input, bool a_sun);
+	/// After ExecuteFrame: what went into which set.
+	void NoteFogTraced(const RayTracingRT::FrameInput& a_input, bool a_traced);
 	winrt::com_ptr<ID3D11ComputeShader> specOccHCS, specOccVCS;
 	std::unique_ptr<ConstantBuffer> specOccCB;
 	bool EnsureSpecOcc(std::uint32_t a_width, std::uint32_t a_height);

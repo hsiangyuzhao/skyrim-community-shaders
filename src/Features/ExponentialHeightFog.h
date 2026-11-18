@@ -101,6 +101,11 @@ struct ExponentialHeightFog : Feature
 		/// (and nothing of them applied there), saves about 1 ms; its history starts over outside. Exteriors unchanged.
 		/// (47m) Default off (the fog is built indoors too); settings saved before 47m are switched off once (OffIndoors47m).
 		bool OffIndoors = false;
+		/// (49b) "RT Sun Shafts in Fog": with Ray Tracing on, the sun in the near grid is also blocked by what Ray Tracing traces (trees, plants,
+		/// characters, objects: they are no longer in the game's shadow map). "RT Light Shadows in Fog": the four strongest traced point-light
+		/// sources per froxel (window beams included) are blocked by walls and objects. Last frame's rays; no data = as before.
+		bool RTSunShafts = true;
+		bool RTLightShadows = true;
 	} volumetric;
 
 	/// (47b) The game's own fog under the height fog. CPU side only; reaches the shaders through
@@ -292,5 +297,33 @@ private:
 	WeatherFogData lastVolumeWeather{};
 	[[nodiscard]] static bool WeatherLayerJumped(const WeatherFogData& a_previous, const WeatherFogData& a_current);
 	std::unique_ptr<VolumetricDebugState> volumetricDebug;  // (47e)
+	// (49b) RT fog visibility: VolumetricFogRTVisibilityCS writes this frame's filtered 3D textures (index rtVisIndex; the other one is its history),
+	// the light scattering pass and lit effects read them with the shared data (t47). Created with the volumes (EnsureVolumetricResources).
+	struct RTFogDataGPU
+	{
+		uint32_t flags = 0;
+		uint32_t pad[3]{};
+	};
+	static_assert(sizeof(RTFogDataGPU) == 16, "RTFogDataGPU must match RTFogVisibility.hlsli");
+	struct RTFilterCB
+	{
+		uint32_t flags[4]{};  // x kRaw* / kHist*, yzw the raw grid
+		float params[4]{};    // sun history weight, light history weight, sun trust kept per frame without new data
+	};
+	std::unique_ptr<Texture3D> rtSunVis[2], rtLightVis[2], rtLightId[2];
+	std::unique_ptr<StructuredBuffer> rtFogData;
+	std::unique_ptr<ConstantBuffer> rtFilterCB;
+	ID3D11ComputeShader* rtVisibilityCS = nullptr;
+	uint32_t rtVisIndex = 0;
+	uint32_t rtNoRawFrames = 0;
+	bool rtHistorySun = false, rtHistoryLights = false;
+	uint32_t rtLastFlags = 0;      // the flags of the last build (panel)
+	uint32_t rtLastFrame = UINT32_MAX;
+	void CreateRTFogResources(const DirectX::XMUINT4& a_gridSize);
+	void ReleaseRTFogResources();
+	/// Runs the filter (when there is anything to filter), uploads the shared data, binds t47 / t48 / t49 / t52 for the CS stage.
+	uint32_t PrepareRTFogVisibility(ID3D11DeviceContext* a_context, bool a_historyValid);
+	/// PS t47 / t48 / t49 / t52 for lit effects (null = off for them).
+	void BindRTFogVisibilityPS(bool a_valid);
 };
 #pragma warning(pop)

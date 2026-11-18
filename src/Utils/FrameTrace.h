@@ -71,6 +71,8 @@ namespace Util::FrameTrace
 	void OnFramesPresented(uint32_t a_count);
 	/// Grass Optimizations' unsmoothed load work this frame.
 	void OnGrassApply(float a_ms);
+	/// (49b) Hitch fix A: grass bucket uploads put off to later frames this frame.
+	void OnGrassSpread(int a_deferred);
 	/// (45) Ray Tracing this frame: D3D12 GPU ms of the last completed submission, CPU ms, BLAS builds (-1 = off).
 	void OnRayTracing(float a_gpuMs, float a_cpuMs, uint32_t a_builds);
 	// ---- (46p) what the RT D3D12 prep submission did (the one whose GPU time is rt_prep_gpu_ms) ---------------------
@@ -217,6 +219,12 @@ namespace Util::FrameTrace
 		// (48c) Extra Lights Where Crowded: the share of the pixels with a traced point light that traced at least one extra rank (percent, read back
 		// a few frames late; -1 = off this frame, K 6, or not known).
 		float plExtraPct = -1.0f;
+		// (49b) Hitch fixes (bits: 1 settle window build budgets (B), 2 pump-off warm-up budgets (C), 4 point variants precompiled / slot 4 - 5 kept (D),
+		// 8 full-size alpha records (E), 16 skin missing-texture cache (F); 0 = all off, -1 = Ray Tracing not running), BLAS builds still queued,
+		// RT fog passes traced this frame (1 / 0, -1 = Ray Tracing not running).
+		int hitchMode = -1;
+		int buildsWaiting = -1;
+		int fogSun = -1, fogLights = -1;
 	};
 	void OnRayTracingDetail(const RayTracingDetail& a_detail);
 

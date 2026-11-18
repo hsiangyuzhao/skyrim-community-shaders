@@ -28,6 +28,11 @@
 #include "RayTracing/TraceReflectCS.dxil.h"
 #include "RayTracing/TraceReflectMatAlphaCS.dxil.h"  // (48f)
 #include "RayTracing/TraceReflectMatCS.dxil.h"
+// (49b) RT fog: sun / point-light passes, each with its alpha-tested variant.
+#include "RayTracing/TraceFogLightsAlphaCS.dxil.h"
+#include "RayTracing/TraceFogLightsCS.dxil.h"
+#include "RayTracing/TraceFogSunAlphaCS.dxil.h"
+#include "RayTracing/TraceFogSunCS.dxil.h"
 
 namespace RayTracingRT
 {
@@ -220,6 +225,13 @@ namespace RayTracingRT
 			if (FAILED(reflectList.As(&context.reflectList)))
 				return fail("ID3D12GraphicsCommandList4 not available");
 			context.reflectList->Close();
+			// (49b) The fog list (same allocator, recorded after the reflection list is closed). Optional: without it there is no RT fog.
+			ComPtr<ID3D12GraphicsCommandList> fogList;
+			if (SUCCEEDED(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, context.allocator.Get(), nullptr, IID_PPV_ARGS(&fogList))) &&
+				SUCCEEDED(fogList.As(&context.fogList)))
+				context.fogList->Close();
+			else
+				context.fogList.Reset();
 			// (46m) Split Trace Sync: the point lights' own list (same allocator, recorded after the sun list is closed).
 			// Optional: without it the trace is never split.
 			ComPtr<ID3D12GraphicsCommandList> pointList;
@@ -432,6 +444,14 @@ namespace RayTracingRT
 			// (48f) The surface record (u3, u4; filled while Capture Materials has its textures).
 			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynReflect + 4));
 			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynReflect + 5));
+			// (49b) RT fog: per set the depth SRV (t5, copied from the sun table each frame) and the three atlas UAVs (filled while they exist).
+			for (std::uint32_t set = 0; set < 2; ++set) {
+				nullSrv.Format = kDepthMaskFormat;
+				device_->CreateShaderResourceView(nullptr, &nullSrv, StagingCpu(kDynFog + set * 4));
+				nullUav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+				for (std::uint32_t k = 1; k < 4; ++k)
+					device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynFog + set * 4 + k));
+			}
 		}
 
 		// (45h) Null views in every alpha slot (the copy layers and the bindless table are filled on use).
@@ -489,6 +509,11 @@ namespace RayTracingRT
 		// (48a) RT reflections step 1: not fatal either (the switch then stays unavailable); rides in the RTAO list.
 		if (aoPipeline_ && !CreateReflectPipeline())
 			reflectPipeline_.Reset();
+		// (49b) RT fog: not fatal either (the fog then keeps the shadow map).
+		if (!CreateFogPipeline()) {
+			fogSunPipeline_.Reset();
+			fogLightPipeline_.Reset();
+		}
 		// (47l) Foliage sway: not fatal either (wind meshes then stay frozen).
 		if (!CreateWindPipeline())
 			windPipeline_.Reset();
@@ -1798,6 +1823,293 @@ namespace RayTracingRT
 		return static_cast<float>(QpcToMs(QpcNow() - start));
 	}
 
+	// ---------------------------------------------------------------------------------------------
+	// (49b) RT fog (TraceFogCS)
+	// ---------------------------------------------------------------------------------------------
+
+	bool Backend::CreateFogPipeline()
+	{
+		// Its own root signature: constants b0 (48), TLAS t0 (2), table (depth t5, sun u0, light vis u1, light ids u2) (1), sources t1 (2);
+		// the alpha-tested variants also records t2 (2), texcoords t3 (2), table (copy layers t4, bindless t0 space1) (1), s0. 58 DWORDs.
+		D3D12_DESCRIPTOR_RANGE ranges[2]{};
+		ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+		ranges[0].NumDescriptors = 1;
+		ranges[0].BaseShaderRegister = 5;
+		ranges[0].OffsetInDescriptorsFromTableStart = 0;
+		ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+		ranges[1].NumDescriptors = 3;
+		ranges[1].BaseShaderRegister = 0;
+		ranges[1].OffsetInDescriptorsFromTableStart = 1;
+		D3D12_DESCRIPTOR_RANGE alphaRanges[2]{};
+		alphaRanges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+		alphaRanges[0].NumDescriptors = 1;
+		alphaRanges[0].BaseShaderRegister = 4;
+		alphaRanges[0].OffsetInDescriptorsFromTableStart = 0;
+		alphaRanges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+		alphaRanges[1].NumDescriptors = kAlphaTextureSlots;
+		alphaRanges[1].BaseShaderRegister = 0;
+		alphaRanges[1].RegisterSpace = 1;
+		alphaRanges[1].OffsetInDescriptorsFromTableStart = 1;
+		D3D12_ROOT_PARAMETER params[7]{};
+		params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+		params[0].Constants.ShaderRegister = 0;
+		params[0].Constants.Num32BitValues = sizeof(FogTraceConstants) / 4;
+		params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+		params[1].Descriptor.ShaderRegister = 0;
+		params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+		params[2].DescriptorTable.NumDescriptorRanges = 2;
+		params[2].DescriptorTable.pDescriptorRanges = ranges;
+		params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+		params[3].Descriptor.ShaderRegister = 1;
+		params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+		params[4].Descriptor.ShaderRegister = 2;
+		params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+		params[5].Descriptor.ShaderRegister = 3;
+		params[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		params[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+		params[6].DescriptorTable.NumDescriptorRanges = 2;
+		params[6].DescriptorTable.pDescriptorRanges = alphaRanges;
+		params[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		D3D12_STATIC_SAMPLER_DESC sampler{};
+		sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+		sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+		sampler.MaxLOD = D3D12_FLOAT32_MAX;
+		sampler.ShaderRegister = 0;
+		sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		D3D12_ROOT_SIGNATURE_DESC rootDesc{};
+		rootDesc.NumParameters = 7;
+		rootDesc.pParameters = params;
+		rootDesc.NumStaticSamplers = 1;
+		rootDesc.pStaticSamplers = &sampler;
+		ComPtr<ID3DBlob> blob, error;
+		HRESULT hr = D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error);
+		if (FAILED(hr) || FAILED(hr = device_->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&fogRootSignature_)))) {
+			logger::warn("[RayTracing] RT fog root signature failed ({}); the volumetric fog keeps the shadow map", HrString(hr));
+			fogRootSignature_.Reset();
+			return false;
+		}
+		struct Variant
+		{
+			const void* code;
+			std::size_t size;
+			ComPtr<ID3D12PipelineState>* pso;
+			const char* name;
+		};
+		const Variant variants[] = {
+			{ g_TraceFogSunCS, sizeof(g_TraceFogSunCS), &fogSunPipeline_, "sun" },
+			{ g_TraceFogSunAlphaCS, sizeof(g_TraceFogSunAlphaCS), &fogSunAlphaPipeline_, "sun (alpha-tested)" },
+			{ g_TraceFogLightsCS, sizeof(g_TraceFogLightsCS), &fogLightPipeline_, "point lights" },
+			{ g_TraceFogLightsAlphaCS, sizeof(g_TraceFogLightsAlphaCS), &fogLightAlphaPipeline_, "point lights (alpha-tested)" },
+		};
+		for (const auto& v : variants) {
+			D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{};
+			psoDesc.pRootSignature = fogRootSignature_.Get();
+			psoDesc.CS.pShaderBytecode = v.code;
+			psoDesc.CS.BytecodeLength = v.size;
+			if (FAILED(hr = device_->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(v.pso->ReleaseAndGetAddressOf())))) {
+				logger::warn("[RayTracing] The RT fog {} shader was rejected by the driver ({})", v.name, HrString(hr));
+				v.pso->Reset();
+			}
+		}
+		if (!fogSunPipeline_ || !fogLightPipeline_) {
+			fogFault_ = "its ray query shaders were rejected by the driver";
+			return false;
+		}
+		return true;
+	}
+
+	bool Backend::EnsureFogFence()
+	{
+		// The fourth fence: shared like the reflection one (D3D12 signals behind the fog list, D3D11 waits on the GPU a frame later).
+		if (fogFence_ && fogFence11_)
+			return true;
+		fogFence_.Reset();
+		fogFence11_.Reset();
+		HRESULT hr;
+		if (FAILED(hr = device_->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fogFence_)))) {
+			fogFence_.Reset();
+			fogFault_ = std::format("could not create its fence ({})", HrString(hr));
+			logger::warn("[RayTracing] RT fog: {}", fogFault_);
+			return false;
+		}
+		HANDLE shared = nullptr;
+		if (FAILED(hr = device_->CreateSharedHandle(fogFence_.Get(), nullptr, GENERIC_ALL, nullptr, &shared))) {
+			fogFence_.Reset();
+			fogFault_ = std::format("could not share its fence ({})", HrString(hr));
+			logger::warn("[RayTracing] RT fog: {}", fogFault_);
+			return false;
+		}
+		hr = device11_->OpenSharedFence(shared, IID_PPV_ARGS(&fogFence11_));
+		CloseHandle(shared);
+		if (FAILED(hr)) {
+			fogFence_.Reset();
+			fogFence11_.Reset();
+			fogFault_ = std::format("D3D11 could not open its fence ({})", HrString(hr));
+			logger::warn("[RayTracing] RT fog: {}", fogFault_);
+			return false;
+		}
+		fogFenceValue_ = 0;
+		pendingFogWait_ = 0;
+		fogWaited11_ = 0;
+		return true;
+	}
+
+	bool Backend::EnsureFogTextures(std::uint32_t a_gridX, std::uint32_t a_gridY, std::uint32_t a_gridZ)
+	{
+		if (!FogAvailable() || !stagingHeap_ || a_gridX == 0 || a_gridY == 0 || a_gridZ == 0)
+			return false;
+		if (FogTexturesReady(a_gridX, a_gridY, a_gridZ))
+			return true;
+		ReleaseFogTextures();
+		if (!EnsureFogFence())
+			return false;
+		const std::uint32_t halfX = (a_gridX + 1) / 2, halfY = (a_gridY + 1) / 2;
+		const std::uint32_t sunH = a_gridY * ((a_gridZ + 1) / 2), lightH = halfY * a_gridZ;
+		for (std::uint32_t set = 0; set < 2; ++set) {
+			if (!CreateSharedTexture(a_gridX, sunH, DXGI_FORMAT_R8G8B8A8_UNORM, false, true, fogSun_[set], "RayTracing Fog Sun", false) ||
+				!CreateSharedTexture(halfX, lightH, DXGI_FORMAT_R8G8B8A8_UNORM, false, true, fogLightVis_[set], "RayTracing Fog Light Visibility", false) ||
+				!CreateSharedTexture(halfX, lightH, DXGI_FORMAT_R8G8B8A8_UNORM, false, true, fogLightId_[set], "RayTracing Fog Light Ids", false)) {
+				ReleaseFogTextures();
+				fogFault_ = "could not create its shared textures";
+				logger::warn("[RayTracing] RT fog: {}", fogFault_);
+				return false;
+			}
+		}
+		fogGridX_ = a_gridX;
+		fogGridY_ = a_gridY;
+		fogGridZ_ = a_gridZ;
+		fogBytes_ = 2ull * 4ull * (static_cast<std::uint64_t>(a_gridX) * sunH + 2ull * halfX * lightH);
+		WriteFogDescriptors();
+		logger::info("[RayTracing] RT fog textures for a {}x{}x{} froxel grid ({:.1f} MB, two sets)", a_gridX, a_gridY, a_gridZ, fogBytes_ / 1048576.0);
+		return true;
+	}
+
+	void Backend::ReleaseFogTextures()
+	{
+		// A submission in flight may still write them: D3D12 keeps them until it is done (Retire).
+		for (std::uint32_t set = 0; set < 2; ++set) {
+			for (auto* tex : { &fogSun_[set], &fogLightVis_[set], &fogLightId_[set] }) {
+				if (tex->resource12)
+					Retire(tex->resource12, 0, nullptr);
+				*tex = {};
+			}
+		}
+		fogGridX_ = fogGridY_ = fogGridZ_ = 0;
+		fogBytes_ = 0;
+		if (stagingHeap_ && device_) {
+			D3D12_UNORDERED_ACCESS_VIEW_DESC nullUav{};
+			nullUav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			nullUav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+			for (std::uint32_t set = 0; set < 2; ++set)
+				for (std::uint32_t k = 1; k < 4; ++k)
+					device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynFog + set * 4 + k));
+		}
+	}
+
+	void Backend::WriteFogDescriptors()
+	{
+		if (!stagingHeap_)
+			return;
+		D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+		uavDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+		for (std::uint32_t set = 0; set < 2; ++set) {
+			ID3D12Resource* const textures[3] = { fogSun_[set].resource12.Get(), fogLightVis_[set].resource12.Get(), fogLightId_[set].resource12.Get() };
+			for (std::uint32_t k = 0; k < 3; ++k)
+				device_->CreateUnorderedAccessView(textures[k], nullptr, &uavDesc, StagingCpu(kDynFog + set * 4 + 1 + k));
+		}
+	}
+
+	bool Backend::RecordFogList(CommandContext& a_context, std::size_t, const FrameInput& a_input, bool a_alphaFrame, D3D12_GPU_DESCRIPTOR_HANDLE a_block)
+	{
+		// Its own list (same allocator as the prep / trace / RTAO / reflection lists, all closed by now), submitted last, signalling the
+		// fourth fence. Every shared texture is in COMMON between lists.
+		stats_.fogTracedLastFrame = stats_.fogSunLastFrame = stats_.fogLightsLastFrame = false;
+		const FogInput* fog = a_input.fog;
+		if (!fog || !FogAvailable() || !fogFence_ || !fogFence11_ || !a_context.fogList || !depthMask_.resource12 || !tlas_)
+			return false;
+		const std::uint32_t set = fog->set & 1u;
+		if (!FogTexturesReady(fog->constants.grid[0], fog->constants.grid[1], fog->constants.grid[2]) || !fogLightVis_[set].resource12 || !fogLightId_[set].resource12)
+			return false;
+		const bool lights = fog->lights && a_input.pointLights && a_context.pointBuffer && stats_.pointTracedLastFrame;
+		const bool sun = fog->sun;
+		if (!sun && !lights)
+			return false;
+		auto* list = a_context.fogList.Get();
+		HRESULT hr;
+		if (FAILED(hr = list->Reset(a_context.allocator.Get(), nullptr))) {
+			Fail("fog command list Reset", hr);
+			return false;
+		}
+		ID3D12DescriptorHeap* heaps[] = { descriptorHeap_.Get() };
+		list->SetDescriptorHeaps(1, heaps);
+		D3D12_RESOURCE_BARRIER pre[4] = {
+			Transition(depthMask_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+			Transition(fogSun_[set].resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+			Transition(fogLightVis_[set].resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+			Transition(fogLightId_[set].resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+		};
+		list->ResourceBarrier(4, pre);
+		list->SetComputeRootSignature(fogRootSignature_.Get());
+		list->SetComputeRoot32BitConstants(0, sizeof(FogTraceConstants) / 4, &fog->constants, 0);
+		list->SetComputeRootShaderResourceView(1, tlas_->GetGPUVirtualAddress());
+		list->SetComputeRootDescriptorTable(2, Offset(a_block, kDynFog + set * 4, descriptorSize_));
+		const bool alpha = fog->alpha && a_alphaFrame && alphaUv_ && a_context.alphaInfoBuffer;
+		if (alpha) {
+			list->SetComputeRootShaderResourceView(4, a_context.alphaInfoBuffer->GetGPUVirtualAddress());
+			list->SetComputeRootShaderResourceView(5, alphaUv_->GetGPUVirtualAddress());
+			auto alphaTable = descriptorHeap_->GetGPUDescriptorHandleForHeapStart();
+			alphaTable.ptr += static_cast<UINT64>(descriptorSize_) * (kAlphaDescriptorBase - 1);
+			list->SetComputeRootDescriptorTable(6, alphaTable);
+		}
+		const std::uint32_t gx = fog->constants.grid[0], gy = fog->constants.grid[1], gz = fog->constants.grid[2];
+		constexpr std::uint32_t kSlicesPerThread = 8;  // TraceFogCS kSlicesPerThread
+		if (sun) {
+			list->SetPipelineState(alpha && fogSunAlphaPipeline_ ? fogSunAlphaPipeline_.Get() : fogSunPipeline_.Get());
+			list->Dispatch((gx + 7) / 8, (gy + 7) / 8, (gz + kSlicesPerThread - 1) / kSlicesPerThread);
+		}
+		if (lights) {
+			list->SetComputeRootShaderResourceView(3, a_context.pointBuffer->GetGPUVirtualAddress());
+			list->SetPipelineState(alpha && fogLightAlphaPipeline_ ? fogLightAlphaPipeline_.Get() : fogLightPipeline_.Get());
+			list->Dispatch(((gx + 1) / 2 + 7) / 8, ((gy + 1) / 2 + 7) / 8, (gz + kSlicesPerThread - 1) / kSlicesPerThread);
+		}
+		D3D12_RESOURCE_BARRIER post[4] = {
+			Transition(depthMask_.resource12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+			Transition(fogSun_[set].resource12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+			Transition(fogLightVis_[set].resource12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+			Transition(fogLightId_[set].resource12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+		};
+		list->ResourceBarrier(4, post);
+		if (FAILED(hr = list->Close())) {
+			Fail("fog command list Close", hr);
+			return false;
+		}
+		stats_.fogSunLastFrame = sun;
+		stats_.fogLightsLastFrame = lights;
+		stats_.fogSetLastFrame = set;
+		return true;
+	}
+
+	bool Backend::WaitForFog(std::uint64_t a_value)
+	{
+		// The fourth fence (GPU-side): right before the D3D11 fog pass that reads last frame's set.
+		if (a_value == 0 || !context11_ || !fogFence11_ || fogWaited11_ >= a_value)
+			return false;
+		if (pendingFogWait_ <= a_value)
+			pendingFogWait_ = 0;
+		fogWaited11_ = a_value;
+		if (FAILED(context11_->Wait(fogFence11_.Get(), a_value))) {
+			Fail("D3D11 Wait (fog)", E_FAIL);
+			return false;
+		}
+		return true;
+	}
+
 	bool Backend::WaitForReflections()
 	{
 		// (48d) The third fence (GPU-side): right before the first D3D11 pass that reads the hit record.
@@ -1929,6 +2241,25 @@ namespace RayTracingRT
 		reflectFence_.Reset();
 		reflectFenceValue_ = 0;
 		pendingReflectWait_ = 0;
+		// (49b) RT fog.
+		for (std::uint32_t set = 0; set < 2; ++set) {
+			fogSun_[set] = {};
+			fogLightVis_[set] = {};
+			fogLightId_[set] = {};
+		}
+		fogGridX_ = fogGridY_ = fogGridZ_ = 0;
+		fogBytes_ = 0;
+		fogFault_.clear();
+		fogFence11_.Reset();
+		fogFence_.Reset();
+		fogFenceValue_ = 0;
+		pendingFogWait_ = 0;
+		fogWaited11_ = 0;
+		fogSunPipeline_.Reset();
+		fogSunAlphaPipeline_.Reset();
+		fogLightPipeline_.Reset();
+		fogLightAlphaPipeline_.Reset();
+		fogRootSignature_.Reset();
 		reflectWidth_ = reflectHeight_ = 0;
 		reflectBytes_ = 0;
 		reflectCounterValid_ = false;
@@ -2116,7 +2447,8 @@ namespace RayTracingRT
 		}
 		for (auto* resource : { tlas_.Get(), scratch_.Get(), skinScratch_.Get(), alphaUv_.Get(), alphaLayers12_.Get(), postbuild_.Get(), pointCounter_.Get(),
 				 aoCounter_.Get(), depthMask_.resource12.Get(), visibility_.resource12.Get(), pointVis_.resource12.Get(), pointIdx_.resource12.Get(),
-				 aoRaw_.resource12.Get(), aoNormal_.resource12.Get(), aoBent_.resource12.Get(), pointWide_.resource12.Get(), pointWidePrev_.Get() })
+				 aoRaw_.resource12.Get(), aoNormal_.resource12.Get(), aoBent_.resource12.Get(), pointWide_.resource12.Get(), pointWidePrev_.Get(), fogSun_[0].resource12.Get(), fogSun_[1].resource12.Get(),
+				 fogLightVis_[0].resource12.Get(), fogLightVis_[1].resource12.Get(), fogLightId_[0].resource12.Get(), fogLightId_[1].resource12.Get() })
 			if (resource)
 				objects.push_back(resource);
 		ApplyResidency(objects.data(), objects.size());
@@ -3174,6 +3506,7 @@ namespace RayTracingRT
 	{
 		if (!ready_ || failed_)
 			return false;
+		stats_.fogTracedLastFrame = false;  // (49b) set again only when this call submits the fog list
 		const HRESULT removed = device_->GetDeviceRemovedReason();
 		if (FAILED(removed))
 			return Fail("D3D12 device", removed);
@@ -3234,7 +3567,7 @@ namespace RayTracingRT
 		}
 		lap(split.collect);
 		for (std::size_t i = 0; i < kContexts; ++i)
-			if (contexts_[i].fenceValue != 0 && contexts_[i].fenceValue <= completed && contexts_[i].aoFenceValue <= aoCompleted && contexts_[i].reflectFenceValue <= ReflectCompleted())
+			if (contexts_[i].fenceValue != 0 && contexts_[i].fenceValue <= completed && contexts_[i].aoFenceValue <= aoCompleted && contexts_[i].reflectFenceValue <= ReflectCompleted() && contexts_[i].fogFenceValue <= FogCompleted())
 				CollectTimestamps(i);
 		lap(split.timestamps);  // (46g)
 		if (index == kContexts) {
@@ -3280,10 +3613,10 @@ namespace RayTracingRT
 				list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase);
 
 			const std::int64_t buildStart = QpcNow();
-			const std::uint32_t maxBuilds = a_input.maxBuilds ? a_input.maxBuilds : static_cast<std::uint32_t>(kMaxBuildsPerFrame);
+			const std::uint32_t maxBuilds = a_input.maxBuilds ? a_input.maxBuilds : SettleCap(static_cast<std::uint32_t>(kMaxBuildsPerFrame), settleMaxBuilds_, a_input);  // (49b) settle window
 			const std::int64_t buildDeadline = buildStart + MsToQpc(a_input.buildCpuMs > 0.0f ? a_input.buildCpuMs : kPlayBuildCpuMs);  // (46g)
 			recWork_ = {};  // (46p)
-			ProcessCompaction(list, completed, a_input.maxBuilds ? a_input.maxBuilds : kMaxCompactionsPerFrame, buildDeadline);
+			ProcessCompaction(list, completed, a_input.maxBuilds ? a_input.maxBuilds : SettleCap(kMaxCompactionsPerFrame, settleMaxCompactions_, a_input), buildDeadline);
 			const std::uint32_t builtNow =
 				BuildQueued(list, a_input.buildCpuMs > 0.0f ? a_input.buildTriangleBudget : StaticTriangleBudget(a_input.buildTriangleBudget), maxBuilds, buildDeadline);  // (46q)
 			frameTrisUsed_ = recWork_.buildTriangles;
@@ -3593,6 +3926,11 @@ namespace RayTracingRT
 		lap(split.record);
 		ID3D12DescriptorHeap* heaps[] = { descriptorHeap_.Get() };
 		traceList->SetDescriptorHeaps(1, heaps);
+		// (49b) RT fog: its tables start with the depth SRV (the sun table's, copied into both fog sets before the block is published).
+		if (a_input.fog && FogAvailable()) {
+			device_->CopyDescriptorsSimple(1, StagingCpu(kDynFog), StagingCpu(kDynSun), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+			device_->CopyDescriptorsSimple(1, StagingCpu(kDynFog + 4), StagingCpu(kDynSun), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+		}
 		// (46f) This context's copy of the run-time descriptors (sun, point and RTAO tables).
 		const D3D12_GPU_DESCRIPTOR_HANDLE block = PublishDescriptors(index);
 		lap(split.publish);  // (46g)
@@ -3692,6 +4030,11 @@ namespace RayTracingRT
 			return false;
 		if (!reflectFrame)
 			stats_.reflectTracedLastFrame = false;
+		// (49b) RT fog: its own list on this context (recorded now, submitted last, signalling the fourth fence).
+		const bool fogFrame = a_input.fog && RecordFogList(context, index, a_input, alphaFrame, block);
+		if (failed_)
+			return false;
+		stats_.fogTracedLastFrame = fogFrame;
 		lap(split.ao);  // (46g)
 
 		// (46f) A second-fence wait never issued last frame (the AO was not used): the D3D11 queue takes it before this
@@ -3708,6 +4051,14 @@ namespace RayTracingRT
 			pendingReflectWait_ = 0;
 			if (FAILED(hr = context11_->Wait(reflectFence11_.Get(), reflectValue)))
 				return Fail("D3D11 Wait (reflections)", hr);
+		}
+		// (49b) Likewise the fourth fence (the fog did not read last frame's set: fog off, or its pass did not run).
+		if (pendingFogWait_ != 0) {
+			const std::uint64_t fogValue = pendingFogWait_;
+			pendingFogWait_ = 0;
+			if (FAILED(hr = context11_->Wait(fogFence11_.Get(), fogValue)))
+				return Fail("D3D11 Wait (fog)", hr);
+			fogWaited11_ = std::max(fogWaited11_, fogValue);
 		}
 		// (46h) Likewise a trace wait never issued (an interior frame with RTAO only leaves it to the AO pass; the callers take it
 		// before the next trace, this is the guard): the D3D11 ready signal below must follow the last D3D12 done value.
@@ -3795,6 +4146,17 @@ namespace RayTracingRT
 			pendingReflectWait_ = reflectValue;
 			stats_.reflectSubmittedLastFrame = true;
 		}
+		// (49b) The fog rays last (behind the reflection list / RTAO / the trace), signalling the fourth fence: no D3D11 pass of this frame
+		// waits for them; the volumetric fog reads them next frame (WaitForFog, or the guard above before the next ready signal).
+		if (fogFrame) {
+			QueueExecute(context.fogList.Get());
+			const std::uint64_t fogValue = ++fogFenceValue_;
+			if (FAILED(hr = QueueSignal(fogFence_.Get(), fogValue, "D3D12 queue Signal (fog)")))
+				return Fail("D3D12 queue Signal (fog)", hr);
+			context.fogFenceValue = fogValue;
+			pendingFogWait_ = fogValue;
+			stats_.fogFenceLastFrame = fogValue;
+		}
 		for (auto& blas : blas_)
 			if (blas.state == BlasState::Built && blas.buildFence == 0)
 				blas.buildFence = doneValue;
@@ -3862,7 +4224,7 @@ namespace RayTracingRT
 		}
 		lap(split.collect);
 		for (std::size_t i = 0; i < kContexts; ++i)
-			if (contexts_[i].fenceValue != 0 && contexts_[i].fenceValue <= completed && contexts_[i].aoFenceValue <= aoCompleted && contexts_[i].reflectFenceValue <= ReflectCompleted())
+			if (contexts_[i].fenceValue != 0 && contexts_[i].fenceValue <= completed && contexts_[i].aoFenceValue <= aoCompleted && contexts_[i].reflectFenceValue <= ReflectCompleted() && contexts_[i].fogFenceValue <= FogCompleted())
 				CollectTimestamps(i);
 		lap(split.timestamps);
 		if (index == kContexts)
@@ -3893,10 +4255,10 @@ namespace RayTracingRT
 		if (timestampHeap_)
 			list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase);
 		const std::int64_t buildStart = QpcNow();
-		const std::uint32_t maxBuilds = a_input.maxBuilds ? a_input.maxBuilds : static_cast<std::uint32_t>(kMaxBuildsPerFrame);
+		const std::uint32_t maxBuilds = a_input.maxBuilds ? a_input.maxBuilds : SettleCap(static_cast<std::uint32_t>(kMaxBuildsPerFrame), settleMaxBuilds_, a_input);  // (49b) settle window
 		const std::int64_t buildDeadline = buildStart + MsToQpc(a_input.buildCpuMs > 0.0f ? a_input.buildCpuMs : kPlayBuildCpuMs);
 		recWork_ = {};  // (46p)
-		ProcessCompaction(list, completed, a_input.maxBuilds ? a_input.maxBuilds : kMaxCompactionsPerFrame, buildDeadline);
+		ProcessCompaction(list, completed, a_input.maxBuilds ? a_input.maxBuilds : SettleCap(kMaxCompactionsPerFrame, settleMaxCompactions_, a_input), buildDeadline);
 		stats_.buildsLastFrame =
 			BuildQueued(list, a_input.buildCpuMs > 0.0f ? a_input.buildTriangleBudget : StaticTriangleBudget(a_input.buildTriangleBudget), maxBuilds, buildDeadline);  // (46q)
 		frameTrisUsed_ = recWork_.buildTriangles;
@@ -4118,7 +4480,7 @@ namespace RayTracingRT
 		if (index == kContexts)
 			return false;
 		for (std::size_t i = 0; i < kContexts; ++i)
-			if (contexts_[i].fenceValue != 0 && contexts_[i].fenceValue <= completed && contexts_[i].aoFenceValue <= aoCompleted && contexts_[i].reflectFenceValue <= ReflectCompleted())
+			if (contexts_[i].fenceValue != 0 && contexts_[i].fenceValue <= completed && contexts_[i].aoFenceValue <= aoCompleted && contexts_[i].reflectFenceValue <= ReflectCompleted() && contexts_[i].fogFenceValue <= FogCompleted())
 				CollectTimestamps(i);
 		auto& context = contexts_[index];
 		cursor_ = (index + 1) % kContexts;
@@ -4428,7 +4790,7 @@ namespace RayTracingRT
 		constexpr double kMinTriangles = 16384.0;     // always some progress
 		const double perTri = msPerTriEma_ > 0.0 ? msPerTriEma_ : kDefaultMsPerTri;
 		const double upper = std::max(static_cast<double>(a_default), kMinTriangles);
-		const double triangles = std::clamp(static_cast<double>(kBudgetGpuMs) / perTri, kMinTriangles, upper);
+		const double triangles = std::clamp(static_cast<double>(kBudgetGpuMs * settleScale_) / perTri, kMinTriangles, upper);  // (49b) settle window: x settleScale_
 		budget_.triBudget = static_cast<std::uint32_t>(triangles);
 		return budget_.triBudget;
 	}

@@ -172,6 +172,25 @@ void LightLimitFix::SetupResources()
 	}
 
 	{
+		// (49b) Per light of the clustered buffer its Ray Tracing source id for the RT fog / particles (RTFogVisibility.hlsli t53; 0 = none):
+		// the shadow tag's slot, or for a window beam (an untagged spot shadow light) its beam source. Never read by Lighting.
+		D3D11_BUFFER_DESC sbDesc{};
+		sbDesc.Usage = D3D11_USAGE_DYNAMIC;
+		sbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		sbDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		sbDesc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+		sbDesc.StructureByteStride = sizeof(uint32_t);
+		sbDesc.ByteWidth = sizeof(uint32_t) * MAX_LIGHTS;
+		fogLightIds = eastl::make_unique<Buffer>(sbDesc);
+		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc;
+		srvDesc.Format = DXGI_FORMAT_UNKNOWN;
+		srvDesc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+		srvDesc.Buffer.FirstElement = 0;
+		srvDesc.Buffer.NumElements = MAX_LIGHTS;
+		fogLightIds->CreateSRV(srvDesc);
+	}
+
+	{
 		strictLightDataCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<StrictLightDataCB>());
 	}
 }
@@ -375,6 +394,9 @@ void LightLimitFix::Prepass()
 	views[1] = lightIndexList->srv.get();
 	views[2] = lightGrid->srv.get();
 	context->PSSetShaderResources(35, ARRAYSIZE(views), views);
+	// (49b) The RT fog / particle source id of each light (Effect.hlsl via RTFogVisibility.hlsli).
+	ID3D11ShaderResourceView* fogIdsView = fogLightIds ? fogLightIds->srv.get() : nullptr;
+	context->PSSetShaderResources(53, 1, &fogIdsView);
 
 	state->EndPerfEvent();
 }
@@ -436,6 +458,7 @@ void LightLimitFix::UpdateLights()
 
 	eastl::vector<LightData> lightsData{};
 	lightsData.reserve(MAX_LIGHTS);
+	fogIdsData.clear();  // (49b)
 
 	// Process point lights
 
@@ -492,6 +515,7 @@ void LightLimitFix::UpdateLights()
 
 						if ((light.color.x + light.color.y + light.color.z) * light.fade > 1e-4 && light.radius > 1e-4) {
 							lightsData.push_back(light);
+							fogIdsData.push_back(rayTracing.FogLightId(bsLight));  // (49b)
 							if (census)
 								censusUsed.push_back(bsLight);
 						} else {
@@ -524,6 +548,14 @@ void LightLimitFix::UpdateLights()
 	size_t bytes = sizeof(LightData) * lightCount;
 	memcpy_s(mapped.pData, bytes, lightsData.data(), bytes);
 	context->Unmap(lights->resource.get(), 0);
+	if (fogLightIds) {  // (49b)
+		fogIdsData.resize(lightCount, 0u);  // one id per light (0 = none)
+		DX::ThrowIfFailed(context->Map(fogLightIds->resource.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped));
+		const size_t idBytes = sizeof(uint32_t) * std::min<size_t>(lightCount, fogIdsData.size());
+		if (idBytes)
+			memcpy_s(mapped.pData, idBytes, fogIdsData.data(), idBytes);
+		context->Unmap(fogLightIds->resource.get(), 0);
+	}
 
 	UpdateStructure();
 }

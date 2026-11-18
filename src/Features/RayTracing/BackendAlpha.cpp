@@ -466,7 +466,7 @@ namespace RayTracingRT
 				a_context.alphaInfoMapped = nullptr;
 				a_context.alphaInfoCapacity = 0;
 			}
-			const std::uint32_t capacity = std::max<std::uint32_t>(256, std::bit_ceil(count));
+			const std::uint32_t capacity = alphaPrealloc_ ? std::max(kAlphaMaxInfos, count) : std::max<std::uint32_t>(256, std::bit_ceil(count));  // (49b) E: full size, never regrown
 			a_context.alphaInfoBuffer = CreateBuffer(static_cast<std::uint64_t>(capacity) * sizeof(AlphaInfoGpu), D3D12_HEAP_TYPE_UPLOAD,
 				D3D12_RESOURCE_STATE_GENERIC_READ, false);
 			if (!a_context.alphaInfoBuffer || FAILED(a_context.alphaInfoBuffer->Map(0, nullptr, &a_context.alphaInfoMapped)) || !a_context.alphaInfoMapped) {
@@ -485,6 +485,42 @@ namespace RayTracingRT
 			a_context.alphaInfoVersion = alphaInfoVersion_;
 		}
 		return true;
+	}
+
+	// (49b) Hitch fix E: every context's alpha record buffer made now at full size (kAlphaMaxInfos x 48 B), so a burst of new cut-out shapes after
+	// arriving (0 -> 1373 records seen) never recreates one per context on successive frames. Contexts already holding a full-size buffer are kept;
+	// a smaller one is replaced only while its context is free.
+	void Backend::PreallocateAlphaInfoBuffers()
+	{
+		if (!alphaPrealloc_ || !device_ || !ready_ || failed_)
+			return;
+		const std::uint64_t completed = fence_ ? fence_->GetCompletedValue() : 0;
+		for (auto& context : contexts_) {
+			if (context.alphaInfoBuffer && context.alphaInfoCapacity >= kAlphaMaxInfos)
+				continue;
+			if (context.alphaInfoBuffer) {
+				if (!ContextFree(context, completed, AOCompleted()))
+					continue;
+				context.alphaInfoBuffer->Unmap(0, nullptr);
+				alphaStats_.infoBytes -= std::min<std::uint64_t>(alphaStats_.infoBytes, static_cast<std::uint64_t>(context.alphaInfoCapacity) * sizeof(AlphaInfoGpu));
+				context.alphaInfoBuffer.Reset();
+				context.alphaInfoMapped = nullptr;
+				context.alphaInfoCapacity = 0;
+			}
+			context.alphaInfoBuffer = CreateBuffer(static_cast<std::uint64_t>(kAlphaMaxInfos) * sizeof(AlphaInfoGpu), D3D12_HEAP_TYPE_UPLOAD,
+				D3D12_RESOURCE_STATE_GENERIC_READ, false);
+			if (!context.alphaInfoBuffer || FAILED(context.alphaInfoBuffer->Map(0, nullptr, &context.alphaInfoMapped)) || !context.alphaInfoMapped) {
+				context.alphaInfoBuffer.Reset();
+				context.alphaInfoMapped = nullptr;
+				context.alphaInfoCapacity = 0;
+				logger::warn("[RayTracing] Hitch fix: could not make a full-size alpha record buffer (it is made on first use instead)");
+				return;
+			}
+			context.alphaInfoBuffer->SetName(L"CS RayTracing alpha records");
+			context.alphaInfoCapacity = kAlphaMaxInfos;
+			context.alphaInfoVersion = 0;
+			alphaStats_.infoBytes += static_cast<std::uint64_t>(kAlphaMaxInfos) * sizeof(AlphaInfoGpu);
+		}
 	}
 
 	void Backend::ReleaseAlphaResources()

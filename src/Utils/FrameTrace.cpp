@@ -52,6 +52,7 @@ namespace Util::FrameTrace
 			uint32_t firstSeen = 0;
 			uint32_t fgPresented = 0;
 			float grassApplyMs = -1.0f;
+			int grassDeferred = -1;  // (49b) Hitch fix A: grass bucket uploads put off this frame (-1 = not run)
 			float rtGpuMs = -1.0f;  // (45) Ray Tracing: D3D12 GPU ms (last completed), CPU ms, BLAS builds
 			float rtCpuMs = -1.0f;
 			uint32_t rtBuilds = 0;
@@ -501,6 +502,7 @@ namespace Util::FrameTrace
 			float playerSpeed = 0.0f;
 			uint32_t fgPresented = 0;
 			float grassApplyMs = -1.0f;
+			int grassDeferred = -1;  // (49b) Hitch fix A: grass bucket uploads put off this frame (-1 = not run)
 			float rtGpuMs = -1.0f;
 			float rtCpuMs = -1.0f;
 			uint32_t rtBuilds = 0;
@@ -1083,6 +1085,10 @@ namespace Util::FrameTrace
 				out << "# (48h) rt_refl_shade_ratio is now the geometric mean of the per-pixel shaded / screen ratios (each clamped to 16x either way) of\n";
 				out << "#   that read-back; rt_refl_shade_ratio_smoothed (last column) = its ~2 s time average, the panel's number (Off-screen Hit\n";
 				out << "#   Brightness ~ 1 / it; -1 = none).\n";
+				out << "# (49b) grass_deferred = Hitch fix A: grass bucket uploads put off to later frames this frame (-1 = grass not updated); rt_hitch_mode =\n";
+				out << "#   Hitch fixes in effect (bits: 1 build budgets tightened after the hand-off (B), 2 widened warm-up budgets, the loading pump did not\n";
+				out << "#   run (C), 4 point variants precompiled / slot 4 - 5 kept (D), 8 full-size alpha records (E), 16 skin missing-texture cache (F));\n";
+				out << "#   rt_builds_waiting = BLAS builds still queued; rt_fog_sun / rt_fog_lights = RT fog passes traced this frame (1 / 0; -1 = RT not running).\n";
 				out << "# (48c) rt_pl_extra_pct = Extra Lights Where Crowded: percent of the pixels with a ray-traced point light that also traced a light past\n";
 				out << "#   the lights-per-pixel count (read back a few frames late; -1 = switch off, 6 lights per pixel, or not known).\n";
 				out << "#   rt_pw_* = the work of the RT D3D12 prep submission whose GPU time is rt_prep_gpu_ms on the same row (1 = valid; early =\n";
@@ -1196,7 +1202,8 @@ namespace Util::FrameTrace
 					   "rt_refl_fill,rt_refl_sync_gpu_ms,"  // (48d)
 					   "rt_refl_mat_copies,rt_refl_mat_pending,rt_refl_mat_textures,rt_refl_attr_mb,"  // (48f)
 					   "rt_refl_shade_gpu_ms,rt_refl_shade_mat_pct,rt_refl_shade_ratio,"  // (48g)
-					   "rt_refl_shade_ratio_smoothed\n";  // (48h) the last one
+					   "rt_refl_shade_ratio_smoothed,"  // (48h)
+					   "grass_deferred,rt_hitch_mode,rt_builds_waiting,rt_fog_sun,rt_fog_lights\n";  // (49b) the last one
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
 					std::string s = std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{},{}", t.scene,
@@ -1410,6 +1417,9 @@ namespace Util::FrameTrace
 					// (48h) The smoothed ratio, after rt_refl_shade_ratio (the old last column).
 					extra.pop_back();
 					extra += std::format(",{:.3f}\n", r.rt.shadeRatioSmoothed);
+					// (49b) Hitch fixes and RT fog, after rt_refl_shade_ratio_smoothed (the old last column).
+					extra.pop_back();
+					extra += std::format(",{},{},{},{},{}\n", r.grassDeferred, r.rt.hitchMode, r.rt.buildsWaiting, r.rt.fogSun, r.rt.fogLights);
 					if (it == a_reflex.end()) {
 						out << (r.reflexFrame == UINT32_MAX ? std::string("-1") : std::to_string(r.reflexFrame)) << ",-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" << engineColumns(r) << extra;
 						continue;
@@ -2225,6 +2235,7 @@ namespace Util::FrameTrace
 
 	void OnFramesPresented(uint32_t a_count) { g_frame.fgPresented = a_count; }
 	void OnGrassApply(float a_ms) { g_frame.grassApplyMs = a_ms; }
+	void OnGrassSpread(int a_deferred) { g_frame.grassDeferred = a_deferred; }
 	void OnRayTracing(float a_gpuMs, float a_cpuMs, uint32_t a_builds)
 	{
 		g_frame.rtGpuMs = a_gpuMs;
@@ -2618,6 +2629,7 @@ namespace Util::FrameTrace
 				r.lightingDraws = g_frame.lightingDraws;
 				r.fgPresented = g_frame.fgPresented;
 				r.grassApplyMs = g_frame.grassApplyMs;
+				r.grassDeferred = g_frame.grassDeferred;
 				r.rtGpuMs = g_frame.rtGpuMs;
 				r.rtCpuMs = g_frame.rtCpuMs;
 				r.rtBuilds = g_frame.rtBuilds;

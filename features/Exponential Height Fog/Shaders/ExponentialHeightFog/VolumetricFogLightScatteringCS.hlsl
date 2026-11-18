@@ -39,6 +39,9 @@ RWTexture3D<float4> LightScattering : register(u0);
 #	endif
 #endif
 #include "Skylighting/Skylighting.hlsli"
+#if !defined(VOLUMETRIC_FOG_FAR_GRID)
+#	include "ExponentialHeightFog/RTFogVisibility.hlsli"  // (49b) RT Sun Shafts / RT Light Shadows in Fog (near grid only)
+#endif
 
 Texture3D<sh2> FogSkylightingProbeArray : register(t50);
 
@@ -341,6 +344,10 @@ float3 AccumulateLocalLightScattering(uint3 coord, float3 cellOffset, float3 pos
 
 	float phaseG = VolumetricFogLighting.w;
 	float3 localScattering = 0.0f.xxx;
+#	if !defined(VOLUMETRIC_FOG_FAR_GRID)
+	// (49b) "RT Light Shadows in Fog": this froxel's four traced sources (half resolution), last frame's rays brought into this grid.
+	const bool rtLights = (RTFogVis::Flags() & RTFogVis::kFogLights) != 0u;
+#	endif
 	[loop] for (uint lightIndex = 0; lightIndex < lightCount; lightIndex++)
 	{
 		uint clusteredLightIndex = LightLimitFix::lightList[grid.offset + lightIndex];
@@ -363,6 +370,15 @@ float3 AccumulateLocalLightScattering(uint3 coord, float3 cellOffset, float3 pos
 
 		const bool isPointLightLinear = light.lightFlags & LightLimitFix::LightFlags::Linear;
 		float3 lightColor = Color::PointLight(light.color.xyz, isPointLightLinear) * attenuation * light.fade;
+#	if !defined(VOLUMETRIC_FOG_FAR_GRID)
+		[branch] if (rtLights)
+		{
+			const uint rtId = RTFogVis::LightId(clusteredLightIndex);
+			bool rtFound;
+			[branch] if (rtId != 0u)
+				lightColor *= RTFogVis::LightVisibility(RTFogVis::PackSlots(RTFogVis::RTFogLightId.Load(int4(coord.xy / 2u, coord.z, 0)), RTFogVis::RTFogLightVis.Load(int4(coord.xy / 2u, coord.z, 0))), rtId, rtFound);
+		}
+#	endif
 		localScattering += lightColor * phase;
 	}
 
@@ -386,6 +402,12 @@ float4 ComputeLightScattering(uint3 coord, float3 cellOffset)
 	float directionalShadow = SampleDirectionalShadow(positionWS, eyeIndex) *
 	                          ShadowSampling::GetWorldShadow(positionWS, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, eyeIndex) *
 	                          WeatherFog::SunlightAttenuation(positionWS.z);
+#if !defined(VOLUMETRIC_FOG_FAR_GRID)
+	// (49b) "RT Sun Shafts in Fog": x the ray-traced visibility (trees, plants, characters, objects: casters Ray Tracing took out of the
+	// shadow map) where it has data; the shadow map keeps the rest (terrain, non-traced objects). Off / no data: unchanged.
+	[branch] if (RTFogVis::Flags() & RTFogVis::kFogSun)
+		directionalShadow *= RTFogVis::SunFactor(RTFogVis::RTFogSun.Load(int4(coord, 0)));
+#endif
 	float3 directionalScattering =
 		GetDirectionalLightColor() *
 		VolumetricFogLighting.x *

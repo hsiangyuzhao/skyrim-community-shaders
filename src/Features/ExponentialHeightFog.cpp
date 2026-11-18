@@ -7,6 +7,7 @@
 #include "Features/LightLimitFix.h"
 #include "Features/LinearLighting.h"
 #include "Features/PhysicalSky.h"
+#include "Features/RayTracing.h"
 #include "Features/Skylighting.h"
 #include "Features/TerrainBlending.h"
 #include "Features/TerrainShadows.h"
@@ -59,7 +60,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     NoiseScale,
     NoiseThreshold,
     NoiseVelocity,
-    OffIndoors)
+    OffIndoors,
+    RTSunShafts,
+    RTLightShadows)
 
 namespace
 {
@@ -407,7 +410,7 @@ void ExponentialHeightFog::ReadVolumetricDebug()
 void ExponentialHeightFog::ClearShaderCache()
 {
     for (auto** cs : { &materialSetupCS, &farMaterialSetupCS, &conservativeDepthCS, &farConservativeDepthCS,
-             &lightScatteringCS, &farLightScatteringCS, &integrationCS, &farIntegrationCS }) {
+             &lightScatteringCS, &farLightScatteringCS, &integrationCS, &farIntegrationCS, &rtVisibilityCS }) {
         if (*cs) {
             (*cs)->Release();
             *cs = nullptr;
@@ -551,6 +554,10 @@ void ExponentialHeightFog::EnsureVolumetricResources()
     hasLightScatteringFarHistory = false;
     hasConservativeDepthFarHistory = false;
     lastPrepassFrame = UINT32_MAX;
+
+    // (49b) RT fog visibility: our filtered textures, and Ray Tracing's shared atlases for this grid (both only here, with the volumes).
+    CreateRTFogResources(gridSize);
+    globals::features::rayTracing.EnsureFogResources(gridSize.x, gridSize.y, gridSize.z);
 }
 
 void ExponentialHeightFog::ReleaseVolumetricResources()
@@ -570,6 +577,7 @@ void ExponentialHeightFog::ReleaseVolumetricResources()
     integratedLightScattering.reset();
     integratedLightScatteringFar.reset();
     currentGridSize = {};
+    ReleaseRTFogResources();
     currentFarGridSize = {};
     hasLightScatteringHistory = false;
     hasConservativeDepthHistory = false;
@@ -577,6 +585,7 @@ void ExponentialHeightFog::ReleaseVolumetricResources()
     hasConservativeDepthFarHistory = false;
     lastPrepassFrame = UINT32_MAX;
     BindIntegratedLightScattering(false);
+    BindRTFogVisibilityPS(false);
 }
 
 void ExponentialHeightFog::BindIntegratedLightScattering(bool a_valid)
@@ -587,6 +596,151 @@ void ExponentialHeightFog::BindIntegratedLightScattering(bool a_valid)
         a_valid && integratedLightScatteringFar ? integratedLightScatteringFar->srv.get() : nullptr
     };
     globals::d3d::context->PSSetShaderResources(21, 2, srvs);
+}
+
+// (49b) RT fog visibility
+void ExponentialHeightFog::CreateRTFogResources(const DirectX::XMUINT4& a_gridSize)
+{
+    ReleaseRTFogResources();
+    auto make3D = [](uint32_t a_x, uint32_t a_y, uint32_t a_z, DXGI_FORMAT a_format) {
+        D3D11_TEXTURE3D_DESC texDesc{};
+        texDesc.Width = a_x;
+        texDesc.Height = a_y;
+        texDesc.Depth = a_z;
+        texDesc.MipLevels = 1;
+        texDesc.Format = a_format;
+        texDesc.Usage = D3D11_USAGE_DEFAULT;
+        texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+        auto tex = std::make_unique<Texture3D>(texDesc);
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+        srvDesc.Format = a_format;
+        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE3D;
+        srvDesc.Texture3D.MipLevels = 1;
+        tex->CreateSRV(srvDesc);
+        D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+        uavDesc.Format = a_format;
+        uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE3D;
+        uavDesc.Texture3D.WSize = a_z;
+        tex->CreateUAV(uavDesc);
+        return tex;
+    };
+    const uint32_t halfX = (a_gridSize.x + 1) / 2, halfY = (a_gridSize.y + 1) / 2;
+    try {
+        for (uint32_t i = 0; i < 2; ++i) {
+            rtSunVis[i] = make3D(a_gridSize.x, a_gridSize.y, a_gridSize.z, DXGI_FORMAT_R8G8_UNORM);
+            rtLightVis[i] = make3D(halfX, halfY, a_gridSize.z, DXGI_FORMAT_R8G8B8A8_UNORM);
+            rtLightId[i] = make3D(halfX, halfY, a_gridSize.z, DXGI_FORMAT_R8G8B8A8_UINT);
+        }
+        rtFogData = std::make_unique<StructuredBuffer>(StructuredBufferDesc<RTFogDataGPU>(1ull, false, true), 1);  // dynamic, SRV only
+        rtFogData->CreateSRV();
+        rtFilterCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<RTFilterCB>());
+    } catch (const std::exception& e) {
+        logger::warn("[Exponential Height Fog] RT fog visibility textures could not be created ({}); the fog keeps the shadow map", e.what());
+        ReleaseRTFogResources();
+    }
+}
+
+void ExponentialHeightFog::ReleaseRTFogResources()
+{
+    for (uint32_t i = 0; i < 2; ++i) {
+        rtSunVis[i].reset();
+        rtLightVis[i].reset();
+        rtLightId[i].reset();
+    }
+    rtFogData.reset();
+    rtFilterCB.reset();
+    rtHistorySun = rtHistoryLights = false;
+    rtLastFlags = 0;
+}
+
+void ExponentialHeightFog::BindRTFogVisibilityPS(bool a_valid)
+{
+    // PS t47 (shared data), t48 (sun), t49 (light visibility), t52 (light ids) for lit effects; null = off for them.
+    const bool valid = a_valid && rtFogData && rtSunVis[rtVisIndex];
+    ID3D11ShaderResourceView* srvs[3]{
+        valid ? rtFogData->SRV() : nullptr,
+        valid ? rtSunVis[rtVisIndex]->srv.get() : nullptr,
+        valid ? rtLightVis[rtVisIndex]->srv.get() : nullptr
+    };
+    ID3D11ShaderResourceView* ids = valid ? rtLightId[rtVisIndex]->srv.get() : nullptr;
+    auto context = globals::d3d::context;
+    context->PSSetShaderResources(47, 3, srvs);
+    context->PSSetShaderResources(52, 1, &ids);
+}
+
+uint32_t ExponentialHeightFog::PrepareRTFogVisibility(ID3D11DeviceContext* a_context, bool a_historyValid)
+{
+    auto& rayTracing = globals::features::rayTracing;
+    const bool particles = rayTracing.ParticlesUseRT();
+    const bool wantSun = volumetric.RTSunShafts || particles;
+    const bool wantLights = volumetric.RTLightShadows || particles;
+    if (!rtSunVis[0] || !rtFogData || !rtFilterCB || !rtVisibilityCS || !rayTracing.loaded || (!wantSun && !wantLights)) {
+        rtHistorySun = rtHistoryLights = false;
+        return 0;
+    }
+    const auto trace = rayTracing.AcquireFogTrace(currentGridSize.x, currentGridSize.y, currentGridSize.z);
+    const bool rawSun = wantSun && trace.sun && trace.sunSRV;
+    const bool rawLights = wantLights && trace.lights && trace.lightVisSRV && trace.lightIdSRV;
+    const bool histSun = a_historyValid && rtHistorySun && wantSun;
+    const bool histLights = a_historyValid && rtHistoryLights && wantLights;
+    if (!rawSun && !rawLights && !histSun) {
+        rtHistorySun = rtHistoryLights = false;
+        return 0;
+    }
+
+    const uint32_t hist = rtVisIndex;
+    const uint32_t out = rtVisIndex ^ 1u;
+    RTFilterCB cb{};
+    cb.flags[0] = (rawSun ? 1u : 0u) | (rawLights ? 2u : 0u) | (histSun ? 4u : 0u) | (histLights ? 8u : 0u);
+    cb.flags[1] = currentGridSize.x;
+    cb.flags[2] = currentGridSize.y;
+    cb.flags[3] = currentGridSize.z;
+    cb.params[0] = 0.85f;  // sun: about 7 frames (the light scattering pass averages ~10 more on top)
+    cb.params[1] = 0.7f;   // point lights: about 3 frames (torches move with their carriers)
+    cb.params[2] = 0.85f;  // without new rays the trust fades back to the shadow map in about 20 frames
+    rtFilterCB->Update(cb);
+
+    // The PS-side slots must not be bound while these are written.
+    BindRTFogVisibilityPS(false);
+    ID3D11Buffer* filterCB = rtFilterCB->CB();
+    a_context->CSSetConstantBuffers(1, 1, &filterCB);
+    ID3D11ShaderResourceView* srvs[6]{
+        rawSun ? trace.sunSRV : nullptr,
+        rawLights ? trace.lightVisSRV : nullptr,
+        rawLights ? trace.lightIdSRV : nullptr,
+        histSun ? rtSunVis[hist]->srv.get() : nullptr,
+        histLights ? rtLightVis[hist]->srv.get() : nullptr,
+        histLights ? rtLightId[hist]->srv.get() : nullptr
+    };
+    ID3D11UnorderedAccessView* uavs[3]{ rtSunVis[out]->uav.get(), rtLightVis[out]->uav.get(), rtLightId[out]->uav.get() };
+    a_context->CSSetShaderResources(0, 6, srvs);
+    a_context->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
+    a_context->CSSetShader(rtVisibilityCS, nullptr, 0);
+    a_context->Dispatch((currentGridSize.x + 7) / 8, (currentGridSize.y + 7) / 8, (currentGridSize.z + 3) / 4);
+    ID3D11ShaderResourceView* nullSrvs[6]{};
+    ID3D11UnorderedAccessView* nullUavs[3]{};
+    ID3D11Buffer* nullCb = nullptr;
+    a_context->CSSetShaderResources(0, 6, nullSrvs);
+    a_context->CSSetUnorderedAccessViews(0, 3, nullUavs, nullptr);
+    a_context->CSSetConstantBuffers(1, 1, &nullCb);
+
+    rtVisIndex = out;
+    // Without new rays the history fades out over about 20 frames; after 30 frames without any it is dropped (no filter pass any more).
+    rtNoRawFrames = (rawSun || rawLights) ? 0u : rtNoRawFrames + 1u;
+    rtHistorySun = rawSun || (histSun && rtNoRawFrames < 30u);
+    rtHistoryLights = rawLights;
+
+    RTFogDataGPU data{};
+    data.flags = (volumetric.RTSunShafts && rtHistorySun ? 1u : 0u) | (volumetric.RTLightShadows && rawLights ? 2u : 0u) |
+                 (particles && rtHistorySun ? 4u : 0u) | (particles && rawLights ? 8u : 0u);
+    rtFogData->Update(&data, sizeof(data));
+
+    // The light scattering pass reads them from the same slots as lit effects.
+    ID3D11ShaderResourceView* csSrvs[3]{ rtFogData->SRV(), rtSunVis[out]->srv.get(), rtLightVis[out]->srv.get() };
+    ID3D11ShaderResourceView* csIds = rtLightId[out]->srv.get();
+    a_context->CSSetShaderResources(47, 3, csSrvs);
+    a_context->CSSetShaderResources(52, 1, &csIds);
+    return data.flags;
 }
 
 void ExponentialHeightFog::Prepass()
@@ -602,6 +756,8 @@ void ExponentialHeightFog::Prepass()
         hasConservativeDepthFarHistory = false;
         lastPrepassFrame = UINT32_MAX;
         BindIntegratedLightScattering(false);
+        BindRTFogVisibilityPS(false);
+        rtHistorySun = rtHistoryLights = false;
         return;
     }
 
@@ -615,6 +771,8 @@ void ExponentialHeightFog::Prepass()
     auto* farScatteringCS = GetShader(farLightScatteringCS, L"Data\\Shaders\\ExponentialHeightFog\\VolumetricFogLightScatteringCS.hlsl", true, true);
     auto* integrateCS = GetShader(integrationCS, L"Data\\Shaders\\ExponentialHeightFog\\VolumetricFogIntegrationCS.hlsl", false, false);
     auto* farIntegrateCS = GetShader(farIntegrationCS, L"Data\\Shaders\\ExponentialHeightFog\\VolumetricFogIntegrationCS.hlsl", true, false);
+    // (49b) RT fog visibility filter (compiled with the other volume shaders; without it the fog keeps the shadow map).
+    GetShader(rtVisibilityCS, L"Data\\Shaders\\ExponentialHeightFog\\VolumetricFogRTVisibilityCS.hlsl", false, false);
     if (!materialCS || !farMaterialCS || !depthCS || !farDepthCS || !scatteringCS || !farScatteringCS || !integrateCS || !farIntegrateCS) {
         BindIntegratedLightScattering(false);
         return;
@@ -755,9 +913,15 @@ void ExponentialHeightFog::Prepass()
     context->CSSetShaderResources(19, 1, &shadowDataSrv);
     context->CSSetShaderResources(25, 1, &cloudSrv);
     context->CSSetShaderResources(35, 3, localLightSrvs);
+    // (49b) The Ray Tracing source id of each light (RT Light Shadows in Fog).
+    ID3D11ShaderResourceView* fogIdsSrv = hasLocalLights && lightLimitFix.fogLightIds ? lightLimitFix.fogLightIds->srv.get() : nullptr;
+    context->CSSetShaderResources(53, 1, &fogIdsSrv);
     context->CSSetShaderResources(50, 1, &skylightingSrv);
     context->CSSetShaderResources(60, 1, &terrainSrv);
     context->CSSetShaderResources(76, 2, iblSrvs);
+
+    // (49b) RT Sun Shafts / RT Light Shadows in Fog / Particles Use RT Shadows: last frame's ray-traced visibility into this grid (t47 / t48 / t49 / t52).
+    const uint32_t rtFlags = PrepareRTFogVisibility(context, temporalHistoryValid);
 
     struct VolumetricPassDesc
     {
@@ -880,6 +1044,9 @@ void ExponentialHeightFog::Prepass()
     context->CSSetShaderResources(50, 1, nullSrvs);
     context->CSSetShaderResources(60, 1, nullSrvs);
     context->CSSetShaderResources(76, 2, nullSrvs);
+    context->CSSetShaderResources(47, 3, nullSrvs);  // (49b)
+    context->CSSetShaderResources(52, 1, nullSrvs);
+    context->CSSetShaderResources(53, 1, nullSrvs);
     context->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
     context->CSSetSamplers(0, 2, nullSamplers);
     context->CSSetConstantBuffers(0, 1, &nullCb);
@@ -922,6 +1089,27 @@ void ExponentialHeightFog::Prepass()
     lastBuildHadLocalLights = hasLocalLights;
     ReadVolumetricDebug();
     BindIntegratedLightScattering(true);
+
+    // (49b) Lit effects read the filtered RT visibility (their flags in the shared data); Ray Tracing traces this grid next frame.
+    rtLastFlags = rtFlags;
+    rtLastFrame = globals::state->frameCount;
+    BindRTFogVisibilityPS(rtFlags != 0u);
+    {
+        auto& rayTracing = globals::features::rayTracing;
+        const bool particles = rayTracing.ParticlesUseRT();
+        RayTracing::FogGridInfo info;
+        info.x = currentGridSize.x;
+        info.y = currentGridSize.y;
+        info.z = currentGridSize.z;
+        info.zParams[0] = p.nearZ.x;
+        info.zParams[1] = p.nearZ.y;
+        info.zParams[2] = p.nearZ.z;
+        info.frame = globals::state->frameCount;
+        info.sun = rtVisibilityCS && (volumetric.RTSunShafts || particles);
+        info.lights = rtVisibilityCS && (volumetric.RTLightShadows || particles);
+        if (rayTracing.loaded)
+            rayTracing.PublishFogGrid(info);
+    }
 }
 
 void ExponentialHeightFog::DrawSettings()
@@ -1038,6 +1226,26 @@ void ExponentialHeightFog::DrawSettings()
         ImGui::Text(
             "On: no 3D fog inside buildings and caves, which saves about 1 ms there. Outside nothing changes.\n"
             "Off (default): the 3D fog is drawn indoors too.");
+    // (49b) Ray-traced visibility in the fog (needs Ray Tracing; last frame's rays, brought into this frame by the fog's own reprojection).
+    ImGui::Checkbox("RT Sun Shafts in Fog", &volumetric.RTSunShafts);
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text(
+            "On (default): with Ray Tracing on, trees, plants, characters and objects block the sun in the 3D fog again\n"
+            "(Ray Tracing takes them out of the game's shadow map, so the fog had no light shafts from them).\n"
+            "One ray per fog cell toward the sun; where Ray Tracing has no data the shadow map is used as before.\n"
+            "Off: as before. Ray Tracing off: no effect. Costs about 0.15-0.35 ms with Ray Tracing on.");
+    ImGui::Checkbox("RT Light Shadows in Fog", &volumetric.RTLightShadows);
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text(
+            "On (default): torches, campfires, lamps and window beams no longer light the fog through walls and objects:\n"
+            "per fog cell the four strongest lights that Ray Tracing shadows (Point Light Shadows on) get one short ray each.\n"
+            "Indoors this needs Skip Volumetric Fog Indoors off. Off: as before (no shadows for lights in the fog).\n"
+            "Costs about 0.2-0.5 ms where many lights shine into fog.");
+    if (volumetric.Enabled && (volumetric.RTSunShafts || volumetric.RTLightShadows || globals::features::rayTracing.ParticlesUseRT())) {
+        const bool recent = rtLastFrame != UINT32_MAX && globals::state->frameCount - rtLastFrame <= 1u;
+        ImGui::TextDisabled("Ray-traced fog: %s; used this frame: sun %s, lights %s, particles %s", globals::features::rayTracing.FogStatusText().c_str(),
+            recent && (rtLastFlags & 1u) ? "yes" : "no", recent && (rtLastFlags & 2u) ? "yes" : "no", recent && (rtLastFlags & 12u) ? "yes" : "no");
+    }
     if (volumetric.Enabled) {
         if (VolumetricFogRequested() && globals::features::volumetricLighting.loaded)
             ImGui::TextColored(palette.InfoColor, "Vanilla Volumetric Lighting is paused while this is on.");

@@ -358,6 +358,34 @@ namespace RayTracingRT
 	};
 	inline constexpr std::uint32_t kPointReprojectRecord = 64;  // (47z) TracePointLightsCS kReprojectRecord (after the 64 sources)
 
+	/// (49b) RT fog (TraceFogCS root constants b0, 48 DWORDs): the volumetric fog's near froxel grid seen from this frame's camera.
+	struct FogTraceConstants
+	{
+		float invViewProj[16]{};      // the sun trace's jittered inverse view-projection (same as TraceConstants)
+		float toSun[4]{};             // xyz to the sun, w max ray length
+		std::uint32_t grid[4]{};      // near grid x, y, z (full resolution), w flags (TraceFogCS kFlag*)
+		float zParams[4]{};           // slice distribution scale, offset, distribution; w the RT fade (0..1)
+		float camera[4]{};            // CameraData x, z, w; w frame index
+		float rect[4]{};              // camera-relative traced xy min / max
+		float lights[4]{};            // sources to scan, hand-off band, ray start offset, beam exit margin
+		float bounds[4]{};            // interior z min / max (camera-relative)
+		float renderSize[4]{};        // w, h, 1 / w, 1 / h
+	};
+	static_assert(sizeof(FogTraceConstants) == 48 * 4, "FogTraceConstants must match TraceFogCS.hlsl");
+	inline constexpr std::uint32_t kFogFlagInterior = 1u;  // TraceFogCS kFlagInterior
+
+	/// (49b) RT fog this frame: the sun pass (exteriors) and / or the point-light pass (needs this frame's point-light sources). Recorded in
+	/// its own list after the reflection list, signalling the fourth fence; written into texture set `set` (0 / 1, alternating per frame:
+	/// the D3D11 side reads the other set, last frame's).
+	struct FogInput
+	{
+		FogTraceConstants constants{};
+		bool sun = false;
+		bool lights = false;
+		bool alpha = false;  // alpha-tested casters tested against their cut-out (the sun's / point lights' alpha frame)
+		std::uint32_t set = 0;
+	};
+
 	/// (45f) What a TLAS instance holds, for the per-category counts and the self-check.
 	enum InstanceCategory : std::uint8_t
 	{
@@ -445,6 +473,8 @@ namespace RayTracingRT
 		// (48f) RT reflections, Capture Materials: the per-instance attribute table (TLAS order: attribute base, triangles, material, type) is
 		// written with the instance descriptors and the reflection rays read it (the RT_MATERIAL variant). false = nothing of it (48e).
 		bool materials = false;
+		// (49b) RT fog: its own list and fence after the reflection list (null = none).
+		const FogInput* fog = nullptr;
 	};
 
 	/// (48f) RT reflections, Capture Materials: the per-triangle attributes (D3D12) and the material table + texture copies (D3D11).
@@ -619,6 +649,12 @@ namespace RayTracingRT
 		bool reflectTracedLastFrame = false;
 		// (48d) The last ExecuteFrame submitted the reflection list and signalled its fence (a WaitForReflections is pending).
 		bool reflectSubmittedLastFrame = false;
+		// (49b) RT fog: the last ExecuteFrame submitted the fog list (sun / point-light passes) into set fogSetLastFrame.
+		bool fogTracedLastFrame = false;
+		bool fogSunLastFrame = false;
+		bool fogLightsLastFrame = false;
+		std::uint32_t fogSetLastFrame = 0;
+		std::uint64_t fogFenceLastFrame = 0;  // the fourth fence's value behind it
 		// (46m) Split Trace Sync: the last ExecuteFrame signalled the sun fence between the sun and the point lights.
 		bool sunSplitLastFrame = false;
 		// (46p) What the submission behind lastPrepGpuMs recorded (set with it).
@@ -1026,6 +1062,38 @@ namespace RayTracingRT
 		[[nodiscard]] const std::string& ReflectFault() const { return reflectFault_; }
 		void ClearReflectFault() { reflectFault_.clear(); }
 
+		// (49b) RT fog (TraceFogCS): two sets of shared RGBA8 atlases (sun; point-light visibility and source ids), D3D12 writes, D3D11 reads
+		// (the set traced last frame). Created by EnsureFogTextures (when the volumetric fog creates its volumes, or once when RT starts
+		// with the fog already built), never inside a normal frame.
+		[[nodiscard]] bool FogAvailable() const { return fogRootSignature_ && fogSunPipeline_ && fogLightPipeline_ && fogFault_.empty(); }
+		bool EnsureFogTextures(std::uint32_t a_gridX, std::uint32_t a_gridY, std::uint32_t a_gridZ);
+		void ReleaseFogTextures();
+		[[nodiscard]] bool FogTexturesReady(std::uint32_t a_gridX, std::uint32_t a_gridY, std::uint32_t a_gridZ) const
+		{
+			return fogSun_[0].resource12 && fogSun_[1].resource12 && fogGridX_ == a_gridX && fogGridY_ == a_gridY && fogGridZ_ == a_gridZ;
+		}
+		[[nodiscard]] ID3D11ShaderResourceView* FogSunSRV(std::uint32_t a_set) const { return fogSun_[a_set & 1u].srv11.Get(); }
+		[[nodiscard]] ID3D11ShaderResourceView* FogLightVisSRV(std::uint32_t a_set) const { return fogLightVis_[a_set & 1u].srv11.Get(); }
+		[[nodiscard]] ID3D11ShaderResourceView* FogLightIdSRV(std::uint32_t a_set) const { return fogLightId_[a_set & 1u].srv11.Get(); }
+		/// (49b) The D3D11 queue waits (on the GPU) for the fog list behind fence value a_value (submitted a frame earlier, normally long done).
+		/// No-op when the D3D11 queue already waited for it (the guard before the next ready signal also takes it).
+		bool WaitForFog(std::uint64_t a_value);
+		[[nodiscard]] std::uint64_t FogBytes() const { return fogBytes_; }
+		[[nodiscard]] const std::string& FogFault() const { return fogFault_; }
+		/// (49b) Hitch fix B: the settle window after a hand-off (on: the GPU-time build budget x 0.5, at most 16 builds and 8 compactions per frame,
+		/// new character shapes at half the CPU time). Only where the caller left the play defaults (no explicit transition budgets).
+		void SetSettle(bool a_on)
+		{
+			settleScale_ = a_on ? 0.5f : 1.0f;
+			settleMaxBuilds_ = a_on ? 16u : 0u;
+			settleMaxCompactions_ = a_on ? 8u : 0u;
+		}
+		[[nodiscard]] bool SettleOn() const { return settleScale_ < 1.0f; }
+		/// (49b) Hitch fix E: per-context alpha record buffers are made at full size (kAlphaMaxInfos) and never regrown; PreallocateAlphaInfoBuffers
+		/// makes the missing ones (backend start, black screen).
+		void SetAlphaPrealloc(bool a_on) { alphaPrealloc_ = a_on; }
+		void PreallocateAlphaInfoBuffers();
+
 		// (48f) RT reflections, Capture Materials (BackendMaterial.cpp). Nothing of it exists while it is not enabled.
 		/// On: attribute BLASes keep their attributes, materials can be registered. Off: nothing new is registered; the attribute buffer, the
 		/// texture pages and the table go once nothing uses them any more (MaterialHousekeeping).
@@ -1181,6 +1249,9 @@ namespace RayTracingRT
 			// signalled (0 = none).
 			ComPtr<ID3D12GraphicsCommandList4> reflectList;
 			std::uint64_t reflectFenceValue = 0;
+			// (49b) The fog list (same allocator, recorded after the reflection list) and the fourth fence's value its submission signalled.
+			ComPtr<ID3D12GraphicsCommandList4> fogList;
+			std::uint64_t fogFenceValue = 0;
 			// (48f) Capture Materials: this context's per-instance attribute table (upload heap, persistently mapped; uint4 per TLAS instance).
 			ComPtr<ID3D12Resource> instanceAttrBuffer;
 			void* instanceAttrMapped = nullptr;
@@ -1197,10 +1268,11 @@ namespace RayTracingRT
 		bool ContextFree(const CommandContext& a_context, std::uint64_t a_completed, std::uint64_t a_aoCompleted) const
 		{
 			return (a_context.fenceValue == 0 || a_context.fenceValue <= a_completed) && a_context.aoFenceValue <= a_aoCompleted &&
-			       a_context.reflectFenceValue <= ReflectCompleted();
+			       a_context.reflectFenceValue <= ReflectCompleted() && a_context.fogFenceValue <= FogCompleted();
 		}
 		[[nodiscard]] std::uint64_t AOCompleted() const { return aoFence_ ? aoFence_->GetCompletedValue() : UINT64_MAX; }
 		[[nodiscard]] std::uint64_t ReflectCompleted() const { return reflectFence_ ? reflectFence_->GetCompletedValue() : UINT64_MAX; }
+		[[nodiscard]] std::uint64_t FogCompleted() const { return fogFence_ ? fogFence_->GetCompletedValue() : UINT64_MAX; }
 
 		enum class BlasState : std::uint8_t
 		{
@@ -1922,7 +1994,7 @@ namespace RayTracingRT
 		// (47n) The 47l RTAO blue noise SRV (slot 11) is gone.
 		// (47z) + last frame's PLIdx SRV (point table offset 9, t8).
 		static constexpr std::uint32_t kDynSun = 0, kDynPoint = 2, kDynAO = 6, kDynWater = 8, kDynAONormal = 10, kDynPointPrev = 11, kDynPointWide = 12, kDynPointWidePrev = 13,
-		                               kDynReflect = 14, kDynAOBent = 20, kDynamicDescriptors = 21;  // (49a) + the RTAO bent normal UAV (RTAO table offset 14, u2). (48f) + the surface record UAVs u3 / u4 (reflection table offsets 4, 5). (47j) + the RTAO smooth normals SRV (RTAO table offset 4); (48a) + the wide slots UAV / prev SRV (point table offsets 10, 11) and the reflection table (depth SRV t1, output UAV u0, prep SRV t5; (48d) + direction UAV u2)
+		                               kDynReflect = 14, kDynAOBent = 20, kDynFog = 21, kDynamicDescriptors = 29;  // (49b) + the fog tables (2 sets x depth SRV t5, sun UAV u0, light vis UAV u1, light id UAV u2). (49a) + the RTAO bent normal UAV (RTAO table offset 14, u2). (48f) + the surface record UAVs u3 / u4 (reflection table offsets 4, 5). (47j) + the RTAO smooth normals SRV (RTAO table offset 4); (48a) + the wide slots UAV / prev SRV (point table offsets 10, 11) and the reflection table (depth SRV t1, output UAV u0, prep SRV t5; (48d) + direction UAV u2)
 		static constexpr std::uint32_t kDynamicBase = kPointDescriptorBase + kPointDescriptors;  // after the (unused) 46b point slots
 		ComPtr<ID3D12DescriptorHeap> stagingHeap_;
 		[[nodiscard]] D3D12_CPU_DESCRIPTOR_HANDLE StagingCpu(std::uint32_t a_slot) const;
@@ -1979,6 +2051,30 @@ namespace RayTracingRT
 		std::uint64_t reflectFenceValue_ = 0;
 		std::uint64_t pendingReflectWait_ = 0;
 		bool EnsureReflectFence();
+		// (49b) Hitch fixes B and E.
+		float settleScale_ = 1.0f;
+		std::uint32_t settleMaxBuilds_ = 0, settleMaxCompactions_ = 0;
+		bool alphaPrealloc_ = false;
+		[[nodiscard]] static std::uint32_t SettleCap(std::uint32_t a_default, std::uint32_t a_cap, const FrameInput& a_input)
+		{
+			return (a_cap != 0 && a_input.buildCpuMs <= 0.0f) ? std::min(a_default, a_cap) : a_default;
+		}
+		// (49b) RT fog.
+		ComPtr<ID3D12RootSignature> fogRootSignature_;
+		ComPtr<ID3D12PipelineState> fogSunPipeline_, fogSunAlphaPipeline_, fogLightPipeline_, fogLightAlphaPipeline_;
+		SharedTexture fogSun_[2], fogLightVis_[2], fogLightId_[2];
+		std::uint32_t fogGridX_ = 0, fogGridY_ = 0, fogGridZ_ = 0;
+		std::uint64_t fogBytes_ = 0;
+		std::string fogFault_;
+		ComPtr<ID3D12Fence> fogFence_;
+		ComPtr<ID3D11Fence> fogFence11_;
+		std::uint64_t fogFenceValue_ = 0;
+		std::uint64_t pendingFogWait_ = 0;
+		std::uint64_t fogWaited11_ = 0;  // the highest fog fence value the D3D11 queue waited for
+		bool CreateFogPipeline();
+		bool EnsureFogFence();
+		void WriteFogDescriptors();
+		bool RecordFogList(CommandContext& a_context, std::size_t a_index, const FrameInput& a_input, bool a_alphaFrame, D3D12_GPU_DESCRIPTOR_HANDLE a_block);
 		std::uint32_t reflectWidth_ = 0, reflectHeight_ = 0;
 		ComPtr<ID3D12Resource> reflectCounter_;          // default heap, UAV: [0] pixels traced (monotonic, wraps)
 		ComPtr<ID3D12Resource> reflectCounterReadback_;  // per context one uint32 copy of it

@@ -386,10 +386,32 @@ add_custom_command(
     COMMENT "Compiling Ray Tracing DXIL (TraceReflectCS with RT_MATERIAL and RT_ALPHA, cs_6_5)"
     VERBATIM
 )
+# (49b) RT fog: one occlusion ray per froxel toward the sun (and, with FOG_LIGHTS, per half-resolution froxel toward its four
+# strongest point-light sources), its own list after the reflection list (fourth fence); read by the volumetric fog a frame later.
+set(CS_RT_FOG_SHADER_SOURCE
+    "${CMAKE_SOURCE_DIR}/src/Features/RayTracing/Shaders/TraceFogCS.hlsl"
+)
+foreach(_cs_fog_variant "Sun;" "SunAlpha;-DRT_ALPHA=1" "Lights;-DFOG_LIGHTS=1" "LightsAlpha;-DFOG_LIGHTS=1;-DRT_ALPHA=1")
+    list(GET _cs_fog_variant 0 _cs_fog_name)
+    list(SUBLIST _cs_fog_variant 1 -1 _cs_fog_defines)
+    list(REMOVE_ITEM _cs_fog_defines "")
+    set(_cs_fog_header "${CMAKE_CURRENT_BINARY_DIR}/generated/RayTracing/TraceFog${_cs_fog_name}CS.dxil.h")
+    add_custom_command(
+        OUTPUT "${_cs_fog_header}"
+        COMMAND
+            "${CS_SDK_DXC}" -nologo -T cs_6_5 -E main -O3 -WX -Qstrip_reflect ${_cs_fog_defines} -Fh
+            "${_cs_fog_header}" -Vn g_TraceFog${_cs_fog_name}CS "${CS_RT_FOG_SHADER_SOURCE}"
+        DEPENDS "${CS_RT_FOG_SHADER_SOURCE}"
+        COMMENT "Compiling Ray Tracing DXIL (TraceFogCS ${_cs_fog_name}, cs_6_5)"
+        VERBATIM
+    )
+    list(APPEND CS_RT_FOG_SHADER_HEADERS "${_cs_fog_header}")
+endforeach()
 target_sources(
     "${PROJECT_NAME}"
     PRIVATE
         "${CS_RT_REFLECT_SHADER_HEADER}"
+        ${CS_RT_FOG_SHADER_HEADERS}
         "${CS_RT_REFLECT_ALPHA_SHADER_HEADER}"
         "${CS_RT_REFLECT_MAT_SHADER_HEADER}"
         "${CS_RT_REFLECT_MAT_ALPHA_SHADER_HEADER}"

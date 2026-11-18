@@ -135,6 +135,8 @@ public:
 	std::unique_ptr<ConstantBuffer> lightCullingCB;
 
 	eastl::unique_ptr<Buffer> lights = nullptr;
+	eastl::unique_ptr<Buffer> fogLightIds = nullptr;  // (49b) RT fog / particles: Ray Tracing source id per light (t53)
+	eastl::vector<uint32_t> fogIdsData;
 	eastl::unique_ptr<Buffer> clusters = nullptr;
 	eastl::unique_ptr<Buffer> lightIndexCounter = nullptr;
 	eastl::unique_ptr<Buffer> lightIndexList = nullptr;
