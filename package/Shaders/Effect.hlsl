@@ -545,6 +545,9 @@ namespace RTFogVis
 	bool ParticleCoords(float3 a_positionWS, uint a_eyeIndex, out float3 a_uvw)
 	{
 		a_uvw = 0.0.xxx;
+		// The grid belongs to the main camera: not for menus or the water reflection's camera (as the volumetric fog lookup).
+		if (!(Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InWorld) || (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InReflection))
+			return false;
 		uint w, h, d;
 		RTFogSun.GetDimensions(w, h, d);
 		const float4 clip = mul(FrameBuffer::CameraViewProj[a_eyeIndex], float4(a_positionWS, 1.0));
