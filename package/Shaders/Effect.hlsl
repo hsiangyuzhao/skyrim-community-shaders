@@ -790,49 +790,6 @@ PS_OUTPUT main(PS_INPUT input)
 	float3 propertyColor = Color::Effect(PropertyColor.xyz);
 	float shadowVariance = 1.0;
 
-#	if defined(LIGHTING)
-	propertyColor = GetLightingColor(input.MSPosition.xyz, input.WorldPosition.xyz, input.Position.xyzw, eyeIndex, shadowVariance);
-
-#		if defined(LIGHT_LIMIT_FIX)
-	uint lightCount = 0;
-	if (LightingInfluence.x > 0.0) {
-		float3 viewPosition = mul(FrameBuffer::CameraView[eyeIndex], float4(input.WorldPosition.xyz, 1)).xyz;
-		float2 screenUV = FrameBuffer::ViewToUV(viewPosition, true, eyeIndex);
-		bool inWorld = Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InWorld;
-
-		uint clusterIndex = 0;
-		if (inWorld && LightLimitFix::GetClusterIndex(screenUV, viewPosition.z, clusterIndex)) {
-			lightCount = LightLimitFix::lightGrid[clusterIndex].lightCount;
-			uint lightOffset = LightLimitFix::lightGrid[clusterIndex].offset;
-			[loop] for (uint i = 0; i < lightCount; i++)
-			{
-				uint clusteredLightIndex = LightLimitFix::lightList[lightOffset + i];
-				LightLimitFix::Light light = LightLimitFix::lights[clusteredLightIndex];
-				if (LightLimitFix::IsLightIgnored(light) || light.lightFlags & LightLimitFix::LightFlags::Shadow) {
-					continue;
-				}
-				float3 lightDirection = light.positionWS[eyeIndex].xyz - input.WorldPosition.xyz;
-				float lightDist = length(lightDirection);
-
-#			if defined(ISL)
-				float intensityMultiplier = InverseSquareLighting::GetAttenuation(lightDist, light);
-#			else
-				float intensityFactor = saturate(lightDist / light.radius);
-				float intensityMultiplier = 1 - intensityFactor * intensityFactor;
-#			endif
-
-				const bool isPointLightLinear = light.lightFlags & LightLimitFix::LightFlags::Linear;
-				float3 lightColor = Color::PointLight(light.color.xyz, isPointLightLinear) * intensityMultiplier * 0.5 * light.fade * Color::EffectLightingMult();
-				propertyColor += lightColor;
-			}
-		}
-	}
-#		endif
-#	elif defined(MEMBRANE)
-	propertyColor *= 0;
-	lightingInfluence = 0;
-#	endif
-
 	float4 baseTexColor = float4(1, 1, 1, 1);
 	float4 baseColor = float4(1, 1, 1, 1);
 #	if !defined(TEXTURE)
@@ -909,6 +866,56 @@ PS_OUTPUT main(PS_INPUT input)
 		baseColor.xyz = Color::Effect(baseColorScale * TexGrayscaleSampler.Sample(SampGrayscaleSampler, grayscaleToColorUv).xyz);
 	}
 
+#	if !defined(MOTIONVECTORS_NORMALS)
+	if (alpha * fogMul.w - AlphaTestRefRS < 0) {
+		discard;
+	}
+#	endif
+
+	// (48n, official CS #3033) Light only pixels that survive the alpha test.
+#	if defined(LIGHTING)
+	propertyColor = GetLightingColor(input.MSPosition.xyz, input.WorldPosition.xyz, input.Position.xyzw, eyeIndex, shadowVariance);
+
+#		if defined(LIGHT_LIMIT_FIX)
+	uint lightCount = 0;
+	if (LightingInfluence.x > 0.0) {
+		float3 viewPosition = mul(FrameBuffer::CameraView[eyeIndex], float4(input.WorldPosition.xyz, 1)).xyz;
+		float2 screenUV = FrameBuffer::ViewToUV(viewPosition, true, eyeIndex);
+		bool inWorld = Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InWorld;
+
+		uint clusterIndex = 0;
+		if (inWorld && LightLimitFix::GetClusterIndex(screenUV, viewPosition.z, clusterIndex)) {
+			lightCount = LightLimitFix::lightGrid[clusterIndex].lightCount;
+			uint lightOffset = LightLimitFix::lightGrid[clusterIndex].offset;
+			[loop] for (uint i = 0; i < lightCount; i++)
+			{
+				uint clusteredLightIndex = LightLimitFix::lightList[lightOffset + i];
+				LightLimitFix::Light light = LightLimitFix::lights[clusteredLightIndex];
+				if (LightLimitFix::IsLightIgnored(light) || light.lightFlags & LightLimitFix::LightFlags::Shadow) {
+					continue;
+				}
+				float3 lightDirection = light.positionWS[eyeIndex].xyz - input.WorldPosition.xyz;
+				float lightDist = length(lightDirection);
+
+#			if defined(ISL)
+				float intensityMultiplier = InverseSquareLighting::GetAttenuation(lightDist, light);
+#			else
+				float intensityFactor = saturate(lightDist / light.radius);
+				float intensityMultiplier = 1 - intensityFactor * intensityFactor;
+#			endif
+
+				const bool isPointLightLinear = light.lightFlags & LightLimitFix::LightFlags::Linear;
+				float3 lightColor = Color::PointLight(light.color.xyz, isPointLightLinear) * intensityMultiplier * 0.5 * light.fade * Color::EffectLightingMult();
+				propertyColor += lightColor;
+			}
+		}
+	}
+#		endif
+#	elif defined(MEMBRANE)
+	propertyColor *= 0;
+	lightingInfluence = 0;
+#	endif
+
 	float3 lightColor = lerp(baseColor.xyz, propertyColor * baseColor.xyz, lightingInfluence.xxx);
 
 	float effectNormalization = 1.0;
@@ -946,12 +953,6 @@ PS_OUTPUT main(PS_INPUT input)
 	}
 #	endif
 	lightColor *= effectNormalization;
-
-#	if !defined(MOTIONVECTORS_NORMALS)
-	if (alpha * fogMul.w - AlphaTestRefRS < 0) {
-		discard;
-	}
-#	endif
 
 	float weatherFogAmount = 0.0;  // (47b) share of the view the game's fog covers under the height fog
 #	if !defined(MOTIONVECTORS_NORMALS)

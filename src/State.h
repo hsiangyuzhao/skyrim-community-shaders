@@ -236,7 +236,10 @@ public:
 		// the geometry has no skin instance (shield, weapon, quiver, helmet): rigid gear hanging off a
 		// bone. Its model space is its own, not the actor's, so Dynamic Snow takes its slope from the
 		// world normal instead of the pre-skinning one.
-		IsActorRigid = 1 << 14
+		IsActorRigid = 1 << 14,
+		// (48n, official CS #3062) Set per draw by the BSLightingShader::SetupGeometry hook in Hooks.cpp when the geometry blends
+		// additively (dest = ONE, e.g. the blood sheen on weapons): Lighting then keeps the G-buffer normal and gloss beneath it.
+		AdditiveLighting = 1 << 15
 	};
 
 	enum class ExtraFeatureDescriptors : uint32_t

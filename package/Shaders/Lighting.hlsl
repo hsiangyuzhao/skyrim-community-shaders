@@ -693,7 +693,8 @@ float GetRimLightMultiplier(float3 L, float3 V, float3 N)
 #	if !defined(TRUE_PBR)
 float ProcessSparkleColor(float color)
 {
-	return exp2(SparkleParams.y * log2(min(1, abs(color))));
+	// (48n, official CS #3091) pow(0, 0) through exp2(0 * -inf) is NaN.
+	return SparkleParams.y > 0 ? exp2(SparkleParams.y * log2(min(1, abs(color)))) : 1.0;
 }
 #	endif
 
@@ -750,7 +751,7 @@ float3 GetLightSpecularInput(PS_INPUT input, float3 L, float3 V, float3 N, float
 	float sparkleColor = ProcessSparkleColor(sparkleColor1) + ProcessSparkleColor(sparkleColor2) + ProcessSparkleColor(sparkleColor3);
 	float VdotN = dot(V, N);
 	V += N * -(2 * VdotN);
-	float sparkleMultiplier = exp2(SparkleParams.w * log2(saturate(dot(V, -L)))) * (SparkleParams.z * sparkleColor);
+	float sparkleMultiplier = (SparkleParams.w > 0 ? exp2(SparkleParams.w * log2(saturate(dot(V, -L)))) : 1.0) * (SparkleParams.z * sparkleColor);  // (48n, #3091)
 	sparkleMultiplier = sparkleMultiplier >= 0.5 ? 1 : 0;
 	lightColorMultiplier += sparkleMultiplier * HdotN;
 #	endif
@@ -2196,6 +2197,76 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	glossiness = lerp(glossiness, 0, lodLandBlendFactor);
 #		endif
 #	endif  // LOD_LAND_BLEND
+
+#	if defined(DO_ALPHA_TEST) && !defined(SPARKLE) && !(defined(LANDSCAPE) && !defined(LOD_LAND_BLEND))
+	// (48n, official CS #3033) Alpha test before lighting: a pixel the test discards no longer runs the whole lighting first.
+	// baseColor.w, MaterialData.z and the vertex alpha are final here (nothing below writes them); the same code as at the
+	// end of the shader, which still runs for the other permutations.
+	float alpha = baseColor.w;
+#		if defined(EMAT) && !defined(LANDSCAPE)
+#			if defined(PARALLAX)
+	alpha = TexColorSampler.SampleBias(SampColorSampler, uvOriginal, SharedData::MipBias).w;
+#			elif defined(TRUE_PBR)
+	[branch] if (PBRParallax)
+	{
+		alpha = TexColorSampler.SampleBias(SampColorSampler, uvOriginal, SharedData::MipBias).w;
+	}
+#			endif
+#		endif
+#		if defined(DO_ALPHA_TEST)
+	[branch] if ((Permutation::PixelShaderDescriptor & Permutation::LightingFlags::AdditionalAlphaMask) != 0)
+	{
+		uint2 alphaMask = input.Position.xy;
+		alphaMask.x = ((alphaMask.x << 2) & 12);
+		alphaMask.x = (alphaMask.y & 3) | (alphaMask.x & ~3);
+		const float maskValues[16] = {
+			0.003922,
+			0.533333,
+			0.133333,
+			0.666667,
+			0.800000,
+			0.266667,
+			0.933333,
+			0.400000,
+			0.200000,
+			0.733333,
+			0.066667,
+			0.600000,
+			0.996078,
+			0.466667,
+			0.866667,
+			0.333333,
+		};
+
+		// (batch 39, item 3) Per-frame noise instead of the fixed pattern when Temporal LOD dither
+		// is on; same pixel and frame as the depth prepass (Utility.hlsl), so the same pixels stay.
+		// The reflection cubemap is not accumulated over frames: it keeps a still pattern.
+		const uint stippleFrame = (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InReflection) ? 0 : SharedData::FrameCount;
+		const float stippleThreshold = SharedData::LODStippleThreshold(uint2(input.Position.xy), maskValues[alphaMask.x], stippleFrame);
+		if (MaterialData.z - stippleThreshold < 0) {
+			discard;
+		}
+	}
+	else
+#		endif  // defined(DO_ALPHA_TEST)
+	{
+		alpha *= MaterialData.z;
+	}
+#		if !(defined(TREE_ANIM) || defined(LODOBJECTSHD) || defined(LODOBJECTS))
+	alpha *= input.Color.w;
+#		endif  // !(defined(TREE_ANIM) || defined(LODOBJECTSHD) || defined(LODOBJECTS))
+#		if defined(DO_ALPHA_TEST)
+#			if defined(DEPTH_WRITE_DECALS)
+	if (alpha - 0.0156862754 < 0) {
+		discard;
+	}
+	alpha = saturate(1.05 * alpha);
+#			endif  // DEPTH_WRITE_DECALS
+	if (alpha - AlphaTestRefRS < 0) {
+		discard;
+	}
+#		endif      // DO_ALPHA_TEST
+#	endif
 
 #	if defined(SNOW) && !defined(TRUE_PBR)
 	useSnowSpecular = landSnowMask != 0.0;
@@ -3862,7 +3933,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #	endif
 
 #	if defined(WATER_EFFECTS)
-	dirLightColorMultiplier *= WaterEffects::ComputeCaustics(waterData, input.WorldPosition.xyz, eyeIndex);
+	dirLightColorMultiplier *= WaterEffects::ComputeCaustics(waterData, input.WorldPosition.xyz, eyeIndex, input.Position.xy);
 #	endif
 
 	float dirLightAngle = dot(worldNormal.xyz, DirLightDirection.xyz);
@@ -5141,9 +5212,18 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		fogFactor = exponentialHeightFog.w;
 	}
 #		endif
-	if (FrameBuffer::FrameParams.y && FrameBuffer::FrameParams.z)
+	// (48n, official CS #3092) ISSAOComposite fades every deferred pixel it fogs by FogNearColor.w (1 / frame buffer range;
+	// 1.0 with the height fog on, see ISSAOComposite.hlsl); forward surfaces (hair, manes, leaf cards) skipped it and came out
+	// up to ~20% brighter in fog. Reflections skip the composite. Applied after the haze, as the composite runs after it.
+	float forwardFogFade = 1.0;
+	if (FrameBuffer::FrameParams.y && FrameBuffer::FrameParams.z) {
 		color.xyz = lerp(color.xyz, fogColor, fogFactor);
-	else
+		forwardFogFade = inReflection ? 1.0 : FogColor.w;
+#		if defined(EXP_HEIGHT_FOG)
+		if (SharedData::exponentialHeightFogSettings.enabled)
+			forwardFogFade = 1.0;
+#		endif
+	} else
 		weatherFogAmount = 0.0;
 
 #		if defined(PHYSICAL_SKY)
@@ -5157,6 +5237,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		color.xyz = color.xyz * apSample.w + apSample.xyz;
 	}
 #		endif
+	color.xyz *= forwardFogFade;  // (48n, #3092)
 #	endif
 
 #	if defined(TESTCUBEMAP) && defined(ENVMAP) && defined(DYNAMIC_CUBEMAPS)
@@ -5171,6 +5252,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #	if defined(LANDSCAPE) && !defined(LOD_LAND_BLEND)
 	psout.Diffuse.w = 0;
 #	else
+#		if !defined(DO_ALPHA_TEST) || defined(SPARKLE)
+	// (48n, official CS #3033) Alpha-tested materials ran this test before lighting (see after LOD_LAND_BLEND).
 	float alpha = baseColor.w;
 #		if defined(EMAT) && !defined(LANDSCAPE)
 #			if defined(PARALLAX)
@@ -5235,6 +5318,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		discard;
 	}
 #		endif      // DO_ALPHA_TEST
+#		endif
 
 #		if defined(ANISOTROPIC_ALPHA)
 	// Uniform alpha material settings
@@ -5436,7 +5520,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	psout.Masks = float4(0, 0, Color::RGBToYCoCg(directionalAmbientColor).x, psout.Diffuse.w);
 #		endif
 
-	float stochasticBlend = (screenNoise * screenNoise) < psout.Diffuse.w ? 1.0 : 0.0;
+	// (48n, official CS #3062) Additive layers (weapon blood sheen) only add light: keep the normal and glossiness beneath
+	// them, or a PBR blade lost its reflection under the blood. Bit 15 = State::ExtraShaderDescriptors::AdditiveLighting
+	// (kept out of Permutation.hlsli so other shaders keep their register allocation).
+	const bool additiveLighting = (Permutation::ExtraShaderDescriptor & (1u << 15)) != 0;
+	float stochasticBlend = !additiveLighting && (screenNoise * screenNoise) < psout.Diffuse.w ? 1.0 : 0.0;
 	psout.NormalGlossiness.w = stochasticBlend;
 #	endif
 

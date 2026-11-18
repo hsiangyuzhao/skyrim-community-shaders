@@ -263,7 +263,13 @@ namespace LightingExtensions
 
 			state->permutationData.ExtraShaderDescriptor &= ~(static_cast<uint32_t>(State::ExtraShaderDescriptors::IsTree) |
 																static_cast<uint32_t>(State::ExtraShaderDescriptors::IsActorGeometry) |
-																static_cast<uint32_t>(State::ExtraShaderDescriptors::IsActorRigid));
+																static_cast<uint32_t>(State::ExtraShaderDescriptors::IsActorRigid) |
+																static_cast<uint32_t>(State::ExtraShaderDescriptors::AdditiveLighting));
+
+			// (48n, official CS #3062) Additive layers (dest blend ONE) only add light.
+			if (auto* alphaProperty = static_cast<const RE::NiAlphaProperty*>(pass->geometry->GetGeometryRuntimeData().properties[RE::BSGeometry::States::kProperty].get());
+				alphaProperty && alphaProperty->GetAlphaBlending() && alphaProperty->GetDestBlendMode() == RE::NiAlphaProperty::AlphaFunction::kOne)
+				state->permutationData.ExtraShaderDescriptor |= static_cast<uint32_t>(State::ExtraShaderDescriptors::AdditiveLighting);
 
 			auto userData = pass->geometry->GetUserData();
 			if (userData)
