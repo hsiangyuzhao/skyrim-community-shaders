@@ -50,11 +50,30 @@ void SampleSSGI(uint2 pixCoord, float3 normalWS, out float ao, out float3 il)
 	il = max(0, Color::YCoCgToRGB(float3(ssgiIlY, ssgiIlCoCg)));
 }
 
+#	if defined(RT_SPECOCC)
+// (49a) RT Specular Occlusion (Ray Tracing > Ambient Occlusion): this frame's blurred RTAO bent normal (RTSpecOccCS) and its switch
+// (RayTracing::BindSpecOccComposite). The define is set only while the switch is on: without it this file compiles as in 48n.
+#		include "RayTracing/RTSpecOcc.hlsli"
+Texture2D<unorm float4> RTSpecOccTexture : register(t21);
+cbuffer RTSpecOccCB : register(b2)
+{
+	uint RTSpecOccOn;  // t21 holds this frame's data (else the scalar specular AO below, as 48n)
+	float RTSpecOccStrength;
+	float2 RTSpecOccPad;
+};
+#	endif
+
 void SampleSSGISpecular(uint2 pixCoord, sh2 lobe, out float ao, out float3 il, in float3 normal, in float3 view, in float roughness)
 {
 	ao = 1 - SsgiAoTexture[pixCoord].x;
 	float NdotV = dot(normal, view);
 	ao = Color::SpecularAOLagarde(saturate(NdotV), ao, roughness);
+#	if defined(RT_SPECOCC)
+	// (49a) The share of the reflection cone inside the visibility cone (bent normal, final AO) replaces the scalar term where the
+	// direction is trusted (RTSpecOcc.hlsli); the scalar term stays the fallback (no data, nearly closed, rough surfaces).
+	[branch] if (RTSpecOccOn != 0u)
+		ao = RTSpecOcc::Occlusion(RTSpecOccTexture[pixCoord], 1 - SsgiAoTexture[pixCoord].x, ao, normal, reflect(view, normal), roughness, RTSpecOccStrength);
+#	endif
 	// Write the out parameter unconditionally at entry: in the SSRT permutation with
 	// EnableSpecular off, no branch below ever assigned it, so the caller consumed an
 	// uninitialised value. Single assignment, single exit - no early return that fxc's
