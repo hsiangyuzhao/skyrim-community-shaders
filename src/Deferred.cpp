@@ -676,6 +676,14 @@ void Deferred::DeferredPasses()
 			ClearShaderCache();
 			compositeAoSparesDirect = aoSparesDirect;
 		}
+		// (49a) RT Specular Occlusion: compile-time too (off = the 48n composite byte for byte); t21 / b2 when compiled in.
+		auto& rayTracingSO = globals::features::rayTracing;
+		if (const bool specOcc = rayTracingSO.SpecOccCompiled(); specOcc != compositeSpecOcc) {
+			ClearShaderCache();
+			compositeSpecOcc = specOcc;
+		}
+		if (compositeSpecOcc)
+			rayTracingSO.BindSpecOccComposite(context);
 		auto shader = interior ? GetComputeMainCompositeInterior() : GetComputeMainComposite();
 		context->CSSetShader(shader, nullptr, 0);
 
@@ -684,7 +692,7 @@ void Deferred::DeferredPasses()
 
 	// Clear
 	{
-		ID3D11ShaderResourceView* views[21]{};
+		ID3D11ShaderResourceView* views[22]{};  // (49a) + t21
 		context->CSSetShaderResources(0, ARRAYSIZE(views), views);
 
 		ID3D11UnorderedAccessView* uavs[3]{ nullptr, nullptr, nullptr };
@@ -693,6 +701,7 @@ void Deferred::DeferredPasses()
 		ID3D11Buffer* buffers[1] = { nullptr };
 		context->CSSetConstantBuffers(12, 1, buffers);
 		context->CSSetConstantBuffers(1, 1, buffers);  // (batch 36f) SSRT composite constants
+		context->CSSetConstantBuffers(2, 1, buffers);  // (49a) RT Specular Occlusion constants
 
 		ID3D11SamplerState* samplers[2]{ nullptr, nullptr };
 		context->CSSetSamplers(0, ARRAYSIZE(samplers), samplers);
@@ -893,6 +902,8 @@ ID3D11ComputeShader* Deferred::GetComputeMainComposite()
 			defines.push_back({ "SSGI", nullptr });
 		if (globals::features::screenSpaceGI.loaded && compositeAoSparesDirect)
 			defines.push_back({ "SSGI_AO_SPARES_DIRECT", nullptr });
+		if (globals::features::screenSpaceGI.loaded && compositeSpecOcc)  // (49a) RT Specular Occlusion (in SampleSSGISpecular)
+			defines.push_back({ "RT_SPECOCC", nullptr });
 
 		if (globals::features::ibl.loaded)
 			defines.push_back({ "IBL", nullptr });
@@ -918,6 +929,10 @@ void Deferred::PrecompileLazyShaders()
 		ClearShaderCache();
 		compositeAoSparesDirect = aoSparesDirect;
 	}
+	if (const bool specOcc = globals::features::rayTracing.SpecOccCompiled(); specOcc != compositeSpecOcc) {  // (49a)
+		ClearShaderCache();
+		compositeSpecOcc = specOcc;
+	}
 	GetComputeMainComposite();
 	GetComputeMainCompositeInterior();
 }
@@ -937,6 +952,8 @@ ID3D11ComputeShader* Deferred::GetComputeMainCompositeInterior()
 			defines.push_back({ "SSGI", nullptr });
 		if (globals::features::screenSpaceGI.loaded && compositeAoSparesDirect)
 			defines.push_back({ "SSGI_AO_SPARES_DIRECT", nullptr });
+		if (globals::features::screenSpaceGI.loaded && compositeSpecOcc)  // (49a) RT Specular Occlusion (in SampleSSGISpecular)
+			defines.push_back({ "RT_SPECOCC", nullptr });
 
 		if (globals::features::ibl.loaded)
 			defines.push_back({ "IBL", nullptr });

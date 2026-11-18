@@ -410,6 +410,9 @@ namespace RayTracingRT
 			// (47j) RTAO: Smooth Normals (filled when its texture exists).
 			nullSrv.Format = kDepthMaskFormat;
 			device_->CreateShaderResourceView(nullptr, &nullSrv, StagingCpu(kDynAONormal));
+			// (49a) RT Specular Occlusion: the bent normal (filled when its texture exists; a null UAV drops the writes).
+			nullUav.Format = kAOFormat8;
+			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynAOBent));
 			// (47z) Last frame's PLIdx (filled with the point textures).
 			nullSrv.Format = kPointFormat;
 			device_->CreateShaderResourceView(nullptr, &nullSrv, StagingCpu(kDynPointPrev));
@@ -1025,7 +1028,7 @@ namespace RayTracingRT
 		// Its own root signature: constants b0, TLAS t0, table (depth t1, AO u0), ray counter u1;
 		// the alpha-tested variant also: records t2, texcoords t3, table (copy layers t4, bindless game textures t0 space1), s0.
 		// 44 + 2 + 1 + 2 + 2 + 2 + 1 = 54 DWORDs.
-		D3D12_DESCRIPTOR_RANGE ranges[3]{};
+		D3D12_DESCRIPTOR_RANGE ranges[4]{};  // (49a) + the bent normal
 		ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
 		ranges[0].NumDescriptors = 1;
 		ranges[0].BaseShaderRegister = 1;
@@ -1039,6 +1042,11 @@ namespace RayTracingRT
 		ranges[2].NumDescriptors = 1;
 		ranges[2].BaseShaderRegister = 5;
 		ranges[2].OffsetInDescriptorsFromTableStart = kDynAONormal - kDynAO;
+		// (49a) RT Specular Occlusion: the bent normal (u2), at the end of the block.
+		ranges[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+		ranges[3].NumDescriptors = 1;
+		ranges[3].BaseShaderRegister = 2;
+		ranges[3].OffsetInDescriptorsFromTableStart = kDynAOBent - kDynAO;
 		// (47n) The 47l blue-noise view (t6) is gone.
 		D3D12_DESCRIPTOR_RANGE alphaRanges[2]{};
 		alphaRanges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -1059,7 +1067,7 @@ namespace RayTracingRT
 		params[1].Descriptor.ShaderRegister = 0;
 		params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-		params[2].DescriptorTable.NumDescriptorRanges = 3;  // (47j) + the smooth normals ((47n) the 47l blue noise is gone)
+		params[2].DescriptorTable.NumDescriptorRanges = 4;  // (47j) + the smooth normals ((47n) the 47l blue noise is gone); (49a) + the bent normal
 		params[2].DescriptorTable.pDescriptorRanges = ranges;
 		params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
@@ -1200,6 +1208,7 @@ namespace RayTracingRT
 		aoCounter_.Reset();
 		aoCounterReadback_.Reset();
 		ReleaseAONormalTexture();  // (47j)
+		ReleaseAOBentTexture();    // (49a)
 		aoRaw_ = {};
 		aoWidth_ = aoHeight_ = 0;
 		aoBytes_ = 0;
@@ -1281,6 +1290,50 @@ namespace RayTracingRT
 		device_->CreateShaderResourceView(aoNormal_.resource12.Get(), &srvDesc, StagingCpu(kDynAONormal));
 	}
 
+	// (49a) RT Specular Occlusion: the bent normal TraceAOCS writes (kFlagBent) and RTSpecOccCS (D3D11) blurs.
+	bool Backend::EnsureAOBentTexture(std::uint32_t a_width, std::uint32_t a_height)
+	{
+		if (!AOAvailable() || !stagingHeap_ || !aoPipeline_)
+			return false;
+		if (a_width == aoBentWidth_ && a_height == aoBentHeight_ && aoBent_.resource12)
+			return true;
+		ReleaseAOBentTexture();
+		if (!CreateSharedTexture(a_width, a_height, kAOFormat8, false, true, aoBent_, "RayTracing RTAO Bent Normal", false)) {
+			aoBent_ = {};
+			return false;
+		}
+		aoBentWidth_ = a_width;
+		aoBentHeight_ = a_height;
+		WriteAOBentDescriptor();
+		logger::info("[RayTracing] RT specular occlusion bent-normal texture {}x{} (RGBA8)", a_width, a_height);
+		return true;
+	}
+
+	void Backend::ReleaseAOBentTexture()
+	{
+		// A submission in flight may still write it: D3D12 keeps it until it is done (Retire).
+		if (aoBent_.resource12)
+			Retire(aoBent_.resource12, 0, nullptr);
+		aoBent_ = {};
+		aoBentWidth_ = aoBentHeight_ = 0;
+		if (stagingHeap_ && device_) {
+			D3D12_UNORDERED_ACCESS_VIEW_DESC nullUav{};
+			nullUav.Format = kAOFormat8;
+			nullUav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynAOBent));
+		}
+	}
+
+	void Backend::WriteAOBentDescriptor()
+	{
+		if (!stagingHeap_ || !aoBent_.resource12)
+			return;
+		D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+		uavDesc.Format = kAOFormat8;
+		uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+		device_->CreateUnorderedAccessView(aoBent_.resource12.Get(), nullptr, &uavDesc, StagingCpu(kDynAOBent));
+	}
+
 	bool Backend::RecordAOTrace(CommandContext& a_context, std::size_t a_index, const FrameInput& a_input, bool a_alphaFrame, D3D12_GPU_DESCRIPTOR_HANDLE a_table)
 	{
 		if (!a_input.ao || !AOAvailable() || !aoRaw_.resource12 || !aoCounter_ || !aoCounterMapped_ || !aoFence_ || !aoFence11_ || !a_context.aoList ||
@@ -1297,12 +1350,18 @@ namespace RayTracingRT
 		list->SetDescriptorHeaps(1, heaps);
 		// (47j) The smooth normals texture (when it exists) is read like the depth.
 		const bool normals = aoNormal_.resource12 != nullptr;
-		D3D12_RESOURCE_BARRIER pre[3] = {
+		// (49a) The bent-normal texture (when it exists) is written like the AO texture.
+		ID3D12Resource* const bent = aoBent_.resource12.Get();
+		D3D12_RESOURCE_BARRIER pre[4] = {
 			Transition(depthMask_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
 			Transition(aoRaw_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-			normals ? Transition(aoNormal_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) : D3D12_RESOURCE_BARRIER{},
 		};
-		list->ResourceBarrier(normals ? 3 : 2, pre);
+		UINT preCount = 2;
+		if (normals)
+			pre[preCount++] = Transition(aoNormal_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+		if (bent)
+			pre[preCount++] = Transition(bent, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+		list->ResourceBarrier(preCount, pre);
 		const UINT queryBase = static_cast<UINT>(kContexts * 6 + a_index * 2);
 		if (timestampHeap_)
 			list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase);
@@ -1326,12 +1385,16 @@ namespace RayTracingRT
 		list->Dispatch((a_input.renderWidth + 15) / 16, (a_input.renderHeight + 7) / 8, 1);  // (47q) TraceAOCS 16 x 8, swizzled in the shader
 		if (timestampHeap_)
 			list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 1);
-		D3D12_RESOURCE_BARRIER post[3] = {
+		D3D12_RESOURCE_BARRIER post[4] = {
 			Transition(depthMask_.resource12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
 			Transition(aoRaw_.resource12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
-			normals ? Transition(aoNormal_.resource12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON) : D3D12_RESOURCE_BARRIER{},
 		};
-		list->ResourceBarrier(normals ? 3 : 2, post);
+		UINT postCount = 2;
+		if (normals)
+			post[postCount++] = Transition(aoNormal_.resource12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+		if (bent)
+			post[postCount++] = Transition(bent, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+		list->ResourceBarrier(postCount, post);
 		// The ray counter's value after this frame, into this context's read-back slot.
 		D3D12_RESOURCE_BARRIER toCopy = Transition(aoCounter_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
 		list->ResourceBarrier(1, &toCopy);
@@ -1850,6 +1913,8 @@ namespace RayTracingRT
 		aoFenceValue_ = 0;
 		pendingAOWait_ = 0;
 		aoNormal_ = {};  // (47j)
+		aoBent_ = {};    // (49a)
+		aoBentWidth_ = aoBentHeight_ = 0;
 		aoNormalWidth_ = aoNormalHeight_ = 0;
 		// (48a)
 		if (reflectCounterReadback_ && reflectCounterMapped_)
@@ -2051,7 +2116,7 @@ namespace RayTracingRT
 		}
 		for (auto* resource : { tlas_.Get(), scratch_.Get(), skinScratch_.Get(), alphaUv_.Get(), alphaLayers12_.Get(), postbuild_.Get(), pointCounter_.Get(),
 				 aoCounter_.Get(), depthMask_.resource12.Get(), visibility_.resource12.Get(), pointVis_.resource12.Get(), pointIdx_.resource12.Get(),
-				 aoRaw_.resource12.Get(), aoNormal_.resource12.Get(), pointWide_.resource12.Get(), pointWidePrev_.Get() })
+				 aoRaw_.resource12.Get(), aoNormal_.resource12.Get(), aoBent_.resource12.Get(), pointWide_.resource12.Get(), pointWidePrev_.Get() })
 			if (resource)
 				objects.push_back(resource);
 		ApplyResidency(objects.data(), objects.size());

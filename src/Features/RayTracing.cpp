@@ -355,6 +355,7 @@ namespace
 	constexpr std::uint32_t kAOTraceSmoothNormals2 = 1024u;  // (47k) TraceAOCS: RTAO: Smooth Normals v2 (offset along Ns, projection; always since 47n)
 	constexpr std::uint32_t kAOTraceDynamicFlag = 2048u;     // (47n) TraceAOCS: mark pixels whose rays hit characters / moving objects (.b + 0.6)
 	constexpr std::uint32_t kAOTraceQuarterFar = 4096u;      // (47q) TraceAOCS: the broad ray on one pixel of each 2x2, rotating
+	constexpr std::uint32_t kAOTraceBent = 8192u;            // (49a) TraceAOCS: RT Specular Occlusion (the bent normal, u2)
 	constexpr std::uint32_t kAOFlagNormalDebug = 128u;       // (47k) RTAOCompositeCS: t5 holds this frame's Smooth Normals debug view
 	// (47l) RTAO: Temporal v2. (TraceAOCS 2048 = the removed Blue-Noise Rays: never set since 47m.)
 	constexpr std::uint32_t kAOFlagTemporalV2 = 256u;        // RTAOCommon.hlsli: Temporal v2 (RTAOTemporalCS RTAO_TEMPORAL_V2, the filters' world sigma)
@@ -1574,6 +1575,8 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.FoliageSway = read("FoliageSway", defaults.FoliageSway);  // (47l)
 		// (47n)
 		settings.SunShadows = read("SunShadows", defaults.SunShadows);
+		settings.AOSpecOcc = read("AOSpecOcc", defaults.AOSpecOcc);  // (49a)
+		settings.AOSpecOccStrength = std::clamp(read("AOSpecOccStrength", defaults.AOSpecOccStrength), 0.0f, 1.0f);
 		settings.PointQuality = read("PointQuality", -1);
 		settings.AOQuality = read("AOQuality", -1);
 		// (47q) The sun's size left the tiers. Saved before 47q (no key): the cone the tier in effect had -- High / Ultra 0.5, Very Low -
@@ -1797,6 +1800,8 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["SunShadows"] = settings.SunShadows;  // (47n)
 	o_json["PointQuality"] = settings.PointQuality;
 	o_json["AOQuality"] = settings.AOQuality;
+	o_json["AOSpecOcc"] = settings.AOSpecOcc;  // (49a)
+	o_json["AOSpecOccStrength"] = settings.AOSpecOccStrength;
 }
 
 void RayTracing::RestoreDefaultSettings()
@@ -1914,6 +1919,7 @@ void RayTracing::SetupResources()
 	pointDenoiseCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<PointDenoiseCB>());  // (46b)
 	pointMaskCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<PointMaskCB>());        // (46c)
 	aoCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<AOCompositeCB>());            // (46f)
+	specOccCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<SpecOccCompositeCB>());  // (49a)
 
 	// Screen Space Shadows hand-off reads its R8 texture through a UAV.
 	D3D11_FEATURE_DATA_FORMAT_SUPPORT2 support{ DXGI_FORMAT_R8_UNORM, 0 };
@@ -1954,6 +1960,8 @@ void RayTracing::ClearShaderCache()
 	for (auto* shader : { &aoFDownCS, &aoFBlurHCS, &aoFBlurVCS, &aoFUpCS, &aoFFullHCS, &aoFFullVCS, &aoFDetailCS, &aoDetailTemporalCS })
 		*shader = nullptr;
 	aoTemporalV2CS = nullptr;  // (47l)
+	specOccHCS = nullptr;  // (49a)
+	specOccVCS = nullptr;
 	for (auto* shader : { &aoTileMarkCS, &aoTileDistHCS, &aoTileDistVCS, &aoTemporalV2WideCS, &sssCasterTilesCS })  // (47r)
 		*shader = nullptr;
 }
@@ -2015,6 +2023,10 @@ void RayTracing::PrecompileShaders()
 		}
 		GetShaderDefined(aoFDetailCS, kFilter, "RTAOFilterCS (detail)", "RTAO_DETAIL");
 		GetShaderDefined(aoDetailTemporalCS, L"Data\\Shaders\\RayTracing\\RTAOTemporalCS.hlsl", "RTAOTemporalCS (detail)", "RTAO_DETAIL_HISTORY");
+		if (settings.AOSpecOcc) {  // (49a)
+			GetShader(specOccHCS, L"Data\\Shaders\\RayTracing\\RTSpecOccCS.hlsl", "RTSpecOccCS (horizontal)");
+			GetShaderDefined(specOccVCS, L"Data\\Shaders\\RayTracing\\RTSpecOccCS.hlsl", "RTSpecOccCS (vertical)", "RTSO_VERTICAL");
+		}
 		if (settings.AOTemporal && aoTier.temporalV2)  // (47l)
 			GetShaderDefined(aoTemporalV2CS, L"Data\\Shaders\\RayTracing\\RTAOTemporalCS.hlsl", "RTAOTemporalCS (v2)", "RTAO_TEMPORAL_V2");
 		// (47r) RTAO: Filter Only Where Traced (always on since 48o).
@@ -5499,6 +5511,7 @@ void RayTracing::ReleaseAOFilter()
 	ReleaseAOExtras();  // (46t)
 	ReleaseAOTemporalV2();  // (47l)
 	ReleaseAOTiles();  // (47r)
+	ReleaseSpecOcc();  // (49a)
 	if (aoPrevDepth) {  // (47u)
 		d3d11Bytes -= std::min<std::uint64_t>(d3d11Bytes, static_cast<std::uint64_t>(aoPrevDepthDesc.Width) * aoPrevDepthDesc.Height * 4);
 		aoPrevDepth = nullptr;
@@ -5822,6 +5835,21 @@ bool RayTracing::PrepareAO(RayTracingRT::FrameInput& a_input, const float a_trac
 		flags |= kAOTraceSelfFix;
 	// (47n) RTAO: Tight History Near Moving Things: the trace marks pixels whose rays hit a character or a moving object (.b).
 	flags |= kAOTraceDynamicFlag;  // (48o) always on
+	// (49a) RT Specular Occlusion: the trace also writes the bent normal (its shared texture at render size). Off (or failed): the
+	// texture goes, the trace writes nothing there (null UAV) and the composite keeps the scalar specular AO.
+	specOccTracedThisFrame = false;
+	if (settings.AOSpecOcc && specOccFault.empty()) {
+		if (backend.EnsureAOBentTexture(width, height))
+			specOccTracedThisFrame = true;
+		else {
+			specOccFault = "could not create its shared bent-normal texture";
+			logger::warn("[RayTracing] RT Specular Occlusion: {}", specOccFault);
+		}
+	} else if (backend.AOBentSRV()) {
+		backend.ReleaseAOBentTexture();
+	}
+	if (specOccTracedThisFrame)
+		flags |= kAOTraceBent;
 	aoShapeThisFrame = shape;
 	c.params[0] = static_cast<float>(frameIndex % 1024);
 	std::memcpy(&c.params[1], &flags, sizeof(float));
@@ -6591,7 +6619,8 @@ void RayTracing::DrawAmbientOcclusionImpl()
 	                         aoNormalDebugHeight == height;
 	if (normalDebug)
 		cb.Size[2] |= kAOFlagNormalDebug;
-	cb.Size[3] = debugOverlay ? static_cast<std::uint32_t>(aoDebugView) : 0u;
+	// (49b) The shaders keep the 49a view numbers: Specular Occlusion is 11 (48o removed "Temporal v2: History", 10, from the menu).
+	cb.Size[3] = debugOverlay ? (aoDebugView == AODebugView::SpecularOcclusion ? 11u : static_cast<std::uint32_t>(aoDebugView)) : 0u;
 	cb.Params[0] = std::clamp(settings.AOStrength, 0.0f, 2.0f);
 	cb.Params[1] = kAOHistoryWeight;
 	cb.Params[2] = kAOClampSlack;
@@ -6796,6 +6825,11 @@ void RayTracing::DrawAmbientOcclusionImpl()
 		ID3D11ShaderResourceView* nullTile = nullptr;
 		context->CSSetShaderResources(10, 1, &nullTile);
 	}
+	// 5. (49a) RT Specular Occlusion: this frame's bent normal, blurred for the deferred composite (after the mix: its debug view
+	//    reads the final AO). Same constant buffer (b0).
+	if (specOccTracedThisFrame && backend.AOBentSRV())
+		RunSpecOcc(context, depth.depthSRV, normal.SRV, debugOverlay && aoDebugView == AODebugView::SpecularOcclusion);
+	specOccTracedThisFrame = false;
 	timers->End(Util::GpuBucket::RayTracingAO);
 	ID3D11Buffer* nullCb[1]{};
 	context->CSSetConstantBuffers(0, 1, nullCb);
@@ -6811,6 +6845,91 @@ void RayTracing::DrawAmbientOcclusionImpl()
 	aoLastNormalGuided = 1;
 	aoLastAlphaBudget = shape.alphaBudget;
 	aoCpuMs += static_cast<float>(static_cast<double>(Qpc() - start) * QpcMs());
+}
+
+// ---------------------------------------------------------------------------------------------
+// (49a) RT Specular Occlusion (S1)
+// ---------------------------------------------------------------------------------------------
+
+bool RayTracing::EnsureSpecOcc(std::uint32_t a_width, std::uint32_t a_height)
+{
+	if (specOccOut.texture && specOccWidth == a_width && specOccHeight == a_height)
+		return true;
+	ReleaseSpecOcc();
+	if (!CreateDenoiseTexture(this, specOccTemp.texture, specOccTemp.srv, specOccTemp.uav, a_width, a_height, DXGI_FORMAT_R8G8B8A8_UNORM, "RayTracing Specular Occlusion Temp") ||
+		!CreateDenoiseTexture(this, specOccOut.texture, specOccOut.srv, specOccOut.uav, a_width, a_height, DXGI_FORMAT_R8G8B8A8_UNORM, "RayTracing Specular Occlusion")) {
+		ReleaseSpecOcc();
+		return false;
+	}
+	specOccWidth = a_width;
+	specOccHeight = a_height;
+	specOccBytes = static_cast<std::uint64_t>(a_width) * a_height * 8;
+	d3d11Bytes += specOccBytes;
+	return true;
+}
+
+void RayTracing::ReleaseSpecOcc()
+{
+	specOccTemp = {};
+	specOccOut = {};
+	specOccWidth = specOccHeight = 0;
+	d3d11Bytes -= std::min(d3d11Bytes, specOccBytes);
+	specOccBytes = 0;
+	specOccFrame = UINT32_MAX;
+}
+
+void RayTracing::RunSpecOcc(ID3D11DeviceContext* a_context, ID3D11ShaderResourceView* a_depth, ID3D11ShaderResourceView* a_normal, bool a_debug)
+{
+	if (!specOccFault.empty())
+		return;
+	auto* h = GetShader(specOccHCS, L"Data\\Shaders\\RayTracing\\RTSpecOccCS.hlsl", "RTSpecOccCS (horizontal)");
+	auto* v = GetShaderDefined(specOccVCS, L"Data\\Shaders\\RayTracing\\RTSpecOccCS.hlsl", "RTSpecOccCS (vertical)", "RTSO_VERTICAL");
+	if (!h || !v) {
+		specOccFault = "its blur shader did not compile (see the log)";
+		logger::warn("[RayTracing] RT Specular Occlusion: {}", specOccFault);
+		return;
+	}
+	if (!EnsureSpecOcc(aoWidth, aoHeight)) {
+		specOccFault = "could not create its blur textures";
+		logger::warn("[RayTracing] RT Specular Occlusion: {}", specOccFault);
+		return;
+	}
+	const UINT groupsX = (aoWidth + 7) / 8, groupsY = (aoHeight + 7) / 8;
+	ID3D11ShaderResourceView* nullSrvs[4]{};
+	ID3D11UnorderedAccessView* nullUavs[2]{};
+	ID3D11ShaderResourceView* srvH[3] = { backend.AOBentSRV(), a_depth, a_normal };
+	ID3D11UnorderedAccessView* uavH[1] = { specOccTemp.uav.get() };
+	a_context->CSSetShaderResources(0, 3, srvH);
+	a_context->CSSetUnorderedAccessViews(0, 1, uavH, nullptr);
+	a_context->CSSetShader(h, nullptr, 0);
+	a_context->Dispatch(groupsX, groupsY, 1);
+	a_context->CSSetShaderResources(0, 4, nullSrvs);
+	a_context->CSSetUnorderedAccessViews(0, 2, nullUavs, nullptr);
+	ID3D11ShaderResourceView* srvV[4] = { specOccTemp.srv.get(), a_depth, a_normal, aoOut.srv.get() };
+	ID3D11UnorderedAccessView* uavV[2] = { specOccOut.uav.get(), a_debug ? debugColorUAV.get() : nullptr };
+	a_context->CSSetShaderResources(0, 4, srvV);
+	a_context->CSSetUnorderedAccessViews(0, 2, uavV, nullptr);
+	a_context->CSSetShader(v, nullptr, 0);
+	a_context->Dispatch(groupsX, groupsY, 1);
+	a_context->CSSetShaderResources(0, 4, nullSrvs);
+	a_context->CSSetUnorderedAccessViews(0, 2, nullUavs, nullptr);
+	specOccFrame = globals::state->frameCount;
+}
+
+void RayTracing::BindSpecOccComposite(ID3D11DeviceContext* a_context)
+{
+	// This frame's blur only (the composite runs in the same frame, after DrawAmbientOcclusion); anything else: the scalar AO.
+	const bool on = settings.AOSpecOcc && specOccOut.srv && specOccFrame == globals::state->frameCount;
+	SpecOccCompositeCB cb{};
+	cb.On = on ? 1u : 0u;
+	cb.Strength = std::clamp(settings.AOSpecOccStrength, 0.0f, 1.0f);
+	if (specOccCB) {
+		specOccCB->Update(cb);
+		ID3D11Buffer* buffer = specOccCB->CB();
+		a_context->CSSetConstantBuffers(2, 1, &buffer);
+	}
+	ID3D11ShaderResourceView* srv = on ? specOccOut.srv.get() : nullptr;
+	a_context->CSSetShaderResources(21, 1, &srv);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -8420,6 +8539,25 @@ void RayTracing::DrawAOPage()
 
 		// (48o) Fixed on, no switches any more: (47n) RTAO: Tight History Near Moving Things and SSGI Contact AO: Uncovered-Area Test,
 		// 4-Frame History; (47r) RTAO: Filter Only Where Traced.
+		// (49a) S1
+		ImGui::SeparatorText("Reflections");
+		ImGui::BeginDisabled(!settings.AO);
+		ImGui::Checkbox("RT Specular Occlusion", &settings.AOSpecOcc);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): the AO rays also note which way each spot is open, and the environment reflection (cubemap) is darkened");
+			ImGui::Text("  by how much of the reflected direction is blocked, not just by how dark the AO is overall: shiny floors along walls,");
+			ImGui::Text("  under tables, in doorways and inside armour folds stop glowing, while reflections that point into the open stay bright.");
+			ImGui::Text("Only where RTAO is traced (about 1.4 m around each surface) and only the cubemap part (SSRT's own reflections are");
+			ImGui::Text("  unchanged); rough surfaces keep the old darkening. Off: exactly as before (the composite is rebuilt once).");
+		}
+		ImGui::BeginDisabled(!settings.AOSpecOcc);
+		ImGui::SliderFloat("Specular Occlusion Strength", &settings.AOSpecOccStrength, 0.0f, 1.0f, "%.2f");
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("1 (default) = the direction-aware darkening where it is trusted; 0 = the old darkening.");
+		ImGui::EndDisabled();
+		if (!specOccFault.empty())
+			RtErrorLine("RT Specular Occlusion was switched off for this session", specOccFault);
+		ImGui::EndDisabled();
 
 		if (ImGui::TreeNodeEx("Advanced")) {
 			ImGui::BeginDisabled(!settings.AO);
@@ -8542,7 +8680,7 @@ void RayTracing::DrawAOPage()
 			ImGui::BeginDisabled(!settings.AO);
 			{
 				const char* views[] = { "Off", "Raw RTAO (broad)", "Filtered RTAO (broad)", "RTAO vs SSGI (split)", "Raw Detail", "Filtered Detail", "Final AO",
-					"Smooth Normals: Confidence", "Smooth Normals: Ns", "Smooth Normals: Ng" };  // (48o) "Temporal v2: History" removed
+					"Smooth Normals: Confidence", "Smooth Normals: Ns", "Smooth Normals: Ng", "Specular Occlusion" };  // (48o) "Temporal v2: History" removed
 				static_assert(IM_ARRAYSIZE(views) == static_cast<int>(AODebugView::Count));
 				int view = static_cast<int>(aoDebugView);
 				if (ImGui::Combo("AO Debug View", &view, views, IM_ARRAYSIZE(views)))
@@ -8557,6 +8695,8 @@ void RayTracing::DrawAOPage()
 					ImGui::Text("(47k) Smooth Normals: Confidence = green where last frame's smooth normal is used (brighter = more trusted),");
 					ImGui::Text("  red = fell back to the smoothed depth direction, blue = no data (sky, just uncovered, off screen, first frame);");
 					ImGui::Text("  Ns = the direction the AO rays are built around, Ng = the flat facet direction (colours: x red, y green, z blue).");
+					ImGui::Text("(49a) Specular Occlusion (RT Specular Occlusion on): how much of the cubemap reflection is kept (white = all,");
+					ImGui::Text("  black = none; Strength 1); blue tint = no bent-normal data there (the old darkening applies).");
 					ImGui::Text("Not saved.");
 				}
 			}
@@ -8961,10 +9101,10 @@ std::string RayTracing::DescribeForProfile() const
 	text += ", RT reflections off (hidden)";
 	// (46f)
 	static constexpr const char* kAOModes[] = { "RTAO (keeps SSGI contact AO)", "darker of RTAO and SSGI AO" };
-	static constexpr const char* kAOViews[] = { "off", "raw", "filtered", "split", "raw detail", "filtered detail", "final", "normal confidence", "normal Ns", "normal Ng" };
+	static constexpr const char* kAOViews[] = { "off", "raw", "filtered", "split", "raw detail", "filtered detail", "final", "normal confidence", "normal Ns", "normal Ng", "specular occlusion" };
 	text += std::format(", RTAO {} {} (mode {}, ray length {:.0f}, strength {:.2f}, temporal {}, max distance {:.0f}, debug view {}{})", settings.AO ? "on" : "off",
 		kTierNames[std::clamp(settings.AOQuality, 0, kTierCustom) + 1], kAOModes[std::clamp(settings.AOMode, 0, 1)], settings.AORayLength, settings.AOStrength,
-		settings.AOTemporal ? "on" : "off", at.distance, kAOViews[std::clamp(static_cast<int>(aoDebugView), 0, 9)], aoOffReason.empty() ? "" : ", switched off: " + aoOffReason);
+		settings.AOTemporal ? "on" : "off", at.distance, kAOViews[std::clamp(static_cast<int>(aoDebugView), 0, 10)], aoOffReason.empty() ? "" : ", switched off: " + aoOffReason);
 	// (46t)
 	static constexpr const char* kAOBudget[] = { "blocked", "half open", "open" };
 	text += std::format(", RTAO detail strength {:.2f}, detail ray length {:.0f}, detail rays {}, full-resolution filter {}, "
@@ -9033,6 +9173,7 @@ nlohmann::json RayTracing::DescribeJson() const
 	j["sun_shadows"] = settings.SunShadows;  // (47n)
 	j["point_quality"] = settings.PointQuality;
 	j["ao_quality"] = settings.AOQuality;
+	j["ao_spec_occ"] = settings.AOSpecOcc ? (specOccFault.empty() ? std::format("on, strength {:.2f}", settings.AOSpecOccStrength) : std::string("failed")) : std::string("off");  // (49a)
 	j["buildings_rt"] = settings.Buildings;
 	j["objects_rt"] = settings.Objects;
 	j["trees_rt"] = settings.Trees;

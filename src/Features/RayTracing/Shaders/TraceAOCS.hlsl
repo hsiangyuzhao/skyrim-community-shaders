@@ -74,6 +74,9 @@ Texture2D<float> DepthMask : register(t1);
 RWTexture2D<float4> AOOut : register(u0);  // (47h) float: RGBA16F, or RGBA8 (kFlagDither8)
 RWByteAddressBuffer RayCounter : register(u1);  // rays traced (monotonic, read back for the F7 trace)
 Texture2D<float> AONormals : register(t5);   // (47j) kFlagSmoothNormals: AONormalPrepCS output (packed octahedral world normal, 0 = none)
+// (49a) kFlagBent "RT Specular Occlusion": the mean of the near AO rays' directions weighted by whether each was open (world,
+// camera-relative), rgb = x 0.5 + 0.5, a = 1 where traced (0 elsewhere). RGBA8, shared with D3D11 (RTSpecOccCS, RTSpecOcc.hlsli).
+RWTexture2D<unorm float4> AOBentOut : register(u2);
 
 static const uint kFlagCharacters = 1u;   // characters are in the TLAS: the character ray
 static const uint kFlagFirstPerson = 2u;  // no character ray for pixels near the camera
@@ -89,6 +92,7 @@ static const uint kFlagSmoothNormals2 = 1024u;  // (47k) RTAO: Smooth Normals v2
 static const uint kFlagDynamic = 2048u;         // (47n) RTAO: Tight History Near Moving Things (see the top)
 static const uint kMovingKey = 0x800000u;       // (47n) Backend kMovingInstanceKey: a scene instance that moved since last frame
 static const uint kFlagQuarterFar = 4096u;      // (47q) two scales: the far part on one pixel of each 2x2, rotating every frame
+static const uint kFlagBent = 8192u;            // (49a) RT Specular Occlusion: write the bent normal (AOBentOut, see main)
 static const uint kMaxDetailRays = 4u;
 static const float kSelfProbe = 4.0;          // (47h) CharacterAt: the probe reaches this far to either side of the pixel (units)
 static const float kSelfGrazeOffset = 1.5;    // (47h) extra ray start offset at a character pixel for a ray along the surface (units)
@@ -546,6 +550,7 @@ uint2 SwizzledGroup(uint2 a_group)
 	const float depth = abs(DepthMask[p]);
 	uint rays = 0u;
 	float4 result = float4(1.0, 0.0, 0.4, 1.0);  // (47n) .b: far weight 1 (x 0.4), not traced
+	float4 bentResult = float4(0.5, 0.5, 0.5, 0.0);  // (49a) kFlagBent: not traced
 	[branch] if (depth < 0.999999 && depth > 0.0)
 	{
 		const float3 P = PositionAt(p, depth);
@@ -676,6 +681,7 @@ uint2 SwizzledGroup(uint2 a_group)
 				}
 			}
 			float nearSum = near0;
+			float3 bentSum = dir * near0;  // (49a) kFlagBent: open directions (the near segments, as the detail term)
 			const uint extra = min(uint(C.Extra.z), kMaxDetailRays);
 			[loop] for (uint i = 1u; i <= extra; ++i)
 			{
@@ -684,8 +690,11 @@ uint2 SwizzledGroup(uint2 a_group)
 				const float3 dirExtra = AboveNg(CosineDirection(u, T, B, Ns), N, smoothOn);
 				const float3 originExtra = self.valid ? P + Noff * (bias + kSelfGrazeOffset * (1.0 - abs(dot(Noff, dirExtra)))) : origin;
 				float tExtra;
-				nearSum += Segment(originExtra, dirExtra, 0.0, shortLength, footprint, flags, characters, self, rays, tExtra, dyn);
+				const float openExtra = Segment(originExtra, dirExtra, 0.0, shortLength, footprint, flags, characters, self, rays, tExtra, dyn);
+				nearSum += openExtra;
+				bentSum += dirExtra * openExtra;
 			}
+			bentResult = float4(saturate(bentSum / float(extra + 1u) * 0.5 + 0.5), 1.0);
 			// .b: the far weight x 0.4, + 0.6 for a pixel with a moving occluder (kFlagDynamic; see the top).
 			const bool dynamicHere = dyn && (flags & kFlagDynamic) != 0u;
 			result = float4(far, weight, (farHere ? near0 : 0.0) * 0.4 + (dynamicHere ? 0.6 : 0.0), nearSum / float(extra + 1u));			// (47h) RGBA8 output: the weight's distance fade gets a +-0.5 LSB triangular dither (two uniform numbers), only inside
@@ -699,6 +708,8 @@ uint2 SwizzledGroup(uint2 a_group)
 		}
 	}
 	AOOut[p] = result;
+	[branch] if (flags & kFlagBent)
+		AOBentOut[p] = bentResult;
 	// One atomic per wave.
 	const uint waveRays = WaveActiveSum(rays);
 	if (WaveIsFirstLane() && waveRays > 0u) {

@@ -257,6 +257,10 @@ public:
 		// (47n) RTAO ghosting: "RTAO: Tight History Near Moving Things" (AODynamicFlag): pixels whose AO rays hit a character or a moving
 		// object (this frame or last) keep at most 1 frame of Temporal v2 history and a tight 3x3 clamp.
 		static constexpr bool AODynamicFlag = true;  // (48o) fixed (no switch, key ignored)
+		// (49a) "RT Specular Occlusion" (S1): the RTAO rays also record a bent normal; the deferred composite intersects its visibility cone
+		// with the reflection cone instead of the scalar (Lagarde) specular AO. Off = the 48n composite exactly (its RT_SPECOCC define off).
+		bool AOSpecOcc = true;
+		float AOSpecOccStrength = 1.0f;  // 0 = the scalar specular AO, 1 = the cone result where it is trusted
 		// (47l) Outside the settings macro too. FoliageSway "Sway in RT Shadows" (under Foliage): with Foliage ray traced / Both, tree-
 		// animated leaves, bushes and branches are traced with the game's wind (a wind BLAS per mesh, posed and refit every frame).
 		// Off = 47k (frozen at their rest pose). No effect with Foliage = Shadow map.
@@ -473,6 +477,7 @@ public:
 		NormalNs,          // (47k) the normal the AO hemisphere is built around (RGB = xyz * 0.5 + 0.5)
 		NormalNg,          // (47k) the depth (facet) normal
 		// (48o) History (47n "Temporal v2: History") removed.
+		SpecularOcclusion, // (49a) RT Specular Occlusion: the factor the composite applies to the cubemap reflection (RTSpecOccCS kViewSpecOcc = 11)
 		Count
 	};
 	Settings settings;
@@ -546,6 +551,11 @@ public:
 	/// then its 1/4-resolution bilateral filter, the clamped history and the mix with SSGI's AO (ScreenSpaceGI::aoOverride).
 	/// No-op unless this frame traced RTAO.
 	void DrawAmbientOcclusion();
+	/// (49a) RT Specular Occlusion: whether DeferredCompositeCS is compiled with RT_SPECOCC (the saved switch; the per-frame data may
+	/// still be missing: BindSpecOccComposite then tells the shader to use the scalar specular AO).
+	[[nodiscard]] bool SpecOccCompiled() const { return loaded && settings.AOSpecOcc; }
+	/// (49a) Deferred::DeferredPasses, right before the composite dispatch: t21 (this frame's blurred bent normal or null) and b2.
+	void BindSpecOccComposite(ID3D11DeviceContext* a_context);
 	/// (48d) Deferred::DeferredPasses, right before the SSRT specular pass: the reflection debug views (Hit Type / Hit Distance / Normal
 	/// Confidence) wait for the reflection list (third fence) and draw. No-op unless one is selected and this frame traced reflections.
 	void DrawReflectionDebugViews();
@@ -1360,6 +1370,14 @@ private:
 	};
 	STATIC_ASSERT_ALIGNAS_16(AOCompositeCB);
 	static_assert(sizeof(AOCompositeCB) == 304, "RTAOCommon.hlsli RTAOCB");
+	/// (49a) DeferredCompositeCS RT_SPECOCC: cbuffer RTSpecOccCB (b2).
+	struct alignas(16) SpecOccCompositeCB
+	{
+		std::uint32_t On = 0;   // t21 holds this frame's blurred bent normal (0: the scalar specular AO, as 48n)
+		float Strength = 0.0f;  // 0 - 1
+		float pad[2]{};
+	};
+	STATIC_ASSERT_ALIGNAS_16(SpecOccCompositeCB);
 	static constexpr std::uint32_t kAOFlagContact = 1u, kAOFlagDarker = 2u, kAOFlagHistory = 4u, kAOFlagSplit = 8u;  // RTAO*CS.hlsl (RTAOCommon.hlsli)
 	static constexpr std::uint32_t kAOFlagDetail = 16u, kAOFlagValidity = 32u, kAOFlagDetailHistory = 64u;                         // (46t)
 	[[nodiscard]] bool AOOn() const { return settings.AO && !aoAutoOff; }
@@ -1391,6 +1409,19 @@ private:
 	bool aoDebugDrawn = false;     // its debug view wrote debugColor this frame (the overlay draws it)
 	std::uint32_t aoWidth = 0, aoHeight = 0;
 	DenoiseTexture aoLoDepth, aoLoNormal, aoFiltered, aoHistory[2], aoOut;
+	// (49a) RT Specular Occlusion: the bent normal blurred (RTSpecOccCS: horizontal into specOccTemp, vertical into specOccOut; RGBA8,
+	// render size, made on first use, released with the filter textures or when the switch goes off) and the composite's b2.
+	DenoiseTexture specOccTemp, specOccOut;
+	std::uint32_t specOccWidth = 0, specOccHeight = 0;
+	std::uint64_t specOccBytes = 0;
+	std::uint32_t specOccFrame = UINT32_MAX;  // State::frameCount when specOccOut was written (the composite reads it that frame only)
+	bool specOccTracedThisFrame = false;      // PrepareAO asked the trace for the bent normal
+	std::string specOccFault;                 // why it is off this session (shader / texture failure)
+	winrt::com_ptr<ID3D11ComputeShader> specOccHCS, specOccVCS;
+	std::unique_ptr<ConstantBuffer> specOccCB;
+	bool EnsureSpecOcc(std::uint32_t a_width, std::uint32_t a_height);
+	void ReleaseSpecOcc();
+	void RunSpecOcc(ID3D11DeviceContext* a_context, ID3D11ShaderResourceView* a_depth, ID3D11ShaderResourceView* a_normal, bool a_debug);
 	std::uint32_t aoHistoryIndex = 0;
 	bool aoHistoryValid = false;
 	std::uint32_t aoHistoryFrame = 0;  // State::frameCount when the history was written (valid for the next frame only)

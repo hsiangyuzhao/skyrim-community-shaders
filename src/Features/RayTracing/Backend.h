@@ -995,6 +995,12 @@ namespace RayTracingRT
 		[[nodiscard]] ID3D11UnorderedAccessView* AONormalUAV() const { return aoNormal_.uav11.Get(); }
 		[[nodiscard]] bool HasAONormalTexture() const { return aoNormal_.resource12 != nullptr; }
 		[[nodiscard]] ID3D11ShaderResourceView* AORawSRV() const { return aoRaw_.srv11.Get(); }
+		/// (49a) RT Specular Occlusion: the shared bent-normal texture (TraceAOCS kFlagBent; null = none).
+		[[nodiscard]] ID3D11ShaderResourceView* AOBentSRV() const { return aoBent_.srv11.Get(); }
+		/// (49a) Creates / resizes the bent-normal texture (render size, with the RTAO texture); false = not available.
+		bool EnsureAOBentTexture(std::uint32_t a_width, std::uint32_t a_height);
+		/// (49a) Retires it (switch off; the trace then writes nothing there).
+		void ReleaseAOBentTexture();
 		[[nodiscard]] const std::string& AOFault() const { return aoFault_; }
 		void ClearAOFault() { aoFault_.clear(); }
 		[[nodiscard]] std::uint64_t AOBytes() const { return aoBytes_; }
@@ -1916,7 +1922,7 @@ namespace RayTracingRT
 		// (47n) The 47l RTAO blue noise SRV (slot 11) is gone.
 		// (47z) + last frame's PLIdx SRV (point table offset 9, t8).
 		static constexpr std::uint32_t kDynSun = 0, kDynPoint = 2, kDynAO = 6, kDynWater = 8, kDynAONormal = 10, kDynPointPrev = 11, kDynPointWide = 12, kDynPointWidePrev = 13,
-		                               kDynReflect = 14, kDynamicDescriptors = 20;  // (48f) + the surface record UAVs u3 / u4 (reflection table offsets 4, 5). (47j) + the RTAO smooth normals SRV (RTAO table offset 4); (48a) + the wide slots UAV / prev SRV (point table offsets 10, 11) and the reflection table (depth SRV t1, output UAV u0, prep SRV t5; (48d) + direction UAV u2)
+		                               kDynReflect = 14, kDynAOBent = 20, kDynamicDescriptors = 21;  // (49a) + the RTAO bent normal UAV (RTAO table offset 14, u2). (48f) + the surface record UAVs u3 / u4 (reflection table offsets 4, 5). (47j) + the RTAO smooth normals SRV (RTAO table offset 4); (48a) + the wide slots UAV / prev SRV (point table offsets 10, 11) and the reflection table (depth SRV t1, output UAV u0, prep SRV t5; (48d) + direction UAV u2)
 		static constexpr std::uint32_t kDynamicBase = kPointDescriptorBase + kPointDescriptors;  // after the (unused) 46b point slots
 		ComPtr<ID3D12DescriptorHeap> stagingHeap_;
 		[[nodiscard]] D3D12_CPU_DESCRIPTOR_HANDLE StagingCpu(std::uint32_t a_slot) const;
@@ -1939,6 +1945,9 @@ namespace RayTracingRT
 		ComPtr<ID3D12PipelineState> aoAlphaPipeline_;
 		SharedTexture aoRaw_;
 		SharedTexture aoNormal_;  // (47j) RTAO: Smooth Normals (R32_FLOAT, packed octahedral normal)
+		SharedTexture aoBent_;    // (49a) RT Specular Occlusion: TraceAOCS u2 (RGBA8, D3D12 writes, D3D11 reads)
+		std::uint32_t aoBentWidth_ = 0, aoBentHeight_ = 0;
+		void WriteAOBentDescriptor();
 		std::uint32_t aoNormalWidth_ = 0, aoNormalHeight_ = 0;
 		void WriteAONormalDescriptor();
 		std::uint32_t aoWidth_ = 0, aoHeight_ = 0;
