@@ -514,6 +514,8 @@ public:
 	void DrawObjectRows();
 	void DrawPointLightPage();
 	void DrawAOPage();
+	/// (49f) The "Fog & Particles" entry: RT Sun Shafts / RT Light Shadows in Fog (Exponential Height Fog's settings) and Particles Use RT Shadows.
+	void DrawFogParticlesPage();
 	/// (48i) The Reflections entry of the Ray Tracing category (was the "Reflections (experimental)" section of the main page).
 	void DrawReflectionsPage();
 	void DrawDiagnostics();
@@ -569,7 +571,7 @@ public:
 	[[nodiscard]] bool SpecOccCompiled() const { return loaded && settings.AOSpecOcc; }
 	/// (49a) Deferred::DeferredPasses, right before the composite dispatch: t21 (this frame's blurred bent normal or null) and b2.
 	void BindSpecOccComposite(ID3D11DeviceContext* a_context);
-	/// (49b) Main page: "Particles" (Particles Use RT Shadows). (49c) "Loading Screens".
+	/// (49b) Particles Use RT Shadows (49f: on the Fog & Particles page). (49c) Main page: "Loading Screens".
 	void DrawParticlesSection();
 	void DrawLoadingScreens();
 	/// (49b) E: the backend switch of this frame.

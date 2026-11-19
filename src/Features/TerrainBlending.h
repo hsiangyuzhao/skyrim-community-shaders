@@ -20,6 +20,12 @@ public:
 	}
 	virtual inline bool HasShaderDefine(RE::BSShader::Type) override { return true; }
 
+	// (49f) The page shows Landscape Seams' "Blend Terrain Seams"; its value lives in this feature's settings block.
+	virtual void DrawSettings() override;
+	virtual void SaveSettings(json& o_json) override;
+	virtual void LoadSettings(json& o_json) override;
+	virtual void RestoreDefaultSettings() override;
+
 	virtual void SetupResources() override;
 
 	ID3D11VertexShader* GetTerrainVertexShader();

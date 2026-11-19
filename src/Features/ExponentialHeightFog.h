@@ -31,6 +31,8 @@ struct ExponentialHeightFog : Feature
 	bool HasShaderDefine(RE::BSShader::Type) override { return true; };
 
 	virtual void DrawSettings() override;
+	/** @brief (49f) RT Sun Shafts / RT Light Shadows in Fog, their prerequisites and status: Ray Tracing > Fog & Particles, "Fog" section. */
+	void DrawRayTracedFogSettings();
 	virtual void SetupResources() override;
 	virtual void ClearShaderCache() override;
 	/// (batch 38, A1) Builds the froxel volumes: conservative depth, medium, light scattering

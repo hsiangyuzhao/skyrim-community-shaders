@@ -393,8 +393,6 @@ void State::Load(ConfigMode a_configMode, bool a_allowReload)
 			// (48o) The "Performance" (47p) and "Engine Fixes" (48n) blocks are ignored: those switches are fixed now.
 			if (advanced.contains("Window Compatibility"))
 				WndProcPseudoHandleFix::Load(advanced["Window Compatibility"]);
-			if (advanced.contains("Landscape Seams"))
-				LandscapeSeamsFix::GetInstance().Load(advanced["Landscape Seams"]);
 		}
 
 		if (settings["General"].is_object()) {
@@ -480,6 +478,17 @@ void State::Load(ConfigMode a_configMode, bool a_allowReload)
 			}
 		}
 
+		// (49f) "Blend Terrain Seams" lives under "Terrain Blending" (its menu page). Read here as well, so it applies when Terrain
+		// Blending is not installed (its own LoadSettings then never runs); 49d / 49e saved it as Advanced."Landscape Seams".Enabled,
+		// which is used only while the new key is absent.
+		{
+			auto& seams = LandscapeSeamsFix::GetInstance();
+			if (settings.contains("Terrain Blending") && settings["Terrain Blending"].is_object() && settings["Terrain Blending"].contains(LandscapeSeamsFix::kSettingKey))
+				seams.Load(settings["Terrain Blending"]);
+			else if (settings.contains("Advanced") && settings["Advanced"].is_object() && settings["Advanced"].contains("Landscape Seams"))
+				seams.LoadLegacy(settings["Advanced"]["Landscape Seams"]);
+		}
+
 		// Save updated applied overrides tracking
 		if (overridesDiscovered > 0) {
 			overrideManager->SaveAppliedOverridesTracking(appliedOverrides);
@@ -543,7 +552,6 @@ void State::Save(ConfigMode a_configMode)
 	advanced["Frame Annotations"] = frameAnnotations;
 	advanced["Engine"] = Batch39Engine::Save();
 	advanced["Window Compatibility"] = WndProcPseudoHandleFix::Save();
-	advanced["Landscape Seams"] = LandscapeSeamsFix::GetInstance().Save();
 	settings["Advanced"] = advanced;
 
 	json general;

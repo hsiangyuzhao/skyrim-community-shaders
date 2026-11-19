@@ -153,10 +153,18 @@ struct LandscapeSeamsFix : EngineFix
 	 */
 	void OnLandSetup(RE::TESObjectLAND* a_land, bool a_pbr);
 
+	/** (49f) Key of the switch in the "Terrain Blending" settings block (its menu page). */
+	static constexpr const char* kSettingKey = "Blend Terrain Seams";
+
 	bool IsEnabled() const { return enabled.load(std::memory_order_relaxed); }
-	void Load(const nlohmann::json& a_json);
-	nlohmann::json Save() const;
-	/** @brief F11 > Advanced > PBR Settings, top: the switch and a status line. */
+	void SetEnabled(bool a_enabled) { enabled.store(a_enabled, std::memory_order_relaxed); }
+	/** @brief Reads kSettingKey from a "Terrain Blending" settings block (missing / not a bool: unchanged). */
+	void Load(const nlohmann::json& a_featureJson);
+	/** @brief 49d / 49e: Advanced."Landscape Seams" = { "Enabled": bool }. */
+	void LoadLegacy(const nlohmann::json& a_json);
+	/** @brief Writes kSettingKey into a "Terrain Blending" settings block. */
+	void Save(nlohmann::json& a_featureJson) const;
+	/** @brief (49f) F11 > Landscape & Textures > Terrain Blending: the "Terrain Seams" section (switch and status line). */
 	void DrawSettings();
 
 private:

@@ -8080,16 +8080,28 @@ void RayTracing::DrawSettings()
 	DrawMasterHeader();
 	// (47y) Moving Characters: Keep Shadow History / Smooth When No History: (48o) fixed on (no switches).
 	DrawObjectRows();  // (47n) one per-kind choice for the sun, the point lights and RTAO
-	DrawParticlesSection();  // (49b)
-	DrawLoadingScreens();    // (49c)
+	// (49f) Particles Use RT Shadows moved to the Fog & Particles entry.
+	DrawLoadingScreens();  // (49c)
 	DrawDiagnostics();
+	ImGui::PopID();
+}
+
+void RayTracing::DrawFogParticlesPage()
+{
+	// (49f) The "Fog & Particles" entry of the Ray Tracing category: what reads the volumetric fog's ray-traced visibility. The fog
+	// switches stay in Exponential Height Fog's settings, the particle switch in Ray Tracing's (saved values carry over).
+	ImGui::PushID("rtFogParticlesPage");
+	DrawMasterHeader();
+	ImGui::SeparatorText("Fog");
+	globals::features::exponentialHeightFog.DrawRayTracedFogSettings();
+	ImGui::SeparatorText("Particles");
+	DrawParticlesSection();
 	ImGui::PopID();
 }
 
 void RayTracing::DrawParticlesSection()
 {
-	// (49b) Particles Use RT Shadows (lit effects read the volumetric fog's ray-traced visibility).
-	ImGui::SeparatorText("Particles");
+	// (49b) Particles Use RT Shadows (lit effects read the volumetric fog's ray-traced visibility). (49f) Section title by the caller.
 	ImGui::Checkbox("Particles Use RT Shadows", &settings.ParticlesRTShadows);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("On (default): smoke, dust and mist sheets (lit effects) take the ray-traced shadows the volumetric fog traces: they darken in the");

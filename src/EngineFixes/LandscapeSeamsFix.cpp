@@ -854,21 +854,26 @@ void LandscapeSeamsFix::GenerateShaderPermutations(RE::BSShader* a_shader)
 	logger::info("[Landscape Seams] Requested seams pixel shaders for {} vanilla landscape permutations (forward + deferred)", requested);
 }
 
-void LandscapeSeamsFix::Load(const nlohmann::json& a_json)
+void LandscapeSeamsFix::Load(const nlohmann::json& a_featureJson)
 {
-	if (a_json.is_object() && a_json.contains("Enabled") && a_json["Enabled"].is_boolean())
-		enabled.store(a_json["Enabled"].get<bool>(), std::memory_order_relaxed);
+	if (a_featureJson.is_object() && a_featureJson.contains(kSettingKey) && a_featureJson[kSettingKey].is_boolean())
+		SetEnabled(a_featureJson[kSettingKey].get<bool>());
 }
 
-nlohmann::json LandscapeSeamsFix::Save() const
+void LandscapeSeamsFix::LoadLegacy(const nlohmann::json& a_json)
 {
-	return nlohmann::json{ { "Enabled", IsEnabled() } };
+	if (a_json.is_object() && a_json.contains("Enabled") && a_json["Enabled"].is_boolean())
+		SetEnabled(a_json["Enabled"].get<bool>());
+}
+
+void LandscapeSeamsFix::Save(nlohmann::json& a_featureJson) const
+{
+	a_featureJson[kSettingKey] = IsEnabled();
 }
 
 void LandscapeSeamsFix::DrawSettings()
 {
-	if (!ImGui::CollapsingHeader("Terrain Seams", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_OpenOnDoubleClick))
-		return;
+	ImGui::SeparatorText("Terrain Seams");
 
 	bool on = IsEnabled();
 	if (ImGui::Checkbox("Blend Terrain Seams", &on))

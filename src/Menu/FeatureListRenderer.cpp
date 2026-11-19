@@ -139,6 +139,8 @@ std::vector<FeatureListRenderer::MenuFuncInfo> FeatureListRenderer::BuildMenuLis
 					menuList.push_back(BuiltInMenu{ "Sun Shadows", []() { globals::features::rayTracing.DrawSunPage(); } });
 					menuList.push_back(BuiltInMenu{ "Point Light Shadows", []() { globals::features::rayTracing.DrawPointLightPage(); } });
 					menuList.push_back(BuiltInMenu{ "Ambient Occlusion", []() { globals::features::rayTracing.DrawAOPage(); } });
+					// (49f) RT Sun Shafts / RT Light Shadows in Fog and Particles Use RT Shadows (were on the fog page and the main page).
+					menuList.push_back(BuiltInMenu{ "Fog & Particles", []() { globals::features::rayTracing.DrawFogParticlesPage(); } });
 					// (48k) No Reflections entry: RT reflections are hidden and always Off (DrawReflectionsPage stays in the source, unreachable).
 				}
 			}

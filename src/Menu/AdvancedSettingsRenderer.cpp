@@ -6,7 +6,6 @@
 #include <imgui_stdlib.h>
 #include <thread>
 
-#include "EngineFixes/LandscapeSeamsFix.h"
 #include "EngineFixes/WndProcPseudoHandleFix.h"
 #include "FeatureIssues.h"
 #include "Features/PerformanceOverlay/ABTesting/ABTesting.h"
@@ -578,8 +577,6 @@ void AdvancedSettingsRenderer::RenderShaderDebugSection()
 
 void AdvancedSettingsRenderer::RenderPBRSection(const std::function<void()>& drawTruePBRSettings)
 {
-	// (49d) Landscape Seams switch on top: it applies to True PBR and vanilla land alike.
-	LandscapeSeamsFix::GetInstance().DrawSettings();
 	drawTruePBRSettings();
 }
 

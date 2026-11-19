@@ -1112,6 +1112,41 @@ void ExponentialHeightFog::Prepass()
     }
 }
 
+void ExponentialHeightFog::DrawRayTracedFogSettings()
+{
+    // (49f) Drawn on Ray Tracing > Fog & Particles ("Fog" section); the values stay in this feature's settings (49b keys).
+    const auto& palette = Menu::GetSingleton()->GetTheme().StatusPalette;
+    ImGui::BeginDisabled(!loaded);
+    // (49b) Ray-traced visibility in the fog (needs Ray Tracing; last frame's rays, brought into this frame by the fog's own reprojection).
+    ImGui::Checkbox("RT Sun Shafts in Fog", &volumetric.RTSunShafts);
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text(
+            "On (default): with Ray Tracing on, trees, plants, characters and objects block the sun in the 3D fog again\n"
+            "(Ray Tracing takes them out of the game's shadow map, so the fog had no light shafts from them).\n"
+            "One ray per fog cell toward the sun; where Ray Tracing has no data the shadow map is used as before.\n"
+            "Off: as before. Ray Tracing off: no effect. Costs about 0.15-0.35 ms with Ray Tracing on.");
+    ImGui::Checkbox("RT Light Shadows in Fog", &volumetric.RTLightShadows);
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text(
+            "On (default): torches, campfires, lamps and window beams no longer light the fog through walls and objects:\n"
+            "per fog cell the four strongest lights that Ray Tracing shadows (Point Light Shadows on) get one short ray each.\n"
+            "Indoors this needs Skip Volumetric Fog Indoors off. Off: as before (no shadows for lights in the fog).\n"
+            "Costs about 0.2-0.5 ms where many lights shine into fog.");
+    ImGui::EndDisabled();
+    // Prerequisites, only when unmet.
+    if (!loaded)
+        ImGui::TextColored(palette.Warning, "Needs Exponential Height Fog (not installed).");
+    else if (!settings.enabled || !volumetric.Enabled)
+        ImGui::TextColored(palette.Warning, "Needs Volumetric Fog on (Lighting > Exponential Height Fog > Volumetric Fog).");
+    else if (volumetric.OffIndoors && Util::IsInterior())
+        ImGui::TextColored(palette.Warning, "Indoors: needs Skip Volumetric Fog Indoors off (Lighting > Exponential Height Fog > Volumetric Fog).");
+    if (loaded && volumetric.Enabled && (volumetric.RTSunShafts || volumetric.RTLightShadows || globals::features::rayTracing.ParticlesUseRT())) {
+        const bool recent = rtLastFrame != UINT32_MAX && globals::state->frameCount - rtLastFrame <= 1u;
+        ImGui::TextDisabled("Ray-traced fog: %s; used this frame: sun %s, lights %s, particles %s", globals::features::rayTracing.FogStatusText().c_str(),
+            recent && (rtLastFlags & 1u) ? "yes" : "no", recent && (rtLastFlags & 2u) ? "yes" : "no", recent && (rtLastFlags & 12u) ? "yes" : "no");
+    }
+}
+
 void ExponentialHeightFog::DrawSettings()
 {
     ImGui::Checkbox("Enable Exponential Height Fog", (bool*)&settings.enabled);
@@ -1226,26 +1261,8 @@ void ExponentialHeightFog::DrawSettings()
         ImGui::Text(
             "On: no 3D fog inside buildings and caves, which saves about 1 ms there. Outside nothing changes.\n"
             "Off (default): the 3D fog is drawn indoors too.");
-    // (49b) Ray-traced visibility in the fog (needs Ray Tracing; last frame's rays, brought into this frame by the fog's own reprojection).
-    ImGui::Checkbox("RT Sun Shafts in Fog", &volumetric.RTSunShafts);
-    if (auto _tt = Util::HoverTooltipWrapper())
-        ImGui::Text(
-            "On (default): with Ray Tracing on, trees, plants, characters and objects block the sun in the 3D fog again\n"
-            "(Ray Tracing takes them out of the game's shadow map, so the fog had no light shafts from them).\n"
-            "One ray per fog cell toward the sun; where Ray Tracing has no data the shadow map is used as before.\n"
-            "Off: as before. Ray Tracing off: no effect. Costs about 0.15-0.35 ms with Ray Tracing on.");
-    ImGui::Checkbox("RT Light Shadows in Fog", &volumetric.RTLightShadows);
-    if (auto _tt = Util::HoverTooltipWrapper())
-        ImGui::Text(
-            "On (default): torches, campfires, lamps and window beams no longer light the fog through walls and objects:\n"
-            "per fog cell the four strongest lights that Ray Tracing shadows (Point Light Shadows on) get one short ray each.\n"
-            "Indoors this needs Skip Volumetric Fog Indoors off. Off: as before (no shadows for lights in the fog).\n"
-            "Costs about 0.2-0.5 ms where many lights shine into fog.");
-    if (volumetric.Enabled && (volumetric.RTSunShafts || volumetric.RTLightShadows || globals::features::rayTracing.ParticlesUseRT())) {
-        const bool recent = rtLastFrame != UINT32_MAX && globals::state->frameCount - rtLastFrame <= 1u;
-        ImGui::TextDisabled("Ray-traced fog: %s; used this frame: sun %s, lights %s, particles %s", globals::features::rayTracing.FogStatusText().c_str(),
-            recent && (rtLastFlags & 1u) ? "yes" : "no", recent && (rtLastFlags & 2u) ? "yes" : "no", recent && (rtLastFlags & 12u) ? "yes" : "no");
-    }
+    // (49f) The ray-traced fog options are drawn on Ray Tracing > Fog & Particles (DrawRayTracedFogSettings); stored here as before.
+    ImGui::TextDisabled("Ray-traced fog options: Ray Tracing > Fog & Particles");
     if (volumetric.Enabled) {
         if (VolumetricFogRequested() && globals::features::volumetricLighting.loaded)
             ImGui::TextColored(palette.InfoColor, "Vanilla Volumetric Lighting is paused while this is on.");
