@@ -6,11 +6,12 @@
 #include "State.h"
 #include "Utils/GpuTimers.h"
 
-// (49f) This page holds Landscape Seams' switch ("Terrain Seams"); its value is saved in this feature's settings block. State::Load
+// (49f) This page holds Landscape Seams' switch ("Terrain Seams") and (49g) "Fix Dark Bands Between Textures" ("PBR Terrain"); their values are saved in this feature's settings block. State::Load
 // also reads it there when Terrain Blending is not installed (the seams work without it).
 void TerrainBlending::DrawSettings()
 {
 	LandscapeSeamsFix::GetInstance().DrawSettings();
+	LandscapeSeamsFix::GetInstance().DrawPbrTerrainSettings();  // (49g) "PBR Terrain": Fix Dark Bands Between Textures
 }
 
 void TerrainBlending::SaveSettings(json& o_json)
@@ -26,6 +27,7 @@ void TerrainBlending::LoadSettings(json& o_json)
 void TerrainBlending::RestoreDefaultSettings()
 {
 	LandscapeSeamsFix::GetInstance().SetEnabled(true);
+	LandscapeSeamsFix::GetInstance().SetRMAOSFixEnabled(true);
 }
 
 ID3D11VertexShader* TerrainBlending::GetTerrainVertexShader()

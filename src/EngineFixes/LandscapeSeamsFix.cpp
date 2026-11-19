@@ -36,6 +36,70 @@ namespace
 		return *address;
 	}
 
+	/// (49g) CreateResources failed: logged once (that piece draws as normal terrain; the menu readout says so for the piece under the player).
+	std::shared_ptr<LandscapeSeamsFix::Resources> ResourceFailure(const char* a_what, HRESULT a_hr)
+	{
+		static std::atomic<bool> logged{ false };
+		if (!logged.exchange(true))
+			logger::warn("[Landscape Seams] Could not create a land piece's blend resources ({} failed, HRESULT {:08X}): such pieces draw as normal terrain (logged once)",
+				a_what, static_cast<uint32_t>(a_hr));
+		return nullptr;
+	}
+
+	/// (49g) A land texture's name for the menu: its editor ID, else its texture set's, else the diffuse file name, else the form ID.
+	std::string LandTextureName(const RE::TESLandTexture* a_texture)
+	{
+		if (a_texture == nullptr)
+			return "-";
+		if (const char* id = a_texture->GetFormEditorID(); id != nullptr && *id != '\0')
+			return id;
+		if (const auto* set = a_texture->textureSet) {
+			if (const char* id = set->GetFormEditorID(); id != nullptr && *id != '\0')
+				return id;
+			if (const char* path = set->textures[0].textureName.c_str(); path != nullptr && *path != '\0') {
+				std::string_view name(path);
+				if (const auto slash = name.find_last_of("\\/"); slash != std::string_view::npos)
+					name.remove_prefix(slash + 1);
+				if (const auto dot = name.find_last_of('.'); dot != std::string_view::npos)
+					name = name.substr(0, dot);
+				if (!name.empty())
+					return std::string(name);
+			}
+		}
+		return std::format("LTEX {:08X}", a_texture->GetFormID());
+	}
+
+	const char* DropReasonText(LandscapeSeamsFix::DropReason a_reason)
+	{
+		switch (a_reason) {
+		case LandscapeSeamsFix::kDropNotLoaded:
+			return "neighbour not loaded";
+		case LandscapeSeamsFix::kDropPbrOnVanilla:
+			return "PBR texture beside vanilla land";
+		default:
+			return "no room: more than 2 foreign textures";
+		}
+	}
+
+	const char* TechniqueDropText(LandscapeSeamsFix::TechniqueDrop a_reason)
+	{
+		using enum LandscapeSeamsFix::TechniqueDrop;
+		switch (a_reason) {
+		case kCacheOff:
+			return "the shader cache is off";
+		case kLightingOff:
+			return "Lighting shaders are not replaced";
+		case kSwitchOff:
+			return "Blend Terrain Seams is off";
+		case kVertexShaderMissing:
+			return "its vertex shader is not ready (still compiling, or it failed to compile)";
+		case kPixelShaderMissing:
+			return "its pixel shader is not ready (still compiling, or it failed to compile)";
+		default:
+			return "-";
+		}
+	}
+
 	bool IsLandscapeTechnique(uint32_t a_descriptor)
 	{
 		const auto type = static_cast<SIE::ShaderCache::LightingShaderTechniques>((a_descriptor >> 24) & 0x3F);
@@ -232,12 +296,36 @@ void LandscapeSeamsFix::Bind(RE::BSGeometry* a_geometry)
 	}
 
 	globals::d3d::context->PSSetShaderResources(FirstPSTexture, NumPSTextures, views.data());
+
+	// (49g) Menu readout: the piece under the player was bound for a seams pass this frame.
+	if (resources && a_geometry == diagGeometry.load(std::memory_order_relaxed))
+		diagBoundFrame.store(globals::state->frameCount, std::memory_order_relaxed);
+}
+
+void LandscapeSeamsFix::NoteTechnique(TechniqueDrop a_reason)
+{
+	const uint32_t frame = globals::state->frameCount;
+	if (a_reason == TechniqueDrop::kNone) {
+		lastSeamsDrawFrame.store(frame, std::memory_order_relaxed);
+		return;
+	}
+	lastSeamsDropFrame.store(frame, std::memory_order_relaxed);
+	lastSeamsDropReason.store(static_cast<uint8_t>(a_reason), std::memory_order_relaxed);
+	const uint32_t bit = 1u << static_cast<uint32_t>(a_reason);
+	if ((loggedDropReasons.fetch_or(bit, std::memory_order_relaxed) & bit) == 0) {
+		if (a_reason == TechniqueDrop::kSwitchOff)
+			logger::info("[Landscape Seams] A land piece drew as normal terrain instead of with the seams shader: {} (logged once per reason)", TechniqueDropText(a_reason));
+		else
+			logger::warn("[Landscape Seams] A land piece drew as normal terrain instead of with the seams shader: {} (logged once per reason)", TechniqueDropText(a_reason));
+	}
 }
 
 void LandscapeSeamsFix::Heal(const QuadKey& a_key, const Quad& a_quad, Healed& a_out) const
 {
 	a_out.active = false;
 	a_out.extraCount = 0;
+	a_out.diag = {};
+	a_out.diag.healed = true;
 
 	const auto& grid = *a_quad.grid;
 
@@ -314,6 +402,7 @@ void LandscapeSeamsFix::Heal(const QuadKey& a_key, const Quad& a_quad, Healed& a
 						const int index = textures.FindOrAdd(neighbour.slots[slot], neighbour.info[slot]);
 						if (index < 0) {
 							complete = false;
+							a_out.diag.fieldOverflow = true;
 							break;
 						}
 						contribution[index] += weight / neighbourTotal;
@@ -410,7 +499,28 @@ void LandscapeSeamsFix::Heal(const QuadKey& a_key, const Quad& a_quad, Healed& a
 
 	for (size_t i = 0; i < candidateCount && a_out.extraCount < MaxExtraLayers; ++i) {
 		layerOf[candidates[i]] = static_cast<int>(EngineLayers + a_out.extraCount);
+		a_out.diag.borrowed[a_out.extraCount] = textures.entries[candidates[i]].texture;
 		a_out.extras[a_out.extraCount++] = *textures.entries[candidates[i]].info;  // reference copies, under the shared lock
+	}
+	a_out.diag.borrowedCount = a_out.extraCount;
+
+	// (49g) Foreign textures that reach the piece but got no layer (their half of the border stays a hard line), strongest first.
+	{
+		std::array<DroppedTexture, MaxFieldTextures> dropped{};
+		uint32_t droppedCount = 0;
+		for (size_t i = 0; i < textures.count; ++i) {
+			const auto& entry = textures.entries[i];
+			if (entry.slot >= 0 || layerOf[i] >= 0 || fieldMax[i] < MinLayerWeight)
+				continue;
+			auto& out = dropped[droppedCount++];
+			out.texture = entry.texture;
+			out.peak = std::min(fieldMax[i], 1.0f);
+			out.reason = entry.info == nullptr ? kDropNotLoaded : ((!a_out.pbr && entry.info->isPbr) ? kDropPbrOnVanilla : kDropNoRoom);
+		}
+		std::sort(dropped.begin(), dropped.begin() + droppedCount, [](const DroppedTexture& a_left, const DroppedTexture& a_right) { return a_left.peak > a_right.peak; });
+		a_out.diag.droppedTotal = droppedCount;
+		a_out.diag.droppedShown = std::min<uint32_t>(droppedCount, static_cast<uint32_t>(MaxDroppedShown));
+		std::copy_n(dropped.begin(), a_out.diag.droppedShown, a_out.diag.dropped.begin());
 	}
 
 	for (auto& layer : a_out.weights) {
@@ -434,6 +544,7 @@ void LandscapeSeamsFix::Heal(const QuadKey& a_key, const Quad& a_quad, Healed& a
 	}
 
 	a_out.active = true;
+	a_out.diag.active = true;
 }
 
 std::shared_ptr<LandscapeSeamsFix::Resources> LandscapeSeamsFix::CreateResources(const Healed& a_healed) const
@@ -515,8 +626,8 @@ std::shared_ptr<LandscapeSeamsFix::Resources> LandscapeSeamsFix::CreateResources
 	}
 
 	winrt::com_ptr<ID3D11Texture2D> texture;
-	if (FAILED(device->CreateTexture2D(&textureDesc, textureData.data(), texture.put())))
-		return nullptr;
+	if (const HRESULT hr = device->CreateTexture2D(&textureDesc, textureData.data(), texture.put()); FAILED(hr))
+		return ResourceFailure("weight texture", hr);
 	Util::SetResourceName(texture.get(), "LandscapeSeamsFix::Weights");
 
 	D3D11_SHADER_RESOURCE_VIEW_DESC textureViewDesc{};
@@ -524,8 +635,8 @@ std::shared_ptr<LandscapeSeamsFix::Resources> LandscapeSeamsFix::CreateResources
 	textureViewDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
 	textureViewDesc.Texture2DArray.MipLevels = 1;
 	textureViewDesc.Texture2DArray.ArraySize = sliceCount;
-	if (FAILED(device->CreateShaderResourceView(texture.get(), &textureViewDesc, resources->weights.put())))
-		return nullptr;
+	if (const HRESULT hr = device->CreateShaderResourceView(texture.get(), &textureViewDesc, resources->weights.put()); FAILED(hr))
+		return ResourceFailure("weight view", hr);
 	Util::SetResourceName(resources->weights.get(), "LandscapeSeamsFix::Weights SRV");
 
 	D3D11_BUFFER_DESC bufferDesc{};
@@ -539,16 +650,16 @@ std::shared_ptr<LandscapeSeamsFix::Resources> LandscapeSeamsFix::CreateResources
 	bufferData.pSysMem = &data;
 
 	winrt::com_ptr<ID3D11Buffer> buffer;
-	if (FAILED(device->CreateBuffer(&bufferDesc, &bufferData, buffer.put())))
-		return nullptr;
+	if (const HRESULT hr = device->CreateBuffer(&bufferDesc, &bufferData, buffer.put()); FAILED(hr))
+		return ResourceFailure("piece data buffer", hr);
 	Util::SetResourceName(buffer.get(), "LandscapeSeamsFix::QuadData");
 
 	D3D11_SHADER_RESOURCE_VIEW_DESC bufferViewDesc{};
 	bufferViewDesc.Format = DXGI_FORMAT_UNKNOWN;
 	bufferViewDesc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
 	bufferViewDesc.Buffer.NumElements = 1;
-	if (FAILED(device->CreateShaderResourceView(buffer.get(), &bufferViewDesc, resources->data.put())))
-		return nullptr;
+	if (const HRESULT hr = device->CreateShaderResourceView(buffer.get(), &bufferViewDesc, resources->data.put()); FAILED(hr))
+		return ResourceFailure("piece data view", hr);
 	Util::SetResourceName(resources->data.get(), "LandscapeSeamsFix::QuadData SRV");
 
 	return resources;
@@ -586,16 +697,32 @@ void LandscapeSeamsFix::Rebuild(const std::vector<QuadKey>& a_keys)
 
 	std::vector<std::shared_ptr<Resources>> built(pending.size());
 	for (size_t i = 0; i < pending.size(); ++i) {
-		if (pending[i].active)
+		if (pending[i].active) {
 			built[i] = CreateResources(pending[i]);
+			pending[i].diag.resourceFailed = built[i] == nullptr;
+		}
+	}
+
+	// (49g) One line per batch: how many pieces have textures that did not fit (their half of the border stays a hard line).
+	uint32_t blendedCount = 0;
+	uint32_t withDropped = 0;
+	uint32_t droppedTextures = 0;
+	uint32_t overflowed = 0;
+	for (const auto& healed : pending) {
+		blendedCount += healed.active && !healed.diag.resourceFailed ? 1u : 0u;
+		withDropped += healed.diag.droppedTotal > 0 ? 1u : 0u;
+		droppedTextures += healed.diag.droppedTotal;
+		overflowed += healed.diag.fieldOverflow ? 1u : 0u;
 	}
 
 	{
 		const std::unique_lock lock(mutex);
 		for (size_t i = 0; i < pending.size(); ++i) {
 			const auto it = quads.find(pending[i].key);
-			if (it != quads.end() && it->second.generation == pending[i].generation)
+			if (it != quads.end() && it->second.generation == pending[i].generation) {
 				std::swap(it->second.resources, built[i]);
+				it->second.diag = pending[i].diag;
+			}
 		}
 	}
 	// `built` now holds the replaced resources. They and the texture references taken by Heal go to the release list: the
@@ -617,7 +744,11 @@ void LandscapeSeamsFix::Rebuild(const std::vector<QuadKey>& a_keys)
 	}
 
 	rebuiltQuads.fetch_add(static_cast<uint32_t>(pending.size()), std::memory_order_relaxed);
-	lastRebuildMs.store(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(), std::memory_order_relaxed);
+	const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+	lastRebuildMs.store(ms, std::memory_order_relaxed);
+	if (!pending.empty())
+		logger::info("[Landscape Seams] Batch: {} land pieces, {} with blended edges, {} with textures that did not fit ({} textures dropped){}, {:.2f} ms",
+			pending.size(), blendedCount, withDropped, droppedTextures, overflowed ? std::format(", {} with too many textures around them", overflowed) : std::string(), ms);
 }
 
 void LandscapeSeamsFix::Enqueue(const std::vector<QuadKey>& a_keys)
@@ -723,6 +854,7 @@ void LandscapeSeamsFix::OnLandSetup(RE::TESObjectLAND* a_land, bool a_pbr)
 			quad.grid = std::move(entry.quad.grid);
 			quad.geometry = entry.quad.geometry;
 			quad.pbr = entry.quad.pbr;
+			quad.diag = {};  // (49g) until the worker has looked at the new data
 			// Healed from the previous data, so they must not be bound until the worker replaces them.
 			staleResources.push_back(std::move(quad.resources));
 			// Invalidates a Rebuild of this quad already in flight on the worker.
@@ -856,8 +988,12 @@ void LandscapeSeamsFix::GenerateShaderPermutations(RE::BSShader* a_shader)
 
 void LandscapeSeamsFix::Load(const nlohmann::json& a_featureJson)
 {
-	if (a_featureJson.is_object() && a_featureJson.contains(kSettingKey) && a_featureJson[kSettingKey].is_boolean())
+	if (!a_featureJson.is_object())
+		return;
+	if (a_featureJson.contains(kSettingKey) && a_featureJson[kSettingKey].is_boolean())
 		SetEnabled(a_featureJson[kSettingKey].get<bool>());
+	if (a_featureJson.contains(kRMAOSFixSettingKey) && a_featureJson[kRMAOSFixSettingKey].is_boolean())
+		SetRMAOSFixEnabled(a_featureJson[kRMAOSFixSettingKey].get<bool>());
 }
 
 void LandscapeSeamsFix::LoadLegacy(const nlohmann::json& a_json)
@@ -869,6 +1005,7 @@ void LandscapeSeamsFix::LoadLegacy(const nlohmann::json& a_json)
 void LandscapeSeamsFix::Save(nlohmann::json& a_featureJson) const
 {
 	a_featureJson[kSettingKey] = IsEnabled();
+	a_featureJson[kRMAOSFixSettingKey] = IsRMAOSFixEnabled();
 }
 
 void LandscapeSeamsFix::DrawSettings()
@@ -899,4 +1036,135 @@ void LandscapeSeamsFix::DrawSettings()
 	}
 	ImGui::TextDisabled("Loaded land pieces: %zu, with blended edges: %zu (prepared so far: %u, last batch %.2f ms on a background thread)",
 		loaded, blended, rebuiltQuads.load(std::memory_order_relaxed), lastRebuildMs.load(std::memory_order_relaxed));
+
+	// (49g) The land piece under the player: what it has, what it borrowed, what did not fit, and whether the seams shader draws it.
+	struct Readout
+	{
+		bool found = false;
+		bool loadedPiece = false;
+		bool pbr = false;
+		bool hasResources = false;
+		RE::BSGeometry* geometry = nullptr;
+		std::array<RE::TESLandTexture*, EngineLayers> slots{};
+		Diagnostics diag;
+	} readout;
+	QuadKey key{};
+	const char* where = nullptr;
+	auto* player = RE::PlayerCharacter::GetSingleton();
+	auto* cell = player != nullptr ? player->GetParentCell() : nullptr;
+	auto* worldSpace = player != nullptr ? player->GetWorldspace() : nullptr;
+	if (cell != nullptr && cell->IsInteriorCell()) {
+		where = "Under you: indoors (no land pieces).";
+	} else if (cell == nullptr || worldSpace == nullptr) {
+		where = "Under you: no game loaded.";
+	} else {
+		const auto position = player->GetPosition();
+		key = { worldSpace->GetFormID(), static_cast<int32_t>(std::floor(position.x / QuadSize)), static_cast<int32_t>(std::floor(position.y / QuadSize)) };
+		const std::shared_lock lock(mutex);
+		if (const auto it = quads.find(key); it != quads.end()) {
+			const auto& quad = it->second;
+			readout.found = true;
+			readout.loadedPiece = quad.geometry != nullptr;
+			readout.pbr = quad.pbr;
+			readout.hasResources = quad.resources != nullptr;
+			readout.geometry = quad.geometry;
+			readout.slots = quad.slots;
+			readout.diag = quad.diag;
+		}
+	}
+	diagGeometry.store(readout.geometry, std::memory_order_relaxed);
+
+	if (ImGui::TreeNodeEx("Land Piece Under You", ImGuiTreeNodeFlags_DefaultOpen)) {
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text(
+				"What the seam blending did for the land piece you stand on (a piece is a quarter of a cell, about 29 m square).\n"
+				"Stand 10-20 m from a straight texture line to judge it. From far away (beyond about 100 m) the ground is the baked "
+				"LOD texture, which this cannot change.");
+		}
+		if (where != nullptr) {
+			ImGui::TextDisabled("%s", where);
+		} else if (!readout.found || !readout.loadedPiece) {
+			ImGui::TextDisabled("Under you: land piece %d, %d - not loaded yet.", key.x, key.y);
+		} else {
+			ImGui::TextDisabled("Under you: land piece %d, %d (cell %d, %d), %s land", key.x, key.y, key.x >> 1, key.y >> 1, readout.pbr ? "True PBR" : "vanilla");
+
+			std::string own;
+			for (const auto* texture : readout.slots) {
+				if (texture == nullptr)
+					continue;
+				if (!own.empty())
+					own += ", ";
+				own += LandTextureName(texture);
+			}
+			ImGui::TextWrapped("Its own textures: %s", own.empty() ? "-" : own.c_str());
+
+			const auto& diag = readout.diag;
+			std::string borrowed;
+			for (uint32_t i = 0; i < diag.borrowedCount; ++i) {
+				if (!borrowed.empty())
+					borrowed += ", ";
+				borrowed += LandTextureName(diag.borrowed[i]);
+			}
+			ImGui::TextWrapped("Borrowed from neighbours: %s", borrowed.empty() ? "none" : borrowed.c_str());
+
+			std::string dropped;
+			for (uint32_t i = 0; i < diag.droppedShown; ++i) {
+				if (!dropped.empty())
+					dropped += "; ";
+				dropped += std::format("{} (up to {:.0f}%, {})", LandTextureName(diag.dropped[i].texture), diag.dropped[i].peak * 100.0f, DropReasonText(diag.dropped[i].reason));
+			}
+			if (diag.droppedTotal > diag.droppedShown)
+				dropped += std::format("; and {} more", diag.droppedTotal - diag.droppedShown);
+			if (diag.fieldOverflow)
+				dropped += dropped.empty() ? "a neighbour was left out (too many textures around)" : "; a neighbour was left out (too many textures around)";
+			if (dropped.empty()) {
+				ImGui::TextWrapped("Did not fit: none");
+			} else {
+				ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.75f, 0.3f, 1.0f));
+				ImGui::TextWrapped("Did not fit (a hard line stays for these): %s", dropped.c_str());
+				ImGui::PopStyleColor();
+			}
+
+			const char* blendText = "yes";
+			if (!diag.healed)
+				blendText = "not yet (being prepared)";
+			else if (!diag.active)
+				blendText = "no (its edges match its neighbours: nothing to blend)";
+			else if (diag.resourceFailed || !readout.hasResources)
+				blendText = "no (could not create its resources, see the log)";
+			ImGui::TextDisabled("Blended edges: %s", blendText);
+
+			const uint32_t frame = globals::state->frameCount;
+			const auto recent = [frame](uint32_t a_frame) { return a_frame != 0 && frame - a_frame <= 2; };
+			std::string shaderText;
+			if (!readout.hasResources)
+				shaderText = "not used (nothing blended on this piece)";
+			else if (!IsEnabled())
+				shaderText = "not used (Blend Terrain Seams is off)";
+			else if (recent(lastSeamsDropFrame.load(std::memory_order_relaxed)))
+				shaderText = std::format("not used: {}", TechniqueDropText(static_cast<TechniqueDrop>(lastSeamsDropReason.load(std::memory_order_relaxed))));
+			else if (recent(diagBoundFrame.load(std::memory_order_relaxed)))
+				shaderText = "in use";
+			else
+				shaderText = "not drawn this frame (look at the ground)";
+			ImGui::TextDisabled("Seams shader: %s", shaderText.c_str());
+		}
+		ImGui::TreePop();
+	}
+}
+
+void LandscapeSeamsFix::DrawPbrTerrainSettings()
+{
+	ImGui::SeparatorText("PBR Terrain");
+
+	bool on = IsRMAOSFixEnabled();
+	if (ImGui::Checkbox("Fix Dark Bands Between Textures", &on))
+		SetRMAOSFixEnabled(on);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text(
+			"True PBR land only. Where a normal (non-PBR) ground texture fades into another one, the old code counted its share twice, "
+			"so half-way through the fade the ground got darker and shinier in a band.\n"
+			"On: each texture counts once, and a non-PBR texture takes its shininess from its own normal map (as official Community "
+			"Shaders does). Off: exactly the old ground. Takes effect immediately.");
+	}
 }

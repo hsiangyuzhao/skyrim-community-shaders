@@ -775,6 +775,9 @@ bool TruePBR::BSLightingShader_SetupMaterial(RE::BSLightingShader* shader, RE::B
 						flags |= (1u << (24 + textureIndex));
 					}
 				}
+				// (49g) "Fix Dark Bands Between Textures" (Terrain Blending page): non-PBR tiles' RMAOS weighted once (Lighting.hlsl landFixRMAOS).
+				if (LandscapeSeamsFix::GetInstance().IsRMAOSFixEnabled())
+					flags |= LandscapeSeamsFix::kRMAOSFixPBRFlag;
 				shadowState->SetPSConstant(flags, RE::BSGraphics::ConstantGroupLevel::PerMaterial, lightingPSConstants.PBRFlags);
 			}
 

@@ -132,8 +132,9 @@ namespace LandscapeSeams
 
 // True PBR material part of a borrowed layer (seamColorRGB is the sampled colour): a vanilla (non-PBR) texture is converted to
 // linear as the engine layers' non-PBR tiles; RMAOS and glint from the texture set's PBR data, else the engine layers' non-PBR
-// RMAOS expression (weight * float4(1 - glossiness, 0, 1, 0) with glossiness still 0 there; kept identical so both sides of a
-// seam match). Vanilla quads need nothing more (their per-layer snow mask is overwritten later in Lighting.hlsl).
+// RMAOS expression, kept identical so both sides of a seam match: (49g) with "Fix Dark Bands Between Textures" (landFixRMAOS,
+// Lighting.hlsl) float4(1 - normal alpha, 0, 1, 0), else the old weight * float4(1 - glossiness, 0, 1, 0) with glossiness still 0
+// there. Vanilla quads need nothing more (their per-layer snow mask is overwritten later in Lighting.hlsl).
 #		if defined(TRUE_PBR)
 #			define LANDSCAPE_SEAMS_MATERIAL(INDEX, RMAOS_TEX, WEIGHT)                                                              \
 				[branch] if (!LandscapeSeams::HasFlag(LandscapeSeams::FlagPbr, INDEX))                                           \
@@ -152,7 +153,7 @@ namespace LandscapeSeams
 				}                                                                                                                \
 				else                                                                                                             \
 				{                                                                                                                \
-					seamRMAOS = (WEIGHT) * float4(1, 0, 1, 0);                                                                   \
+					seamRMAOS = landFixRMAOS ? float4(1 - seamNormal.a, 0, 1, 0) : (WEIGHT) * float4(1, 0, 1, 0);                \
 				}                                                                                                                \
 				blendedRMAOS += seamRMAOS * (WEIGHT);
 #		else

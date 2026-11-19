@@ -482,10 +482,12 @@ void State::Load(ConfigMode a_configMode, bool a_allowReload)
 		// Blending is not installed (its own LoadSettings then never runs); 49d / 49e saved it as Advanced."Landscape Seams".Enabled,
 		// which is used only while the new key is absent.
 		{
+			// (49g) "Fix Dark Bands Between Textures" is read from the same block (missing: stays on).
 			auto& seams = LandscapeSeamsFix::GetInstance();
-			if (settings.contains("Terrain Blending") && settings["Terrain Blending"].is_object() && settings["Terrain Blending"].contains(LandscapeSeamsFix::kSettingKey))
+			const bool terrainBlock = settings.contains("Terrain Blending") && settings["Terrain Blending"].is_object();
+			if (terrainBlock)
 				seams.Load(settings["Terrain Blending"]);
-			else if (settings.contains("Advanced") && settings["Advanced"].is_object() && settings["Advanced"].contains("Landscape Seams"))
+			if (!(terrainBlock && settings["Terrain Blending"].contains(LandscapeSeamsFix::kSettingKey)) && settings.contains("Advanced") && settings["Advanced"].is_object() && settings["Advanced"].contains("Landscape Seams"))
 				seams.LoadLegacy(settings["Advanced"]["Landscape Seams"]);
 		}
 

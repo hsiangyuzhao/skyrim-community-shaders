@@ -158,15 +158,27 @@ bool Hooks::BSShader_BeginTechnique::thunk(RE::BSShader* shader, uint32_t vertex
 	// cache off) or the switch is off. Only the seams bit goes, so the quad keeps its own permutation (upstream #2841).
 	constexpr auto landscapeSeamsFlag = static_cast<uint32_t>(SIE::ShaderCache::LightingShaderFlags::LandscapeSeams);
 	if ((pixelDescriptor & landscapeSeamsFlag) != 0 && shader->shaderType.get() == RE::BSShader::Type::Lighting) {
-		bool seamsReady = shaderCache->IsEnabled() && state->enabledClasses[RE::BSShader::Type::Lighting - 1] && LandscapeSeamsFix::GetInstance().IsEnabled();
-		if (seamsReady) {
+		// (49g) The reason is noted (menu readout under the player) and logged once per reason.
+		using enum LandscapeSeamsFix::TechniqueDrop;
+		auto& seams = LandscapeSeamsFix::GetInstance();
+		LandscapeSeamsFix::TechniqueDrop drop = kNone;
+		if (!shaderCache->IsEnabled())
+			drop = kCacheOff;
+		else if (!state->enabledClasses[RE::BSShader::Type::Lighting - 1])
+			drop = kLightingOff;
+		else if (!seams.IsEnabled())
+			drop = kSwitchOff;
+		else {
 			auto probeVertexDescriptor = vertexDescriptor;
 			auto probePixelDescriptor = pixelDescriptor;
 			state->ModifyShaderLookup(*shader, probeVertexDescriptor, probePixelDescriptor);
-			seamsReady = shaderCache->GetVertexShader(*shader, probeVertexDescriptor) != nullptr &&
-			             shaderCache->GetPixelShader(*shader, probePixelDescriptor) != nullptr;
+			if (shaderCache->GetVertexShader(*shader, probeVertexDescriptor) == nullptr)
+				drop = kVertexShaderMissing;
+			else if (shaderCache->GetPixelShader(*shader, probePixelDescriptor) == nullptr)
+				drop = kPixelShaderMissing;
 		}
-		if (!seamsReady) {
+		seams.NoteTechnique(drop);
+		if (drop != kNone) {
 			vertexDescriptor &= ~landscapeSeamsFlag;
 			pixelDescriptor &= ~landscapeSeamsFlag;
 		}

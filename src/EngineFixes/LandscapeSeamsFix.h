@@ -32,7 +32,7 @@
  *    the quad draws as normal terrain.
  *  - Borrowed textures come only from loaded neighbours (an unloaded quad keeps its border weights, not its textures,
  *    so no texture stays resident because of us).
- *  - Runtime switch "Blend Terrain Seams" (Advanced > PBR Settings). Off: the seams bit is never set, which draws
+ *  - Runtime switch "Blend Terrain Seams" ((49f) Landscape & Textures > Terrain Blending). Off: the seams bit is never set, which draws
  *    exactly what 49c drew. The worker still prepares quads while off so that switching on is instant.
  *  - Slots t104-t111 (upstream t104 before jiayev moved them to t117 for his physical sky, which this fork does not have).
  */
@@ -118,6 +118,33 @@ struct LandscapeSeamsFix : EngineFix
 		bool valid = false;  // textures present (loaded quad with a known material)
 	};
 
+	/** (49g) Why a piece borrows what it borrows (menu readout under the player, per-batch log line). */
+	enum DropReason : uint8_t
+	{
+		kDropNoRoom = 0,       ///< more than MaxExtraLayers foreign textures: the strongest were taken
+		kDropNotLoaded = 1,    ///< the neighbour showing it is not loaded (its textures are not kept)
+		kDropPbrOnVanilla = 2  ///< a True PBR texture beside vanilla land (the vanilla shader cannot read it)
+	};
+	struct DroppedTexture
+	{
+		RE::TESLandTexture* texture = nullptr;
+		float peak = 0.0f;  ///< its highest healed weight in the piece (0..1)
+		DropReason reason = kDropNoRoom;
+	};
+	static constexpr size_t MaxDroppedShown = 6;
+	struct Diagnostics
+	{
+		std::array<RE::TESLandTexture*, MaxExtraLayers> borrowed{};
+		uint32_t borrowedCount = 0;
+		std::array<DroppedTexture, MaxDroppedShown> dropped{};
+		uint32_t droppedShown = 0;
+		uint32_t droppedTotal = 0;
+		bool healed = false;          ///< the worker has looked at this piece since it loaded
+		bool active = false;          ///< its edges had something to blend
+		bool fieldOverflow = false;   ///< too many textures around it: a neighbour was left out
+		bool resourceFailed = false;  ///< CreateResources failed: draws as normal terrain
+	};
+
 	struct Quad
 	{
 		std::array<RE::TESLandTexture*, EngineLayers> slots{};
@@ -128,6 +155,7 @@ struct LandscapeSeamsFix : EngineFix
 		std::shared_ptr<Resources> resources;
 		uint64_t generation = 0;
 		bool pbr = false;
+		Diagnostics diag;  ///< (49g) from the last Rebuild since it loaded
 	};
 
 	struct Healed
@@ -139,6 +167,19 @@ struct LandscapeSeamsFix : EngineFix
 		uint32_t extraCount = 0;
 		std::array<SlotInfo, MaxExtraLayers> extras{};
 		std::array<std::array<uint8_t, GridVertices>, MaxLayers> weights{};
+		Diagnostics diag;
+	};
+
+	/** (49g) Why BeginTechnique drew normal terrain instead of a seams pass (logged once per reason, shown in the menu). */
+	enum class TechniqueDrop : uint8_t
+	{
+		kNone = 0,
+		kCacheOff,
+		kLightingOff,
+		kSwitchOff,
+		kVertexShaderMissing,
+		kPixelShaderMissing,
+		kCount
 	};
 
 	/** @brief Releases land geometry the engine has dropped. Once per frame (State::Reset); cheap, never blocks. */
@@ -155,17 +196,27 @@ struct LandscapeSeamsFix : EngineFix
 
 	/** (49f) Key of the switch in the "Terrain Blending" settings block (its menu page). */
 	static constexpr const char* kSettingKey = "Blend Terrain Seams";
+	/** (49g) Key of "Fix Dark Bands Between Textures" in the same block. */
+	static constexpr const char* kRMAOSFixSettingKey = "Fix Dark Bands Between Textures";
+	/** (49g) The PBRFlags bit True PBR sets on landscape materials for it (Lighting.hlsl landFixRMAOS; bits 18-23 were unused). */
+	static constexpr uint32_t kRMAOSFixPBRFlag = 1u << 18;
 
 	bool IsEnabled() const { return enabled.load(std::memory_order_relaxed); }
 	void SetEnabled(bool a_enabled) { enabled.store(a_enabled, std::memory_order_relaxed); }
-	/** @brief Reads kSettingKey from a "Terrain Blending" settings block (missing / not a bool: unchanged). */
+	bool IsRMAOSFixEnabled() const { return rmaosFix.load(std::memory_order_relaxed); }
+	void SetRMAOSFixEnabled(bool a_enabled) { rmaosFix.store(a_enabled, std::memory_order_relaxed); }
+	/** @brief Reads kSettingKey and kRMAOSFixSettingKey from a "Terrain Blending" settings block (missing / not a bool: unchanged). */
 	void Load(const nlohmann::json& a_featureJson);
 	/** @brief 49d / 49e: Advanced."Landscape Seams" = { "Enabled": bool }. */
 	void LoadLegacy(const nlohmann::json& a_json);
-	/** @brief Writes kSettingKey into a "Terrain Blending" settings block. */
+	/** @brief Writes kSettingKey and kRMAOSFixSettingKey into a "Terrain Blending" settings block. */
 	void Save(nlohmann::json& a_featureJson) const;
-	/** @brief (49f) F11 > Landscape & Textures > Terrain Blending: the "Terrain Seams" section (switch and status line). */
+	/** @brief (49f) F11 > Landscape & Textures > Terrain Blending: the "Terrain Seams" section (switch, status line, (49g) the land piece under the player). */
 	void DrawSettings();
+	/** @brief (49g) The "PBR Terrain" section below it: "Fix Dark Bands Between Textures". */
+	void DrawPbrTerrainSettings();
+	/** @brief (49g) BeginTechnique's decision for a seams pass (kNone = drawn with the seams shader). Render thread; logs each reason once. */
+	void NoteTechnique(TechniqueDrop a_reason);
 
 private:
 	LandscapeSeamsFix() = default;
@@ -178,6 +229,7 @@ private:
 	void WorkerLoop(std::stop_token a_stop);
 
 	std::atomic<bool> enabled{ true };
+	std::atomic<bool> rmaosFix{ true };
 
 	std::shared_mutex mutex;
 	std::unordered_map<QuadKey, Quad, QuadKeyHash> quads;
@@ -199,4 +251,12 @@ private:
 	// Status line (menu only).
 	std::atomic<uint32_t> rebuiltQuads{ 0 };
 	std::atomic<double> lastRebuildMs{ 0.0 };
+
+	// (49g) Readout: the piece under the player (set by the menu) and when Bind last saw it; BeginTechnique's last decisions.
+	std::atomic<RE::BSGeometry*> diagGeometry{ nullptr };
+	std::atomic<uint32_t> diagBoundFrame{ 0 };
+	std::atomic<uint32_t> lastSeamsDrawFrame{ 0 };
+	std::atomic<uint32_t> lastSeamsDropFrame{ 0 };
+	std::atomic<uint8_t> lastSeamsDropReason{ 0 };
+	std::atomic<uint32_t> loggedDropReasons{ 0 };
 };
