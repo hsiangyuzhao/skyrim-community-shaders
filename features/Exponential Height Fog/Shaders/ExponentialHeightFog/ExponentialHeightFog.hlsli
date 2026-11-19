@@ -261,45 +261,47 @@ namespace ExponentialHeightFog
     bool GetVolumeEndColor(float3 positionWS, uint eyeIndex, out float3 a_color)
     {
         a_color = 0.0f;
-        float4 clipPosition = mul(FrameBuffer::CameraViewProj[eyeIndex], float4(positionWS, 1.0f));
-        [branch] if (!(clipPosition.w > 0.0f))
-            return false;
+        bool valid = false;
+        const float4 clipPosition = mul(FrameBuffer::CameraViewProj[eyeIndex], float4(positionWS, 1.0f));
         const bool far = SharedData::volumetricFogSettings.FarEnabled != 0;
-        uint width, height, depth;
+        uint width = 0, height = 0, depth = 0;
         [branch] if (far)
             ExponentialHeightFogIntegratedLightScatteringFar.GetDimensions(width, height, depth);
         else
             ExponentialHeightFogIntegratedLightScattering.GetDimensions(width, height, depth);
-        [branch] if (width == 0 || height == 0 || depth < 2)
-            return false;
-        float2 uv = saturate(clipPosition.xy / clipPosition.w * float2(0.5f, -0.5f) + 0.5f);
-        uv = Stereo::ConvertToStereoUV(uv, eyeIndex);
-        const float2 size = float2(width, height);
-        float2 uvMin = 0.5f / size;
-        float2 uvMax = 1.0f - uvMin;
+        [branch] if (clipPosition.w > 0.0f && width != 0 && height != 0 && depth >= 2)
+        {
+            float2 uv = saturate(clipPosition.xy / clipPosition.w * float2(0.5f, -0.5f) + 0.5f);
+            uv = Stereo::ConvertToStereoUV(uv, eyeIndex);
+            const float2 size = float2(width, height);
+            float2 uvMin = 0.5f / size;
+            float2 uvMax = 1.0f - uvMin;
 #if defined(VR)
-        uvMin.x += eyeIndex == 0 ? 0.0f : 0.5f;
-        uvMax.x -= eyeIndex == 0 ? 0.5f : 0.0f;
+            uvMin.x += eyeIndex == 0 ? 0.0f : 0.5f;
+            uvMax.x -= eyeIndex == 0 ? 0.5f : 0.0f;
 #endif
-        uv = clamp(uv, uvMin, uvMax);
-        const float zLast = 1.0f - 0.5f / float(depth);
-        const float zPrev = 1.0f - 1.5f / float(depth);
-        float4 last, prev;
-        [branch] if (far)
-        {
-            last = ExponentialHeightFogIntegratedLightScatteringFar.SampleLevel(SampColorSampler, float3(uv, zLast), 0);
-            prev = ExponentialHeightFogIntegratedLightScatteringFar.SampleLevel(SampColorSampler, float3(uv, zPrev), 0);
+            uv = clamp(uv, uvMin, uvMax);
+            const float zLast = 1.0f - 0.5f / float(depth);
+            const float zPrev = 1.0f - 1.5f / float(depth);
+            float4 last = 0.0f, prev = 0.0f;
+            [branch] if (far)
+            {
+                last = ExponentialHeightFogIntegratedLightScatteringFar.SampleLevel(SampColorSampler, float3(uv, zLast), 0);
+                prev = ExponentialHeightFogIntegratedLightScatteringFar.SampleLevel(SampColorSampler, float3(uv, zPrev), 0);
+            }
+            else
+            {
+                last = ExponentialHeightFogIntegratedLightScattering.SampleLevel(SampColorSampler, float3(uv, zLast), 0);
+                prev = ExponentialHeightFogIntegratedLightScattering.SampleLevel(SampColorSampler, float3(uv, zPrev), 0);
+            }
+            const float dT = prev.a - last.a;
+            [branch] if (dT > 1e-4f)
+            {
+                a_color = max((last.rgb - prev.rgb) / dT, 0.0f);
+                valid = all(isfinite(a_color));
+            }
         }
-        else
-        {
-            last = ExponentialHeightFogIntegratedLightScattering.SampleLevel(SampColorSampler, float3(uv, zLast), 0);
-            prev = ExponentialHeightFogIntegratedLightScattering.SampleLevel(SampColorSampler, float3(uv, zPrev), 0);
-        }
-        const float dT = prev.a - last.a;
-        [branch] if (!(dT > 1e-4f))
-            return false;
-        a_color = max((last.rgb - prev.rgb) / dT, 0.0f);
-        return all(isfinite(a_color));
+        return valid;
     }
 
     /// Height fog with the volumetric fog in front of it. The analytical fog only covers the
