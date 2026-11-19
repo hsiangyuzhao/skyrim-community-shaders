@@ -71,7 +71,7 @@ StructuredBuffer<float> AEAdaptation : register(t4);
 
 float4 LoadSceneColor(uint2 tid)
 {
-	return float4(AutoExposureMath::ExposeColor(TexColor[tid].rgb, AEAdaptation[0], AEExposureCompensation, AEAdaptationRange, AEPurkinjeStartEV, AEPurkinjeMaxEV, AEPurkinjeStrength), 1);
+	return float4(AutoExposureMath::ExposeColor(TexColor[tid].rgb, AEAdaptation[0], AEAdaptation[1], AEExposureCompensation, AEAdaptationRange, AEPurkinjeStartEV, AEPurkinjeMaxEV, AEPurkinjeStrength), 1);
 }
 #else
 float4 LoadSceneColor(uint2 tid)

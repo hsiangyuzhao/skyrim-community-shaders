@@ -11,6 +11,7 @@
 #include "FeatureIssues.h"
 #include "Features/CloudShadows.h"
 #include "Features/PerformanceOverlay.h"
+#include "Features/PhysicalSky.h"
 #include "Features/RayTracing.h"
 #include "Features/Skin.h"
 #include "Features/TerrainBlending.h"
@@ -844,6 +845,11 @@ void State::UpdateSharedData([[maybe_unused]] bool a_inWorld, [[maybe_unused]] b
 {
 	{
 		SharedDataCB data{};
+
+		// (49h stage 2) Physical Sky "Physical Ambient": the physical sky's ambient goes into the engine's directional ambient before it is
+		// copied here (and before the engine sets it on the draws that follow).
+		if (globals::features::physicalSky.loaded)
+			globals::features::physicalSky.ApplyPhysicalAmbient();
 
 		const auto shaderManager = globals::game::smState;
 		const RE::NiTransform& dalcTransform = shaderManager->directionalAmbientTransform;

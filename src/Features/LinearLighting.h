@@ -96,6 +96,8 @@ struct LinearLighting : Feature
 	void UnbindEffectScene();
 	/** @brief (49g) The unlit smoke and mist scale: ambient luminance now / the current weather's midday ambient, clamped. */
 	float ComputeUnlitSceneScale();
+	/** @brief (49h stage 2) ComputeUnlitSceneScale, or Physical Sky's physical ambient ratio while "Physical Ambient" is in effect. */
+	float ComputeUnlitSceneScaleWithPhysical();
 
 	struct alignas(16) PerFrameData
 	{

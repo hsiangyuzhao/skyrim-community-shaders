@@ -4,6 +4,7 @@
 #include "Util.h"
 #include "Utils/GpuTimers.h"
 
+#include "Features/PhysicalSky.h"
 #include "Features/PostProcessing.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
@@ -20,10 +21,163 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	AdaptSpeed,
 	PurkinjeStartEV,
 	PurkinjeMaxEV,
-	PurkinjeStrength)
+	PurkinjeStrength,
+	ExposureMode,
+	PhysDarkCompensation,
+	PhysFullAdaptationAbove,
+	PhysDarkestAdapted,
+	PhysBrightBoost,
+	PhysAdaptIntoDark,
+	PhysAdaptIntoBright,
+	PhysIgnoreDarkest,
+	PhysIgnoreBrightest,
+	PhysCentreWeight,
+	PhysHoldSmallChanges,
+	PhysPurkinjeStartEV,
+	PhysPurkinjeMaxEV)
+
+bool HistogramAutoExposure::PhysicalMode() const
+{
+	// (49h stage 2) Auto follows Physical Sky's "Physical Lighting" master (also indoors: the curve applies everywhere).
+	if (settings.ExposureMode == kExposurePhysical)
+		return true;
+	if (settings.ExposureMode == kExposureClassic)
+		return false;
+	const auto& physicalSky = globals::features::physicalSky;
+	return physicalSky.PhysLightingOn(true);
+}
+
+float HistogramAutoExposure::LastExposureEV() const
+{
+	if (!readbackValid || !(readback[0] > 0.f))
+		return 0.f;
+	return std::log2(0.18f * std::exp2(settings.ExposureCompensation) / readback[0]);
+}
+
+std::string HistogramAutoExposure::DescribeForTrace() const
+{
+	if (!readbackValid)
+		return std::format("Auto Exposure {} (no readback yet)", PhysicalMode() ? "Physical" : "Classic");
+	const float sceneEV = readback[1] > 0.f ? std::log2(readback[1] / 0.125f) : 0.f;
+	const float compensationEV = readback[3] > 0.f ? std::log2(readback[3]) : 0.f;
+	return std::format("Auto Exposure {}: scene {:+.2f} EV, compensation {:+.2f} EV, exposure {:+.2f} EV (alpha {:.2f}, darkest {:+.1f} EV)",
+		readbackPhysical ? "Physical" : "Classic", sceneEV, compensationEV, LastExposureEV(), settings.PhysDarkCompensation, settings.PhysDarkestAdapted);
+}
+
+void HistogramAutoExposure::QueueReadback()
+{
+	// (49h stage 2) Copy the 16-byte adaptation buffer into a staging ring; read the oldest copy without waiting.
+	auto context = globals::d3d::context;
+	auto device = globals::d3d::device;
+	if (!adaptationSB || !adaptationSB->SRV())
+		return;
+	const uint32_t slot = readbackIndex % kReadbackCount;
+	const uint32_t oldest = (readbackIndex + 1) % kReadbackCount;
+	if (readbackBuffers[oldest] && readbackPending[oldest]) {
+		D3D11_MAPPED_SUBRESOURCE mapped{};
+		if (SUCCEEDED(context->Map(readbackBuffers[oldest].get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped)) && mapped.pData) {
+			float values[4];
+			std::memcpy(values, mapped.pData, sizeof(values));
+			context->Unmap(readbackBuffers[oldest].get(), 0);
+			readbackPending[oldest] = false;
+			bool finite = true;
+			for (float v : values)
+				finite = finite && std::isfinite(v);
+			if (finite) {
+				std::memcpy(readback, values, sizeof(values));
+				readbackValid = true;
+				readbackPhysical = lastModePhysical;
+			}
+		}
+	}
+	if (!readbackBuffers[slot]) {
+		D3D11_BUFFER_DESC desc{};
+		desc.ByteWidth = 4 * sizeof(float);
+		desc.Usage = D3D11_USAGE_STAGING;
+		desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		if (FAILED(device->CreateBuffer(&desc, nullptr, readbackBuffers[slot].put())))
+			return;
+	}
+	winrt::com_ptr<ID3D11Resource> source;
+	adaptationSB->SRV()->GetResource(source.put());
+	if (!source)
+		return;
+	context->CopyResource(readbackBuffers[slot].get(), source.get());
+	readbackPending[slot] = true;
+	++readbackIndex;
+}
 
 void HistogramAutoExposure::DrawSettings()
 {
+	// (49h stage 2) "Exposure Mode".
+	{
+		static constexpr const char* kModeNames[kExposureModeCount] = { "Auto (follows Physical Lighting)", "Classic", "Physical" };
+		settings.ExposureMode = std::clamp(settings.ExposureMode, 0, kExposureModeCount - 1);
+		ImGui::Combo("Exposure Mode", &settings.ExposureMode, kModeNames, kExposureModeCount);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text(
+				"Auto (default): Physical while Physical Sky > Scene Lighting > Physical Lighting is on, else Classic.\n"
+				"Classic: the controls as before (adaptation range, one speed).\n"
+				"Physical: adapts over a wide range (bright noon to a moonless night) and keeps dark scenes darker on screen with\n"
+				"one curve (Dark Scene Compensation); slow into the dark, quick into the light; jumps after loads, fast travel and\n"
+				"waiting; holds while a menu is open.");
+		const bool physical = PhysicalMode();
+		if (readbackValid) {
+			const float sceneEV = readback[1] > 0.f ? std::log2(readback[1] / 0.125f) : 0.f;
+			const float targetEV = readback[2] > 0.f ? std::log2(readback[2] / 0.125f) : 0.f;
+			const float compensationEV = readback[3] > 0.f ? std::log2(readback[3]) : 0.f;
+			ImGui::TextDisabled("Now (%s): scene %+.2f EV, target %+.2f EV, compensation %+.2f EV, final exposure %+.2f EV",
+				readbackPhysical ? "Physical" : "Classic", sceneEV, targetEV, compensationEV, LastExposureEV());
+		}
+		if (physical) {
+			ImGui::SliderFloat("Exposure Compensation", &settings.ExposureCompensation, -5.f, 5.f, "%+.2f EV");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Extra brightness for every scene, in EV (+1 = twice as bright).");
+			ImGui::SliderFloat("Dark Scene Compensation", &settings.PhysDarkCompensation, 0.f, 1.f, "%.2f");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text(
+					"How much darker than the day a dark scene stays on screen: 0 = every scene as bright as noon, 1 = no brightening\n"
+					"below Full Adaptation Above. 0.6 (default): full moon about -2.8 EV, moonless about -4.5 EV, torch-lit room -0.6 EV.");
+			ImGui::SliderFloat("Full Adaptation Above", &settings.PhysFullAdaptationAbove, -4.f, 2.f, "%+.1f EV");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Scenes brighter than this are shown at full brightness; darker ones by Dark Scene Compensation.");
+			ImGui::SliderFloat("Darkest Adapted Scene", &settings.PhysDarkestAdapted, -10.f, -3.f, "%+.1f EV");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("The eye stops adapting here: darker scenes get darker on screen one to one.");
+			ImGui::SliderFloat("Bright Scene Boost", &settings.PhysBrightBoost, 0.f, 0.5f, "%.2f");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Scenes brighter than +1.5 EV (sunlit snow, a bright sky) stay a little brighter on screen.");
+			ImGui::SliderFloat("Adapt Into Dark", &settings.PhysAdaptIntoDark, 0.2f, 10.f, "%.1f s");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Time to adapt when the scene gets darker (walking into a cave).");
+			ImGui::SliderFloat("Adapt Into Bright", &settings.PhysAdaptIntoBright, 0.1f, 5.f, "%.1f s");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Time to adapt when the scene gets brighter (walking out into daylight).");
+			ImGui::SliderFloat("Ignore Darkest %", &settings.PhysIgnoreDarkest, 0.f, 40.f, "%.0f%%");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("This share of the darkest screen samples does not count (black shadows, letterbox).");
+			ImGui::SliderFloat("Ignore Brightest %", &settings.PhysIgnoreBrightest, 0.f, 40.f, "%.0f%%");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("This share of the brightest screen samples does not count (the sun, fire, highlights).");
+			ImGui::SliderFloat("Centre Weight", &settings.PhysCentreWeight, 0.f, 1.f, "%.2f");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("0 = the whole screen counts the same; 1 = the middle counts three times.");
+			ImGui::Checkbox("Hold Small Changes", &settings.PhysHoldSmallChanges);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Changes smaller than about 0.1-0.35 EV are not followed (no pumping when turning the camera).");
+			if (ImGui::TreeNodeEx("Purkinje Effect##phys", ImGuiTreeNodeFlags_DefaultOpen)) {
+				ImGui::SliderFloat("Max Strength", &settings.PurkinjeStrength, 0.f, 5.f, "%.2f");
+				ImGui::SliderFloat("Fade In EV", &settings.PhysPurkinjeStartEV, -12.f, 2.f, "%.2f EV");
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::Text("The blue shift starts when the adapted scene is darker than this (Physical mode's own value).");
+				ImGui::SliderFloat("Max Effect EV", &settings.PhysPurkinjeMaxEV, -12.f, 2.f, "%.2f EV");
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::Text("From this scene brightness down, the blue shift is the strongest.");
+				ImGui::TreePop();
+			}
+			return;
+		}
+	}
 	if (globals::game::isVR) {
 		settings.EnableToD = false;
 	} else {
@@ -152,7 +306,9 @@ void HistogramAutoExposure::SetupResources()
 		histogramSB = std::make_unique<StructuredBuffer>(StructuredBufferDesc<uint>(256u, false), 256);
 		histogramSB->CreateUAV();
 
-		adaptationSB = std::make_unique<StructuredBuffer>(StructuredBufferDesc<float>(1u, false), 1);
+		adaptationSB = std::make_unique<StructuredBuffer>(StructuredBufferDesc<float>(4u, false), 4);  // (49h stage 2) four slots (histogram.cs.hlsl)
+		snapFrames = 2;
+		readbackValid = false;
 		adaptationSB->CreateSRV();
 		adaptationSB->CreateUAV();
 	}
@@ -205,6 +361,11 @@ void HistogramAutoExposure::ReleaseResources()
 	histogramSB = nullptr;
 	adaptationSB = nullptr;
 	texAdapt = nullptr;
+	for (int i = 0; i < kReadbackCount; ++i) {
+		readbackBuffers[i] = nullptr;
+		readbackPending[i] = false;
+	}
+	readbackValid = false;
 }
 
 void HistogramAutoExposure::ClearShaderCache()
@@ -251,6 +412,11 @@ void HistogramAutoExposure::GetExposureParameters(float& exposureCompensation, f
 	auto& pp = globals::features::postProcessing;
 	exposureCompensation = settings.ExposureCompensation;
 	adaptationRange = settings.AdaptationRange;
+	// (49h stage 2) Physical: the curve is in the divisor itself (histogram.cs.hlsl); no time-of-day / interior overrides and no clamp.
+	if (PhysicalMode()) {
+		adaptationRange = { -40.f, 40.f };
+		return;
+	}
 	if (pp.imageSpaceManager != nullptr) {
 		if (settings.EnableToD) {
 			exposureCompensation = pp.imageSpaceManager->timeOfDay[0] * settings.ToDExposure[0] +
@@ -291,8 +457,54 @@ void HistogramAutoExposure::Draw(TextureInfo& inout_tex)
 		.PurkinjeMaxEV = settings.PurkinjeMaxEV,
 		.PurkinjeStrength = settings.PurkinjeStrength,
 	};
+	// (49h stage 2) Physical mode's constants; snaps after loads / time skips / mode switches, holds while the game is paused.
+	const bool physical = PhysicalMode();
+	{
+		auto* ui = RE::UI::GetSingleton();
+		if (ui && (ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME) || ui->IsMenuOpen(RE::MainMenu::MENU_NAME)))
+			snapFrames = std::max(snapFrames, 4);
+		const auto calendar = RE::Calendar::GetSingleton();
+		const float hours = calendar ? calendar->GetHoursPassed() : 0.f;
+		if (lastHoursPassed >= 0.f && !(std::abs(hours - lastHoursPassed) < 0.01f))
+			snapFrames = std::max(snapFrames, 1);
+		lastHoursPassed = hours;
+		if (physical != lastModePhysical)
+			snapFrames = std::max(snapFrames, 1);
+		lastModePhysical = physical;
+		const bool snap = snapFrames > 0;
+		if (snapFrames > 0)
+			--snapFrames;
+		const bool hold = ui && ui->GameIsPaused();
+		if (physical) {
+			const auto& s = settings;
+			cbData.PurkinjeStartEV = s.PhysPurkinjeStartEV;
+			cbData.PurkinjeMaxEV = s.PhysPurkinjeMaxEV;
+			cbData.PhysMinLogLum = kPhysMinLogLum;
+			cbData.PhysLogLumRange = kPhysLogLumRange;
+			cbData.PhysMode = 1u;
+			cbData.PhysDeltaTime = std::clamp(RE::BSTimer::GetSingleton()->realTimeDelta, 0.f, 0.5f);
+			cbData.PhysTrimLow = std::clamp(s.PhysIgnoreDarkest, 0.f, 40.f) * 0.01f;
+			cbData.PhysTrimHigh = std::clamp(s.PhysIgnoreBrightest, 0.f, 40.f) * 0.01f;
+			cbData.PhysCentreWeight = std::clamp(s.PhysCentreWeight, 0.f, 1.f);
+			cbData.PhysDeadband = s.PhysHoldSmallChanges ? 1.f : 0.f;
+			cbData.PhysTauDark = std::clamp(s.PhysAdaptIntoDark, 0.2f, 10.f);
+			cbData.PhysTauBright = std::clamp(s.PhysAdaptIntoBright, 0.1f, 5.f);
+			cbData.PhysSlewDark = kPhysSlewDark;
+			cbData.PhysSlewBright = kPhysSlewBright;
+			cbData.PhysAlpha = std::clamp(s.PhysDarkCompensation, 0.f, 1.f);
+			cbData.PhysEVRef = std::clamp(s.PhysFullAdaptationAbove, -4.f, 2.f);
+			cbData.PhysEVMin = std::clamp(s.PhysDarkestAdapted, -10.f, -3.f);
+			cbData.PhysBeta = std::clamp(s.PhysBrightBoost, 0.f, 0.5f);
+			cbData.PhysEVHi = kPhysEVHi;
+			cbData.PhysAdaptMinEV = kPhysAdaptMinEV;
+			cbData.PhysAdaptMaxEV = kPhysAdaptMaxEV;
+			cbData.PhysFlags = (snap ? 1u : 0u) | (hold ? 2u : 0u);
+		}
+	}
 	autoExposureCB->Update(cbData);
-	lastExposureCompensation = cbData.ExposureCompensation;
+	// (49h stage 2) Local Exposure pivots around the middle grey this pass targets: x the compensation curve in Physical mode
+	// (read back 2-3 frames late; it changes slowly).
+	lastExposureCompensation = cbData.ExposureCompensation * (physical && readbackValid && readbackPhysical && readback[3] > 0.f ? readback[3] : 1.f);
 
 	std::array<ID3D11ShaderResourceView*, 2> srvs = { nullptr };
 	std::array<ID3D11UnorderedAccessView*, 2> uavs = { nullptr };
@@ -346,6 +558,8 @@ void HistogramAutoExposure::Draw(TextureInfo& inout_tex)
 		context->Dispatch(1, 1, 1);
 		state->EndPerfEvent();
 	}
+	resetViews();
+	QueueReadback();  // (49h stage 2)
 
 	// (44e) Folded: Local Exposure applies the same exposure when it reads the image.
 	lastFolded = foldIntoNext;

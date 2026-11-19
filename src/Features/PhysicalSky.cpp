@@ -11,6 +11,13 @@
 #include "SkySync.h"
 #include "TerrainShadows.h"
 
+namespace
+{
+	// (49h stage 2) Defined with the physical scene code at the end of this file.
+	float Luminance3Of(const float3& a_color);
+	float3 HueOfColor(const float3& a_color, float a_maxSaturation);
+}
+
 #include "Menu.h"
 #include "State.h"
 #include "Util.h"
@@ -142,6 +149,17 @@ void PhysicalSky::LoadSettings(json& o_json)
 			pl.farFog = j.value("farFog", d.farFog);
 			pl.forwardCubemap = j.value("forwardCubemap", d.forwardCubemap);
 			pl.smallFixes = j.value("smallFixes", d.smallFixes);
+			// (49h stage 2)
+			pl.realSkyRatios = j.value("realSkyRatios", d.realSkyRatios);
+			pl.physicalAmbient = j.value("physicalAmbient", d.physicalAmbient);
+			pl.measuredClouds = j.value("measuredClouds", d.measuredClouds);
+			pl.cloudsStarsWaterFollow = j.value("cloudsStarsWaterFollow", d.cloudsStarsWaterFollow);
+			auto clampValue = [](float a_value, float a_lo, float a_hi, float a_default) { return std::isfinite(a_value) ? std::clamp(a_value, a_lo, a_hi) : a_default; };
+			pl.compressionK = clampValue(j.value("compressionK", d.compressionK), 0.1f, 1.f, d.compressionK);
+			pl.overcastKappa = clampValue(j.value("overcastKappa", d.overcastKappa), 0.f, 1.f, d.overcastKappa);
+			pl.airglowRatio = clampValue(j.value("airglowRatio", d.airglowRatio), 5.f, 100.f, d.airglowRatio);
+			pl.smoothingSeconds = clampValue(j.value("smoothingSeconds", d.smoothingSeconds), 0.1f, 10.f, d.smoothingSeconds);
+			pl.hueSaturationCap = clampValue(j.value("hueSaturationCap", d.hueSaturationCap), 0.f, 1.f, d.hueSaturationCap);
 		}
 		settings.moonStarFadeStrength = o_json.value("moonStarFadeStrength", defaults.moonStarFadeStrength);
 		settings.moonPlanetshineStrength = o_json.value("moonPlanetshineStrength", defaults.moonPlanetshineStrength);
@@ -294,7 +312,10 @@ void PhysicalSky::SaveSettings(json& o_json)
 		o_json["physicalLighting"] = { { "enabled", pl.enabled }, { "sameDirectLight", pl.sameDirectLight }, { "moonCloudGrey", pl.moonCloudGrey },
 			{ "cloudAmbient", pl.cloudAmbient }, { "iblNoFeedback", pl.iblNoFeedback }, { "iblEnvOcclusion", pl.iblEnvOcclusion },
 			{ "farShadows", pl.farShadows }, { "farSkylight", pl.farSkylight }, { "lodScale", pl.lodScale }, { "farFog", pl.farFog },
-			{ "forwardCubemap", pl.forwardCubemap }, { "smallFixes", pl.smallFixes } };
+			{ "forwardCubemap", pl.forwardCubemap }, { "smallFixes", pl.smallFixes },
+			{ "realSkyRatios", pl.realSkyRatios }, { "physicalAmbient", pl.physicalAmbient }, { "measuredClouds", pl.measuredClouds },
+			{ "cloudsStarsWaterFollow", pl.cloudsStarsWaterFollow }, { "compressionK", pl.compressionK }, { "overcastKappa", pl.overcastKappa },
+			{ "airglowRatio", pl.airglowRatio }, { "smoothingSeconds", pl.smoothingSeconds }, { "hueSaturationCap", pl.hueSaturationCap } };
 	}
 	o_json["moonStarFadeStrength"] = settings.moonStarFadeStrength;
 	o_json["moonPlanetshineStrength"] = settings.moonPlanetshineStrength;
@@ -828,6 +849,12 @@ void PhysicalSky::SetupResources()
 {
 	auto device = globals::d3d::device;
 
+	// (49h stage 2) "Overcast From Measured Clouds": the cube reduce's constants and result (4 floats).
+	cloudCoverCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<CloudCoverCB>());
+	cloudCoverSB = std::make_unique<StructuredBuffer>(StructuredBufferDesc<float>(4u, false), 4);
+	cloudCoverSB->CreateUAV();
+	cloudCoverSB->CreateSRV();
+
 	logger::debug("Creating samplers...");
 	{
 		D3D11_SAMPLER_DESC samplerDesc = {};
@@ -1005,7 +1032,8 @@ void PhysicalSky::CompileShaders()
 		{ &csMsLutGen, "LutGen.cs.hlsl", { { "LUTGEN", "1" } } },
 		{ &csSvLutGen, "LutGen.cs.hlsl", { { "LUTGEN", "2" } } },
 		{ &csApLutGen, "LutGen.cs.hlsl", { { "LUTGEN", "3" } } },
-		{ &csShadowAccum, "ShadowAccum.cs.hlsl", {} }
+		{ &csShadowAccum, "ShadowAccum.cs.hlsl", {} },
+		{ &csCloudCover, "CloudCoverCS.hlsl", {} }  // (49h stage 2) optional: without it the weather estimate is used
 	};
 
 	for (auto& info : shaderInfos) {
@@ -1052,9 +1080,10 @@ void PhysicalSky::UpdateMoonData(float a_exposure, float a_sunElevation, float3&
 	// (40d) The moon colours stay the user's (they light the scene through Sky Sync); only their
 	// glow in the scattering LUTs is scaled here.
 	const auto& s = effective;
-	const float strength = std::clamp(s.moonGlowStrength, 0.f, 1.f);
-	a_masserGlow = settings.masserColor * (a_exposure * strength);
-	a_secundaGlow = settings.secundaColor * (a_exposure * strength);
+	// (49h stage 2) Real Sky Ratios: the glow at strength 1 from the moon at the real ratio (the light itself).
+	const float strength = physScene.active ? 1.f : std::clamp(s.moonGlowStrength, 0.f, 1.f);
+	a_masserGlow = MoonLightBase(0) * (a_exposure * strength);
+	a_secundaGlow = MoonLightBase(1) * (a_exposure * strength);
 	moonCbData = {};
 	moonStarFadeAmount[0] = moonStarFadeAmount[1] = 0.f;  // (48b)
 	moonPlanetshineAmount[0] = moonPlanetshineAmount[1] = 0.f;
@@ -1071,8 +1100,13 @@ void PhysicalSky::UpdateMoonData(float a_exposure, float a_sunElevation, float3&
 		const auto& skySync = globals::features::skySync;
 		const float masserVisibility = MoonHorizonVisibility(sky->masser, sky, skySync.rawDirections[static_cast<int>(SkySync::Caster::Masser)].z);
 		const float secundaVisibility = MoonHorizonVisibility(sky->secunda, sky, skySync.rawDirections[static_cast<int>(SkySync::Caster::Secunda)].z);
-		a_masserGlow = a_masserGlow * (SkySync::PhaseFactorFromTexture(sky->masser) * masserVisibility);
-		a_secundaGlow = a_secundaGlow * (SkySync::PhaseFactorFromTexture(sky->secunda) * secundaVisibility);
+		// (49h stage 2) Real Sky Ratios: the real phase curve (a crescent is ~1/40 of full, not 1/4).
+		auto phase = [&](const RE::Moon* a_moon) {
+			const float picture = SkySync::PhaseFactorFromTexture(a_moon);
+			return physScene.active ? RealMoonPhase(picture) : picture;
+		};
+		a_masserGlow = a_masserGlow * (phase(sky->masser) * masserVisibility);
+		a_secundaGlow = a_secundaGlow * (phase(sky->secunda) * secundaVisibility);
 	}
 
 	// fixed (47m, pinned since 44h): "Moon Physical Brightness" on.
@@ -1094,8 +1128,35 @@ void PhysicalSky::UpdateMoonData(float a_exposure, float a_sunElevation, float3&
 			const float irradiance = (0.2126f * a_color.x + 0.7152f * a_color.y + 0.0722f * a_color.z) * a_exposure;
 			return std::clamp(irradiance / std::max(solidAngle, 1e-6f), 1.f, cap);
 		};
-		moonCbData.masserDiskScale = discScale(sky->masser, settings.masserColor);
-		moonCbData.secundaDiskScale = discScale(sky->secunda, settings.secundaColor);
+		// (49h stage 2) Real Sky Ratios: the disc as before at exposure 1 (the user's moon colour), x the moon's irradiance now / that
+		// reference (the disc stays as bright against its own sky as the moonlight on the ground does).
+		auto realRatio = [&](int a_moon, const float3& a_color) {
+			if (!physScene.active)
+				return 1.f;
+			const float reference = Luminance3Of(a_color);
+			const float now = Luminance3Of(MoonLightBase(a_moon)) * a_exposure;
+			return reference > 1e-8f ? std::clamp(now / reference, 1e-3f, 4.f) : 1.f;
+		};
+		const float discExposure = physScene.active ? 1.f : a_exposure;
+		auto discScaleAt = [&](const RE::Moon* a_moon, const float3& a_color) {
+			if (!a_moon || !a_moon->moonMesh || !sky->root)
+				return 1.f;
+			const float dist = (a_moon->moonMesh->world.translate - sky->root->world.translate).Length();
+			const float radius = a_moon->moonMesh->worldBound.radius * 0.70710678f;
+			if (!(radius > 0.f) || dist <= radius)
+				return 1.f;
+			const float sinR = radius / dist;
+			const float solidAngle = 2.f * DirectX::XM_PI * (1.f - std::sqrt(1.f - sinR * sinR));
+			const float irradiance = Luminance3Of(a_color) * discExposure;
+			return std::clamp(irradiance / std::max(solidAngle, 1e-6f), 1.f, cap);
+		};
+		if (physScene.active) {
+			moonCbData.masserDiskScale = discScaleAt(sky->masser, settings.masserColor) * realRatio(0, settings.masserColor);
+			moonCbData.secundaDiskScale = discScaleAt(sky->secunda, settings.secundaColor) * realRatio(1, settings.secundaColor);
+		} else {
+			moonCbData.masserDiskScale = discScale(sky->masser, settings.masserColor);
+			moonCbData.secundaDiskScale = discScale(sky->secunda, settings.secundaColor);
+		}
 	}
 
 	UpdateMoonSky(a_exposure, a_sunElevation);
@@ -1117,7 +1178,8 @@ void PhysicalSky::UpdateMoonSky(float a_exposure, float a_sunElevation)
 	const float dayFade = SkySync::MoonDayFade(DirectX::XMConvertToDegrees(a_sunElevation));
 	const auto& skySync = globals::features::skySync;
 	const RE::Moon* moons[2] = { sky->masser, sky->secunda };
-	const float3* colors[2] = { &settings.masserColor, &settings.secundaColor };
+	const float3 moonBase[2] = { MoonLightBase(0), MoonLightBase(1) };  // (49h stage 2) real ratio under Real Sky Ratios
+	const float3* colors[2] = { &moonBase[0], &moonBase[1] };
 	const float sinElevation[2] = { skySync.rawDirections[static_cast<int>(SkySync::Caster::Masser)].z,
 		skySync.rawDirections[static_cast<int>(SkySync::Caster::Secunda)].z };
 	auto toHalves = [](const float a_low, const float a_high) {
@@ -1176,12 +1238,20 @@ std::string PhysicalSky::DescribeForTrace() const
 	if (!loaded)
 		return "Physical Sky not loaded";
 	const auto& s = effective;
-	return std::format(
+	std::string text = std::format(
 		"Physical Sky {} (sky fixes {}, moon sky glow {:.2f}); moonlight fades stars {} (strength {:.2f}, now Masser {:.4f} / Secunda {:.4f} before clouds); "
 		"moon planetshine {} (strength {:.2f}, now Masser {:.3f} / Secunda {:.3f})",
 		s.enabled && cbData.enabled ? "on" : (s.enabled ? "on (not drawn here)" : "off"), SkyFixesActive() ? "on" : "off", s.moonGlowStrength,
 		s.moonFadesStars ? "on" : "off", s.moonStarFadeStrength, moonStarFadeAmount[0], moonStarFadeAmount[1],
 		s.moonPlanetshine ? "on" : "off", s.moonPlanetshineStrength, moonPlanetshineAmount[0], moonPlanetshineAmount[1]);
+	// (49h stage 2) Physical outdoor lighting.
+	const auto& pl = s.physicalLighting;
+	const auto& ps = physScene;
+	text += std::format("; physical lighting {} (sky ratios {}, physical ambient {}, measured clouds {}, follow {}): S {:+.2f} EV, scene light {:+.2f} EV vs anchor, cloud cover {:.2f} ({}), R_amb {:.2f}, stars x{:.2f}",
+		pl.enabled ? "on" : "off", ps.active ? "in effect" : (pl.realSkyRatios ? "on (not here)" : "off"), ps.ambientActive ? "in effect" : (pl.physicalAmbient ? "on (not here)" : "off"),
+		pl.measuredClouds ? (ps.coverMeasured ? "measured" : "on (estimate)") : "off", ps.followActive ? "in effect" : (pl.cloudsStarsWaterFollow ? "on (not here)" : "off"),
+		std::log2(std::max(ps.S, 1e-6f)), ps.eRef > 0.f && ps.eReal > 0.f ? std::log2(ps.eReal / ps.eRef) : 0.f, ps.cover, ps.coverMeasured ? "measured" : "estimate", ps.rAmb, ps.starScale);
+	return text;
 }
 
 float PhysicalSky::MoonHorizonVisibility(const RE::Moon* a_moon, const RE::Sky* a_sky, float a_sinElevation)
@@ -1223,6 +1293,22 @@ void PhysicalSky::UpdateNightBaseLight(float a_sunElevation)
 	const float strength = std::clamp(effective.nightBaseLight, 0.f, 1.f);
 	if (!(strength > 0.f))
 		return;  // 0: no flag, the LUTs run exactly the 41a code
+	// (49h stage 2) Real Sky Ratios: the physical airglow, constant (independent of the moon and the hour): the weather's night hue at
+	// the full-moon sky's luminance / airglowRatio, zenith Lz and horizon 2 Lz, x S. The strength above only switches it on.
+	if (physScene.active) {
+		float3 upper, horizon, lower;
+		NightWeatherColors(upper, horizon, lower);
+		const float cap = std::clamp(settings.physicalLighting.hueSaturationCap, 0.f, 1.f);
+		const float lz = physScene.airglowZenith * physScene.S;
+		nightCbData.baseUpper = HueOfColor(upper, cap) * lz;
+		nightCbData.baseHorizon = HueOfColor(horizon, cap) * (2.f * lz);
+		nightCbData.baseLower = HueOfColor(lower, cap) * (2.f * lz);
+		nightBaseUnfadedUpper = nightCbData.baseUpper;
+		nightBaseUnfadedHorizon = nightCbData.baseHorizon;
+		nightBaseFade = 1.f;
+		nightCbData.flags = kNightBaseLight;
+		return;
+	}
 	// Gone once the sun's own twilight has taken over: full at -6 degrees, 0 at +4.
 	const float fade = 1.f - SkySync::SmoothStep(-6.f, 4.f, DirectX::XMConvertToDegrees(a_sunElevation));
 	// (47a) Sky Fixes measures the night base at full strength even after it has faded out.
@@ -1358,6 +1444,12 @@ void PhysicalSky::UpdateSkyFixes(const bool a_fixes, const RE::NiPoint3& a_lutSu
 		nightCbData.nightBaseUnfade = nightBaseFade > 1e-6f ? 1.f / nightBaseFade : 0.f;
 	}
 
+	// (49h stage 2) Real Sky Ratios: the sky has its real brightness relative to the ground (S on both); no factor.
+	if (physScene.active) {
+		skyScaleSmoothed = -1.f;
+		return;
+	}
+
 	// ---- Sky brightness follows the ground ----
 	// T = Zn + g (Zd - Zn): the zenith brightness that keeps the day's sky-to-ground ratio, where g is how far
 	// the weather's ground ambient has gone from its night to its day key, Zn the night base light's zenith
@@ -1479,22 +1571,28 @@ void PhysicalSky::UpdateCloudData(float a_exposure, float a_sunElevation)
 	// far above a real moon's, so by day they would brighten the clouds).
 	if (auto* sky = globals::game::sky) {
 		const auto& skySync = globals::features::skySync;
-		const float dayFade = SkySync::MoonDayFade(DirectX::XMConvertToDegrees(a_sunElevation));
-		const float masser = SkySync::PhaseFactorFromTexture(sky->masser) *
+		// (49h stage 2) Real Sky Ratios: the real phase and no day fade (at the real ratio the moon is lost in the daylight by itself).
+		const float dayFade = physScene.active ? 1.f : SkySync::MoonDayFade(DirectX::XMConvertToDegrees(a_sunElevation));
+		auto phase = [&](const RE::Moon* a_moon) {
+			const float picture = SkySync::PhaseFactorFromTexture(a_moon);
+			return physScene.active ? RealMoonPhase(picture) : picture;
+		};
+		const float masser = phase(sky->masser) *
 		                     MoonHorizonVisibility(sky->masser, sky, skySync.rawDirections[static_cast<int>(SkySync::Caster::Masser)].z) * dayFade;
-		const float secunda = SkySync::PhaseFactorFromTexture(sky->secunda) * SkySync::SecundaIntensityFactor *
+		const float secunda = phase(sky->secunda) * SkySync::SecundaIntensityFactor *
 		                      MoonHorizonVisibility(sky->secunda, sky, skySync.rawDirections[static_cast<int>(SkySync::Caster::Secunda)].z) * dayFade;
-		cloudCbData.masserColor = settings.masserColor * (scale * masser);
-		cloudCbData.secundaColor = settings.secundaColor * (scale * secunda);
+		cloudCbData.masserColor = MoonLightBase(0) * (scale * masser);
+		cloudCbData.secundaColor = MoonLightBase(1) * (scale * secunda);
 	}
 
 	// (44h) "Moonlight on Clouds": Sky.hlsl takes the moons out of RelightCloudMulti and adds them
 	// after the weather's cloud colour (CloudMoonLight).
 	if (s.moonCloudLight) {
 		cloudCbData.flags |= kCloudMoonDirect;
-		cloudCbData.moonCloudStrength = std::clamp(s.moonCloudStrength, 0.f, 3.f);
+		// (49h stage 2) Real Sky Ratios: the moonlight on clouds is the light itself (strength 1, its own colour).
+		cloudCbData.moonCloudStrength = physScene.active ? 1.f : std::clamp(s.moonCloudStrength, 0.f, 3.f);
 		cloudCbData.moonCloudHalo = std::clamp(s.moonCloudHalo, 0.f, 4.f);
-		cloudCbData.moonCloudSaturation = 0.35f;
+		cloudCbData.moonCloudSaturation = physScene.active ? 1.f : 0.35f;
 	}
 
 	cloudCbData.skyAmbient = std::clamp(s.cloudSkyAmbient, 0.f, 4.f);
@@ -1544,6 +1642,11 @@ void PhysicalSky::Reset()
 		horizonFixCbData.flags = PhysLightingFlags();  // (49h stage 1) the rules that do not need the physical sky still apply (interiors)
 		cloudCbData = {};
 		linearLighting.isDirLightLinear = false;
+		// (49h stage 2) Interiors and other worldspaces: no ambient rewrite, S = 1 (the auto exposure curve still applies).
+		physScene.active = physScene.ambientActive = physScene.followActive = false;
+		physScene.sValid = false;
+		physScene.S = 1.f;
+		physScene.rAmb = physScene.starScale = physScene.unlitScale = 1.f;
 		return;
 	}
 
@@ -1587,8 +1690,6 @@ void PhysicalSky::Reset()
 		}
 	}
 	nightCbData.lutSunDir = { lutSunDir.x, lutSunDir.y, lutSunDir.z };
-	// (41b, F1) Faded by the sun height the sky itself uses.
-	UpdateNightBaseLight(std::asin(std::clamp(lutSunDir.z, -1.f, 1.f)));
 	auto masserDir = skySync.rawDirections[static_cast<int>(SkySync::Caster::Masser)];
 	auto secundaDir = skySync.rawDirections[static_cast<int>(SkySync::Caster::Secunda)];
 	// (40d) With the discs left where the game puts them, the glow follows each disc's on-screen
@@ -1605,6 +1706,17 @@ void PhysicalSky::Reset()
 		}
 	}
 
+	// (49h stage 2) The physical scene (S, the physical ambient, cloud cover) before anything is scaled by it. Camera radius as
+	// cbData.zCameraPlanet below, in km.
+	{
+		float cameraRadiusKm = settings.planetRadius;
+		if (auto cam = RE::PlayerCamera::GetSingleton(); cam && cam->cameraRoot)
+			cameraRadiusKm = (cam->cameraRoot->world.translate.z - worldspaceInfo.zBottom) * Util::Units::GAME_UNIT_TO_KM + settings.planetRadius;
+		UpdatePhysicalScene(lutSunDir, masserDir, secundaDir, cameraRadiusKm);
+	}
+	// (41b, F1) Faded by the sun height the sky itself uses. (49h stage 2) After the scene: Real Sky Ratios' airglow is x S.
+	UpdateNightBaseLight(std::asin(std::clamp(lutSunDir.z, -1.f, 1.f)));
+
 	float sunAngle = DirectX::XMConvertToRadians(90.f) - acos(sunDir.z);
 	float adaptAmount = (sunAngle - settings.adaptationStart) / (settings.adaptationEnd - settings.adaptationStart);
 	adaptAmount = std::min(1.f, std::max(0.f, adaptAmount));
@@ -1614,6 +1726,9 @@ void PhysicalSky::Reset()
 	const bool skyFixes = SkyFixesActive();
 	if (skyFixes)
 		exposure = 1.f;
+	// (49h stage 2) "Real Sky Ratios": every physical source x the compression S (the old exposure variable brought back).
+	if (physScene.active)
+		exposure = physScene.S;
 
 	float3 masserGlow, secundaGlow;
 	// (48b) The sun's true elevation, as for the clouds just below.
@@ -1683,7 +1798,7 @@ void PhysicalSky::Reset()
 			return RE::NiColor(color.x, color.y, color.z);
 		};
 		// (40d) The moonlight keeps the full colour: the glow strength only scales the sky LUTs.
-		skySync.lightColors = { LightConvFn(cbData.sunlightColor), LightConvFn(settings.masserColor * exposure), LightConvFn(settings.secundaColor * exposure) };
+		skySync.lightColors = { LightConvFn(cbData.sunlightColor), LightConvFn(MoonLightBase(0) * exposure), LightConvFn(MoonLightBase(1) * exposure) };  // (49h stage 2) real ratio under Real Sky Ratios
 	} else {
 		linearLighting.isDirLightLinear = false;
 	}
@@ -1702,6 +1817,12 @@ void PhysicalSky::Reset()
 	// fixed (47m): Horizon Fix removed; anchorOffset, altitude and flags stay 0 (as with Horizon Fix off).
 	horizonFixCbData = {};
 	horizonFixCbData.flags = PhysLightingFlags();  // (49h stage 1) Physical Lighting rule bits (flags was unused since 47m)
+	// (49h stage 2) "Clouds, Stars and Water Follow": the star scale and the water ambient ratio in the two padding floats (Sky.hlsl, Water.hlsl;
+	// read only with kPLFollow set).
+	if (physScene.followActive) {
+		horizonFixCbData.anchorOffset = physScene.starScale;
+		horizonFixCbData.altitude = physScene.rAmb;
+	}
 	auto& heightFog = globals::features::exponentialHeightFog;
 	// (47g) EHF "Physical Fog Brightness": the clear sky's light on the fog (0 = off; independent of the Horizon Fix).
 	if (heightFog.loaded && heightFog.vanillaFog.PhysicalFogBrightness)
@@ -1730,6 +1851,7 @@ void PhysicalSky::Prepass()
 {
 	if (cbData.enabled) {
 		AccumShadow();
+		DispatchCloudCover();  // (49h stage 2) after Cloud Shadows' EarlyPrepass copied this frame's cube
 
 		std::array srvs = { texTrLut->srv.get(), texSvLut->srv.get(), texApLut->srv.get(), texApShadow->srv.get() };
 		globals::d3d::context->PSSetShaderResources(61, (uint)srvs.size(), srvs.data());
@@ -2138,6 +2260,11 @@ uint32_t PhysicalSky::PhysLightingFlags() const
 	flags |= pl.farFog ? kPLFarFog : 0u;
 	flags |= pl.forwardCubemap ? kPLForwardCubemap : 0u;
 	flags |= pl.smallFixes ? kPLSmallFixes : 0u;
+	// (49h stage 2) In effect this frame (outdoors with the physical sky; 0 indoors).
+	flags |= physScene.active ? kPLRealRatios : 0u;
+	flags |= physScene.ambientActive ? kPLPhysAmbient : 0u;
+	flags |= physScene.active && pl.measuredClouds ? kPLMeasuredClouds : 0u;
+	flags |= physScene.followActive ? kPLFollow : 0u;
 	// True PBR land drawn in the last ~2 s (the near land's light scale is 1 / pi then).
 	const uint32_t frame = globals::state->frameCount;
 	const uint32_t lastPbr = TruePBR::lastPbrLandFrame.load(std::memory_order_relaxed);
@@ -2220,9 +2347,48 @@ void PhysicalSky::SettingsSceneLighting()
 			"Unlit effects counted the surroundings' light twice and the weather ambient unconverted; distant billboard trees got\n"
 			"the weather ambient through roofs and canopies; the deferred ambient used another upward boost than the surfaces;\n"
 			"indoors a few passes scaled the sun differently.");
+	// (49h stage 2) Physical outdoor lighting (design-49h-stage2.md).
+	ImGui::Checkbox("Real Sky Ratios", &pl.realSkyRatios);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"The sun, the moons, the sky, the clouds and the night sky keep their real brightness ratios, squeezed by one factor\n"
+			"(S below) so they fit the screen: a clear sky with the sun at 30 degrees looks as before, nights are much darker\n"
+			"before the eye adapts (Post Processing > Histogram Auto Exposure, Exposure Mode Auto / Physical). The moon is the\n"
+			"real moon (a crescent ~1/40 of full), its sky glow and its light on clouds at full strength, the moonless sky a faint\n"
+			"airglow in the weather's night colour; dusk fades continuously into night. Needs Override Directional Light.\n"
+			"Off: as stage 1 (no scaling).");
+	ImGui::Checkbox("Physical Ambient", &pl.physicalAmbient);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"The game's ambient light (the light in shade) comes from the physical sky now, through the clouds, keeping only the\n"
+			"weather's colour: shade, fog, grass, distant trees, lit smoke and the cubemap all follow the sky. Image Based\n"
+			"Lighting then adds only the light bounced off the surroundings (its weather-ambient and sky values are overridden\n"
+			"while this is on; your saved values come back when it is off). Off: the weather's ambient as before.");
+	ImGui::Checkbox("Overcast From Measured Clouds", &pl.measuredClouds);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"How cloudy it is and whether a cloud covers the sun or a moon is measured from the clouds actually drawn (Cloud\n"
+			"Shadows' cloud map). Off, or without Cloud Shadows: estimated from the weather type (clear / cloudy / rain / snow).");
+	ImGui::Checkbox("Clouds, Stars and Water Follow", &pl.cloudsStarsWaterFollow);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"Stars and the Milky Way keep their brightness against the night sky (they are fixed-brightness pictures), and the\n"
+			"water's own colour follows the ambient light. Clouds already follow through the two boxes above.");
+	{
+		const auto& ps = physScene;
+		if (ps.active)
+			ImGui::TextDisabled("Sky compression S: %+.2f EV; scene light %+.2f EV against a clear sky with the sun at 30 degrees",
+				std::log2(std::max(ps.S, 1e-6f)), ps.eRef > 0.f && ps.eReal > 0.f ? std::log2(ps.eReal / ps.eRef) : 0.f);
+		else if (pl.enabled && pl.realSkyRatios)
+			ImGui::TextDisabled("Sky compression: not in effect here (interior, no physical sky, or Override Directional Light off)");
+		if (ps.active || ps.ambientActive)
+			ImGui::TextDisabled("Cloud cover %.2f (%s); cloud in front of the sun %.2f", ps.cover, ps.coverMeasured ? "measured" : "weather estimate",
+				1.f - ps.coverTr[0]);
+		if (ps.ambientActive || ps.followActive)
+			ImGui::TextDisabled("Ambient now / weather ambient (R_amb): %.2f; stars x%.2f; unlit smoke x%.2f", ps.rAmb, ps.starScale, ps.unlitScale);
+	}
 	ImGui::Unindent();
 	ImGui::EndDisabled();
-	// (49h stage 2) leaves room here for its checkboxes.
 
 	ImGui::SeparatorText("Related (own switches)");
 	ImGui::Checkbox("Sun Highlight on Water Follows the Atmosphere", &settings.waterSunTransmittance);
@@ -2233,4 +2399,545 @@ void PhysicalSky::SettingsSceneLighting()
 	ImGui::TextDisabled("Also: Lighting > Exponential Height Fog > Stable Fog Colour; Materials > Dynamic Cubemaps > Reflection Brightness Fix.");
 	if (pl.enabled && pl.lodScale)
 		ImGui::TextDisabled("PBR land seen: %s", (PhysLightingFlags() & kPLLandPbr) ? "yes (far land uses the PBR scale)" : "no");
+
+	// (49h stage 2) Engineering constants, collapsed. Not look controls (the look control is Dark Scene Compensation in the auto exposure).
+	if (ImGui::TreeNodeEx("Developer", ImGuiTreeNodeFlags_None)) {
+		ImGui::SliderFloat("Compression k", &pl.compressionK, 0.1f, 1.f, "%.2f");
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Screen light = anchor x (real light / anchor)^k. 1 = no compression (real ratios), 0.3 = default.");
+		ImGui::SliderFloat("Overcast Pass-Through", &pl.overcastKappa, 0.f, 1.f, "%.2f");
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Share of the blocked sunlight and of the clear sky that a full cloud cover still lets through as diffuse light.");
+		ImGui::SliderFloat("Full Moon Sky / Airglow", &pl.airglowRatio, 5.f, 100.f, "%.0f");
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("The moonless night sky is the full-moon sky's brightness divided by this.");
+		ImGui::SliderFloat("Smoothing", &pl.smoothingSeconds, 0.1f, 10.f, "%.1f s");
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("S and the ambient follow the sky with this time constant (jumps after loads and time skips).");
+		ImGui::SliderFloat("Weather Hue Saturation Cap", &pl.hueSaturationCap, 0.f, 1.f, "%.2f");
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("The weather's ambient and night-sky colours are used at most this saturated.");
+		ImGui::TreePop();
+	}
+}
+
+////////////////////////////////////////////////// (49h stage 2) Physical outdoor lighting (design-49h-stage2.md 0 / A)
+
+namespace
+{
+	float Luminance3(const float3& c) { return 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z; }
+	float LuminanceV(const PhysicalSkyModel::Vec3& c) { return static_cast<float>(0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]); }
+	float3 ToFloat3(const PhysicalSkyModel::Vec3& c) { return { static_cast<float>(c[0]), static_cast<float>(c[1]), static_cast<float>(c[2]) }; }
+	PhysicalSkyModel::Vec3 ToVec3(const float3& c) { return { c.x, c.y, c.z }; }
+	PhysicalSkyModel::Vec3 UnitVec(const RE::NiPoint3& d)
+	{
+		const double l = std::sqrt(double(d.x) * d.x + double(d.y) * d.y + double(d.z) * d.z);
+		return l > 1e-9 ? PhysicalSkyModel::Vec3{ d.x / l, d.y / l, d.z / l } : PhysicalSkyModel::Vec3{ 0.0, 0.0, 1.0 };
+	}
+	float3 Finite3(const float3& c, const float3& a_fallback = {})
+	{
+		return (std::isfinite(c.x) && std::isfinite(c.y) && std::isfinite(c.z)) ? float3(std::max(c.x, 0.f), std::max(c.y, 0.f), std::max(c.z, 0.f)) : a_fallback;
+	}
+	/// A colour's hue at luminance 1, its saturation ((max - min) / max) limited to a_maxSaturation; grey for black.
+	float3 HueOf(const float3& a_color, float a_maxSaturation)
+	{
+		const float3 c = Finite3(a_color);
+		const float y = Luminance3(c);
+		if (!(y > 1e-12f))
+			return { 1.f, 1.f, 1.f };
+		float3 h = c / y;
+		const float hi = std::max({ h.x, h.y, h.z });
+		const float lo = std::min({ h.x, h.y, h.z });
+		const float sat = hi > 1e-6f ? (hi - lo) / hi : 0.f;
+		const float cap = std::clamp(a_maxSaturation, 0.f, 1.f);
+		if (sat > cap) {
+			// h' = 1 + t (h - 1) has saturation cap at t = cap / ((hi - lo) - cap (hi - 1)).
+			const float denom = (hi - lo) - cap * (hi - 1.f);
+			const float t = denom > 1e-6f ? std::clamp(cap / denom, 0.f, 1.f) : 0.f;
+			h = float3(1.f, 1.f, 1.f) + (h - float3(1.f, 1.f, 1.f)) * t;
+			const float y2 = Luminance3(h);
+			if (y2 > 1e-6f)
+				h /= y2;
+		}
+		return h;
+	}
+
+	/// The upper-hemisphere directions of the CPU sky integration (6 rings of 15 degrees) and their solid angles.
+	struct SceneDirections
+	{
+		std::array<PhysicalSkyModel::Vec3, PhysicalSky::kSceneDirections> dir{};
+		std::array<double, PhysicalSky::kSceneDirections> solidAngle{};
+		std::array<float, PhysicalSky::kSceneDirections> elevationSin{};
+		SceneDirections()
+		{
+			constexpr int counts[6] = { 16, 14, 12, 9, 6, 3 };
+			int k = 0;
+			for (int ring = 0; ring < 6; ++ring) {
+				const double e = DirectX::XMConvertToRadians(7.5f + 15.f * ring);
+				const double lo = DirectX::XMConvertToRadians(15.f * ring);
+				const double hi = DirectX::XMConvertToRadians(15.f * (ring + 1));
+				const double ringOmega = 2.0 * DirectX::XM_PI * (std::sin(hi) - std::sin(lo));
+				for (int i = 0; i < counts[ring]; ++i, ++k) {
+					const double a = 2.0 * DirectX::XM_PI * (i + 0.5 * (ring & 1)) / counts[ring];
+					dir[k] = { std::cos(e) * std::cos(a), std::cos(e) * std::sin(a), std::sin(e) };
+					solidAngle[k] = ringOmega / counts[ring];
+					elevationSin[k] = static_cast<float>(std::sin(e));
+				}
+			}
+		}
+	};
+	const SceneDirections& GetSceneDirections()
+	{
+		static const SceneDirections directions;
+		return directions;
+	}
+	/// Axis normals in the engine's order: +x, -x, +y, -y, +z, -z.
+	constexpr double kAxes[6][3] = { { 1, 0, 0 }, { -1, 0, 0 }, { 0, 1, 0 }, { 0, -1, 0 }, { 0, 0, 1 }, { 0, 0, -1 } };
+
+	/// Adds radiance a_L from direction a_d (solid angle a_omega) to the six axis irradiances.
+	void AddToAxes(float3 a_E[6], const PhysicalSkyModel::Vec3& a_d, const float3& a_L, double a_omega)
+	{
+		for (int a = 0; a < 6; ++a) {
+			const double c = kAxes[a][0] * a_d[0] + kAxes[a][1] * a_d[1] + kAxes[a][2] * a_d[2];
+			if (c > 0.0)
+				a_E[a] += a_L * static_cast<float>(c * a_omega);
+		}
+	}
+}
+
+float PhysicalSky::RealMoonPhase(float a_pictureFactor)
+{
+	// Real lunar phase brightness relative to full (Allen; opposition surge included): gibbous ~0.35, quarter ~0.09, crescent ~0.025.
+	// Sky Sync's picture factors: crescent 0.25, quarter 0.5, gibbous 0.75, full 1, new 0.05.
+	const float f = std::isfinite(a_pictureFactor) ? a_pictureFactor : 1.f;
+	if (f <= SkySync::NewMoonIntensityFactor + 1e-4f)
+		return 0.f;
+	if (f < 0.25f)
+		return 0.025f * (f - SkySync::NewMoonIntensityFactor) / (0.25f - SkySync::NewMoonIntensityFactor);
+	constexpr float keys[4] = { 0.25f, 0.5f, 0.75f, 1.f };
+	constexpr float values[4] = { 0.025f, 0.09f, 0.35f, 1.f };
+	for (int i = 0; i < 3; ++i) {
+		if (f <= keys[i + 1]) {
+			const float t = (f - keys[i]) / (keys[i + 1] - keys[i]);
+			return std::exp(std::lerp(std::log(values[i]), std::log(values[i + 1]), t));
+		}
+	}
+	return 1.f;
+}
+
+float PhysicalSky::WeatherCloudCover()
+{
+	// (49h stage 2) Without the cube: the weather's classification, blended through a transition.
+	const auto* sky = globals::game::sky;
+	if (!sky || !sky->currentWeather)
+		return 0.3f;
+	using Flag = RE::TESWeather::WeatherDataFlag;
+	auto coverOf = [](const RE::TESWeather* a_weather) {
+		const auto& flags = a_weather->data.flags;
+		if (flags.any(Flag::kRainy))
+			return 0.95f;
+		if (flags.any(Flag::kSnow))
+			return 0.9f;
+		if (flags.any(Flag::kCloudy))
+			return 0.7f;
+		if (flags.any(Flag::kPleasant))
+			return 0.15f;
+		return 0.4f;
+	};
+	const float pct = std::isfinite(sky->currentWeatherPct) ? std::clamp(sky->currentWeatherPct, 0.f, 1.f) : 1.f;
+	const float now = coverOf(sky->currentWeather);
+	if (sky->lastWeather && sky->lastWeather != sky->currentWeather && pct < 1.f)
+		return std::lerp(coverOf(sky->lastWeather), now, pct);
+	return now;
+}
+
+void PhysicalSky::DispatchCloudCover()
+{
+	// (49h stage 2) T3: the cube reduce (CloudCoverCS.hlsl) and a non-blocking readback 2-3 frames late.
+	if (!csCloudCover || !cloudCoverSB || !cloudCoverCB || !PhysLightingOn(settings.physicalLighting.measuredClouds))
+		return;
+	auto& cloudShadows = globals::features::cloudShadows;
+	if (!cloudShadows.loaded || !cloudShadows.texCubemapCloudOccCopy || cloudShadows.FramesSinceCapture() > CloudShadows::kCaptureMaxAgeFrames)
+		return;
+	auto context = globals::d3d::context;
+	auto device = globals::d3d::device;
+
+	const uint32_t slot = cloudReadbackIndex % kCloudReadbackCount;
+	const uint32_t oldest = (cloudReadbackIndex + 1) % kCloudReadbackCount;
+	if (cloudReadback[oldest] && cloudReadbackPending[oldest]) {
+		D3D11_MAPPED_SUBRESOURCE mapped{};
+		if (SUCCEEDED(context->Map(cloudReadback[oldest].get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped)) && mapped.pData) {
+			float values[4];
+			std::memcpy(values, mapped.pData, sizeof(values));
+			context->Unmap(cloudReadback[oldest].get(), 0);
+			cloudReadbackPending[oldest] = false;
+			bool ok = true;
+			for (float v : values)
+				ok = ok && std::isfinite(v);
+			if (ok) {
+				for (int i = 0; i < 4; ++i)
+					cloudMeasured[i] = std::clamp(values[i], 0.f, 1.f);
+				cloudMeasuredFrame = globals::state->frameCount;
+			}
+		}
+	}
+	if (!cloudReadback[slot]) {
+		D3D11_BUFFER_DESC desc{};
+		desc.ByteWidth = 4 * sizeof(float);
+		desc.Usage = D3D11_USAGE_STAGING;
+		desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		if (FAILED(device->CreateBuffer(&desc, nullptr, cloudReadback[slot].put())))
+			return;
+	}
+
+	const auto& sun = nightCbData.lutSunDir;
+	CloudCoverCB cb{
+		.sunDir = { sun.x, sun.y, sun.z, 0.f },
+		.masserDir = { cbData.masserDir.x, cbData.masserDir.y, cbData.masserDir.z, 0.f },
+		.secundaDir = { cbData.secundaDir.x, cbData.secundaDir.y, cbData.secundaDir.z, 0.f },
+	};
+	cloudCoverCB->Update(cb);
+
+	ID3D11ShaderResourceView* srv = cloudShadows.texCubemapCloudOccCopy->srv.get();
+	ID3D11UnorderedAccessView* uav = cloudCoverSB->UAV();
+	ID3D11SamplerState* sampler = sampTr.get();
+	ID3D11Buffer* buffer = cloudCoverCB->CB();
+	context->CSSetShaderResources(0, 1, &srv);
+	context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+	context->CSSetSamplers(0, 1, &sampler);
+	context->CSSetConstantBuffers(0, 1, &buffer);
+	context->CSSetShader(csCloudCover.get(), nullptr, 0);
+	context->Dispatch(1, 1, 1);
+	srv = nullptr;
+	uav = nullptr;
+	sampler = nullptr;
+	buffer = nullptr;
+	context->CSSetShaderResources(0, 1, &srv);
+	context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+	context->CSSetSamplers(0, 1, &sampler);
+	context->CSSetConstantBuffers(0, 1, &buffer);
+	context->CSSetShader(nullptr, nullptr, 0);
+
+	winrt::com_ptr<ID3D11Resource> source;
+	cloudCoverSB->SRV()->GetResource(source.put());
+	if (!source)
+		return;
+	context->CopyResource(cloudReadback[slot].get(), source.get());
+	cloudReadbackPending[slot] = true;
+	++cloudReadbackIndex;
+}
+
+void PhysicalSky::UpdatePhysicalScene(const RE::NiPoint3& a_lutSunDir, const RE::NiPoint3& a_masserDir, const RE::NiPoint3& a_secundaDir, float a_cameraRadiusKm)
+{
+	auto& ps = physScene;
+	const auto& pl = settings.physicalLighting;
+	const bool wantRatios = PhysLightingOn(pl.realSkyRatios) && settings.overrideDirLight;  // the direct light must be Physical Sky's to scale it
+	const bool wantAmbient = PhysLightingOn(pl.physicalAmbient);
+	const bool wantFollow = PhysLightingOn(pl.cloudsStarsWaterFollow);
+	auto neutral = [&ps]() {
+		ps.active = ps.ambientActive = ps.followActive = false;
+		ps.S = ps.sTarget = 1.f;
+		ps.sLog = 0.f;
+		ps.sValid = false;
+		ps.ambientValid = false;
+		ps.rAmb = ps.starScale = ps.unlitScale = 1.f;
+	};
+	auto* sky = globals::game::sky;
+	if (!(wantRatios || wantAmbient || wantFollow) || !sky || !UpdateCpuSkyModel() || !(a_cameraRadiusKm > 0.f)) {
+		neutral();
+		return;
+	}
+	const auto& skySync = globals::features::skySync;
+	const double cameraRadius = a_cameraRadiusKm;
+	const auto& dirs = GetSceneDirections();
+	const float3 sunColor = Finite3(settings.sunlightColor);
+	const float sunLum = Luminance3(sunColor);
+	const auto& ll = globals::features::linearLighting.settings;
+	const float ambientGamma = ll.enableLinearLighting && std::isfinite(ll.ambientGamma) ? std::clamp(ll.ambientGamma, 0.1f, 5.f) : 1.f;
+	const float pbrCompensation = ll.enableLinearLighting ? 1.f : RE::NI_PI;
+	const float diffuseMult = ll.enableLinearLighting && std::isfinite(ll.vanillaDiffuseMult) ? std::max(ll.vanillaDiffuseMult, 0.f) : 1.f;
+	const float toShader = diffuseMult / pbrCompensation;  // irradiance (light-colour units) -> the shaders' ambient (as the direct light x NdotL x 0.28)
+	const float hueCap = std::clamp(pl.hueSaturationCap, 0.f, 1.f);
+
+	// The moons at the real ratio: the user's colours give only the hue.
+	ps.moonReal[0] = HueOf(settings.masserColor, 1.f) * (sunLum * kMoonToSun);
+	ps.moonReal[1] = HueOf(settings.secundaColor, 1.f) * (sunLum * kMoonToSun);
+	const RE::Moon* moons[2] = { sky->masser, sky->secunda };
+	const RE::NiPoint3 moonDirs[2] = { a_masserDir, a_secundaDir };
+	float visibility[2] = {};
+	float picture[2] = {};
+	for (int i = 0; i < 2; ++i) {
+		picture[i] = SkySync::PhaseFactorFromTexture(moons[i]);
+		ps.realPhase[i] = RealMoonPhase(picture[i]);
+		visibility[i] = MoonHorizonVisibility(moons[i], sky, skySync.rawDirections[static_cast<int>(i == 0 ? SkySync::Caster::Masser : SkySync::Caster::Secunda)].z);
+	}
+
+	// The weather's night colours (floor + linearised), for the airglow's hue and the stage-1 night base the stars were set against.
+	float3 nightUpper, nightHorizon, nightLower;
+	NightWeatherColors(nightUpper, nightHorizon, nightLower);
+
+	// Snap on time skips, loads, a new sun path, or after being inactive.
+	const uint32_t frame = globals::state->frameCount;
+	const auto calendar = RE::Calendar::GetSingleton();
+	const float hours = calendar ? calendar->GetHoursPassed() : 0.f;
+	const uint32_t warp = skySync.GetSunWarpGeneration();
+	const bool snap = !ps.sValid || !(std::abs(hours - ps.lastHours) < 0.01f) || warp != ps.lastWarp;
+	ps.lastHours = hours;
+	ps.lastWarp = warp;
+
+	// ---- Anchor: a clear sky with the sun at 30 degrees (same azimuth), refreshed every ~4 s or when the sun colour changes. ----
+	if (ps.anchorFrame == UINT32_MAX || frame - ps.anchorFrame >= 480u || std::abs(ps.anchorSunLum - sunLum) > 1e-4f * std::max(sunLum, 1e-6f)) {
+		ps.anchorFrame = frame;
+		ps.anchorSunLum = sunLum;
+		const double horizontal = std::sqrt(double(a_lutSunDir.x) * a_lutSunDir.x + double(a_lutSunDir.y) * a_lutSunDir.y);
+		const double e30 = DirectX::XMConvertToRadians(30.f);
+		PhysicalSkyModel::Light sun30{};
+		sun30.dir = horizontal > 1e-6 ? PhysicalSkyModel::Vec3{ a_lutSunDir.x / horizontal * std::cos(e30), a_lutSunDir.y / horizontal * std::cos(e30), std::sin(e30) } :
+		                                PhysicalSkyModel::Vec3{ std::cos(e30), 0.0, std::sin(e30) };
+		sun30.color = ToVec3(sunColor);
+		float3 E[6] = {};
+		for (int k = 0; k < kSceneDirections; ++k)
+			AddToAxes(E, dirs.dir[k], Finite3(ToFloat3(skyModelCpu.SkyRay(cameraRadius, dirs.dir[k], &sun30, 1))), dirs.solidAngle[k]);
+		const float3 tr = Finite3(ToFloat3(skyModelCpu.Transmittance(cameraRadius, sun30.dir)), { 1.f, 1.f, 1.f });
+		ps.eRef = std::max(Luminance3(sunColor * tr) * 0.5f + Luminance3(E[4]), 1e-6f);
+		float3 mean = {};
+		for (int a = 0; a < 6; ++a)
+			mean += E[a];
+		ps.anchorAmbientMean = std::max(Luminance3(mean) / 6.f * toShader, 1e-8f);
+		// The full moon high in a clear sky: its sky's zenith luminance; the airglow is that / airglowRatio (constant, phase-independent).
+		const double e60 = DirectX::XMConvertToRadians(60.f);
+		PhysicalSkyModel::Light moon60{};
+		moon60.dir = { std::cos(e60), 0.0, std::sin(e60) };
+		moon60.color = ToVec3(ps.moonReal[0]);
+		ps.anchorFullMoonSky = std::max(LuminanceV(skyModelCpu.SkyRay(cameraRadius, { 0.0, 0.0, 1.0 }, &moon60, 1)), 0.f);
+	}
+	ps.airglowZenith = ps.anchorFullMoonSky / std::clamp(pl.airglowRatio, 1.f, 1000.f);
+
+	// ---- The sky now (every 4th frame, and on a snap) ----
+	if (snap || ps.heavyFrame == UINT32_MAX || frame - ps.heavyFrame >= 4u) {
+		ps.heavyFrame = frame;
+		float3 Eclear[6] = {};
+		float3 direct[3] = {};  // horizontal direct irradiance of the sun and the moons, clear sky (sun units)
+		if (wantRatios) {
+			// The real sources: the sun, the moons at the real ratio x real phase x visibility; no sky brightness factor.
+			PhysicalSkyModel::Light lights[3] = {};
+			lights[0] = { UnitVec(a_lutSunDir), ToVec3(sunColor) };
+			for (int i = 0; i < 2; ++i)
+				lights[1 + i] = { UnitVec(moonDirs[i]), ToVec3(ps.moonReal[i] * (ps.realPhase[i] * visibility[i])) };
+			const float3 hueUpper = HueOf(nightUpper, hueCap), hueHorizon = HueOf(nightHorizon, hueCap);
+			for (int k = 0; k < kSceneDirections; ++k) {
+				float3 L = Finite3(ToFloat3(skyModelCpu.SkyRay(cameraRadius, dirs.dir[k], lights, 3)));
+				// The airglow: zenith Lz, horizon 2 Lz, as the night base gradient (LutGen).
+				const float mix = SkySync::SmoothStep(0.f, 0.5f, dirs.elevationSin[k]);
+				L += (hueHorizon * 2.f + (hueUpper - hueHorizon * 2.f) * mix) * ps.airglowZenith;
+				AddToAxes(Eclear, dirs.dir[k], L, dirs.solidAngle[k]);
+			}
+			const float sunElevation = DirectX::XMConvertToDegrees(std::asin(std::clamp(static_cast<float>(UnitVec(a_lutSunDir)[2]), -1.f, 1.f)));
+			const float3 sunTr = ComputeLightTransmittance({ a_lutSunDir.x, a_lutSunDir.y, a_lutSunDir.z });
+			direct[0] = sunColor * sunTr * (std::max(static_cast<float>(UnitVec(a_lutSunDir)[2]), 0.f) * SkySync::SmoothStep(-0.5f, 0.5f, sunElevation));
+			for (int i = 0; i < 2; ++i) {
+				const float3 moonTr = ComputeLightTransmittance({ moonDirs[i].x, moonDirs[i].y, moonDirs[i].z });
+				direct[1 + i] = ps.moonReal[i] * moonTr *
+				                (std::max(static_cast<float>(UnitVec(moonDirs[i])[2]), 0.f) * ps.realPhase[i] * visibility[i] * (i == 1 ? SkySync::SecundaIntensityFactor : 1.f));
+			}
+		} else {
+			// The sky as drawn now (stage 1 units): the uploaded lights (moon glow strength), Sky Fixes' brightness factor on the sun, the
+			// night base light as uploaded last frame.
+			PhysicalSkyModel::Light sunLight = { UnitVec(a_lutSunDir), ToVec3(sunColor) };
+			PhysicalSkyModel::Light moonLights[2] = {
+				{ UnitVec(moonDirs[0]), ToVec3(cbData.masserColor) },
+				{ UnitVec(moonDirs[1]), ToVec3(cbData.secundaColor) },
+			};
+			const float skyScale = std::clamp(nightCbData.skyScale, 1.f, kSkyFixesScaleCap);
+			const bool baseOn = (nightCbData.flags & kNightBaseLight) != 0;
+			for (int k = 0; k < kSceneDirections; ++k) {
+				float3 L = Finite3(ToFloat3(skyModelCpu.SkyRay(cameraRadius, dirs.dir[k], &sunLight, 1))) * skyScale;
+				L += Finite3(ToFloat3(skyModelCpu.SkyRay(cameraRadius, dirs.dir[k], moonLights, 2)));
+				if (baseOn) {
+					const float mix = SkySync::SmoothStep(0.f, 0.5f, dirs.elevationSin[k]);
+					L += nightCbData.baseHorizon + (nightCbData.baseUpper - nightCbData.baseHorizon) * mix;
+				}
+				AddToAxes(Eclear, dirs.dir[k], L, dirs.solidAngle[k]);
+			}
+		}
+
+		// ---- Clouds: cover c and the transmission toward each body; overcast = kappa x (the blocked direct + the clear sky) ----
+		const bool measured = PhysLightingOn(pl.measuredClouds) && cloudMeasuredFrame != UINT32_MAX && frame - cloudMeasuredFrame < 60u;
+		float cover, tr[3];
+		if (measured) {
+			cover = cloudMeasured[0];
+			for (int i = 0; i < 3; ++i)
+				tr[i] = 1.f - cloudMeasured[1 + i];
+		} else {
+			cover = WeatherCloudCover();
+			for (int i = 0; i < 3; ++i)
+				tr[i] = 1.f - 0.85f * cover;
+		}
+		ps.cover = cover;
+		ps.coverMeasured = measured;
+		for (int i = 0; i < 3; ++i)
+			ps.coverTr[i] = tr[i];
+		const float kappa = std::clamp(pl.overcastKappa, 0.f, 1.f);
+		float3 blocked = {}, directNow = {};
+		for (int i = 0; i < 3; ++i) {
+			blocked += direct[i] * (1.f - tr[i]);
+			directNow += direct[i] * tr[i];
+		}
+		const float3 overcast = (blocked + Eclear[4]) * (cover * kappa);
+		constexpr float shape[6] = { kOvercastVerticalRatio, kOvercastVerticalRatio, kOvercastVerticalRatio, kOvercastVerticalRatio, 1.f, 0.f };
+		for (int a = 0; a < 6; ++a)
+			ps.targetAmbient[a] = Finite3((Eclear[a] * (1.f - cover) + overcast * shape[a]) * toShader);
+
+		if (wantRatios) {
+			ps.eReal = std::max(Luminance3(directNow) + Luminance3(ps.targetAmbient[4]) / std::max(toShader, 1e-8f), 0.f);
+			const float ratio = std::max(ps.eReal / ps.eRef, 1e-12f);
+			const float k = std::clamp(pl.compressionK, 0.05f, 1.f);
+			const float target = std::pow(ratio, k - 1.f);
+			ps.sTarget = std::isfinite(target) ? std::clamp(target, 1e-3f, 2e5f) : 1.f;
+		} else {
+			ps.eReal = 0.f;
+			ps.sTarget = 1.f;
+		}
+	}
+
+	// ---- Smoothing (log S, the unscaled ambient) ----
+	const float dt = globals::game::deltaTime ? std::clamp(*globals::game::deltaTime, 0.f, 1.f) : 0.f;
+	const float follow = snap ? 1.f : 1.f - std::exp(-dt / std::clamp(pl.smoothingSeconds, 0.1f, 10.f));
+	if (snap)
+		ps.sLog = std::log(ps.sTarget);
+	else
+		ps.sLog += (std::log(ps.sTarget) - ps.sLog) * follow;
+	ps.sValid = true;
+	ps.S = wantRatios ? std::clamp(std::exp(ps.sLog), 1e-3f, 2e5f) : 1.f;
+	for (int a = 0; a < 6; ++a)
+		ps.ambient[a] = (snap || !ps.ambientValid) ? ps.targetAmbient[a] : ps.ambient[a] + (ps.targetAmbient[a] - ps.ambient[a]) * follow;
+	ps.ambientValid = true;
+	ps.active = wantRatios;
+	ps.ambientActive = wantAmbient;
+	ps.followActive = wantFollow;
+
+	// ---- Physical ambient x S with the weather's hue per axis, and the engine transform built from it ----
+	float3 ambient[6];
+	float3 engineMean = {};
+	for (int a = 0; a < 6; ++a) {
+		const float3 physical = ps.ambient[a] * ps.S;
+		const auto& e = sky->directionalAmbientColors[a / 2][a % 2];
+		const float3 engineGamma = Finite3({ e.red, e.green, e.blue });
+		const float3 engineLinear = { std::pow(engineGamma.x, ambientGamma), std::pow(engineGamma.y, ambientGamma), std::pow(engineGamma.z, ambientGamma) };
+		engineMean += engineLinear;
+		const float confidence = std::clamp(Luminance3(engineGamma) * 255.f / 8.f, 0.f, 1.f);
+		const float3 skyHue = HueOf(Luminance3(physical) > 0.f ? physical : ps.ambient[4], 1.f);
+		const float3 hue = HueOf(skyHue + (HueOf(engineLinear, 1.f) - skyHue) * confidence, hueCap);
+		ambient[a] = hue * Luminance3(physical);
+	}
+	float3 physicalMean = {};
+	for (int a = 0; a < 6; ++a)
+		physicalMean += ambient[a];
+	const float engineLum = Luminance3(engineMean) / 6.f;
+	ps.rAmb = engineLum > 1e-6f ? std::clamp(Luminance3(physicalMean) / 6.f / engineLum, 0.01f, 100.f) : 1.f;
+	ps.unlitScale = std::clamp(Luminance3(physicalMean) / 6.f / ps.anchorAmbientMean, LinearLighting::kMinUnlitSceneScale, 1.f);
+	{
+		// Stars: the physical night base now over the stage-1 night base (weather night zenith x Night Sky Base Light) they were set against.
+		const float stageOne = Luminance3(nightUpper) * std::clamp(effective.nightBaseLight, 0.f, 1.f);
+		ps.starScale = (wantRatios && stageOne > 1e-8f) ? std::clamp(ps.airglowZenith * ps.S / stageOne, 0.05f, 20.f) : 1.f;
+	}
+	{
+		float3 encoded[6];
+		for (int a = 0; a < 6; ++a)
+			encoded[a] = { std::pow(ambient[a].x, 1.f / ambientGamma), std::pow(ambient[a].y, 1.f / ambientGamma), std::pow(ambient[a].z, 1.f / ambientGamma) };
+		float3 mean = {};
+		for (int a = 0; a < 6; ++a)
+			mean += encoded[a];
+		mean /= 6.f;
+		RE::NiTransform t{};
+		const float* channel[3] = { &mean.x, &mean.y, &mean.z };
+		for (int c = 0; c < 3; ++c)
+			for (int j = 0; j < 3; ++j) {
+				const float plus = c == 0 ? encoded[2 * j].x : c == 1 ? encoded[2 * j].y : encoded[2 * j].z;
+				const float minus = c == 0 ? encoded[2 * j + 1].x : c == 1 ? encoded[2 * j + 1].y : encoded[2 * j + 1].z;
+				t.rotate.entry[c][j] = 0.5f * (plus - minus);
+			}
+		t.translate = { *channel[0], *channel[1], *channel[2] };
+		t.scale = 1.f;
+		dalcPhysical = t;
+	}
+}
+
+void PhysicalSky::NightWeatherColors(float3& a_upper, float3& a_horizon, float3& a_lower) const
+{
+	// The weather's night sky keyframes (sRGB, blended through a transition), the airglow floor, linearised as the sky colours are.
+	using ColorTypes = RE::TESWeather::ColorTypes;
+	auto nightColor = [](const RE::TESWeather* a_weather, int a_type) {
+		const auto& c = a_weather->colorData[a_type][RE::TESWeather::ColorTime::kNight];
+		return float3(c.red, c.green, c.blue) * (1.f / 255.f);
+	};
+	float3 upper = {}, horizon = {}, lower = {};
+	if (auto* sky = globals::game::sky; sky && sky->currentWeather) {
+		upper = nightColor(sky->currentWeather, ColorTypes::kSkyUpper);
+		horizon = nightColor(sky->currentWeather, ColorTypes::kHorizon);
+		lower = nightColor(sky->currentWeather, ColorTypes::kSkyLower);
+		const float pct = std::clamp(sky->currentWeatherPct, 0.f, 1.f);
+		if (sky->lastWeather && sky->lastWeather != sky->currentWeather && pct < 1.f) {
+			upper = float3::Lerp(nightColor(sky->lastWeather, ColorTypes::kSkyUpper), upper, pct);
+			horizon = float3::Lerp(nightColor(sky->lastWeather, ColorTypes::kHorizon), horizon, pct);
+			lower = float3::Lerp(nightColor(sky->lastWeather, ColorTypes::kSkyLower), lower, pct);
+		}
+	}
+	const float3 airglow = float3(8.f, 12.f, 20.f) * (1.f / 255.f);
+	const auto& ll = globals::features::linearLighting.settings;
+	auto toLinear = [&](float3 c) {
+		c = float3(std::max(c.x, airglow.x), std::max(c.y, airglow.y), std::max(c.z, airglow.z));
+		if (ll.enableLinearLighting) {
+			const float g = ll.skyGamma;
+			c = float3(std::pow(c.x, g), std::pow(c.y, g), std::pow(c.z, g));
+		}
+		return c;
+	};
+	a_upper = toLinear(upper);
+	a_horizon = toLinear(horizon);
+	a_lower = toLinear(lower);
+}
+
+void PhysicalSky::ApplyPhysicalAmbient()
+{
+	// (49h stage 2) T2. The engine's value is kept whenever it differs from what we wrote (the engine refreshed it); switched off, that
+	// value goes back once (if the engine has not written its own since).
+	auto* smState = globals::game::smState;
+	if (!smState || !loaded)
+		return;
+	auto& transform = smState->directionalAmbientTransform;
+	auto same = [](const RE::NiTransform& a, const RE::NiTransform& b) {
+		return std::memcmp(&a.rotate, &b.rotate, sizeof(a.rotate)) == 0 && std::memcmp(&a.translate, &b.translate, sizeof(a.translate)) == 0;
+	};
+	const bool ours = dalcWritten && same(transform, dalcLastWritten);
+	if (!ours) {
+		dalcEngine = transform;
+		dalcEngineValid = true;
+	}
+	if (physScene.ambientActive && physScene.ambientValid) {
+		transform.rotate = dalcPhysical.rotate;
+		transform.translate = dalcPhysical.translate;
+		dalcLastWritten = transform;
+		dalcWritten = true;
+	} else if (dalcWritten) {
+		if (ours && dalcEngineValid) {
+			transform.rotate = dalcEngine.rotate;
+			transform.translate = dalcEngine.translate;
+		}
+		dalcWritten = false;
+	}
+}
+
+bool PhysicalSky::GetPhysicalUnlitScale(float& a_scale) const
+{
+	if (!physScene.ambientActive || !physScene.ambientValid)
+		return false;
+	a_scale = physScene.unlitScale;
+	return true;
+}
+
+namespace
+{
+	float Luminance3Of(const float3& a_color) { return Luminance3(a_color); }
+	float3 HueOfColor(const float3& a_color, float a_maxSaturation) { return HueOf(a_color, a_maxSaturation); }
 }

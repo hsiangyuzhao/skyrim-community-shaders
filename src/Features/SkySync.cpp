@@ -494,10 +494,15 @@ void SkySync::UpdateCombined(const RE::Sky* sky)
 	float strength[3] = {};
 	strength[sunIdx] = SunResidual * SmoothStep(SunResidualEndElevation * twilight, 0.0f, sunElevation) +
 	                   (1.0f - SunResidual) * SmoothStep(0.0f, SunFullElevation, sunElevation);
+	// (49h stage 2) Physical Sky "Real Sky Ratios": the sun's light is the disc's, gone as it sets (-0.5 .. +0.5 degrees); the air's
+	// reddening and dimming come from the transmittance and the twilight from the physical sky's ambient, all in the same compression S.
+	const bool realRatios = globals::features::physicalSky.loaded && globals::features::physicalSky.RealSkyRatiosActive();
+	if (realRatios)
+		strength[sunIdx] = SmoothStep(-0.5f, 0.5f, sunElevation);
 
 	// The moons: phase, height, and gone by day. The weather does not switch them off (as in the
 	// Clock model: overcast nights keep their moonlight).
-	const float dayFade = MoonDayFade(sunElevation);
+	const float dayFade = realRatios ? 1.0f : MoonDayFade(sunElevation);  // (49h stage 2) at the real ratio the moon is lost in daylight by itself
 	const RE::Moon* moons[3] = { nullptr, sky->masser, sky->secunda };
 	for (const int i : { masserIdx, secundaIdx }) {
 		if (!moons[i] || !moons[i]->moonMesh)
@@ -507,7 +512,12 @@ void SkySync::UpdateCombined(const RE::Sky* sky)
 		// the same height as on the clouds and in the sky (PhysicalSky::MoonHorizonVisibility: weather x -2..3 degrees). Off: the Clock model.
 		if (const auto& physicalSky = globals::features::physicalSky; physicalSky.PhysLightingOn(physicalSky.settings.physicalLighting.sameDirectLight))
 			s = PhysicalSky::MoonHorizonVisibility(moons[i], sky, rawDirections[i].z);
-		s *= PhaseFactorFromTexture(moons[i]) * dayFade;
+		// (49h stage 2) Real Sky Ratios: the weather's moon visibility and the real phase curve.
+		if (realRatios)
+			s = PhysicalSky::MoonHorizonVisibility(moons[i], sky, rawDirections[i].z) * PhysicalSky::RealMoonPhase(PhaseFactorFromTexture(moons[i]));
+		else
+			s *= PhaseFactorFromTexture(moons[i]);
+		s *= dayFade;
 		if (i == secundaIdx)
 			s *= SecundaIntensityFactor;
 		strength[i] = s;

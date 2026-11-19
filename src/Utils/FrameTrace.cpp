@@ -3,6 +3,7 @@
 #include "Features/ExponentialHeightFog.h"
 #include "Features/PerformanceOverlay.h"
 #include "Features/PhysicalSky.h"
+#include "Features/PostProcessing.h"
 #include "Features/RayTracing.h"
 #include "Features/ScreenSpaceGI.h"
 #include "Features/ScreenSpacePointLightShadows.h"
@@ -844,6 +845,13 @@ namespace Util::FrameTrace
 			}
 			text += "; " + globals::features::screenSpacePointLightShadows.DescribeForTrace();  // (47k)
 			text += "; " + globals::features::physicalSky.DescribeForTrace();  // (48b)
+			// (49h stage 2) The auto exposure in effect (mode, scene EV, compensation, exposure; read back 2-3 frames late).
+			if (auto& pp = globals::features::postProcessing; pp.loaded) {
+				if (auto* ae = static_cast<HistogramAutoExposure*>(pp.pipeline[static_cast<size_t>(PostProcessing::FeaturePipelineIndex::AutoExposure)].get()); ae && ae->enabled)
+					text += "; " + ae->DescribeForTrace();
+				else
+					text += "; Auto Exposure off";
+			}
 			return text;
 		}
 

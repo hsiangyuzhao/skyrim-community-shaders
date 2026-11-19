@@ -1,4 +1,5 @@
 #include "LinearLighting.h"
+#include "PhysicalSky.h"
 
 #include "JiayeStatement.h"
 
@@ -227,6 +228,16 @@ void LinearLighting::UnbindEffectScene()
 	globals::d3d::context->PSSetConstantBuffers(7, 1, &buffer);
 }
 
+float LinearLighting::ComputeUnlitSceneScaleWithPhysical()
+{
+	// (49h stage 2) Physical Sky "Physical Ambient": the engine ambient is the physical sky now, so the scale is its ambient now over its
+	// clear-sky anchor (sun at 30 degrees), not over this weather's midday ambient keyframe.
+	float scale = 1.0f;
+	if (globals::features::physicalSky.loaded && globals::features::physicalSky.GetPhysicalUnlitScale(scale))
+		return scale;
+	return ComputeUnlitSceneScale();
+}
+
 float LinearLighting::ComputeUnlitSceneScale()
 {
 	// Ambient luminance as the shaders see it: the directional ambient's isotropic part (DALC x (0,0,0,1) = its translation, the mean of
@@ -275,7 +286,7 @@ void LinearLighting::Prepass()
 		EffectSceneData effectScene{};
 		if (settings.enableLinearLighting && settings.effectsFollowScene && !isMainLoadingMenu) {
 			effectScene.flags = 1u | (settings.effectsFollowLit ? 2u : 0u) | (settings.effectsFollowUnlit ? 4u : 0u);
-			unlitSceneScale = settings.effectsFollowUnlit ? ComputeUnlitSceneScale() : 1.0f;
+			unlitSceneScale = settings.effectsFollowUnlit ? ComputeUnlitSceneScaleWithPhysical() : 1.0f;
 		} else {
 			unlitSceneScale = 1.0f;
 		}

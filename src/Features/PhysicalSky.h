@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Buffer.h"
 #include "PhysicalSkyModel.h"
 
 struct PhysicalSky final : public Feature
@@ -219,6 +220,17 @@ struct PhysicalSky final : public Feature
 			bool farFog = true;            // S6: the far height fog continues the volumetric fog's light
 			bool forwardCubemap = true;    // S7: forward cubemap reflections at the cubemap's own brightness, ambient converted
 			bool smallFixes = true;        // S8: small consistency fixes
+			// (49h stage 2, design-49h-stage2.md): four checkboxes under the master, and the engineering constants of the collapsed
+			// "Developer" node. Off = stage 1 exactly (S = 1, no ambient write, the user's IBL values).
+			bool realSkyRatios = true;           // T1: one compression S of the real sun / moon / sky ratios on every physical source
+			bool physicalAmbient = true;         // T2: the engine ambient (DALC) rewritten from the physical sky with the weather's hue
+			bool measuredClouds = true;          // T3: cloud cover and the clouds in front of the sun / moons from Cloud Shadows' cube
+			bool cloudsStarsWaterFollow = true;  // T4: stars and the water's body colour follow the physical night
+			float compressionK = 0.3f;           // Developer: E_pipe = E_ref (E_real / E_ref)^k
+			float overcastKappa = 0.25f;         // Developer: light an overcast layer passes on (of the blocked sun + the clear sky)
+			float airglowRatio = 25.f;           // Developer: full-moon sky luminance / airglow luminance
+			float smoothingSeconds = 1.5f;       // Developer: S and the ambient follow the sky with this time constant
+			float hueSaturationCap = 0.6f;       // Developer: the weather hue's saturation at most
 		} physicalLighting;
 		/// (48b) Its strength, 0-3. 1: Masser full and high on a clear night keeps about 40% of the Milky Way's light.
 		float moonStarFadeStrength = 1.f;
@@ -450,6 +462,11 @@ struct PhysicalSky final : public Feature
 		kPLForwardCubemap = 1u << 8,
 		kPLSmallFixes = 1u << 9,
 		kPLLandPbr = 1u << 10,  // information: the loaded land uses True PBR texture sets
+		// (49h stage 2) information bits, in effect this frame (Sky.hlsl / Water.hlsl read kPLFollow through local constants).
+		kPLRealRatios = 1u << 11,
+		kPLPhysAmbient = 1u << 12,
+		kPLMeasuredClouds = 1u << 13,
+		kPLFollow = 1u << 14,
 	};
 	struct NightCbData
 	{
@@ -465,6 +482,11 @@ struct PhysicalSky final : public Feature
 	static_assert(sizeof(NightCbData) == 64);
 	/// (41b, F1) Fills nightCbData's base light from the current weather; a_sunElevation in radians.
 	void UpdateNightBaseLight(float a_sunElevation);
+	/// (49h stage 2) A moon's light at full phase: the user's colour, or under Real Sky Ratios its hue at the real ratio to the sun.
+	[[nodiscard]] float3 MoonLightBase(int a_moon) const { return physScene.active ? physScene.moonReal[a_moon] : (a_moon == 0 ? settings.masserColor : settings.secundaColor); }
+	/// (49h stage 2) The weather's night sky colours (SkyUpper, Horizon, SkyLower; blended through a transition) with the airglow floor,
+	/// linearised as the sky colours are; before any strength or fade.
+	void NightWeatherColors(float3& a_upper, float3& a_horizon, float3& a_lower) const;
 	/// (47a) The night base light at full strength (fade 1) and its fade this frame, for Sky Fixes.
 	float3 nightBaseUnfadedUpper = {};
 	float3 nightBaseUnfadedHorizon = {};
@@ -555,6 +577,84 @@ struct PhysicalSky final : public Feature
 	/// (49h stage 1) A Physical Lighting rule in effect (master and its checkbox) -- for the C++ side of S1 / S4a.
 	[[nodiscard]] bool PhysLightingOn(bool a_rule) const { return loaded && settings.physicalLighting.enabled && a_rule; }
 	void SettingsSceneLighting();
+
+	////////////////////////////////////////////////// (49h stage 2) Physical outdoor lighting
+	/// Real ratios of the sources, before the compression: the real full moon's irradiance relative to the sun.
+	static constexpr float kMoonToSun = 2.5e-6f;
+	/// Overcast sky's light on a vertical surface / on a horizontal one (CIE overcast sky).
+	static constexpr float kOvercastVerticalRatio = 0.396f;
+	/// Number of upper-hemisphere directions of the CPU sky integration.
+	static constexpr int kSceneDirections = 60;
+	/// Real brightness of a moon phase picture relative to full (the picture factor 0.05 new .. 0.25 crescent .. 1 full).
+	static float RealMoonPhase(float a_pictureFactor);
+	/// The physical scene of this frame (Reset). All neutral while inactive.
+	struct PhysScene
+	{
+		bool active = false;          // Real Sky Ratios in effect (exterior, physical sky drawn, master + T1)
+		bool ambientActive = false;   // Physical Ambient in effect (T2, outdoors)
+		bool followActive = false;    // T4 in effect
+		float S = 1.f;                // the compression in effect (smoothed)
+		float sTarget = 1.f;
+		float sLog = 0.f;             // smoothed log(S)
+		bool sValid = false;
+		float eReal = 0.f;            // horizontal illuminance, sun units (luminance), clouds applied
+		float eRef = 0.f;             // the same for a clear sky with the sun at 30 degrees
+		float cover = 0.f;            // cloud cover 0-1
+		float coverTr[3] = { 1.f, 1.f, 1.f };  // cloud transmission toward the sun, Masser, Secunda
+		bool coverMeasured = false;   // from the cube (else the weather estimate)
+		float3 moonReal[2] = {};      // full-phase moon irradiance at the real ratio (sun units), the moon colour's hue
+		float realPhase[2] = { 1.f, 1.f };
+		float3 ambient[6] = {};       // physical ambient per axis (+x -x +y -y +z -z), linear, shader units (smoothed)
+		bool ambientValid = false;
+		float rAmb = 1.f;             // physical ambient / the engine's (luminance)
+		float starScale = 1.f;        // physical night base / the stage-1 night base (luminance)
+		float unlitScale = 1.f;       // physical ambient now / at the clear-sky anchor, for unlit effects
+		float airglowZenith = 0.f;    // sun units, unscaled
+		uint32_t heavyFrame = UINT32_MAX;
+		float lastHours = -1.f;
+		uint32_t lastWarp = 0;
+		// Anchor cache (clear sky, sun at 30 degrees): E_ref, the full-moon sky luminance, the anchor's ambient mean.
+		uint32_t anchorFrame = UINT32_MAX;
+		float anchorSunLum = -1.f;
+		float anchorFullMoonSky = 0.f;
+		float anchorAmbientMean = 0.f;
+		float3 targetAmbient[6] = {};
+	} physScene;
+	/// Fills physScene (S, the ambient, the ratios). a_*Dir: the LUTs' sun and the moons' glow directions (world).
+	void UpdatePhysicalScene(const RE::NiPoint3& a_lutSunDir, const RE::NiPoint3& a_masserDir, const RE::NiPoint3& a_secundaDir, float a_cameraRadiusKm);
+	/// T2: writes the physical ambient into the engine's directional ambient (State::UpdateSharedData, before it is copied), or puts the
+	/// engine's own value back once after it is switched off.
+	void ApplyPhysicalAmbient();
+	/// T2 in effect this frame (the IBL upload overrides: DALCAmount 1, SkyIBLScale 0, EnvIBLScale 1; the fog's sky light from the ambient).
+	[[nodiscard]] bool PhysicalAmbientActive() const { return physScene.ambientActive; }
+	/// T1 in effect this frame (Sky Sync: no sun residual below the horizon, the moons at the real ratio and phase, no day fade).
+	[[nodiscard]] bool RealSkyRatiosActive() const { return physScene.active; }
+	/// T2: the unlit effects' scene scale (physical ambient now / clear-sky anchor); false while inactive.
+	bool GetPhysicalUnlitScale(float& a_scale) const;
+	RE::NiTransform dalcPhysical = {};
+	RE::NiTransform dalcLastWritten = {};
+	RE::NiTransform dalcEngine = {};
+	bool dalcWritten = false;
+	bool dalcEngineValid = false;
+	/// T3: Cloud Shadows' cube reduced to 4 numbers (cover, and the cloud in front of the sun / Masser / Secunda) and read back late.
+	struct CloudCoverCB
+	{
+		float4 sunDir;
+		float4 masserDir;
+		float4 secundaDir;
+	};
+	std::unique_ptr<ConstantBuffer> cloudCoverCB;
+	std::unique_ptr<StructuredBuffer> cloudCoverSB;
+	winrt::com_ptr<ID3D11ComputeShader> csCloudCover = nullptr;
+	static constexpr int kCloudReadbackCount = 3;
+	winrt::com_ptr<ID3D11Buffer> cloudReadback[kCloudReadbackCount];
+	bool cloudReadbackPending[kCloudReadbackCount] = {};
+	uint32_t cloudReadbackIndex = 0;
+	float cloudMeasured[4] = { 0.f, 0.f, 0.f, 0.f };
+	uint32_t cloudMeasuredFrame = UINT32_MAX;
+	void DispatchCloudCover();
+	/// The weather's cloud cover estimate (flags x transition) for when the cube is not available.
+	static float WeatherCloudCover();
 	/// (49h) EHF "Stable Fog Colour": Physical Sky's transmittance from the camera toward a_dir (towards the light) as
 	/// PhysSky::SampleTr gives the shaders (Transmittance Mix applied), from the CPU model; 1 while Physical Sky is off or the
 	/// model cannot be had.
@@ -585,6 +685,7 @@ struct PhysicalSky final : public Feature
 	winrt::com_ptr<ID3D11ComputeShader> csSvLutGen = nullptr;
 	winrt::com_ptr<ID3D11ComputeShader> csApLutGen = nullptr;
 	winrt::com_ptr<ID3D11ComputeShader> csShadowAccum = nullptr;
+	// (49h stage 2) csCloudCover is declared with the scene data above.
 
 	ID3D11SamplerState* originalPSSamplers[2] = { nullptr, nullptr };
 

@@ -76,7 +76,7 @@ float3 PurkinjeShift(float3 c, float nightAdaptation)
 	return LMS2RGB(lmsr.rgb + lms_gain) / logExposure;
 }
 	/// The adapt pass's output for one pixel (before 44e written to its own full-resolution texture).
-	float3 ExposeColor(float3 rgb, float avgLuma, float exposureCompensation, float2 adaptationRange, float purkinjeStartEV, float purkinjeMaxEV, float purkinjeStrength)
+	float3 ExposeColor(float3 rgb, float avgLuma, float purkinjeLuma, float exposureCompensation, float2 adaptationRange, float purkinjeStartEV, float purkinjeMaxEV, float purkinjeStrength)
 	{
 		const static float logEV = -3;  // log2(0.125)
 
@@ -88,7 +88,7 @@ float3 PurkinjeShift(float3 c, float nightAdaptation)
 		// Optimize Purkinje shift calculation by avoiding unnecessary work
 		if (purkinjeStrength > 1e-3) {
 			// Pre-calculate some parts of the purkinje mix calculation
-			float log_avgLuma = log2(avgLuma);
+			float log_avgLuma = log2(purkinjeLuma);  // (49h stage 2) the adapted scene luminance (= avgLuma in Classic)
 			float mix_term = (log_avgLuma - logEV - purkinjeMaxEV) / (purkinjeStartEV - purkinjeMaxEV);
 			float purkinjeMix = lerp(purkinjeStrength, 0.f, saturate(mix_term));
 

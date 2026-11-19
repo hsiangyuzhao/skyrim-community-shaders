@@ -18,7 +18,7 @@ StructuredBuffer<float> RWTexAdaptation : register(t1);
 		return;
 
 	// (44e) The math lives in exposure.hlsli, so Local Exposure can apply it on load instead.
-	float3 color = AutoExposureMath::ExposeColor(TexColor[tid].rgb, RWTexAdaptation[0], ExposureCompensation, AdaptationRange, PurkinjeStartEV, PurkinjeMaxEV, PurkinjeStrength);
+	float3 color = AutoExposureMath::ExposeColor(TexColor[tid].rgb, RWTexAdaptation[0], RWTexAdaptation[1], ExposureCompensation, AdaptationRange, PurkinjeStartEV, PurkinjeMaxEV, PurkinjeStrength);
 
 	RWTexOut[tid] = float4(color, 1);
 }

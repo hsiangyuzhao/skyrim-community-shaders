@@ -404,6 +404,18 @@ namespace SkyFixes
 #		endif
 }
 
+// (49h stage 2) Physical Sky "Clouds, Stars and Water Follow": PhysicalSky::PhysLightFlags bit 14 in horizonFixData.Flags (named here, not
+// in PhysicalLighting.hlsli, which Lighting includes); the star scale rides in horizonFixData.AnchorOffset (padding since 47m).
+namespace PhysFollow
+{
+	static const uint FollowFlag = (1u << 14);
+	/// The star layer's scale: the physical night base over the night base the stars were set against; 1 while off.
+	float StarScale()
+	{
+		return (SharedData::horizonFixData.Flags & FollowFlag) != 0u ? max(SharedData::horizonFixData.AnchorOffset, 0.0) : 1.0;
+	}
+}
+
 // (48b) "Moonlight Fades Stars" and "Moon Planetshine": PhysicalSky::NightFlags bits 6 / 7 and the two spare floats of
 // PhysSkyMoonData (each holds two halves: x = Masser, y = Secunda), named here so SharedData.hlsli stays byte-identical.
 namespace MoonSky
@@ -543,6 +555,7 @@ PS_OUTPUT main(PS_INPUT input)
 
 #		elif defined(HORIZFADE)
 	psout.Color.xyz = float3(1.5, 1.5, 1.5) * (Color::Sky(input.Color.xyz) * baseColor.xyz + yyy);
+	psout.Color.xyz *= PhysFollow::StarScale();  // (49h stage 2) stars keep their brightness against the physical night sky
 	psout.Color.w = input.TexCoord2.x * (baseColor.w * input.Color.w);
 #		else
 	psout.Color.w = input.Color.w * baseColor.w;

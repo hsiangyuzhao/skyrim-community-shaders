@@ -34,7 +34,60 @@ struct HistogramAutoExposure : public PostProcessFeature
 		float PurkinjeStartEV = -1.5f;  // EV
 		float PurkinjeMaxEV = -4.f;     // EV
 		float PurkinjeStrength = 1.f;
+
+		// (49h stage 2) "Exposure Mode" (ExposureModes). Classic = the controls above, as before; Physical = the wide-range trimmed
+		// histogram, asymmetric adaptation and the dark-scene compensation curve below (design-49h-stage2.md B).
+		int ExposureMode = 0;
+		float PhysDarkCompensation = 0.6f;    // alpha: on-screen darkening per EV the scene is darker than Full Adaptation Above
+		float PhysFullAdaptationAbove = -1.f; // EV_ref
+		float PhysDarkestAdapted = -6.5f;     // EV_min: the adaptation stops here
+		float PhysBrightBoost = 0.25f;        // beta above EV_hi (+1.5)
+		float PhysAdaptIntoDark = 3.5f;       // seconds
+		float PhysAdaptIntoBright = 0.8f;     // seconds
+		float PhysIgnoreDarkest = 10.f;       // percent of the samples
+		float PhysIgnoreBrightest = 5.f;      // percent
+		float PhysCentreWeight = 0.f;         // 0-1: the centre counts up to 3x
+		bool PhysHoldSmallChanges = true;     // deadband 0.10-0.35 EV
+		float PhysPurkinjeStartEV = -3.f;     // the Purkinje fade-in in this mode (the strength above is shared)
+		float PhysPurkinjeMaxEV = -7.5f;
 	} settings;
+
+	/// (49h stage 2) Exposure Mode values.
+	enum ExposureModes : int
+	{
+		kExposureAuto = 0,  // Physical while Physical Sky's "Physical Lighting" master is on, else Classic
+		kExposureClassic,
+		kExposurePhysical,
+		kExposureModeCount
+	};
+	/// (49h stage 2) The mode in effect this frame (Auto resolved).
+	[[nodiscard]] bool PhysicalMode() const;
+	/// (49h stage 2) Compensation curve constants that are not in the menu.
+	static constexpr float kPhysEVHi = 1.5f;
+	static constexpr float kPhysAdaptMinEV = -9.5f;
+	static constexpr float kPhysAdaptMaxEV = 5.f;
+	static constexpr float kPhysSlewDark = 1.5f;    // EV per second
+	static constexpr float kPhysSlewBright = 3.f;
+	static constexpr float kPhysMinLogLum = -15.f;  // EV -12 .. +11
+	static constexpr float kPhysLogLumRange = 23.f;
+	/// (49h stage 2) Snap / hold bookkeeping (loads, fast travel, time skips, first frame, mode switch; menus hold).
+	int snapFrames = 2;
+	bool lastModePhysical = false;
+	float lastHoursPassed = -1.f;
+	/// (49h stage 2) The adaptation buffer read back 2-3 frames late, for the status line, the F7 header and Local Exposure's pivot:
+	/// [0] divisor, [1] adapted luminance, [2] filtered target, [3] compensation (linear).
+	static constexpr int kReadbackCount = 3;
+	winrt::com_ptr<ID3D11Buffer> readbackBuffers[kReadbackCount];
+	bool readbackPending[kReadbackCount] = {};
+	uint32_t readbackIndex = 0;
+	float readback[4] = { 0.f, 0.f, 0.f, 1.f };
+	bool readbackValid = false;
+	bool readbackPhysical = false;
+	void QueueReadback();
+	/// (49h stage 2) One line for the F7 trace header (mode, scene EV, compensation, exposure).
+	std::string DescribeForTrace() const;
+	/// (49h stage 2) The last exposure multiplier as EV (0.18 x compensation / divisor), from the readback.
+	[[nodiscard]] float LastExposureEV() const;
 
 	// buffers
 	struct alignas(16) AutoExposureCB
@@ -48,7 +101,30 @@ struct HistogramAutoExposure : public PostProcessFeature
 		float PurkinjeStrength;
 
 		float pad[3];
+
+		// (49h stage 2) Physical mode (common.hlsli); Classic leaves them 0 and never reads them.
+		float PhysMinLogLum;
+		float PhysLogLumRange;
+		uint PhysMode;
+		float PhysDeltaTime;
+		float PhysTrimLow;
+		float PhysTrimHigh;
+		float PhysCentreWeight;
+		float PhysDeadband;
+		float PhysTauDark;
+		float PhysTauBright;
+		float PhysSlewDark;
+		float PhysSlewBright;
+		float PhysAlpha;
+		float PhysEVRef;
+		float PhysEVMin;
+		float PhysBeta;
+		float PhysEVHi;
+		float PhysAdaptMinEV;
+		float PhysAdaptMaxEV;
+		uint PhysFlags;
 	};
+	static_assert(sizeof(AutoExposureCB) == 128);
 	std::unique_ptr<ConstantBuffer> autoExposureCB = nullptr;
 	std::unique_ptr<StructuredBuffer> histogramSB = nullptr;
 	std::unique_ptr<StructuredBuffer> adaptationSB = nullptr;

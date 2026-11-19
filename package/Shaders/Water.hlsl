@@ -897,6 +897,13 @@ struct DiffuseOutput
 	float refractionMul;
 };
 
+/// (49h stage 2) Physical Sky "Clouds, Stars and Water Follow": the water's own (body) colour x the physical ambient / the weather's ambient
+/// (horizonFixData.Altitude, padding since 47m; PhysicalSky::PhysLightFlags bit 14, named here). 1 while off.
+float WaterAmbientFollow()
+{
+	return (SharedData::horizonFixData.Flags & (1u << 14)) != 0u ? clamp(SharedData::horizonFixData.Altitude, 0.0, 100.0) : 1.0;
+}
+
 DiffuseOutput GetWaterDiffuseColor(PS_INPUT input, float3 normal, float3 viewDirection, inout float4 distanceMul, float refractionsDepthFactor, float fresnel, uint eyeIndex, float3 viewPosition, float noise, float depth)
 {
 #			if defined(REFRACTIONS)
@@ -955,13 +962,13 @@ DiffuseOutput GetWaterDiffuseColor(PS_INPUT input, float3 normal, float3 viewDir
 
 	DiffuseOutput output;
 	output.refractionColor = refractionColor;
-	output.refractionDiffuseColor = refractionDiffuseColor;
+	output.refractionDiffuseColor = refractionDiffuseColor * WaterAmbientFollow();  // (49h stage 2)
 	output.depth = depth;
 	output.refractionMul = refractionMul;
 	return output;
 #			else
 	DiffuseOutput output;
-	output.refractionColor = lerp(Color::Water(ShallowColor.xyz), Color::Water(DeepColor.xyz), fresnel) * GetLdotN(normal);
+	output.refractionColor = lerp(Color::Water(ShallowColor.xyz), Color::Water(DeepColor.xyz), fresnel) * GetLdotN(normal) * WaterAmbientFollow();  // (49h stage 2)
 	output.refractionDiffuseColor = output.refractionColor;
 	output.depth = 1;
 	output.refractionMul = 1;

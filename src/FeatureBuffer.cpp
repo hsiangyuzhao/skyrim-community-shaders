@@ -57,7 +57,17 @@ std::pair<unsigned char*, size_t> GetFeatureBufferData(bool a_inWorld)
 		globals::features::lodBlending.settings,
 		globals::features::hairSpecular.settings,
 		globals::features::terrainVariation.settings,
-		globals::features::ibl.settings,
+		[] {
+			// (49h stage 2) Physical Sky "Physical Ambient": the ambient is the physical sky, so IBL adds only the surroundings' bounce
+			// (values only, at upload; the saved settings are untouched).
+			auto ibl = globals::features::ibl.settings;
+			if (globals::features::physicalSky.PhysicalAmbientActive()) {
+				ibl.DALCAmount = 1.0f;
+				ibl.SkyIBLScale = 0.0f;
+				ibl.EnvIBLScale = 1.0f;
+			}
+			return ibl;
+		}(),
 		globals::features::extendedTranslucency.GetCommonBufferData(),
 		globals::features::linearLighting.GetCommonBufferData(),
 		globals::features::postProcessing.settings,

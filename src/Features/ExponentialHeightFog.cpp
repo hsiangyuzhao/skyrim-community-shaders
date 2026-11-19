@@ -792,7 +792,10 @@ void ExponentialHeightFog::Prepass()
     const auto& depthStencil = globals::game::renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
     auto& terrainBlending = globals::features::terrainBlending;
     ID3D11ShaderResourceView* depthSrv = terrainBlending.loaded && terrainBlending.blendedDepthTexture16 ? terrainBlending.blendedDepthTexture16->srv.get() : depthStencil.depthSRV;
-    const bool hasIBL = ibl.loaded && ibl.settings.EnableDiffuseIBL && ibl.diffuseIBLTexture && ibl.diffuseSkyIBLTexture;
+    // (49h stage 2) Physical Sky "Physical Ambient": the sky light comes from the (physical) directional ambient; the IBL branch would
+    // lose the sky (SkyIBLScale is 0 then).
+    const bool hasIBL = ibl.loaded && ibl.settings.EnableDiffuseIBL && ibl.diffuseIBLTexture && ibl.diffuseSkyIBLTexture &&
+        !globals::features::physicalSky.PhysicalAmbientActive();
     const bool hasSkylighting = skylighting.loaded && skylighting.texProbeArray;
 
     const bool temporalReprojection = Util::GetTemporal();
