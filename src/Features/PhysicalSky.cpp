@@ -566,12 +566,8 @@ void PhysicalSky::SettingsCelestials()
 		ImGui::Text(
 			"Apply additional atmospheric tranmisttance on the directional light.\n"
 			"Introduces natural yellowening at sunset with white sunlight.");
-	// (49h)
-	ImGui::Checkbox("Sun Highlight on Water Follows the Atmosphere", &settings.waterSunTransmittance);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text(
-			"On (default): the sun's bright highlight on water is reddened and dimmed by the atmosphere like the sunlight on the\n"
-			"ground (Transmittance Mix above), so at dusk and dawn it is no longer a white glare. Off: as in 49g.");
+	// (49h stage 1) "Sun Highlight on Water Follows the Atmosphere" moved to Scene Lighting > Related (own switches).
+	ImGui::TextDisabled("Sun highlight on water: Scene Lighting tab > Related (own switches)");
 
 	ImGui::SeparatorText("Sun");
 	{
