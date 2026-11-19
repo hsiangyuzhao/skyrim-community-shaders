@@ -105,12 +105,25 @@ namespace
 	 * @brief Copies what a neighbour may borrow from each slot: the texture pointers and PBR values the engine (vanilla land) or
 	 * True PBR (PBR land) has just put into this quad's material, plus the land texture's snow / specular values. Pointer copies
 	 * and field reads only: no texture lookup or load. Runs in the land setup hook, after both material setups.
+	 *
+	 * (49e) The material type is proven before any field is read: True PBR land (a_pbr) must carry exactly a
+	 * BSLightingShaderMaterialPBRLandscape, vanilla land exactly the engine's BSLightingShaderMaterialLandscape (vtable compares).
+	 * GetFeature() cannot tell them apart: the PBR material returns kMultiTexLandLODBlend too (49d read PBR land with the vanilla
+	 * layout and crashed). Anything else: no slot information (the quad still blends, nothing is borrowed from it).
 	 */
-	void ReadSlotInfo(RE::BSGeometry* a_geometry, LandscapeSeamsFix::Quad& a_out)
+	void ReadSlotInfo(RE::BSGeometry* a_geometry, bool a_pbr, LandscapeSeamsFix::Quad& a_out)
 	{
 		auto* property = netimmerse_cast<RE::BSLightingShaderProperty*>(a_geometry->GetGeometryRuntimeData().properties[RE::BSGeometry::States::kEffect].get());
 		const auto* material = property != nullptr ? property->material : nullptr;
-		const auto feature = material != nullptr ? material->GetFeature() : RE::BSShaderMaterial::Feature::kNone;
+		static const std::uintptr_t vanillaLandscapeVtable = RE::VTABLE_BSLightingShaderMaterialLandscape[0].address();
+		const std::uintptr_t vtable = material != nullptr ? *reinterpret_cast<const std::uintptr_t*>(material) : 0;
+		const bool pbrMaterial = a_pbr && BSLightingShaderMaterialPBRLandscape::IsInstance(material);
+		const bool vanillaMaterial = !a_pbr && vtable != 0 && vtable == vanillaLandscapeVtable;
+		if (material != nullptr && !pbrMaterial && !vanillaMaterial) {
+			static std::atomic<bool> logged{ false };
+			if (!logged.exchange(true))
+				logger::warn("[Landscape Seams] Land material of an unexpected type ({}, vtable {:X}): its textures are not borrowed", a_pbr ? "True PBR land" : "vanilla land", vtable);
+		}
 
 		for (uint32_t slot = 0; slot < LandscapeSeamsFix::EngineLayers; ++slot) {
 			auto& info = a_out.info[slot];
@@ -119,7 +132,7 @@ namespace
 			if (landTexture == nullptr)
 				continue;
 
-			if (feature == BSLightingShaderMaterialPBRLandscape::FEATURE) {
+			if (pbrMaterial) {
 				const auto* pbr = static_cast<const BSLightingShaderMaterialPBRLandscape*>(material);
 				info.color = pbr->landscapeBaseColorTextures[slot];
 				info.normal = pbr->landscapeNormalTextures[slot];
@@ -131,7 +144,7 @@ namespace
 					info.glint = glint.enabled;
 					info.glintParams = { glint.screenSpaceScale, 40.0f - glint.logMicrofacetDensity, glint.microfacetRoughness, glint.densityRandomization };
 				}
-			} else if (feature == RE::BSShaderMaterial::Feature::kMultiTexLandLODBlend) {
+			} else if (vanillaMaterial) {
 				const auto* vanilla = static_cast<const RE::BSLightingShaderMaterialLandscape*>(material);
 				info.color = slot == 0 ? vanilla->diffuseTexture : vanilla->landscapeDiffuseTexture[slot - 1];
 				info.normal = slot == 0 ? vanilla->normalTexture : vanilla->landscapeNormalTexture[slot - 1];
@@ -673,7 +686,7 @@ void LandscapeSeamsFix::OnLandSetup(RE::TESObjectLAND* a_land, bool a_pbr)
 			coordinates->cellY * 2 + static_cast<int32_t>(quadIndex >> 1)
 		};
 		ReadQuad(a_land, quadIndex, entry.quad);
-		ReadSlotInfo(geometry, entry.quad);
+		ReadSlotInfo(geometry, a_pbr, entry.quad);
 		geometry->IncRefCount();
 		entry.quad.geometry = geometry;
 		entry.quad.pbr = a_pbr;

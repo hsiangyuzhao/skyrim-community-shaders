@@ -2,6 +2,8 @@
 
 BSLightingShaderMaterialPBRLandscape::BSLightingShaderMaterialPBRLandscape()
 {
+	// (49e) In the most derived constructor's body the object's vtable pointer is this class's vtable.
+	Vtable.store(*reinterpret_cast<const void* const*>(this), std::memory_order_release);
 	std::fill(isPbr.begin(), isPbr.end(), false);
 	std::fill(roughnessScales.begin(), roughnessScales.end(), 1.f);
 	std::fill(displacementScales.begin(), displacementScales.end(), 1.f);

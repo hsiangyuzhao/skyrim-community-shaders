@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+
 #include "TruePBR.h"
 
 class BSLightingShaderMaterialPBRLandscape : public RE::BSLightingShaderMaterialBase
@@ -30,6 +32,16 @@ public:
 	bool HasGlint() const;
 
 	inline static std::unordered_map<BSLightingShaderMaterialPBRLandscape*, std::array<TruePBR::PBRTextureSetData*, NumTiles>> All;
+
+	/// (49e) This class's vtable, recorded by the constructor. GetFeature() returns kMultiTexLandLODBlend like the vanilla landscape
+	/// material, so only the vtable tells the two apart (Landscape Seams reads a quad's material by its exact type).
+	inline static std::atomic<const void*> Vtable{ nullptr };
+	/// (49e) True only for a material of exactly this class (vtable compare; null-safe).
+	static bool IsInstance(const RE::BSShaderMaterial* a_material)
+	{
+		const void* vtable = Vtable.load(std::memory_order_acquire);
+		return a_material != nullptr && vtable != nullptr && *reinterpret_cast<const void* const*>(a_material) == vtable;
+	}
 
 	// members
 	std::uint32_t numLandscapeTextures = 0;
