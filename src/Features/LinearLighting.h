@@ -59,8 +59,43 @@ struct LinearLighting : Feature
 		float bloodEffectMult = 1.0f;
 		float projectedEffectMult = 1.0f;
 		float deferredEffectMult = 1.0f;
-		float otherEffectMult = 1.0f;
+		float otherEffectMult = 1.0f;  ///< used while "Effects Follow Scene Light" is off (the old single multiplier)
+
+		// (49g) "Effects Follow Scene Light" (Effects tree). Off: exactly the old effect lighting with otherEffectMult.
+		bool effectsFollowScene = true;
+		bool effectsFollowLit = true;    ///< Lit Smoke and Mist: the light a matte surface gets at that spot
+		bool effectsFollowUnlit = true;  ///< Unlit Smoke and Mist: x the scene's ambient brightness relative to midday
+		// The three multipliers that replace otherEffectMult while it is on (missing in old settings: all take otherEffectMult).
+		float fireMagicEffectMult = 1.0f;
+		float litSmokeEffectMult = 1.0f;
+		float unlitSmokeEffectMult = 1.0f;
 	} settings;
+
+	/** (49g) Effect.hlsl EffectSceneCB (PS b7), bound for every effect draw. */
+	struct alignas(16) EffectSceneData
+	{
+		uint flags;  // 1 master, 2 lit, 4 unlit (0 while Linear Lighting is off)
+		float fireMagicMult;
+		float litSmokeMult;
+		float unlitSmokeMult;
+		float unlitSceneScale;
+		float pad[3];
+	};
+	static_assert(sizeof(EffectSceneData) == 32);
+	std::unique_ptr<ConstantBuffer> EffectSceneCB;
+
+	/** Lowest scale for unlit smoke and mist (very dark scenes keep a trace of it). */
+	static constexpr float kMinUnlitSceneScale = 0.05f;
+	float unlitSceneScale = 1.0f;        ///< this frame's value (menu status)
+	float unlitAmbientNow = 0.0f;        ///< luminance of the ambient now (menu status)
+	float unlitAmbientMidday = -1.0f;    ///< this weather's midday ambient luminance; last exterior value indoors (< 0: none yet)
+
+	/** @brief (49g) Binds EffectSceneCB to PS b7 (Hooks.cpp, BSEffectShader::SetupGeometry). */
+	void BindEffectScene();
+	/** @brief (49g) Unbinds PS b7 after an effect draw (BSEffectShader::RestoreGeometry): b7 is Advanced Skin's slot in Lighting. */
+	void UnbindEffectScene();
+	/** @brief (49g) The unlit smoke and mist scale: ambient luminance now / the current weather's midday ambient, clamped. */
+	float ComputeUnlitSceneScale();
 
 	struct alignas(16) PerFrameData
 	{

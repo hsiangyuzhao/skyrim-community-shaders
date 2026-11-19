@@ -27,6 +27,7 @@
 #include "Features/GrassOptimizations.h"
 #include "Features/InteriorSun.h"
 #include "Features/LightLimitFix.h"
+#include "Features/LinearLighting.h"
 #include "Features/LODBlending.h"
 #include "Features/Skin.h"
 #include "Features/TerrainHelper.h"
@@ -247,6 +248,21 @@ namespace EffectExtensions
 					state->permutationData.ExtraShaderDescriptor |= static_cast<uint32_t>(State::ExtraShaderDescriptors::EffectShadows);
 				}
 			}
+
+			// (49g) Linear Lighting's effect constants (Effect.hlsl EffectSceneCB, PS b7) for this draw.
+			globals::features::linearLighting.BindEffectScene();
+		}
+		static inline REL::Relocation<decltype(thunk)> func;
+	};
+
+	// (49g) PS b7 is Advanced Skin's per-geometry buffer in Lighting shaders (rebound for every Lighting draw while Skin is on). Unbound
+	// after each effect draw, so a Lighting draw never reads the effect constants (with Skin off it reads nothing there, as before).
+	struct BSEffectShader_RestoreGeometry
+	{
+		static void thunk(RE::BSShader* shader, RE::BSRenderPass* pass, uint32_t renderFlags)
+		{
+			func(shader, pass, renderFlags);
+			globals::features::linearLighting.UnbindEffectScene();
 		}
 		static inline REL::Relocation<decltype(thunk)> func;
 	};
@@ -1248,6 +1264,7 @@ namespace Hooks
 
 		logger::info("Installing SetupGeometry hooks");
 		stl::write_vfunc<0x6, EffectExtensions::BSEffectShader_SetupGeometry>(RE::VTABLE_BSEffectShader[0]);
+		stl::write_vfunc<0x7, EffectExtensions::BSEffectShader_RestoreGeometry>(RE::VTABLE_BSEffectShader[0]);
 		stl::write_vfunc<0x6, LightingExtensions::BSLightingShader_SetupGeometry>(RE::VTABLE_BSLightingShader[0]);
 		stl::write_thunk_call<GrassExtensions::BSGrassShaderProperty_ctor>(REL::RelocationID(15214, 15383).address() + REL::Relocate(0x45B, 0x4F5));
 		stl::write_vfunc<0x6, GrassExtensions::BSGrassShader_SetupGeometry>(RE::VTABLE_BSGrassShader[0]);

@@ -535,9 +535,10 @@ cbuffer PerGeometry : register(b2)
 #		include "ExponentialHeightFog/ExponentialHeightFog.hlsli"
 #	endif
 
-#	if defined(LIGHTING) && defined(EXP_HEIGHT_FOG)
+#	if defined(EXP_HEIGHT_FOG)
 // (49b) "Particles Use RT Shadows" (Ray Tracing): the volumetric fog's ray-traced froxel visibility, temporally filtered
 // (ExponentialHeightFog/RTFogVisibility.hlsli; only while the near fog grid is built). Off / unbound: every factor is 1 and no light is added.
+// (49g) In every effect permutation: lit smoke without the LIGHTING flag uses it too when it follows the scene light.
 #		include "ExponentialHeightFog/RTFogVisibility.hlsli"
 namespace RTFogVis
 {
@@ -593,6 +594,222 @@ float ComputeShadowVariance(float shadow)
     return (v < epsilon) ? 1.0 : 0.0;
 }
 
+// (49g) Linear Lighting > Effects: "Effects Follow Scene Light" and the three effect multipliers (LinearLighting.cpp; bound for every
+// effect draw by Hooks.cpp, unbound again after it). Zero (master off) = the old effect lighting and the old Other Effects Multiplier.
+cbuffer EffectSceneCB : register(b7)
+{
+	uint EffectSceneFlags;        // 1 master, 2 lit smoke and mist, 4 unlit smoke and mist
+	float EffectFireMagicMult;    // Fire and Magic Multiplier
+	float EffectLitSmokeMult;     // Lit Smoke and Mist Multiplier
+	float EffectUnlitSmokeMult;   // Unlit Smoke and Mist Multiplier
+	float EffectUnlitSceneScale;  // the scene's ambient brightness now / this weather's midday, clamped (C++)
+	float3 EffectScenePad;
+};
+
+namespace EffectScene
+{
+	static const uint kMaster = 1u;
+	static const uint kLit = 2u;
+	static const uint kUnlit = 4u;
+
+	static const uint kFireMagic = 0u;
+	static const uint kLitSmoke = 1u;
+	static const uint kUnlitSmoke = 2u;
+
+	bool Master()
+	{
+		return ENABLE_LL && (EffectSceneFlags & kMaster) != 0u;
+	}
+
+	/// Which of the three multipliers an effect takes: additive (fire, magic, sparks, light sprites) and unlit palette-coloured ones
+	/// (grayscale to colour: flames and magic drawn with alpha) -> Fire and Magic; others lit / unlit by their Lighting Influence.
+	uint Category(float a_lightingInfluence)
+	{
+#	if defined(ADDBLEND)
+		return kFireMagic;
+#	else
+		if (a_lightingInfluence > 0.0)
+			return kLitSmoke;
+		if (Permutation::PixelShaderDescriptor & Permutation::EffectFlags::GrayscaleToColor)
+			return kFireMagic;
+		return kUnlitSmoke;
+#	endif
+	}
+
+	/// The effects whose multiplier is one of the three (membrane, blood, projected and deferred effects keep their own).
+	bool OwnMultiplier()
+	{
+#	if defined(MEMBRANE) || defined(BLOOD) || defined(PROJECTED_UV) || defined(DEFERRED)
+		return false;
+#	else
+		return true;
+#	endif
+	}
+
+	float Multiplier(uint a_category)
+	{
+		return a_category == kFireMagic ? EffectFireMagicMult : (a_category == kLitSmoke ? EffectLitSmokeMult : EffectUnlitSmokeMult);
+	}
+
+	/// In-world effects that may follow the scene light (never additive, membrane, blood, sky, projected or deferred effects).
+	bool CanFollow()
+	{
+#	if defined(ADDBLEND) || defined(MEMBRANE) || defined(BLOOD) || defined(SKY_OBJECT) || defined(PROJECTED_UV) || defined(DEFERRED)
+		return false;
+#	else
+		return (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InWorld) != 0u;
+#	endif
+	}
+
+	/// Unlit effects scaled by the scene brightness: alpha-blended ones only (a multiplicative blend darkens, it does not shine).
+	bool CanFollowUnlit()
+	{
+#	if defined(MULTBLEND) || defined(MULTBLEND_DECAL)
+		return false;
+#	else
+		return CanFollow();
+#	endif
+	}
+
+	/// The light a matte vanilla surface gets at this spot (Lighting.hlsl's vanilla diffuse terms, without a normal): the ambient
+	/// (the directional ambient's isotropic part) with IBL and skylighting as GetLightingColor's own sun path does, plus the sun
+	/// (Physical Sky transmittance, the weather fog's sun attenuation) x its shadow (Volumetric Shadows' particle shadows or the shadow
+	/// map, x the ray-traced visibility of "Particles Use RT Shadows") x Vanilla Diffuse Multiplier x Effect Lighting Multiplier.
+	float3 MatteLight(float3 a_positionWS, float4 a_screenPosition, uint a_eyeIndex, inout float a_shadowVariance)
+	{
+		float3 ambient = Color::Ambient(max(0, mul(SharedData::DirectionalAmbient, float4(0, 0, 0, 1))));
+		float skylightingDiffuse = 1.0;
+#	if defined(SKYLIGHTING)
+		[branch] if (!SharedData::InInterior)
+		{
+#		if defined(VR)
+			float3 positionMSSkylight = a_positionWS + FrameBuffer::CameraPosAdjust[a_eyeIndex].xyz - FrameBuffer::CameraPosAdjust[0].xyz;
+#		else
+			float3 positionMSSkylight = a_positionWS;
+#		endif
+			sh2 skylightingSH = Skylighting::sampleNoBias(SharedData::skylightingSettings, Skylighting::SkylightingProbeArray, positionMSSkylight);
+			skylightingDiffuse = saturate(SphericalHarmonics::FuncProductIntegral(skylightingSH, SphericalHarmonics::EvaluateCosineLobe(float3(0, 0, 1))) / Math::PI);
+			skylightingDiffuse = lerp(1.0, skylightingDiffuse, Skylighting::getFadeOutFactor(a_positionWS));
+			skylightingDiffuse = Skylighting::mixDiffuse(SharedData::skylightingSettings, skylightingDiffuse);
+		}
+#	endif
+#	if defined(IBL)
+		const bool diffuseIBL = SharedData::iblSettings.EnableDiffuseIBL && (!SharedData::InInterior || SharedData::iblSettings.EnableInterior);
+		if (diffuseIBL)
+			ambient *= SharedData::iblSettings.DALCAmount;
+#	endif
+		ambient *= skylightingDiffuse;
+#	if defined(IBL)
+		[branch] if (diffuseIBL)
+		{
+#		if defined(SKYLIGHTING)
+			ambient += Color::Saturation(ImageBasedLighting::GetIBLColor(float3(0, 0, 0), skylightingDiffuse), SharedData::iblSettings.IBLSaturation) * SharedData::iblSettings.DiffuseIBLScale;
+#		else
+			ambient += Color::Saturation(ImageBasedLighting::GetIBLColor(float3(0, 0, 0)), SharedData::iblSettings.IBLSaturation) * SharedData::iblSettings.DiffuseIBLScale;
+#		endif
+		}
+#	endif
+
+		// The sun as Lighting.hlsl takes it (Linear Lighting's sunlight scale outside the gamma, outdoors only).
+		const float llDirLightMult = (SharedData::linearLightingSettings.enableLinearLighting && !SharedData::linearLightingSettings.isDirLightLinear && !SharedData::InInterior) ? SharedData::linearLightingSettings.dirLightMult : 1.0f;
+		float3 sun = Color::DirectionalLight(SharedData::DirLightColor.xyz / max(llDirLightMult, 1e-5), SharedData::linearLightingSettings.isDirLightLinear) * llDirLightMult;
+		sun *= Color::VanillaDiffuseMult() * Color::EffectLightingMult();
+#	if defined(PHYSICAL_SKY)
+		if (SharedData::physSkyData.enabled)
+			sun *= PhysSky::SampleTr(normalize(SharedData::DirLightDirection.xyz), SampDepthSampler);
+#	endif
+#	if defined(EXP_HEIGHT_FOG)
+		sun *= WeatherFog::SunlightAttenuation(a_positionWS.z);  // 1 unless "CS Fog Takes Over" applies
+#	endif
+		[branch] if (!SharedData::InInterior)
+		{
+			bool isWorldShadow = false;
+			float shadow;
+#	if defined(VOLUMETRIC_SHADOWS)
+			[branch] if (VolumetricShadows::ParticleShadowsEnabled())
+				shadow = VolumetricShadows::GetEffectShadow(a_positionWS, normalize(a_positionWS), a_screenPosition.xy, a_eyeIndex);
+			else
+#	endif
+				shadow = ShadowSampling::GetEffectShadow(a_positionWS, normalize(a_positionWS), a_screenPosition.xy, a_eyeIndex, isWorldShadow);
+#	if defined(EXP_HEIGHT_FOG)
+			shadow *= RTFogVis::ParticleSun(a_positionWS, a_eyeIndex);
+#	endif
+			sun *= shadow;
+			if (!isWorldShadow)
+				a_shadowVariance = ComputeShadowVariance(shadow);
+		}
+		return ambient + sun;
+	}
+
+#	if defined(LIGHT_LIMIT_FIX)
+	/// Light Limit Fix's clustered point lights on an effect (49b: x the ray-traced visibility of "Particles Use RT Shadows"). Each light
+	/// adds PointLight x attenuation x a_scaleA x fade x a_scaleB: the old lit-effect loop with a_scaleA = 0.5, a_scaleB = Effect Lighting
+	/// Multiplier; following the scene light a_scaleA = Vanilla Diffuse Multiplier.
+	void AddPointLights(inout float3 a_color, float3 a_positionWS, uint a_eyeIndex, float a_scaleA, float a_scaleB, inout uint a_lightCount)
+	{
+		float3 viewPosition = mul(FrameBuffer::CameraView[a_eyeIndex], float4(a_positionWS, 1)).xyz;
+		float2 screenUV = FrameBuffer::ViewToUV(viewPosition, true, a_eyeIndex);
+		bool inWorld = Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InWorld;
+
+		uint clusterIndex = 0;
+		if (inWorld && LightLimitFix::GetClusterIndex(screenUV, viewPosition.z, clusterIndex)) {
+			a_lightCount = LightLimitFix::lightGrid[clusterIndex].lightCount;
+			uint lightOffset = LightLimitFix::lightGrid[clusterIndex].offset;
+#		if defined(EXP_HEIGHT_FOG)
+			// (49b) Particles Use RT Shadows: the four point-light sources traced at this spot of the fog grid. A light among them is shadowed by
+			// its ray-traced visibility; a shadow-casting light (skipped before) lights the effect only when it is among them.
+			bool rtLights = (RTFogVis::Flags() & RTFogVis::kParticleLights) != 0u;
+			uint2 rtSlots = 0u.xx;
+			[branch] if (rtLights)
+			{
+				float3 rtUvw;
+				rtLights = RTFogVis::ParticleCoords(a_positionWS, a_eyeIndex, rtUvw);
+				uint rtW, rtH, rtD;
+				RTFogVis::RTFogLightId.GetDimensions(rtW, rtH, rtD);
+				const int4 rtCoord = int4(min(uint3(rtUvw * float3(rtW, rtH, rtD)), uint3(rtW, rtH, rtD) - 1u), 0);
+				if (rtLights)
+					rtSlots = RTFogVis::PackSlots(RTFogVis::RTFogLightId.Load(rtCoord), RTFogVis::RTFogLightVis.Load(rtCoord));
+			}
+#		endif
+			[loop] for (uint i = 0; i < a_lightCount; i++)
+			{
+				uint clusteredLightIndex = LightLimitFix::lightList[lightOffset + i];
+				LightLimitFix::Light light = LightLimitFix::lights[clusteredLightIndex];
+				if (LightLimitFix::IsLightIgnored(light))
+					continue;
+				bool skipLight = (light.lightFlags & LightLimitFix::LightFlags::Shadow) != 0u;
+				float rtLightVis = 1.0;
+#		if defined(EXP_HEIGHT_FOG)
+				[branch] if (rtLights)
+				{
+					const uint rtId = RTFogVis::LightId(clusteredLightIndex);
+					bool rtFound;
+					rtLightVis = RTFogVis::LightVisibility(rtSlots, rtId, rtFound);
+					if (rtFound)
+						skipLight = false;
+				}
+#		endif
+				if (skipLight)
+					continue;
+				float3 lightDirection = light.positionWS[a_eyeIndex].xyz - a_positionWS;
+				float lightDist = length(lightDirection);
+
+#		if defined(ISL)
+				float intensityMultiplier = InverseSquareLighting::GetAttenuation(lightDist, light);
+#		else
+				float intensityFactor = saturate(lightDist / light.radius);
+				float intensityMultiplier = 1 - intensityFactor * intensityFactor;
+#		endif
+
+				const bool isPointLightLinear = light.lightFlags & LightLimitFix::LightFlags::Linear;
+				float3 lightColor = Color::PointLight(light.color.xyz, isPointLightLinear) * intensityMultiplier * a_scaleA * light.fade * a_scaleB;
+				a_color += lightColor * rtLightVis;
+			}
+		}
+	}
+#	endif
+}
+
 #	if defined(LIGHTING) && (defined(VOLUMETRIC_SHADOWS) || defined(EXP_HEIGHT_FOG))  // (47d) + the sunlight in the weather's fog
 // (batch 38, A2) Port of upstream ShadowSampling::ExtractLighting (0f79d567a): split the
 // engine's combined effect light colour into sun and ambient by the luminance ratio of the
@@ -630,14 +847,17 @@ float3 EstimateEffectDirectionalPart(float3 inputColor)
 #	endif
 
 #	if defined(LIGHTING)
-float3 GetLightingColor(float3 msPosition, float3 worldPosition, float4 screenPosition, uint eyeIndex, inout float shadowVariance)
+float3 GetLightingColor(float3 msPosition, float3 worldPosition, float4 screenPosition, uint eyeIndex, inout float shadowVariance, bool a_follow)
 {
 	float4 lightDistanceSquared = (PLightPositionX[eyeIndex] - msPosition.xxxx) * (PLightPositionX[eyeIndex] - msPosition.xxxx) + (PLightPositionY[eyeIndex] - msPosition.yyyy) * (PLightPositionY[eyeIndex] - msPosition.yyyy) + (PLightPositionZ[eyeIndex] - msPosition.zzzz) * (PLightPositionZ[eyeIndex] - msPosition.zzzz);
 	float4 lightFadeMul = 1.0.xxxx - saturate(PLightingRadiusInverseSquared * lightDistanceSquared);
 
 	float3 color = DLightColor.xyz * Color::EffectLightingMult();
 
-	if ((Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::EffectShadows)) {
+	[branch] if (a_follow) {
+		// (49g) Effects Follow Scene Light > Lit Smoke and Mist: the light a matte vanilla surface gets here (EffectScene::MatteLight).
+		color = EffectScene::MatteLight(worldPosition, screenPosition, eyeIndex, shadowVariance);
+	} else if ((Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::EffectShadows)) {
 		float llDirLightMult = (SharedData::linearLightingSettings.enableLinearLighting && !SharedData::linearLightingSettings.isDirLightLinear) ? SharedData::linearLightingSettings.dirLightMult : 1.0f;
 		float3 dirLightColor = Color::DirectionalLight(SharedData::DirLightColor.xyz / max(llDirLightMult, 1e-5), SharedData::linearLightingSettings.isDirLightLinear) * llDirLightMult * 0.5 * Color::EffectLightingMult();
 
@@ -779,13 +999,15 @@ float3 GetLightingColor(float3 msPosition, float3 worldPosition, float4 screenPo
 #		endif
 	}
 
+	// (49g) Following the scene light, the engine's point lights x Vanilla Diffuse Multiplier as on surfaces (Effect Lighting Multiplier a trim).
+	const float pointLightMult = a_follow ? Color::VanillaDiffuseMult() * Color::EffectLightingMult() : Color::EffectLightingMult();
 #		if defined(LIGHT_LIMIT_FIX)
 	if (!(Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InWorld))
 #		endif
 	{
-		color.x += dot(Color::PointLight(PLightColorR.xxx).x * lightFadeMul * Color::EffectLightingMult(), 1.0.xxxx);
-        color.y += dot(Color::PointLight(PLightColorG.xxx).x * lightFadeMul * Color::EffectLightingMult(), 1.0.xxxx);
-        color.z += dot(Color::PointLight(PLightColorB.xxx).x * lightFadeMul * Color::EffectLightingMult(), 1.0.xxxx);
+		color.x += dot(Color::PointLight(PLightColorR.xxx).x * lightFadeMul * pointLightMult, 1.0.xxxx);
+        color.y += dot(Color::PointLight(PLightColorG.xxx).x * lightFadeMul * pointLightMult, 1.0.xxxx);
+        color.z += dot(Color::PointLight(PLightColorB.xxx).x * lightFadeMul * pointLightMult, 1.0.xxxx);
 	}
 
 	return color;
@@ -931,84 +1153,48 @@ PS_OUTPUT main(PS_INPUT input)
 	}
 #	endif
 
+	// (49g) Effects Follow Scene Light (Linear Lighting > Effects): which multiplier this effect takes, and whether its light follows
+	// the scene (lit smoke and mist: the light a matte surface gets here; unlit smoke and mist: scaled by the scene's brightness).
+	// Master off: both false, every term below as before.
+	const uint sceneCategory = EffectScene::Category(lightingInfluence);
+	const bool sceneMaster = EffectScene::Master();
+	const bool followLit = sceneMaster && (EffectSceneFlags & EffectScene::kLit) != 0u && sceneCategory == EffectScene::kLitSmoke && EffectScene::CanFollow();
+	const bool followUnlit = sceneMaster && (EffectSceneFlags & EffectScene::kUnlit) != 0u && sceneCategory == EffectScene::kUnlitSmoke && EffectScene::CanFollowUnlit();
+
 	// (48n, official CS #3033) Light only pixels that survive the alpha test.
 #	if defined(LIGHTING)
-	propertyColor = GetLightingColor(input.MSPosition.xyz, input.WorldPosition.xyz, input.Position.xyzw, eyeIndex, shadowVariance);
+	propertyColor = GetLightingColor(input.MSPosition.xyz, input.WorldPosition.xyz, input.Position.xyzw, eyeIndex, shadowVariance, followLit);
 
 #		if defined(LIGHT_LIMIT_FIX)
 	uint lightCount = 0;
-	if (LightingInfluence.x > 0.0) {
-		float3 viewPosition = mul(FrameBuffer::CameraView[eyeIndex], float4(input.WorldPosition.xyz, 1)).xyz;
-		float2 screenUV = FrameBuffer::ViewToUV(viewPosition, true, eyeIndex);
-		bool inWorld = Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InWorld;
-
-		uint clusterIndex = 0;
-		if (inWorld && LightLimitFix::GetClusterIndex(screenUV, viewPosition.z, clusterIndex)) {
-			lightCount = LightLimitFix::lightGrid[clusterIndex].lightCount;
-			uint lightOffset = LightLimitFix::lightGrid[clusterIndex].offset;
-#			if defined(EXP_HEIGHT_FOG)
-			// (49b) Particles Use RT Shadows: the four point-light sources traced at this spot of the fog grid. A light among them is shadowed by
-			// its ray-traced visibility; a shadow-casting light (skipped before) lights the effect only when it is among them.
-			bool rtLights = (RTFogVis::Flags() & RTFogVis::kParticleLights) != 0u;
-			uint2 rtSlots = 0u.xx;
-			[branch] if (rtLights)
-			{
-				float3 rtUvw;
-				rtLights = RTFogVis::ParticleCoords(input.WorldPosition.xyz, eyeIndex, rtUvw);
-				uint rtW, rtH, rtD;
-				RTFogVis::RTFogLightId.GetDimensions(rtW, rtH, rtD);
-				const int4 rtCoord = int4(min(uint3(rtUvw * float3(rtW, rtH, rtD)), uint3(rtW, rtH, rtD) - 1u), 0);
-				if (rtLights)
-					rtSlots = RTFogVis::PackSlots(RTFogVis::RTFogLightId.Load(rtCoord), RTFogVis::RTFogLightVis.Load(rtCoord));
-			}
-#			endif
-			[loop] for (uint i = 0; i < lightCount; i++)
-			{
-				uint clusteredLightIndex = LightLimitFix::lightList[lightOffset + i];
-				LightLimitFix::Light light = LightLimitFix::lights[clusteredLightIndex];
-				if (LightLimitFix::IsLightIgnored(light))
-					continue;
-				bool skipLight = (light.lightFlags & LightLimitFix::LightFlags::Shadow) != 0u;
-				float rtLightVis = 1.0;
-#			if defined(EXP_HEIGHT_FOG)
-				[branch] if (rtLights)
-				{
-					const uint rtId = RTFogVis::LightId(clusteredLightIndex);
-					bool rtFound;
-					rtLightVis = RTFogVis::LightVisibility(rtSlots, rtId, rtFound);
-					if (rtFound)
-						skipLight = false;
-				}
-#			endif
-				if (skipLight)
-					continue;
-				float3 lightDirection = light.positionWS[eyeIndex].xyz - input.WorldPosition.xyz;
-				float lightDist = length(lightDirection);
-
-#			if defined(ISL)
-				float intensityMultiplier = InverseSquareLighting::GetAttenuation(lightDist, light);
-#			else
-				float intensityFactor = saturate(lightDist / light.radius);
-				float intensityMultiplier = 1 - intensityFactor * intensityFactor;
-#			endif
-
-				const bool isPointLightLinear = light.lightFlags & LightLimitFix::LightFlags::Linear;
-				float3 lightColor = Color::PointLight(light.color.xyz, isPointLightLinear) * intensityMultiplier * 0.5 * light.fade * Color::EffectLightingMult();
-				propertyColor += lightColor * rtLightVis;
-			}
-		}
-	}
+	if (LightingInfluence.x > 0.0)
+		EffectScene::AddPointLights(propertyColor, input.WorldPosition.xyz, eyeIndex, followLit ? Color::VanillaDiffuseMult() : 0.5, Color::EffectLightingMult(), lightCount);
 #		endif
 #	elif defined(MEMBRANE)
 	propertyColor *= 0;
 	lightingInfluence = 0;
+#	else
+	// (49g) Lit smoke and mist without the LIGHTING flag (the engine hands them one light colour): the same light as the lit ones.
+	[branch] if (followLit)
+	{
+		propertyColor = EffectScene::MatteLight(input.WorldPosition.xyz, input.Position.xyzw, eyeIndex, shadowVariance);
+#		if defined(LIGHT_LIMIT_FIX)
+		uint followLightCount = 0;
+		EffectScene::AddPointLights(propertyColor, input.WorldPosition.xyz, eyeIndex, Color::VanillaDiffuseMult(), Color::EffectLightingMult(), followLightCount);
+#		endif
+	}
 #	endif
 
 	float3 lightColor = lerp(baseColor.xyz, propertyColor * baseColor.xyz, lightingInfluence.xxx);
 
+	// (49g) Unlit Smoke and Mist: x the scene's ambient brightness relative to this weather's midday (dims at night and indoors).
+	[branch] if (followUnlit)
+		lightColor *= EffectUnlitSceneScale;
+
 	float effectNormalization = 1.0;
 #	if defined(IBL) && !defined(LIGHTING) && !defined(DEFERRED)
-	if (SharedData::iblSettings.EnableDiffuseIBL && SharedData::iblSettings.EffectNormalization && (!SharedData::InInterior || SharedData::iblSettings.EnableInterior) && (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InWorld)) {
+	// (49g) Not on effects that follow the scene light (they already have the scene's brightness).
+	if (SharedData::iblSettings.EnableDiffuseIBL && SharedData::iblSettings.EffectNormalization && (!SharedData::InInterior || SharedData::iblSettings.EnableInterior) && (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InWorld) && !followLit && !followUnlit) {
 		float directionalAmbientColorLuminance = Color::RGBToLuminance(
             max(0, mul(SharedData::DirectionalAmbient, float4(0, 0, 0, 1.0)))
         );
@@ -1041,6 +1227,12 @@ PS_OUTPUT main(PS_INPUT input)
 	}
 #	endif
 	lightColor *= effectNormalization;
+
+	// (49g) With Effects Follow Scene Light the effect's multiplier (Fire and Magic / Lit / Unlit Smoke and Mist) comes before the fog, so the
+	// fog over an effect matches the fog around it. Master off: Color::EffectMult after the fog, as before.
+	const bool sceneMultBeforeFog = sceneMaster && EffectScene::OwnMultiplier();
+	[branch] if (sceneMultBeforeFog)
+		lightColor *= EffectScene::Multiplier(sceneCategory);
 
 	float weatherFogAmount = 0.0;  // (47b) share of the view the game's fog covers under the height fog
 #	if !defined(MOTIONVECTORS_NORMALS)
@@ -1076,7 +1268,7 @@ PS_OUTPUT main(PS_INPUT input)
 
 	alpha = Color::EffectAlpha(alpha);
 
-	float4 finalColor = float4(Color::EffectMult(blendedColor), alpha);
+	float4 finalColor = float4(sceneMultBeforeFog ? blendedColor : Color::EffectMult(blendedColor), alpha);
 #	if defined(MULTBLEND_DECAL)
 	finalColor.xyz *= alpha;
 #	else
