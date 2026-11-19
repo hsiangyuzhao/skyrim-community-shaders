@@ -102,15 +102,13 @@ namespace Skylighting
 			positionMS.xyz += offset * CELL_SIZE * 0.5;
 		}
 
+		const bool farFallback = PhysLight::On(PhysLight::kFarSkylight);  // (49h stage 1, S4b)
+		const float farFade = farFallback ? getFadeOutFactorRaw(positionMS) : 1.0;
 		float3 positionMSAdjusted = positionMS - params.PosOffset.xyz;
 		float3 uvw = positionMSAdjusted / ARRAY_SIZE + .5;
 
-		if (any(uvw < 0) || any(uvw > 1))
-			return PhysLight::On(PhysLight::kFarSkylight) ? FarVisibilitySH() : scaledUnitSH;  // (49h stage 1, S4b)
-		const bool farFallback = PhysLight::On(PhysLight::kFarSkylight);  // (49h stage 1, S4b)
-		const float farFade = farFallback ? getFadeOutFactorRaw(positionMS) : 1.0;
-		[branch] if (farFallback && farFade <= 0.0)
-			return FarVisibilitySH();
+		if (any(uvw < 0) || any(uvw > 1) || (farFallback && farFade <= 0.0))
+			return farFallback ? FarVisibilitySH() : scaledUnitSH;  // (49h stage 1, S4b) outside: the fallback (one exit, as before)
 
 		float3 cellVxCoord = uvw * ARRAY_DIM;
 		int3 cell000 = floor(cellVxCoord - 0.5);
@@ -160,14 +158,12 @@ namespace Skylighting
 
 		const bool farFallback = PhysLight::On(PhysLight::kFarSkylight);  // (49h stage 1, S4b)
 		const float farFade = farFallback ? getFadeOutFactorRaw(positionMS) : 1.0;
-		[branch] if (farFallback && farFade <= 0.0)
-			return FarVisibilitySH();
 
 		float3 positionMSAdjusted = positionMS - params.PosOffset.xyz;
 		float3 uvw = positionMSAdjusted / ARRAY_SIZE + .5;
 
-		if (any(uvw < 0) || any(uvw > 1))
-			return PhysLight::On(PhysLight::kFarSkylight) ? FarVisibilitySH() : scaledUnitSH;  // (49h stage 1, S4b)
+		if (any(uvw < 0) || any(uvw > 1) || (farFallback && farFade <= 0.0))
+			return farFallback ? FarVisibilitySH() : scaledUnitSH;  // (49h stage 1, S4b) outside: the fallback (one exit, as before)
 
 		float3 cellVxCoord = uvw * ARRAY_DIM;
 		int3 cell000 = floor(cellVxCoord - 0.5);

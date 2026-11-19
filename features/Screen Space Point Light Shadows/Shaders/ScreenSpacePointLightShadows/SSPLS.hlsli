@@ -79,7 +79,7 @@ namespace ScreenSpacePointLightShadows
 		[branch] if (a_k > 0u)
 		{
 			// In the top K; the ones close to the first light out fade with it (no seam when the set changes).
-			w = a_score >= a_last * 0.999 && a_score > 0.0 ? (a_next > 0.0 ? smoothstep(1.0, 1.5, a_score / a_next) : 1.0) : 0.0;
+			w = a_score >= a_last * 0.999 && a_score > 0.0 ? (a_next > 0.0 ? smoothstep(1.0, 1.5, a_score / max(a_next, 1e-30)) : 1.0) : 0.0;
 		}
 		w *= smoothstep(0.035, 0.07, a_score / max(a_strongest, 1e-8)) * smoothstep(0.001, 0.002, a_score);  // Skip Weak Lights
 		return w;
