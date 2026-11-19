@@ -96,6 +96,9 @@ void GrassOptimizations::DrawSettings()
 		else if (!shadersReady)
 			ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Compiling optimized grass shaders; grass is drawn by the game until they are ready.");
 	}
+	// (49h) Pointer: the grass buffer pool and the loading-screen uploads are switched on Ray Tracing's Loading Screens page (49c).
+	ImGui::TextDisabled("Grass buffer pool and loading-screen uploads: Ray Tracing > Ray Tracing > Loading Screens >");
+	ImGui::TextDisabled("  \"Finish Loading Work Behind the Loading Screen\"");
 
 	ImGui::SeparatorText("Culling & LOD");
 

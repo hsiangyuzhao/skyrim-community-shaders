@@ -370,6 +370,13 @@ namespace PhysicalSkyModel
 		return lum;
 	}
 
+	Vec3 Model::Transmittance(double a_cameraRadius, const Vec3& a_dir) const
+	{
+		if (!ready)
+			return { 1.0, 1.0, 1.0 };
+		return TrAt({ 0.0, 0.0, a_cameraRadius }, a_dir);
+	}
+
 	double Model::RingLuminance(double a_cameraRadius, double a_elevationDeg, const Light* a_lights, int a_lightCount) const
 	{
 		const double e = a_elevationDeg * (kPi / 180.0);

@@ -301,6 +301,11 @@ namespace NeuralRendering
 		// afterwards logs the process's video memory next to the figure from before the build.
 		bool g_reportVramAfterRun = false;
 		std::uint64_t g_vramBeforeBuild = 0;
+		// (49h) Video memory right before the pass was built from nothing (switch-on), and the net after each switch-off: a real leak
+		// grows it on every cycle (one cycle alone mixes in the game's own allocations and the driver's caches).
+		std::uint64_t g_vramBeforeSwitchOn = 0;
+		std::int64_t g_lastNetAfterOff = 0;
+		std::uint32_t g_netGrowthStreak = 0;
 
 		std::uint32_t ClampModelPercent(std::uint32_t percent)
 		{
@@ -445,6 +450,17 @@ namespace NeuralRendering
 			g_haveResourceKey = false;
 			g_reportVramAfterRun = false;
 			logger::info("[DLSSNR] released everything ({}): video memory {}", why, SignedMB(before, after));
+			if (g_vramBeforeSwitchOn) {
+				// (49h) Net over the whole on / off cycle; warned when it grew on three cycles in a row by more than 30 MB each.
+				const std::int64_t net = static_cast<std::int64_t>(after) - static_cast<std::int64_t>(g_vramBeforeSwitchOn);
+				g_netGrowthStreak = net > g_lastNetAfterOff + 30 ? g_netGrowthStreak + 1 : 0u;
+				logger::info("[DLSSNR] on / off cycle: video memory {} MB before switch-on, {} MB now ({:+} MB; includes the game's own changes meanwhile)",
+					g_vramBeforeSwitchOn, after, net);
+				if (g_netGrowthStreak >= 3)
+					logger::warn("[DLSSNR] the net video memory after switching off grew on three cycles in a row: possible leak, keep this log");
+				g_lastNetAfterOff = net;
+				g_vramBeforeSwitchOn = 0;
+			}
 		}
 
 		bool RunPass(const Decision& decision, const Renderer::PassInput& input)
@@ -507,6 +523,7 @@ namespace NeuralRendering
 			input.residualMode = std::min(nr.residualMode, 1u);
 			input.protectSky = nr.protectSky;
 			input.maskSkyValue = nr.maskSkyValue ? 1u : 0u;
+			input.stabilize = nr.stabilize;  // (49h)
 			return input;
 		}
 	}
@@ -659,6 +676,7 @@ namespace NeuralRendering
 				g_vramBeforeBuild = vramAfter;
 			} else {
 				g_vramBeforeBuild = vramBefore;
+				g_vramBeforeSwitchOn = vramBefore;  // (49h)
 			}
 			g_reportVramAfterRun = true;
 			g_lastResourceKey = resourceKey;
@@ -852,6 +870,7 @@ namespace NeuralRendering
 		o["residual_mode"] = nr.residualMode ? "log-ratio split" : "additive (41b)";
 		o["protect_sky"] = nr.protectSky;
 		o["mask_sky_value"] = nr.maskSkyValue ? 1 : 0;
+		o["stabilize"] = nr.stabilize;  // (49h)
 		o["feature_creations"] = Runtime::Instance().FeatureCreations();
 		o["max_in_flight"] = renderer.MaxInFlight();
 		o["backpressure_waits"] = renderer.BackpressureWaits();

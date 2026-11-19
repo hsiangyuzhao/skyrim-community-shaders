@@ -132,6 +132,14 @@ namespace RayTracingCharacters
 		void Configure(bool a_physics, bool a_hair, bool a_alpha, bool a_firstPersonPlayer, bool a_dropTiny);
 		/// (47p) Bone matrices within float noise of the last skinned ones count as a still pose (no re-skinning).
 		void SetBonesTolerant(bool a_on) { bonesTolerant_ = a_on; }
+		/// (49h) "Hair: Ignore Faint Strands in RT": strict kGreater alpha thresholds and hair cards cut at alpha 0.5. A change re-captures
+		/// every character (next Update).
+		void SetStrictAlpha(bool a_on)
+		{
+			if (a_on != strictAlpha_)
+				RequestFlush();
+			strictAlpha_ = a_on;
+		}
 		/// (47q) The NPC rule: NPCs farther than this from the camera (with kBodyOnlyHysteresis) are traced with their merged opaque body /
 		/// armour only -- physics parts, hair and cut-out parts leave the TLAS and go back to the engine cascades -- and their merged BLAS
 		/// is refit every other frame (staggered by actor). The player and nearer NPCs: every part, every frame. 0 = no limit.
@@ -272,6 +280,7 @@ namespace RayTracingCharacters
 		bool alpha_ = false;
 		bool dropTiny_ = false;  // (47p)
 		bool bonesTolerant_ = false;  // (47p) "Ray tracing: ignore bone noise"
+		bool strictAlpha_ = true;     // (49h)
 		float bodyOnlyDistance_ = 0.0f;  // (47q) 0 = no limit
 		bool materials_ = false;         // (48g)
 		std::uint32_t stillReused_ = 0;  // (45n)

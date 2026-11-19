@@ -51,7 +51,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	DistanceNormalisation,
 	EnableContactAo,
 	ContactRadius,
-	ContactStrength)
+	ContactStrength,
+	SmoothContactAo)
 
 ////////////////////////////////////////////////////////////////////////////////////
 
@@ -343,6 +344,18 @@ void ScreenSpaceGI::DrawSettings()
 				std::vector<std::string> tooltipLines = {
 					"How dark contact shadows get. 1.0 is already strong; higher is rarely needed.",
 					"0 hides them but still costs performance; use the checkbox above to turn them off."
+				};
+				Util::DrawMultiLineTooltip(tooltipLines);
+			}
+
+			// (49h)
+			ImGui::Checkbox("Smooth Contact AO", &settings.SmoothContactAo);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				std::vector<std::string> tooltipLines = {
+					"On (default): contact shadows darken gradually and never turn a crease solid black, so a higher Strength deepens",
+					"creases (cleavage, armpits, cloth folds) instead of blackening every nook. Radius only changes the reach (it no",
+					"longer also acts as a second strength up close), and the look no longer changes with the DLSS mode.",
+					"Off: as in 49g (the same at low strength; past about 1.3 creases clip to black)."
 				};
 				Util::DrawMultiLineTooltip(tooltipLines);
 			}
@@ -904,7 +917,7 @@ void ScreenSpaceGI::UpdateSB()
 		// had before. Every subsequent frame carries the real value.
 		data.PrevFrameDim = (prevFrameDim.x > 0.0f && prevFrameDim.y > 0.0f) ? prevFrameDim : dynres;
 		// (47n) Contact AO: bit 0 the uncovered-area test + 4-frame window, bit 1 last frame's contact depth is there to test against.
-		data.ContactFlags = 1u | (contactDepthValid ? 2u : 0u);  // (48o) ContactGhostFix always on
+		data.ContactFlags = 1u | (contactDepthValid ? 2u : 0u) | (settings.SmoothContactAo ? 4u : 0u);  // (48o) ContactGhostFix always on; (49h) bit 2 Smooth Contact AO
 		data.ssgiPad0 = 0.0f;
 	}
 

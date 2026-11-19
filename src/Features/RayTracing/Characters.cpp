@@ -156,7 +156,7 @@ namespace RayTracingCharacters
 		/// (47p, "Ray tracing: leave out tiny parts that cast nothing") Eyes, brows and the mouth (teeth, tongue): tiny FaceGen
 		/// parts inside or on the head. The head's own shadow covers theirs, and a hit this close to the character's own surface
 		/// is ignored by the trace anyway (kCharacterSelfShadowOffset).
-		bool TinyFacePart(RE::BSGeometry* a_geometry)
+		bool TinyFacePart(RE::BSGeometry* a_geometry, bool a_lashes)
 		{
 			const auto& bound = a_geometry->worldBound;
 			if (!(bound.radius > 0.0f) || bound.radius > 8.0f)
@@ -180,6 +180,9 @@ namespace RayTracingCharacters
 			for (const char* key : { "eyes", "brow", "mouth", "teeth", "tongue" })
 				if (name.find(key) != std::string::npos)
 					return true;
+			// (49h) "Eyelashes" does not contain "eyes" (with Hair: Ignore Faint Strands in RT on).
+			if (a_lashes && name.find("lash") != std::string::npos)
+				return true;
 			return false;
 		}
 
@@ -683,7 +686,7 @@ namespace RayTracingCharacters
 			return nullptr;
 		}
 		// (47p) Tiny face parts that cast nothing visible (eyes, brows, mouth): not skinned or built at all.
-		if (dropTiny_ && !hair && TinyFacePart(a_geometry)) {
+		if (dropTiny_ && !hair && TinyFacePart(a_geometry, strictAlpha_)) {
 			++stats_.skipTinyFace;
 			return nullptr;
 		}
@@ -1121,6 +1124,15 @@ namespace RayTracingCharacters
 				return nullptr;
 			}
 			material.threshold = static_cast<float>(alphaProperty->alphaThreshold) / 255.0f;
+			// (49h) "Hair: Ignore Faint Strands in RT": the trace keeps alpha >= threshold. kGreater means alpha > threshold: half a step
+			// up keeps exactly that for 8-bit alpha (threshold 0 no longer turns a whole hair card solid). Hair cards keep only alpha
+			// >= 0.5 (their fringe of faint strands is blended, not tested, in the picture: as a solid board it cast wide stripes).
+			if (strictAlpha_) {
+				if (test == RE::NiAlphaProperty::TestFunction::kGreater)
+					material.threshold = (static_cast<float>(alphaProperty->alphaThreshold) + 0.5f) / 255.0f;
+				if (hair)
+					material.threshold = std::max(material.threshold, 0.5f);
+			}
 			material.alphaScale = rawAlpha.materialAlpha;
 			std::copy_n(rawAlpha.uv, 4, material.uvTransform);
 			const std::uint32_t colorOffset = vertexDesc.GetAttributeOffset(RE::BSGraphics::Vertex::VA_COLOR);

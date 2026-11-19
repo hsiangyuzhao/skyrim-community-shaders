@@ -39,7 +39,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	UseSSS,
 	FuzzStrength,
 	FuzzRoughness,
-	FuzzF0);
+	FuzzF0,
+	SkinAOOnDirectLight);
 
 void Skin::DrawSettings()
 {
@@ -140,6 +141,14 @@ void Skin::DrawSettings()
 	ImGui::SliderFloat("Body Tiling Multiplier", &settings.BodyTilingMultiplier, 0.5f, 5.0f, "%.1f");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("Multiply the tiling for the body to match the face");
+	}
+
+	// (49h) "Skin AO on Direct Light" (default on = before 49a).
+	ImGui::Checkbox("Skin AO on Direct Light", &settings.SkinAOOnDirectLight);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("On (default, as before 49a): the shading baked into the skin texture (creases, cleavage, folds) also darkens sunlight\n"
+		            "and lamp light, so they stay visible in direct sun.");
+		ImGui::Text("Off (as 49b-49g): that shading only darkens the ambient light and reflections; in full sun creases look flatter.");
 	}
 
 	// (49b) The 49a fixes (pore detail, shading fixes, no direct-light AO) are fixed on; the _wet / _rfaos compare switch and its status
@@ -1598,14 +1607,14 @@ void Skin::SetupExtraTexture(RE::BSLightingShaderMaterialBase const* material, R
 	// disassembly; the "never loaded" reading of community-shaders #2940 does not hold for this code.)
 	// (49b) Hitch fix F: a path already found missing this session is not looked up again (each new character with the same skin repeated the
 	// failed VFS lookup); it gets the black default, which the Lighting shader treats like the engine's small default (no texture).
-	const bool skipMissing = globals::features::rayTracing.RememberMissingSkin();
-	if (skipMissing && KnownMissingSkinModTexture(0, workingExtraPtr.extraTexturePath)) {
+	// (49h) Always (was under Ray Tracing's "Reserve Shaders and Memory Up Front" since 49c).
+	if (KnownMissingSkinModTexture(0, workingExtraPtr.extraTexturePath)) {
 		workingExtraPtr.rfaosTexture = stateData.defaultTextureBlack;
 		++skinModLookupsSkipped;
 	} else {
 		inTextureSet->SetTexture(RE::BSTextureSet::Texture::kEnvironment, workingExtraPtr.rfaosTexture);
 	}
-	if (skipMissing && KnownMissingSkinModTexture(1, workingExtraPtr.wetnessTexturePath)) {
+	if (KnownMissingSkinModTexture(1, workingExtraPtr.wetnessTexturePath)) {
 		workingExtraPtr.wetnessTexture = stateData.defaultTextureBlack;
 		++skinModLookupsSkipped;
 	} else {
@@ -1671,7 +1680,7 @@ uint32_t Skin::Fix49aShaderFlags() const
 	uint32_t f = 0;
 	f |= settings.FixPoreDetail ? 1u : 0u;
 	f |= settings.SkinShadingFixes ? 2u : 0u;
-	f |= settings.NoDirectLightAO ? 4u : 0u;
+	f |= settings.SkinAOOnDirectLight ? 0u : 4u;  // (49h) a switch again: off = the 49b-49g kFix49aNoDirectAO
 	return f;
 }
 

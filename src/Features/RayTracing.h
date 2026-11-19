@@ -192,6 +192,9 @@ public:
 		// the RT weight is 1 everywhere inside the interior's box.
 		bool AOInteriors = true;
 		int AOModeInterior = 0;        // AOModeKind (indoors)
+		// (49h) AOContactOnce "RTAO: Count Contact Once" (RT Ambient Occlusion > Advanced, under Mode Indoors): in the RTAO + contact AO mode
+		// the darker of the RTAO detail term and the contact AO, not their product (RTAOCompositeCS kFlagContactOnce). Off = 49g.
+		bool AOContactOnce = true;
 		// (46k) Transitions (Ray Tracing > Advanced): the loading pump (always on since 47m) prepares the destination behind the
 		// loading screen; its CPU per loading-screen frame; the frames after the loading screen still counted as black (the Fader
 		// Menu cannot tell when its fade-in starts).
@@ -269,7 +272,7 @@ public:
 		// the destination is captured and built before the loading screen closes (at most 3 s). LoadThreadCopies "Use the Loading Screen's Thread
 		// for GPU Copies": meanwhile the thread presenting the loading screen makes the cut-out texture copies and the grass uploads (D3D11).
 		// ReserveUpFront "Reserve Shaders and Memory Up Front": 49b D (point-denoiser wide variants at the main menu, slot 4 - 5 kept), E (alpha
-		// record buffers at full size), F (Advanced Skin remembers missing skin-mod textures). Master off = 48o / 49a.
+		// record buffers at full size); (49h) F (Advanced Skin remembers missing skin-mod textures) is always on now. Master off = 48o / 49a.
 		bool LoadFinish = true;
 		bool LoadPrepareArrival = true;
 		bool LoadThreadCopies = true;
@@ -329,7 +332,12 @@ public:
 		static constexpr bool PointCurvedRanking = true;  // (48o) fixed (no switch, key ignored)
 		// PointCloseContact "Close-Contact Shadows on Characters": the point lights' character ray starts 2 units out instead of 6 (6 kept
 		// where the light grazes or faces away from the depth normal: the terminator). The sun's character ray is unchanged.
-		static constexpr bool PointCloseContact = true;  // (48o) fixed (no switch, key ignored)
+		// (49h) Re-exposed (Point Light Shadows > Point Lights > Advanced), default on (= 48o-49g). Off: the 6-unit start, as the sun.
+		bool PointCloseContact = true;
+		// (49h) HairFaintStrands "Hair: Ignore Faint Strands in RT" (Objects in Ray Tracing > Characters > Hair): hair cards keep alpha >= 0.5
+		// in the trace (their faint fringe made a solid board), and every kGreater alpha test (characters and cut-out objects) keeps alpha >
+		// threshold instead of >= threshold. A change re-captures characters and the scene.
+		bool HairFaintStrands = true;
 		// (47y) Outside the settings macro. Grainy RT shadows on moving characters; each on by default, off = 47x exactly.
 		// MovingKeepHistory "Moving Characters: Keep Shadow History" (sun and point lights): where the camera-only reprojection finds no
 		// valid history (a moving surface), the denoisers also try last frame's motion vectors at constant velocity (the trace runs
@@ -657,8 +665,6 @@ public:
 	[[nodiscard]] bool LoadOn(bool a_item) const { return settings.LoadFinish && a_item; }
 	/// (49c) "Reserve Shaders and Memory Up Front" (49b D, E, F).
 	[[nodiscard]] bool ReserveOn() const { return LoadOn(settings.ReserveUpFront); }
-	/// (49b) F, (49c) under "Reserve Shaders and Memory Up Front" (read by Advanced Skin).
-	[[nodiscard]] bool RememberMissingSkin() const { return loaded && ReserveOn(); }
 	/// (49c) The loading-screen thread may run the grass uploads now (Grass Optimizations asks; see LoadingThreadWork).
 	[[nodiscard]] bool LoadingThreadWorkOpen() const { return loadThreadGate.load(); }
 	/// (49c) Probes (log only): a LoadingMenu hide message and SKSE's post-load-game message, with their thread and time.

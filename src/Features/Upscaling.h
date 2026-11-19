@@ -168,6 +168,10 @@ public:
 		// polarity: maskSkyValue is the value written for sky texels (the rest get the other one).
 		bool protectSky = false;
 		uint maskSkyValue = 1;
+		// (49h) "Stabilise Neural Rendering": the change the model makes (a per-pixel log2 ratio against the frame it was given) is
+		// blended with last frame's, reprojected with the motion vectors (depth-checked, clamped to this frame's 3x3 neighbourhood, weight
+		// 0.65 x (1 - |motion| / 12 px)): less shimmer from the model. StabilizeCS.hlsl. Default off.
+		bool stabilize = false;
 	};
 
 	struct Settings

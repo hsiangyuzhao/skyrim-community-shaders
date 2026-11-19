@@ -54,6 +54,10 @@ namespace PhysicalSkyModel
 		/// Mean luminance of SkyRay over 16 directions a_elevationDeg above the horizon.
 		double RingLuminance(double a_cameraRadius, double a_elevationDeg, const Light* a_lights, int a_lightCount) const;
 
+		/// (49h) Transmittance from a camera a_cameraRadius km from the planet centre toward a_dir (unit), as PhysSky::SampleTr
+		/// reads the LUT (Sky Precision: x the planet's visibility). {1, 1, 1} while the model is not ready.
+		Vec3 Transmittance(double a_cameraRadius, const Vec3& a_dir) const;
+
 	private:
 		static constexpr int TrW = 256, TrH = 64, MsW = 32, MsH = 32;
 

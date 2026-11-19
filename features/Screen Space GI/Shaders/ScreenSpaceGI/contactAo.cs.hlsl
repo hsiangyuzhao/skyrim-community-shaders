@@ -99,6 +99,11 @@ static const float ContactAccumFrames = 8.0;
 static const float ContactAccumFramesShort = 4.0;
 static const uint kContactFlagGhostFix = 1u;
 static const uint kContactFlagPrevDepth = 2u;
+// (49h) "Smooth Contact AO" (Screen Space GI > Contact AO): visibility exp(-occlusion) instead of saturate(1 - occlusion) (the same
+// slope at the start, never clipped to black: strength stays a strength); the falloff over the radius the clamped taps really reach
+// (near the camera the pixel cap shrank the tap disk but the falloff kept the full radius: Radius acted as a second strength); the
+// 64 px cap scaled with the render height (/ 1440), so DLSS modes no longer change the look. Off = 49g.
+static const uint kContactFlagSmooth = 4u;
 
 // Slack on the neighbourhood fence, in occlusion units. Two R8_UNORM quanta.
 //
@@ -138,8 +143,9 @@ groupshared float g_contact[8][8];
  */
 float EvaluateContact(uint2 a_px, float3 a_posVS, float3 a_normalVS, float a_viewZ, uint a_eyeIndex, float a_phase)
 {
+	const bool smooth = (ContactFlags & kContactFlagSmooth) != 0u;  // (49h)
 	const float radius = max(ContactRadius, 0.1) / GAME_UNIT_TO_CM;
-	const float radiusSq = radius * radius;
+	float radiusSq = radius * radius;
 
 	// View units per pixel at this depth, measured by reconstructing the next texel across at the
 	// *same* depth. Needs no knowledge of the projection convention and is automatically right
@@ -150,7 +156,15 @@ float EvaluateContact(uint2 a_px, float3 a_posVS, float3 a_normalVS, float a_vie
 
 	// Clamped at both ends: the floor keeps a distant pixel's taps on distinct texels, and the
 	// ceiling stops a near-field pixel from turning this into a full-screen AO pass.
-	const float pixelRadius = clamp(radius / max(unitsPerPixel, 1e-4), MinContactPixels, MaxContactPixels);
+	// (49h) Smooth Contact AO: the cap in 1440p pixels (the render height under DLSS), and the falloff over the radius the clamped
+	// taps actually cover when the cap hits (not past it: beyond the radius nothing counts anyway).
+	const float maxPixels = smooth ? max(MaxContactPixels * FrameDim.y / 1440.0, MinContactPixels) : MaxContactPixels;
+	const float pixelRadius = clamp(radius / max(unitsPerPixel, 1e-4), MinContactPixels, maxPixels);
+	[flatten] if (smooth)
+	{
+		const float reach = min(radius, pixelRadius * unitsPerPixel);
+		radiusSq = max(reach * reach, 1e-6);
+	}
 
 	// The clamp is the *render* extent, not the texture extent: under dynamic resolution only the
 	// sub-rect [0, FrameDim) of the depth buffer holds this frame's values, so a 64-pixel tap
@@ -200,7 +214,8 @@ float EvaluateContact(uint2 a_px, float3 a_posVS, float3 a_normalVS, float a_vie
 
 	occlusion *= ContactStrength * (4.0 / float(ContactSamples));
 
-	return saturate(1.0 - occlusion);
+	// (49h) Smooth Contact AO: exp(-occlusion) never reaches black, so a strong setting deepens creases instead of flattening them.
+	return smooth ? exp(-max(occlusion, 0.0)) : saturate(1.0 - occlusion);
 }
 
 [numthreads(8, 8, 1)] void main(

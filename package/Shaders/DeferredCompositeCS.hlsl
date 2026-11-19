@@ -175,6 +175,22 @@ float SSRTCompositeViewZ(float screenDepth)
 #	define COMPOSITE_AMBIENT_SKY
 #endif
 
+// (49h) Composite fixes (DynamicCubemaps::BindCompositeConstants; unbound = all zero = 49g):
+//  bit 0 "Reflection Brightness Fix" (F11 > Materials > Dynamic Cubemaps): the cubemap reflection at the cubemap's own brightness,
+//        as SSRT's miss fallback reads it, instead of its colour at 0.5 x weather ambient + IBL brightness; while the cubemap is
+//        warming up (CubemapTrust < 1) it blends from the old formula with the weather ambient in Linear Lighting units.
+cbuffer CompositeFixCB : register(b3)
+{
+	uint CompositeFixFlags;
+	float CubemapTrust;  // 0 right after a load / an instant weather change, 1 once ~5 captures are in
+	float2 CompositeFixPad;
+};
+
+bool ReflectionFixOn()
+{
+	return (CompositeFixFlags & 1u) != 0u;
+}
+
 #if defined(PHYSICAL_SKY)
 #	define PS_DEFERRED_RSRCS
 #	define PS_DEFERRED_SAMPLERS
@@ -438,10 +454,16 @@ float SSRTCompositeViewZ(float screenDepth)
 
 		float3 finalIrradiance = 0;
 
-        float directionalAmbientColorSpecular = Color::RGBToLuminance(max(0, mul(SharedData::DirectionalAmbient, float4(R, 1.0)))) * Color::ReflectionNormalisationScale;
+		// (49h) Reflection Brightness Fix: the weather ambient converted like every other ambient (Color::Ambient: Linear Lighting's
+		// conversion; upstream compendium-clean DeferredCompositeCS.hlsl:232). Off: the raw value as in 49g.
+		const float3 dalcSpecularRaw = max(0, mul(SharedData::DirectionalAmbient, float4(R, 1.0)));
+		float directionalAmbientColorSpecular = Color::RGBToLuminance(ReflectionFixOn() ? Color::Ambient(dalcSpecularRaw) : dalcSpecularRaw) * Color::ReflectionNormalisationScale;
+		// (49h) Reflection Brightness Fix: the cubemap at its own brightness (linear), as SSRT's miss fallback reads it.
+		float3 rawCubemapIrradiance = 0.0;
 
 #	if defined(INTERIOR)
 		float3 specularIrradiance = EnvTexture.SampleLevel(LinearSampler, R, level);
+		rawCubemapIrradiance = Color::IrradianceToLinear(specularIrradiance);
 
         float specularIrradianceLuminance = Color::RGBToLuminance(EnvTexture.SampleLevel(LinearSampler, R, 15));
 
@@ -510,6 +532,15 @@ float SSRTCompositeViewZ(float screenDepth)
 		}
 
 		finalIrradiance = lerp(specularIrradiance, specularIrradianceReflections, skylightingSpecular);
+
+		// (49h) As ssrt_raymarch.hlsl's cubemap fallback (CubemapNormalization 0): the no-sky capture as it is, plus the sky the
+		// full capture adds, x the specular sky visibility above.
+		[branch] if (ReflectionFixOn())
+		{
+			const float3 envNoSky = EnvTexture.SampleLevel(LinearSampler, R, level);
+			const float3 envWithSky = EnvReflectionsTexture.SampleLevel(LinearSampler, R, level);
+			rawCubemapIrradiance = Color::IrradianceToLinear(envNoSky + max(envWithSky - envNoSky, 0.0) * skylightingSpecular);
+		}
 #	else
 #		if defined(IBL)
 		float3 iblColor = 0;
@@ -524,10 +555,17 @@ float SSRTCompositeViewZ(float screenDepth)
 
         float specularIrradianceReflectionsLuminance = Color::RGBToLuminance(EnvReflectionsTexture.SampleLevel(LinearSampler, R, 15));
 
+		rawCubemapIrradiance = Color::IrradianceToLinear(specularIrradianceReflections);
+
 	    specularIrradianceReflections = (specularIrradianceReflections / max(specularIrradianceReflectionsLuminance, 0.001)) * directionalAmbientColorSpecular;
 
 		finalIrradiance = Color::IrradianceToLinear(specularIrradianceReflections);
 #	endif
+
+		// (49h) Reflection Brightness Fix: the cubemap's own brightness, blended in as the cubemap warms up after a load or an
+		// instant weather change (CubemapTrust 0 -> 1 over ~5 captures; the formula above holds meanwhile). Off: 49g.
+		[branch] if (ReflectionFixOn() && CubemapTrust > 0.0)
+			finalIrradiance = lerp(finalIrradiance, max(rawCubemapIrradiance, 0.0), saturate(CubemapTrust));
 
 #	if defined(SSGI)
 		float ssgiAo;

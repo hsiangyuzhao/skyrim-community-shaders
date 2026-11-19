@@ -75,7 +75,9 @@ struct Skin : Feature
 		static constexpr bool UseSkinModTextures = true;
 		static constexpr bool FixPoreDetail = true;
 		static constexpr bool SkinShadingFixes = true;
-		static constexpr bool NoDirectLightAO = true;
+		// (49h) "Skin AO on Direct Light" (Advanced Skin page): the skin AO (_rfaos alpha / the skin AO term) also darkens sunlight and
+		// lamps again, as before 49a (default on). Off = 49b-49g (NoDirectLightAO fixed on). New key (the 49a key stays ignored).
+		bool SkinAOOnDirectLight = true;
 		// (44a) Extra wetness, the Perlin wetness parameters, the film strength and the 43b
 		// coverage options moved to the Wet Skin page (WetSkin.h). (47o) StartSweat / FullSweat /
 		// UseDynamicWetness (moved there in 47i) are no longer kept here (WetSkin reads the raw JSON).

@@ -135,6 +135,8 @@ namespace NeuralRendering
 			/// the far plane); sky texels get maskSkyValue (0 or 1), the rest the other.
 			bool protectSky = false;
 			std::uint32_t maskSkyValue = 1;
+			/// (49h) "Stabilise Neural Rendering" (StabilizeCS.hlsl): the per-pixel edit blended with last frame's (shader route only).
+			bool stabilize = false;
 		};
 
 		/// (batch 38a) The Batch 38 pass. Leaves the colour untouched and returns false on any

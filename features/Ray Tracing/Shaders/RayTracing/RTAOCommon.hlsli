@@ -57,6 +57,9 @@ bool RawDynamic(float a_b)
 // A pass skips a group whose tiles are all farther than the reach its consumers need from it (the traced pixels read nothing it skipped:
 // every traced pixel's value is exactly 47q's). Unbound (the flag off): reads 0, nothing is skipped.
 static const uint kFlagTileSkip = 2048u;
+// (49h) "RTAO: Count Contact Once" (KeepContact mode): the contact AO and the RTAO detail term see the same centimetre-scale creases; the
+// darker of the two is taken instead of their product (large scale x min(detail, contact)).
+static const uint kFlagContactOnce = 4096u;
 Texture2D<uint> TileDist : register(t10);
 
 bool TilesFar(int2 a_lo, int2 a_hi, uint a_reach)
