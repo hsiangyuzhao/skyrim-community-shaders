@@ -3,6 +3,7 @@
 
 #include "Common/Color.hlsli"
 #include "Common/Math.hlsli"
+#include "Common/PhysicalLighting.hlsli"
 #include "Common/SharedData.hlsli"
 
 #ifndef OMIT_PS_NAMESPACE
@@ -488,6 +489,14 @@ float3 SampleTr(float3 sunDir, SamplerState sampSv)
 	return tr;
 }
 
+// (49h stage 1, S1) "Same Sun and Moon Light Everywhere": the phase below is normalised so an isotropic cloud sends back E / 2, about
+// 1.8x what a white ground surface shows in the same light (E x the vanilla diffuse factor, 0.28 with Linear Lighting). x this puts
+// the sun and the moons on clouds in ground units. 1 while off.
+float CloudGroundUnits()
+{
+	return PhysLight::On(PhysLight::kDirect) ? 2.0 * Color::VanillaDiffuseMult() : 1.0;
+}
+
 #		if defined(CLOUD_SHADOWS)
 float3 RelightCloud(float4 baseColor, float3 viewDir, float3 cloudPosWS, SamplerState sampTr, SamplerState sampCube)
 {
@@ -512,7 +521,7 @@ float3 RelightCloud(float4 baseColor, float3 viewDir, float3 cloudPosWS, Sampler
 		data.silverLiningSpread > 0 ? data.silverLiningSpread: 0,
 		data.silverLiningSpread < 0 ? 1 + data.silverLiningSpread : 1,
 		lerp(0.25 * RCP_PI, Phase::ThomasSchander(u), data.silverLiningMix),
-		0.25 * RCP_PI) * 2 * Math::PI * data.cloudRelightMix;
+		0.25 * RCP_PI) * 2 * Math::PI * data.cloudRelightMix * CloudGroundUnits();
 
 	float3 cloudColor = baseColor.rgb * data.cloudOriginalMix;
 
@@ -604,7 +613,7 @@ float CloudPhase(float alpha, float3 viewDir, float3 lightDir)
 		data.silverLiningSpread > 0 ? data.silverLiningSpread : 0,
 		data.silverLiningSpread < 0 ? 1 + data.silverLiningSpread : 1,
 		lerp(0.25 * RCP_PI, Phase::ThomasSchander(u), data.silverLiningMix),
-		0.25 * RCP_PI) * 2 * Math::PI * data.cloudRelightMix;
+		0.25 * RCP_PI) * 2 * Math::PI * data.cloudRelightMix * CloudGroundUnits();  // (49h stage 1, S1)
 }
 
 // One body's light on the cloud: colour x the air between it and the cloud x the planet's shadow x
@@ -648,7 +657,8 @@ float3 RelightCloudMulti(float4 baseColor, float3 viewDir, float3 cloudPosWS, Sa
 	// over the upper sky, the zenith and four directions 15 degrees up. A white matte layer under an
 	// even sky of radiance L sends back L; a light of irradiance E sends back E / pi, which the phase
 	// normalisation above turns into E / 2. The same factor (pi / 2) is applied to the sky.
-	[branch] if (cloud.SkyAmbient > 0.0)
+	// (49h stage 1, S2) "Clouds Get the Sky's Ambient Light": Sky.hlsl adds the ground's ambient after the weather cloud colour instead.
+	[branch] if (cloud.SkyAmbient > 0.0 && !PhysLight::On(PhysLight::kCloudAmbient))
 	{
 		const float c15 = 0.9659258, s15 = 0.2588190;
 		// the zenith: SkyViewLutUv's v floor, or (47b, Sky Precision) the first row's centre
@@ -688,8 +698,12 @@ float3 CloudMoonLight(float4 baseColor, float3 viewDir, float3 cloudPosWS, Sampl
 		float3 light = CloudBodyLight(baseColor, viewDir, posPlanet, masserDir, cloud.MasserColor, sampTr, sampCube) * masserHalo;
 		light += CloudBodyLight(baseColor, viewDir, posPlanet, secundaDir, cloud.SecundaColor, sampTr, sampCube) * secundaHalo;
 
-		light = lerp(Color::RGBToLuminance(light), light, saturate(cloud.MoonCloudSaturation));
-		result = min(baseColor.a * baseColor.rgb * light * cloud.MoonCloudStrength, 16.0);
+		// (49h stage 1, S1) the moonlight on clouds is the ground's moonlight: no strength factor, its own colour (grey only with "Greyer
+		// Moonlight on Clouds"), cloud alpha once (the blend applies it). Off: 44h.
+		const bool groundMoon = PhysLight::On(PhysLight::kDirect);
+		const float saturation = (!groundMoon || PhysLight::On(PhysLight::kMoonGrey)) ? saturate(cloud.MoonCloudSaturation) : 1.0;
+		light = lerp(Color::RGBToLuminance(light), light, saturation);
+		result = groundMoon ? min(baseColor.rgb * light, 16.0) : min(baseColor.a * baseColor.rgb * light * cloud.MoonCloudStrength, 16.0);
 	}
 	return result;
 }

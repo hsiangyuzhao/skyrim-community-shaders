@@ -1594,12 +1594,12 @@ void Skin::SetupExtraTexture(RE::BSLightingShaderMaterialBase const* material, R
 
 	auto& workingExtraPtr = skinExtraTextures.try_emplace(hashKey).first->second;
 	workingExtraPtr.rfaosTexture = stateData.defaultTextureWhite;
-	workingExtraPtr.wetnessTexture = stateData.defaultTextureWhite;
+	// (49h) The _wet texture is no longer loaded or bound: only the retired Legacy (pre-42c) wetness read it.
+	workingExtraPtr.wetnessTexture = stateData.defaultTextureBlack;
 	workingExtraPtr.extraTexturePath = extraTexturePath;
-	workingExtraPtr.wetnessTexturePath = wetnessTexturePath;
+	workingExtraPtr.wetnessTexturePath = "";
 
 	inTextureSet->SetTexturePath(RE::BSTextureSet::Texture::kEnvironment, workingExtraPtr.extraTexturePath.c_str());
-	inTextureSet->SetTexturePath(RE::BSTextureSet::Texture::kMultilayer, workingExtraPtr.wetnessTexturePath.c_str());
 	// Despite its CommonLib name, BSTextureSet vfunc 26 ("SetTexture") is the engine's texture-set loader: it reads the slot's
 	// path and loads it into the out pointer with BSShaderManager::GetTexture(path, demand = true, out, slot == kHeight)
 	// (SE 1.5.97: BSShaderTextureSet 0x1412E5390, BGSTextureSet 0x1402D1B90 -> 0x141295C30), i.e. through the game's BSA / loose
@@ -1614,14 +1614,7 @@ void Skin::SetupExtraTexture(RE::BSLightingShaderMaterialBase const* material, R
 	} else {
 		inTextureSet->SetTexture(RE::BSTextureSet::Texture::kEnvironment, workingExtraPtr.rfaosTexture);
 	}
-	if (KnownMissingSkinModTexture(1, workingExtraPtr.wetnessTexturePath)) {
-		workingExtraPtr.wetnessTexture = stateData.defaultTextureBlack;
-		++skinModLookupsSkipped;
-	} else {
-		inTextureSet->SetTexture(RE::BSTextureSet::Texture::kMultilayer, workingExtraPtr.wetnessTexture);
-	}
 	NoteSkinModTexture(0, workingExtraPtr.extraTexturePath, workingExtraPtr.rfaosTexture);
-	NoteSkinModTexture(1, workingExtraPtr.wetnessTexturePath, workingExtraPtr.wetnessTexture);
 
 	workingExtraPtr.hasExtraTexture = workingExtraPtr.rfaosTexture != nullptr && !workingExtraPtr.extraTexturePath.empty() && workingExtraPtr.rfaosTexture != stateData.defaultTextureBlack;
 	workingExtraPtr.hasWetnessTexture = workingExtraPtr.wetnessTexture != nullptr && !workingExtraPtr.wetnessTexturePath.empty() && workingExtraPtr.wetnessTexture != stateData.defaultTextureBlack;

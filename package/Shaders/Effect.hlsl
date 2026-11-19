@@ -4,6 +4,7 @@
 #include "Common/Math.hlsli"
 #include "Common/MotionBlur.hlsli"
 #include "Common/Permutation.hlsli"
+#include "Common/PhysicalLighting.hlsli"
 #include "Common/Random.hlsli"
 #include "Common/SharedData.hlsli"
 #include "Common/Skinned.hlsli"
@@ -818,6 +819,8 @@ namespace EffectScene
 float3 EstimateEffectDirectionalPart(float3 inputColor)
 {
 	float3 ambientColor = max(0, mul(SharedData::DirectionalAmbient, float4(0, 0, 1, 1)));
+	if (PhysLight::On(PhysLight::kSmallFixes))  // (49h stage 1, S8) the weather ambient converted like every other ambient
+		ambientColor = Color::Ambient(ambientColor);
 #		if defined(IBL)
 	if (SharedData::iblSettings.EnableDiffuseIBL && (!SharedData::InInterior || SharedData::iblSettings.EnableInterior)) {
 		ambientColor *= SharedData::iblSettings.DALCAmount;
@@ -830,7 +833,7 @@ float3 EstimateEffectDirectionalPart(float3 inputColor)
 	}
 #		endif
 
-	float llDirLightMult = (SharedData::linearLightingSettings.enableLinearLighting && !SharedData::linearLightingSettings.isDirLightLinear) ? SharedData::linearLightingSettings.dirLightMult : 1.0f;
+	float llDirLightMult = PhysLight::DirLightMultApplies() ? SharedData::linearLightingSettings.dirLightMult /* (49h stage 1, S8) + not indoors */ : 1.0f;
 	float3 dirLightColor = Color::DirectionalLight(SharedData::DirLightColor.xyz / max(llDirLightMult, 1e-5), SharedData::linearLightingSettings.isDirLightLinear) * llDirLightMult;
 
 	float inputLuma = Color::RGBToLuminance(inputColor);
@@ -858,8 +861,8 @@ float3 GetLightingColor(float3 msPosition, float3 worldPosition, float4 screenPo
 		// (49g) Effects Follow Scene Light > Lit Smoke and Mist: the light a matte vanilla surface gets here (EffectScene::MatteLight).
 		color = EffectScene::MatteLight(worldPosition, screenPosition, eyeIndex, shadowVariance);
 	} else if ((Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::EffectShadows)) {
-		float llDirLightMult = (SharedData::linearLightingSettings.enableLinearLighting && !SharedData::linearLightingSettings.isDirLightLinear) ? SharedData::linearLightingSettings.dirLightMult : 1.0f;
-		float3 dirLightColor = Color::DirectionalLight(SharedData::DirLightColor.xyz / max(llDirLightMult, 1e-5), SharedData::linearLightingSettings.isDirLightLinear) * llDirLightMult * 0.5 * Color::EffectLightingMult();
+		float llDirLightMult = PhysLight::DirLightMultApplies() ? SharedData::linearLightingSettings.dirLightMult /* (49h stage 1, S8) + not indoors */ : 1.0f;
+		float3 dirLightColor = Color::DirectionalLight(SharedData::DirLightColor.xyz / max(llDirLightMult, 1e-5), SharedData::linearLightingSettings.isDirLightLinear) * llDirLightMult * (PhysLight::On(PhysLight::kSmallFixes) ? Color::VanillaDiffuseMult() : 0.5) * Color::EffectLightingMult();  // (49h stage 1, S8) the ground's diffuse factor (was 0.5)
 
 #		if defined(PHYSICAL_SKY)
 		if (SharedData::physSkyData.enabled)
@@ -870,6 +873,8 @@ float3 GetLightingColor(float3 msPosition, float3 worldPosition, float4 screenPo
 #		endif
 
 		float3 ambientColor = max(0, mul(SharedData::DirectionalAmbient, float4(0, 0, 1, 1)));
+		if (PhysLight::On(PhysLight::kSmallFixes))  // (49h stage 1, S8) converted (was raw)
+			ambientColor = Color::Ambient(ambientColor);
 
 #		if defined(IBL)
 		if (SharedData::iblSettings.EnableDiffuseIBL && (!SharedData::InInterior || SharedData::iblSettings.EnableInterior)) {
@@ -914,7 +919,7 @@ float3 GetLightingColor(float3 msPosition, float3 worldPosition, float4 screenPo
 
 #		if defined(IBL)
 		float3 iblColor = 0;
-		if (SharedData::iblSettings.EnableDiffuseIBL) {
+		if (SharedData::iblSettings.EnableDiffuseIBL && !PhysLight::On(PhysLight::kSmallFixes)) {  // (49h stage 1, S8) the IBL was added a second time here
 			if (!SharedData::InInterior || SharedData::iblSettings.EnableInterior)
 			{
 #			if defined(SKYLIGHTING)
@@ -1160,6 +1165,10 @@ PS_OUTPUT main(PS_INPUT input)
 	const bool sceneMaster = EffectScene::Master();
 	const bool followLit = sceneMaster && (EffectSceneFlags & EffectScene::kLit) != 0u && sceneCategory == EffectScene::kLitSmoke && EffectScene::CanFollow();
 	const bool followUnlit = sceneMaster && (EffectSceneFlags & EffectScene::kUnlit) != 0u && sceneCategory == EffectScene::kUnlitSmoke && EffectScene::CanFollowUnlit();
+	// (49h stage 1, S1) "Same Sun and Moon Light Everywhere": lit smoke and mist that follow the scene light never glow brighter than lit -- the
+	// material's emissive multiple (BaseColorScale.x, in BaseColor and in the grayscale-to-colour lookup; mountain clouds 1.5) capped at 1.
+	[branch] if (followLit && PhysLight::On(PhysLight::kDirect) && baseColorScale > 1.0)
+		baseColor.xyz /= baseColorScale;
 
 	// (48n, official CS #3033) Light only pixels that survive the alpha test.
 #	if defined(LIGHTING)

@@ -268,42 +268,17 @@ namespace Random
 	///////////////////////////////////////////////////////////
 
 	// https://www.shadertoy.com/view/slB3z3
+	// (49h) The 16 gradients as a table (was a 16-case switch: same values, so the noise is bit-identical; much less for fxc to chew).
+	static const float3 kPerlinGradients[16] = {
+		float3(1, 1, 0), float3(-1, 1, 0), float3(1, -1, 0), float3(-1, -1, 0),
+		float3(1, 0, 1), float3(-1, 0, 1), float3(1, 0, -1), float3(-1, 0, -1),
+		float3(0, 1, 1), float3(0, -1, 1), float3(0, 1, -1), float3(0, -1, -1),
+		float3(1, 1, 0), float3(-1, 1, 0), float3(0, -1, 1), float3(0, -1, -1)
+	};
+
 	float3 perlinGradient(uint hash)
 	{
-		switch (int(hash) & 15) {  // look at the last four bits to pick a gradient direction
-		case 0:
-			return float3(1, 1, 0);
-		case 1:
-			return float3(-1, 1, 0);
-		case 2:
-			return float3(1, -1, 0);
-		case 3:
-			return float3(-1, -1, 0);
-		case 4:
-			return float3(1, 0, 1);
-		case 5:
-			return float3(-1, 0, 1);
-		case 6:
-			return float3(1, 0, -1);
-		case 7:
-			return float3(-1, 0, -1);
-		case 8:
-			return float3(0, 1, 1);
-		case 9:
-			return float3(0, -1, 1);
-		case 10:
-			return float3(0, 1, -1);
-		case 11:
-			return float3(0, -1, -1);
-		case 12:
-			return float3(1, 1, 0);
-		case 13:
-			return float3(-1, 1, 0);
-		case 14:
-			return float3(0, -1, 1);
-		case 15:
-			return float3(0, -1, -1);
-		}
+		return kPerlinGradients[hash & 15u];  // look at the last four bits to pick a gradient direction
 	}
 
 	// range: -1 to 1

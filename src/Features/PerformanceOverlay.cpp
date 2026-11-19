@@ -43,6 +43,7 @@
 #include "Utils/EngineTiming.h"
 #include "Utils/FrameTrace.h"
 #include "Utils/LatencyPacer.h"
+#include "Utils/ReflectionCensus.h"
 #include "Utils/Screenshot.h"
 #include "Utils/UI.h"
 #include <nlohmann/json.hpp>
@@ -208,6 +209,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	StallSampler,
 	ScreenshotKey,
 	ScreenshotOnSave,
+	ReflectionCensus,
 	ScreenshotSaveHDR,
 	TraceKey,
 	TraceSeconds)
@@ -3879,6 +3881,10 @@ void PerformanceOverlay::DrawCompactSummary(const PerfView::ViewConfig& a_cfg)
 		const ImVec4 color = view.messageIsError ? theme.StatusPalette.Error : theme.StatusPalette.SuccessColor;
 		ImGui::TextColored(blinkOff ? ImVec4(color.x, color.y, color.z, 0.35f) : color, "%s", view.message.c_str());
 	}
+	if (settings.ReflectionCensus) {  // (49h)
+		if (const std::string census = ::ReflectionCensus::Summary(); !census.empty())
+			ImGui::TextDisabled("%s", census.c_str());
+	}
 
 	// (46r) Plain-words summary. Display only: every number is one the overlay already collects
 	// (view.summary, the frame clock, the F7 series, the DXGI budget, Ray Tracing's own sample).
@@ -4569,6 +4575,10 @@ void PerformanceOverlay::DrawViewOptions()
 		if (ImGui::SmallButton("Take one"))
 			Util::Screenshot::Request();
 		ImGui::Checkbox("Screenshot with every saved frame (F12)", &settings.ScreenshotOnSave);
+		// (49h)
+		ImGui::Checkbox("Reflection census with every saved frame (F12)", &settings.ReflectionCensus);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted("Classifies every pixel of the frame by its reflection (smooth / semi / rough / none / sky, how many would need a ray-traced\nreflection, what SSRT did) and adds a reflection_census block to the saved JSON, with a one-line summary here. One pass,\nonly when a frame is saved; nothing on screen changes.");
 		ImGui::Checkbox("HDR: also save the HDR10 image (16-bit PNG)", &settings.ScreenshotSaveHDR);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::TextUnformatted("The untouched picture sent to the display (PQ, BT.2020). Image viewers show it washed out; it is for analysis.");
@@ -5391,6 +5401,8 @@ void PerformanceOverlay::SaveFrameJson(const PerfView::ViewConfig& a_cfg)
 		out << j.dump(2, ' ', false, nlohmann::json::error_handler_t::replace);
 		out.close();
 		view.lastSavedFile = name;
+		if (settings.ReflectionCensus)  // (49h) the census is added to this file a few frames later
+			::ReflectionCensus::Request(path);
 		logger::info("[PerfSnapshot] Saved frame JSON: {}", path.string());
 		FlashMessage("Saved " + name);
 	} catch (const std::exception& e) {

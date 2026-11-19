@@ -503,6 +503,10 @@ void SkySync::UpdateCombined(const RE::Sky* sky)
 		if (!moons[i] || !moons[i]->moonMesh)
 			continue;
 		float s = SmoothStep(MoonStartElevation, MoonFullElevation, elevationDeg(rawDirections[i]));
+		// (49h stage 1, S1) "Same Sun and Moon Light Everywhere": the ground's moonlight follows the weather's moon visibility and fades in at
+		// the same height as on the clouds and in the sky (PhysicalSky::MoonHorizonVisibility: weather x -2..3 degrees). Off: the Clock model.
+		if (const auto& physicalSky = globals::features::physicalSky; physicalSky.PhysLightingOn(physicalSky.settings.physicalLighting.sameDirectLight))
+			s = PhysicalSky::MoonHorizonVisibility(moons[i], sky, rawDirections[i].z);
 		s *= PhaseFactorFromTexture(moons[i]) * dayFade;
 		if (i == secundaIdx)
 			s *= SecundaIntensityFactor;

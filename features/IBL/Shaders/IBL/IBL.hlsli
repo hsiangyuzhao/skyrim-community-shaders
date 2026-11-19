@@ -6,6 +6,7 @@
 #include "Common/Random.hlsli"
 #include "Common/SharedData.hlsli"
 #include "Common/Spherical Harmonics/SphericalHarmonics.hlsli"
+#include "Common/PhysicalLighting.hlsli"
 
 namespace ImageBasedLighting
 {
@@ -114,6 +115,10 @@ namespace ImageBasedLighting
 			float3 envRaw = GetDiffuseIBL(rayDir);
 			float3 skyRaw = max(GetSkyDiffuseIBL(rayDir) - envRaw, 0);
 			float3 envTerm = TrimSaturation(envRaw, SharedData::iblSettings.EnvIBLSaturation) * SharedData::iblSettings.EnvIBLScale;
+			// (49h stage 1, S3b) "Canopies Block the Surroundings' Light": the env probe fills the sky with ground colour, so its upper
+			// hemisphere is blocked by skylighting like the sky term (callers pass minus the direction of interest: up = -rayDir.z).
+			[branch] if (PhysLight::On(PhysLight::kEnvOcclusion))
+				envTerm *= lerp(1.0, saturate(skylighting), saturate(0.5 - 0.5 * rayDir.z));
 			float3 skyTerm = TrimSaturation(skyRaw, SharedData::iblSettings.SkyIBLSaturation) * SharedData::iblSettings.SkyIBLScale;
 			color = envTerm + skyTerm * skylighting;
 		}

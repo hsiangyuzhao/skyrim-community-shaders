@@ -1167,6 +1167,7 @@ void ExponentialHeightFog::DrawRayTracedFogSettings()
 
 void ExponentialHeightFog::DrawSettings()
 {
+	ImGui::TextDisabled("Unified with the sky: Sky > Physical Sky > Scene Lighting");  // (49h stage 1) pointer to the Physical Lighting rules
     ImGui::Checkbox("Enable Exponential Height Fog", (bool*)&settings.enabled);
     ImGui::SliderFloat("Start Distance", &settings.startDistance, 0.0f, 100000.0f, "%.1f");
     if (auto _tt = Util::HoverTooltipWrapper())

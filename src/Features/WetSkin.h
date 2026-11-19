@@ -183,7 +183,8 @@ struct WetSkin : Feature
 	float MaxDryMultiplier() const;
 	GPUParams GetGPUParams() const;
 
-	bool IsOriginal() const { return settings.Model == static_cast<uint32_t>(Model::Original); }
+	/// (49h) The Legacy (pre-42c) model is retired: always Physical (a saved Model 1 loads as Physical).
+	bool IsOriginal() const { return false; }
 	/// (47f) The Physical model. (47o) With Simple gone, every model but Legacy is Physical.
 	bool IsPhysical() const { return !IsOriginal(); }
 

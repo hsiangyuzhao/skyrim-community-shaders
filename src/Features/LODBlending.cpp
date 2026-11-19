@@ -14,6 +14,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 
 void LODBlending::DrawSettings()
 {
+	ImGui::TextDisabled("Unified with the sky: Sky > Physical Sky > Scene Lighting");  // (49h stage 1) pointer to the Physical Lighting rules
 	ImGui::SliderFloat("LOD Terrain Brightness", &settings.LODTerrainBrightness, 0.01f, 5.f, "%.2f");
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text("Brightness of distant (LOD) terrain, to match it with nearby terrain. Higher = brighter.");

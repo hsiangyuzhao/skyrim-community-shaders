@@ -15,6 +15,7 @@
 #include "State.h"
 #include "Util.h"
 #include "Utils/GpuTimers.h"
+#include "TruePBR.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	PhysicalSky::WorldspaceInfo,
@@ -36,9 +37,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	sunlightColor,
 	masserColor,
 	secundaColor,
-	proceduralSun,
 	// (47m) removed sunDiskRad (Legacy (36f) only); the old key is ignored on load.
-	sunAlignToVanilla,
 	sunReplaceVanilla,
 	sunSoftEdge,
 	sunPhysicalRadiance,
@@ -126,6 +125,24 @@ void PhysicalSky::LoadSettings(json& o_json)
 		settings.aerosolPreset = o_json.value("aerosolPreset", defaults.aerosolPreset);  // (47b)
 		settings.moonFadesStars = o_json.value("moonFadesStars", defaults.moonFadesStars);  // (48b)
 		settings.waterSunTransmittance = o_json.value("waterSunTransmittance", defaults.waterSunTransmittance);  // (49h)
+		// (49h stage 1) Physical Lighting: missing keys keep their defaults.
+		if (const auto it = o_json.find("physicalLighting"); it != o_json.end() && it->is_object()) {
+			auto& pl = settings.physicalLighting;
+			const Settings::PhysicalLighting d{};
+			const auto& j = *it;
+			pl.enabled = j.value("enabled", d.enabled);
+			pl.sameDirectLight = j.value("sameDirectLight", d.sameDirectLight);
+			pl.moonCloudGrey = j.value("moonCloudGrey", d.moonCloudGrey);
+			pl.cloudAmbient = j.value("cloudAmbient", d.cloudAmbient);
+			pl.iblNoFeedback = j.value("iblNoFeedback", d.iblNoFeedback);
+			pl.iblEnvOcclusion = j.value("iblEnvOcclusion", d.iblEnvOcclusion);
+			pl.farShadows = j.value("farShadows", d.farShadows);
+			pl.farSkylight = j.value("farSkylight", d.farSkylight);
+			pl.lodScale = j.value("lodScale", d.lodScale);
+			pl.farFog = j.value("farFog", d.farFog);
+			pl.forwardCubemap = j.value("forwardCubemap", d.forwardCubemap);
+			pl.smallFixes = j.value("smallFixes", d.smallFixes);
+		}
 		settings.moonStarFadeStrength = o_json.value("moonStarFadeStrength", defaults.moonStarFadeStrength);
 		settings.moonPlanetshineStrength = o_json.value("moonPlanetshineStrength", defaults.moonPlanetshineStrength);
 	}
@@ -272,6 +289,13 @@ void PhysicalSky::SaveSettings(json& o_json)
 	o_json["aerosolPreset"] = settings.aerosolPreset;  // (47b)
 	o_json["moonFadesStars"] = settings.moonFadesStars;  // (48b)
 	o_json["waterSunTransmittance"] = settings.waterSunTransmittance;  // (49h)
+	{
+		const auto& pl = settings.physicalLighting;  // (49h stage 1)
+		o_json["physicalLighting"] = { { "enabled", pl.enabled }, { "sameDirectLight", pl.sameDirectLight }, { "moonCloudGrey", pl.moonCloudGrey },
+			{ "cloudAmbient", pl.cloudAmbient }, { "iblNoFeedback", pl.iblNoFeedback }, { "iblEnvOcclusion", pl.iblEnvOcclusion },
+			{ "farShadows", pl.farShadows }, { "farSkylight", pl.farSkylight }, { "lodScale", pl.lodScale }, { "farFog", pl.farFog },
+			{ "forwardCubemap", pl.forwardCubemap }, { "smallFixes", pl.smallFixes } };
+	}
 	o_json["moonStarFadeStrength"] = settings.moonStarFadeStrength;
 	o_json["moonPlanetshineStrength"] = settings.moonPlanetshineStrength;
 }
@@ -323,6 +347,10 @@ void PhysicalSky::DrawSettings()
 		}
 		if (ImGui::BeginTabItem("Clouds")) {
 			SettingsClouds();
+			ImGui::EndTabItem();
+		}
+		if (ImGui::BeginTabItem("Scene Lighting")) {  // (49h stage 1)
+			SettingsSceneLighting();
 			ImGui::EndTabItem();
 		}
 		if (ImGui::BeginTabItem("Debug")) {
@@ -530,78 +558,7 @@ void PhysicalSky::SettingsCelestials()
 		ImGui::ColorEdit3("Light Color", &settings.sunlightColor.x, ImGuiColorEditFlags_DisplayHSV | ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text(lightColorHint);
-		static constexpr const char* sunLookNames[kSunLookCount] = { "Custom", "Bright (realistic)", "Soft", "Vanilla sun (procedural off)" };
-		int look = settings.proceduralSun ? std::clamp(settings.sunLook, 0, kSunLookCount - 1) : static_cast<int>(kSunLookVanilla);
-		if (ImGui::Combo("Sun Look", &look, sunLookNames, kSunLookCount))
-			ApplySunLook(look);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text(
-				"One-click looks for the sun:\n"
-				"Bright: real-size disk with a strong glow around it, reads as blinding.\n"
-				"Soft: slightly larger disk, gentle glow.\n"
-				"Vanilla sun: procedural sun off, the game's own sun picture.\n"
-				"Moving any sun setting below switches this to Custom.");
-		if (ImGui::Checkbox("Procedural Sun", &settings.proceduralSun))
-			settings.sunLook = settings.proceduralSun ? kSunLookCustom : kSunLookVanilla;
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text(
-				"Draws the sun as part of the physical sky: a real-size disk whose colour and brightness\n"
-				"come from the atmosphere (white at noon, orange and dimmer at sunset, gone below the\n"
-				"horizon), instead of the game's fixed sun picture. Off: the game's sun picture.");
-		if (ImGui::SliderFloat("Sun Disk Angular Radius", &settings.sunDiskRadiusDeg, 0.05f, 2.f, "%.2f deg", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic))
-			settings.sunLook = kSunLookCustom;
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("Radius of the disk. 0.27 = the real sun (0.53 degrees across).");
-		ImGui::SameLine();
-		ImGui::TextDisabled("(%.2f deg across)", settings.sunDiskRadiusDeg * 2.f);
-
-		// (44h) The procedural-sun options are hidden (not just disabled) while Procedural Sun is
-		// off; their values are still saved and loaded.
-		if (settings.proceduralSun) {
-			ImGui::SeparatorText("Procedural Sun");
-			ImGui::Checkbox("Align with Vanilla Sun", &settings.sunAlignToVanilla);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text(
-					"Centres the disk (and the sky's glow around the sun) exactly where the game draws its sun.\n"
-					"Off: the old direction, which drifts 2-4 degrees off the game's sun as you climb.");
-			if (ImGui::Checkbox("Replace Vanilla Sun", &settings.sunReplaceVanilla))
-				settings.sunLook = kSunLookCustom;
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("The disk replaces the game's sun picture instead of being added next to it (no second sun).");
-			if (ImGui::Checkbox("Soft Edge", &settings.sunSoftEdge))
-				settings.sunLook = kSunLookCustom;
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("Fades the rim of the disk so it does not shimmer with DLSS.");
-			if (ImGui::Checkbox("Physical Brightness", &settings.sunPhysicalRadiance))
-				settings.sunLook = kSunLookCustom;
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text(
-					"Makes the disk as bright as a real sun for its size, limited by the cap below.\n"
-					"Anything far above a sunlit white wall already shows as pure white on screen; the extra\n"
-					"only matters for bloom (COD Bloom). Off: the old dim flat disk.");
-			if (settings.sunPhysicalRadiance) {
-				if (ImGui::SliderFloat("Brightness Cap", &settings.sunRadianceCap, 10.f, 62250.f, "%.0f", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic))
-					settings.sunLook = kSunLookCustom;
-				if (auto _tt = Util::HoverTooltipWrapper())
-					ImGui::Text(
-						"Upper limit of the disk's brightness (1 = about a sunlit white wall). Only changes how\n"
-						"strongly COD Bloom spreads the sun; lower = less DLSS/frame-gen shimmer. Upstream 62250.");
-			}
-			if (ImGui::SliderFloat("Sun Glow", &settings.sunGlowIntensity, 0.f, 30.f, "%.1f", ImGuiSliderFlags_AlwaysClamp))
-				settings.sunLook = kSunLookCustom;
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text(
-					"A glow in the sky around the disk, coloured by the atmosphere like the disk.\n"
-					"This is what makes the sun read as blinding: the game has no bloom on it unless COD Bloom\n"
-					"is on. 1 = as bright as a sunlit white wall at the disk's edge. 0 = no glow.");
-			if (ImGui::SliderFloat("Sun Glow Width", &settings.sunGlowWidthDeg, 0.1f, 5.f, "%.2f deg", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic))
-				settings.sunLook = kSunLookCustom;
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("How far the glow reaches from the disk's edge before fading (a faint wider tail follows).");
-			ImGui::Checkbox("Hide Vanilla Sun Glare", &settings.sunHideVanillaGlare);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("Removes the game's large halo around the sun while the procedural sun is on.");
-		}
+		// (49h) Sun Look, Procedural Sun, Sun Disk Angular Radius and the procedural-sun group are retired (the game's sun is drawn).
 		ImGui::PopID();
 	}
 
@@ -1086,7 +1043,7 @@ void PhysicalSky::UpdateExtCbData()
 		flags |= kExtSkyPrecision;  // (47b)
 	extCbData.flags = flags;
 	extCbData.sunRadianceCap = std::clamp(s.sunRadianceCap, 1.f, 62250.f);
-	extCbData.sunGlowIntensity = s.proceduralSun ? std::clamp(s.sunGlowIntensity, 0.f, 30.f) : 0.f;
+	extCbData.sunGlowIntensity = 0.f;  // (49h) the procedural sun is retired
 	extCbData.sunGlowWidth = DirectX::XMConvertToRadians(std::clamp(s.sunGlowWidthDeg, 0.1f, 5.f));
 }
 
@@ -1556,38 +1513,6 @@ void PhysicalSky::UpdateEffective()
 		effective.twilightLength = 1.f;
 }
 
-void PhysicalSky::ApplySunLook(int a_look)
-{
-	settings.sunLook = std::clamp(a_look, 0, kSunLookCount - 1);
-	switch (settings.sunLook) {
-	case kSunLookBright:
-		settings.proceduralSun = true;
-		settings.sunReplaceVanilla = true;
-		settings.sunSoftEdge = true;
-		settings.sunPhysicalRadiance = true;
-		settings.sunDiskRadiusDeg = 0.27f;
-		settings.sunRadianceCap = 4000.f;
-		settings.sunGlowIntensity = 6.f;
-		settings.sunGlowWidthDeg = 0.8f;
-		break;
-	case kSunLookSoft:
-		settings.proceduralSun = true;
-		settings.sunReplaceVanilla = true;
-		settings.sunSoftEdge = true;
-		settings.sunPhysicalRadiance = true;
-		settings.sunDiskRadiusDeg = 0.4f;
-		settings.sunRadianceCap = 100.f;
-		settings.sunGlowIntensity = 2.f;
-		settings.sunGlowWidthDeg = 1.5f;
-		break;
-	case kSunLookVanilla:
-		settings.proceduralSun = false;
-		break;
-	default:
-		break;
-	}
-}
-
 void PhysicalSky::Reset()
 {
 	UpdateEffective();
@@ -1616,6 +1541,7 @@ void PhysicalSky::Reset()
 		skyScaleSmoothed = -1.f;  // (47a) snap when the sky comes back
 		cbData.enabled = allGood;
 		horizonFixCbData = {};  // (47f)
+		horizonFixCbData.flags = PhysLightingFlags();  // (49h stage 1) the rules that do not need the physical sky still apply (interiors)
 		cloudCbData = {};
 		linearLighting.isDirLightLinear = false;
 		return;
@@ -1633,7 +1559,7 @@ void PhysicalSky::Reset()
 	// along the apparent direction -- dipped by atan(altitude / 325000), 1.5-4 degrees -- in the
 	// sky root's local frame, which Sky Sync rotates by the cell's north rotation. The raw
 	// direction used before sat that far off the quad: a second, clipped or missing disk.
-	if (s.sunAlignToVanilla) {
+	if constexpr (Settings::sunAlignToVanilla) {  // (49h) fixed on
 		RE::NiPoint3 apparent = skySync.directions[static_cast<int>(SkySync::Caster::Sun)];
 		RE::NiPoint3 trueDir = sunDir;
 		if (auto* sky = globals::game::sky; sky && sky->root) {
@@ -1724,7 +1650,7 @@ void PhysicalSky::Reset()
 		.masserColor = masserGlow,
 		.apTrMix = settings.apTrMix,
 		.secundaDir = { secundaDir.x, secundaDir.y, secundaDir.z },
-		.sunDiskCos = cos(DirectX::XMConvertToRadians(std::clamp(s.sunDiskRadiusDeg, 0.05f, 10.f))) * (settings.proceduralSun ? 1.f : 0.f),
+		.sunDiskCos = 0.f,  // (49h) the procedural sun is retired (field kept, SharedData unchanged)
 		.secundaColor = secundaGlow,
 		.enabled = allGood,
 		.tonemapper = linearLighting.settings.enableLinearLighting ? 0 : settings.tonemapper,
@@ -1775,6 +1701,7 @@ void PhysicalSky::Reset()
 
 	// fixed (47m): Horizon Fix removed; anchorOffset, altitude and flags stay 0 (as with Horizon Fix off).
 	horizonFixCbData = {};
+	horizonFixCbData.flags = PhysLightingFlags();  // (49h stage 1) Physical Lighting rule bits (flags was unused since 47m)
 	auto& heightFog = globals::features::exponentialHeightFog;
 	// (47g) EHF "Physical Fog Brightness": the clear sky's light on the fog (0 = off; independent of the Horizon Fix).
 	if (heightFog.loaded && heightFog.vanillaFog.PhysicalFogBrightness)
@@ -2192,4 +2119,118 @@ float3 PhysicalSky::ComputeLightTransmittance(const float3& a_dir)
 		*out[c] = 1.f + (t - 1.f) * mix;
 	}
 	return result;
+}
+
+uint32_t PhysicalSky::PhysLightingFlags() const
+{
+	// (49h stage 1) Physical Lighting rule bits for SharedData::horizonFixData.Flags (Common/PhysicalLighting.hlsli).
+	const auto& pl = settings.physicalLighting;
+	if (!pl.enabled)
+		return 0u;
+	uint32_t flags = 0u;
+	flags |= pl.sameDirectLight ? kPLDirect : 0u;
+	flags |= pl.sameDirectLight && pl.moonCloudGrey ? kPLMoonGrey : 0u;
+	flags |= pl.cloudAmbient ? kPLCloudAmbient : 0u;
+	flags |= pl.iblNoFeedback ? kPLIblNoFeedback : 0u;
+	flags |= pl.iblEnvOcclusion ? kPLEnvOcclusion : 0u;
+	flags |= pl.farSkylight ? kPLFarSkylight : 0u;
+	flags |= pl.lodScale ? kPLLodScale : 0u;
+	flags |= pl.farFog ? kPLFarFog : 0u;
+	flags |= pl.forwardCubemap ? kPLForwardCubemap : 0u;
+	flags |= pl.smallFixes ? kPLSmallFixes : 0u;
+	// True PBR land drawn in the last ~2 s (the near land's light scale is 1 / pi then).
+	const uint32_t frame = globals::state->frameCount;
+	const uint32_t lastPbr = TruePBR::lastPbrLandFrame.load(std::memory_order_relaxed);
+	if (lastPbr != 0u && frame - lastPbr < 240u)
+		flags |= kPLLandPbr;
+	return flags;
+}
+
+void PhysicalSky::SettingsSceneLighting()
+{
+	// (49h stage 1) Physical Lighting: one light model for the ground, the sky, clouds, effects, fog and the far scenery.
+	InfoBox("One light model for everything: the ground, clouds, lit smoke, fog, reflections and the far scenery get the sun, the moon and the sky in the same units.");
+	auto& pl = settings.physicalLighting;
+	ImGui::Checkbox("Physical Lighting", &pl.enabled);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"On (default): the rules below (each can be switched alone). Off: everything as in 49h before this tab existed.\n"
+			"Shown in game where it matters most: night clouds against the moonlit ground, snow in the open, forest edges,\n"
+			"the edge of the loaded area, and fog in the distance.");
+	ImGui::BeginDisabled(!pl.enabled);
+	ImGui::Indent();
+	ImGui::Checkbox("Same Sun and Moon Light Everywhere", &pl.sameDirectLight);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"Sunlit clouds are as bright as a white wall in the same sun (were ~1.8x brighter). Moonlight on clouds is the same light\n"
+			"as on the ground (no extra strength factor, not counted twice). Lit smoke and mist never glow brighter than lit\n"
+			"(mountain clouds were x1.5). A weather that hides the moon also takes the moonlight off the ground, and the moon fades\n"
+			"in and out at the same height on the ground and on the clouds.");
+	ImGui::Indent();
+	ImGui::BeginDisabled(!pl.sameDirectLight);
+	ImGui::Checkbox("Greyer Moonlight on Clouds", &pl.moonCloudGrey);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Off (default): clouds get the moonlight's own colour, as the ground does. On: partly grey, as before (Moon Cloud Saturation).");
+	ImGui::EndDisabled();
+	ImGui::Unindent();
+	ImGui::Checkbox("Clouds Get the Sky's Ambient Light", &pl.cloudAmbient);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"Clouds are lit by the same sky light that lights the ground in shade (were multiplied by the weather's near-black\n"
+			"night cloud colour, so night clouds had almost none). The weather's cloud colour only tints them.");
+	ImGui::Checkbox("Screen Light Probe Without Feedback", &pl.iblNoFeedback);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"The light probe that Image Based Lighting takes from the screen no longer contains its own light: bright snow and\n"
+			"stone stop lifting their own shadows (it could run away on snow). Shadows are a little darker and more even.");
+	ImGui::Checkbox("Canopies Block the Surroundings' Light", &pl.iblEnvOcclusion);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"Under trees, eaves and overhangs the light from the surroundings coming from above is blocked like the sky's light\n"
+			"(the probe fills the sky with ground colour, which leaked under every roof).");
+	ImGui::Checkbox("Far Objects Keep Their Shadows", &pl.farShadows);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"With ray-traced sun shadows: houses, rocks and other full objects get sun / moon shadows out to where the rays reach\n"
+			"(the edge of the loaded area, ~120-175 m), not only to the game's 86 m.");
+	ImGui::Checkbox("Far Skylight Is Not Open Sky", &pl.farSkylight);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"Beyond the skylighting area (~70 m) surfaces no longer count as seeing the whole sky: a sideways or downward face sees\n"
+			"half or less. Far shaded areas, forests and valleys are less bright, especially at night.");
+	ImGui::Checkbox("Far Land in the Near Land's Light", &pl.lodScale);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"With PBR land the far (LOD) land gets the same sunlight / moonlight scale as the near land (was 12%% darker), and the\n"
+			"LOD Blending brightness (gamma) reaches both kinds of far land. Removes the step at the loaded edge.");
+	ImGui::Checkbox("Far Fog Continues the Near Fog", &pl.farFog);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"With volumetric fog on, the far height fog takes the colour the volumetric fog has at its far end (same sun, sky and\n"
+			"weather fog colour) instead of the reflection probe's colour toward the view, so there is no seam at ~850 m and\n"
+			"no white veil from the probe. Without volumetric fog: the weather fog colour at its physical brightness.");
+	ImGui::Checkbox("Forward Reflections at the Cubemap's Brightness", &pl.forwardCubemap);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"Hair, glass and other see-through or forward-drawn shiny things reflect the cubemap at its own brightness, like the\n"
+			"rest of the scene with Reflection Brightness Fix (Materials > Dynamic Cubemaps). Were 2-5x too bright.");
+	ImGui::Checkbox("Small Lighting Fixes", &pl.smallFixes);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"Unlit effects counted the surroundings' light twice and the weather ambient unconverted; distant billboard trees got\n"
+			"the weather ambient through roofs and canopies; the deferred ambient used another upward boost than the surfaces;\n"
+			"indoors a few passes scaled the sun differently.");
+	ImGui::Unindent();
+	ImGui::EndDisabled();
+	// (49h stage 2) leaves room here for its checkboxes.
+
+	ImGui::SeparatorText("Related (own switches)");
+	ImGui::Checkbox("Sun Highlight on Water Follows the Atmosphere", &settings.waterSunTransmittance);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"On (default): the sun's bright highlight on water is reddened and dimmed by the atmosphere like the sunlight on the\n"
+			"ground (Celestials > Transmittance Mix), so at dusk and dawn it is no longer a white glare. Off: as in 49g.");
+	ImGui::TextDisabled("Also: Lighting > Exponential Height Fog > Stable Fog Colour; Materials > Dynamic Cubemaps > Reflection Brightness Fix.");
+	if (pl.enabled && pl.lodScale)
+		ImGui::TextDisabled("PBR land seen: %s", (PhysLightingFlags() & kPLLandPbr) ? "yes (far land uses the PBR scale)" : "no");
 }

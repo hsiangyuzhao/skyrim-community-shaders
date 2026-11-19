@@ -8,6 +8,7 @@
 #include "Common/Math.hlsli"
 #include "Common/MotionBlur.hlsli"
 #include "Common/Permutation.hlsli"
+#include "Common/PhysicalLighting.hlsli"
 #include "Common/Random.hlsli"
 #include "Common/SharedData.hlsli"
 #include "Common/Skinned.hlsli"
@@ -1097,13 +1098,11 @@ namespace Perf47p
 	static const uint kSssTrans = 8u;    // skin: no transmittance profile while its strength (sssParams.w) is 0
 	static const uint kSsplsDist = 16u;  // SSPLS: no light ranking beyond Max Distance (no steps are marched there)
 	static const uint kHairSspls = 32u;  // (A) no SSPLS for hair in its forward / blended pass
+	// (49h) Every switch is permanent (they only skip work whose result is 0 or unused): always true, so fxc drops the off arms.
+	// (Was: the per-geometry bits of Advanced Skin, 0 on everything else.)
 	bool On(uint a_flag)
 	{
-#	if defined(CS_SKIN)
-		return (uint(max(Skin::wetCharParams[11].x, 0.0) + 0.5) & a_flag) != 0u;
-#	else
-		return false;
-#	endif
+		return a_flag != 0u;
 	}
 }
 
@@ -2057,19 +2056,13 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #	if defined(SKIN) && defined(CS_SKIN)
 	float4 skinsk = 0;
 	float4 skinExtra = 0;
-	float4 skinWetnessSample = 0;
 	uint2 skinExtraDimensions = uint2(0, 0);
-	uint2 wetnessDimensions = uint2(0, 0);
 	bool hasSkinExtra = false;
-	bool hasSkinWetness = false;
 	if (skinEnabled) {
 		skinsk = TexRimSoftLightWorldMapOverlaySampler.SampleBias(SampRimSoftLightWorldMapOverlaySampler, uv, SharedData::MaterialMipBias());
 		TexSkinExtraSampler.GetDimensions(skinExtraDimensions.x, skinExtraDimensions.y);
-		TexSkinWetnessSampler.GetDimensions(wetnessDimensions.x, wetnessDimensions.y);
 		hasSkinExtra = skinExtraDimensions.x > 32 && skinExtraDimensions.y > 32;
-		hasSkinWetness = wetnessDimensions.x > 32 && wetnessDimensions.y > 32;
 	}
-	float4 skinWetnessNormal = float4(0.f, 0.f, 0.f, 1.f);
 
 	if (hasSkinExtra && SharedData::skinData.skinParams.x > 0.0f) {
 		skinExtra = TexSkinExtraSampler.SampleBias(SampColorSampler, uv, SharedData::MaterialMipBias());
@@ -2081,22 +2074,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	} else {
 		skinRoughnessSet = false;
 	}
-	if (hasSkinWetness && skinEnabled) {
-		skinWetnessSample = TexSkinWetnessSampler.SampleBias(SampColorSampler, uv, SharedData::MaterialMipBias());
-		// (49a) "Skin Shading Fixes": a grey (height / mask) _wet texture is also recognised after block compression (BC7 leaves
-		// its channels a few 1/255 apart: 48n then read the grey as a normal map, mask 1).
-		const float wetGreySpread = max(abs(skinWetnessSample.x - skinWetnessSample.y), abs(skinWetnessSample.y - skinWetnessSample.z));
-		const bool wetGrey = Skin::Fix49a(Skin::kFix49aShading) ? (wetGreySpread <= 3.0 / 255.0) : (skinWetnessSample.x == skinWetnessSample.y && skinWetnessSample.y == skinWetnessSample.z);
-		if ((skinWetnessSample.y == 0 && skinWetnessSample.z == 0) || (wetGrey && skinWetnessSample.w >= 0.99f)) {
-			skinWetMask = skinWetnessSample.x;
-			skinWetnessNormal.xyz = Skin::CalculateNormalFromHeight(skinWetMask, SharedData::skinData.wetParams.w * 0.0001, uv) * 0.5 + 0.5;
-		} else {
-			skinWetnessNormal.xyz = skinWetnessSample.xyz;
-			skinWetMask = skinWetnessSample.w;
-		}
-	} else {
-		skinWetMask = 1.0;
-	}
+	// (49h) The skin mod's _wet texture is no longer read: only the retired Legacy (pre-42c) wetness used it (Physical: mask 1).
 #	endif
 
 	float landSnowMask1 = GetLandSnowMaskValue(baseColor.w);
@@ -2107,6 +2085,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float lodLandNoiseParameter = GetLodLandBlendParameter(baseColor.xyz);
 	float noise = TexLandLodNoiseSampler.Sample(SampLandLodNoiseSampler, uv * 3.0.xx).x;
 	float lodLandNoiseMultiplier = GetLodLandBlendMultiplier(lodLandNoiseParameter, noise);
+	[flatten] if (PhysLight::On(PhysLight::kLodScale))  // (49h stage 1, S5) the noise varies the far land around its own brightness, no longer darkens it
+		lodLandNoiseMultiplier /= GetLodLandBlendMultiplier(lodLandNoiseParameter, 0.5);
 	baseColor.xyz *= lodLandNoiseMultiplier;
 	normal.xyz *= 2;
 	normal.w = 1;
@@ -2224,6 +2204,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float lodBlendParameter = GetLodLandBlendParameter(lodLandColor.xyz);
 	float lodBlendMask = TexLandLodBlend2Sampler.Sample(SampLandLodBlend2Sampler, 3.0.xx * input.TexCoord0.zw).x;
 	float lodLandFadeFactor = GetLodLandBlendMultiplier(lodBlendParameter, lodBlendMask);
+	[flatten] if (PhysLight::On(PhysLight::kLodScale))  // (49h stage 1, S5) the blend ring as the far land
+		lodLandFadeFactor /= GetLodLandBlendMultiplier(lodBlendParameter, 0.5);
 	float lodLandBlendFactor = LODTexParams.z * input.LandBlendWeights2.w;
 	normal.xyz = lerp(normal.xyz, float3(0, 0, 1), lodLandBlendFactor);
 
@@ -2342,14 +2324,12 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		else
 	float2 wetUV = uv * SharedData::skinData.skinDetailParams.y;
 #		endif
-	float2 dynamicWet = Skin::GetWetness(input.WorldPosition.z + FrameBuffer::CameraPosAdjust[eyeIndex].z, worldNormal.xyz);
 	// (44a) Wet Skin model (Characters > Wet Skin). "Legacy (pre-42c)": the 41b Advanced Skin
 	// film exactly (Perlin coverage, _wet mask, half strength for skins without one); the CPU
 	// also turns the 42c character switches off. (47f) "Physical": the CPU keeps each character's
 	// water; soft patches; a broad sheen; beads and rivulets on the film only. (47o) The Simple
 	// model is gone: "not Legacy" is Physical.
 	const bool skinWetNew = Skin::WetPhysical();
-	float skinFilmStrength = clamp(dynamicWet.x + dynamicWet.y + SharedData::skinData.skinParams2.y, 0.f, 2.f) * (hasSkinWetness ? 1.0 : 0.5);
 	// (42c, 4.3) The rain on the skin. (47o) Physical keeps the rain itself (CPU); this is only the "rain is falling on it" test of
 	// the generic wet lobes below. Legacy: none ("Rain Wets Advanced Skin" was forced off there and is gone).
 	float skinRainStrength = 0.0;
@@ -2439,10 +2419,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		skinWetness = saturate((vFilm + vBead * (1.0 - saturate(Skin::wetPhysParams[3].x) * skinPhysBeadFade * beadDrawn)) / Skin::kPhysFilmFull);
 		skinWetMask = 1.0;
 		skinWetStreakDriver = Skin::WetPhysTrail(swimTrail, sweatRegion, rainRegion) * saturate(wn * 4.0);
-	} else {
-		// Legacy: no rain on the film (skinRainStrength is 0 here).
-		skinWetness = Skin::PerlinNoise(wetUV, SharedData::skinData.wetParams.x, SharedData::skinData.wetParams.y, SharedData::skinData.wetParams.z, min(skinFilmStrength, 2.f));
-	}
+	}  // (49h) the Legacy (pre-42c) film is retired: no Physical model, no skin wetness
 	if ((SharedData::skinData.skinDetailParams.w > 0.0f || skinWetness > 0.0f) && skinEnabled) {
 #		if defined(FACEGEN)
 		float2 detailUV = input.TexCoord0.xy * SharedData::skinData.skinDetailParams.x;
@@ -2543,25 +2520,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			Skin::SkinWetDetail(skinWetDetail, skinWetDropMask, skinWetDropRim, skinWetStreak, wetWorldNormal);
 			skinWetDetailPending = false;
 #		endif
-		} else if (skinWetness > 0.0f) {
-			float3 wetNormal = Skin::CalculateNormalFromHeight(skinWetness, SharedData::skinData.wetParams.w * 0.0005, uv);
-			if (hasSkinWetness) {
-				// float3 wetMaskNormal = Skin::CalculateNormalFromHeight(skinWetMask, SharedData::skinData.wetParams.w * 0.00005, uv);
-				float3 wetMaskNormal = (skinWetnessNormal.xyz * 2.0 - 1.0);
-				wetNormal = Skin::ReorientNormal(wetMaskNormal, wetNormal);
-			}
-			if (SharedData::skinData.skinParams2.y > 1.0f) {
-				wetNormal = lerp(wetNormal, tangentNormal, saturate(SharedData::skinData.skinParams2.y - 1.0f));
-			}
-			// Texture sampling already supplies filtered mask coverage. Applying a
-			// second screen-space fwidth here made the artist mask vary with distance;
-			// procedural wet/dry coverage is filtered at its threshold instead.
-			const float wetMaskCoverage = saturate(skinWetMask);
-			const float wetNormalWeight = Skin::GetWetnessResponse(skinWetness * wetMaskCoverage);
-			float3 combinedWetNormal = normalize(lerp(combinedTangentNormal, wetNormal, wetNormalWeight));
-			wetWorldNormal = normalize(mul(tbn, combinedWetNormal));
-			worldNormal.xyz = wetWorldNormal;
-		}
+		}  // (49h) the Legacy wet normal is retired
 	}
 #	endif  // CS_SKIN
 
@@ -3180,7 +3139,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 					// exactly, the later multiply is 1 then), strength 1 = the unmasked cubemap F0 / roughness, masked once below.
 					// Materials without a mask texture (envMask = glossiness, no later multiply) keep envMask. Off: envMask, as 48b.
 					float envMaskF0 = envMask;
-					[branch] if ((SharedData::vanillaFresnelSettings.EyeDirectSpecularMode & kVFEnvMaskApplyOnce) != 0u && EnvmapData.y != 0.0)
+					[branch] if (EnvmapData.y != 0.0)  // (49h) Apply Once is permanent (48o): the off arm is gone
 						envMaskF0 = lerp(envMask, 1.0, SharedData::vanillaFresnelSettings.EnvMaskStrength);
 #				if defined(SPECULAR)
 					F0 = max(lerp(baseF0, F0, envMaskF0), SharedData::vanillaFresnelSettings.MinF0);
@@ -3283,26 +3242,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	bool eyeForceVanillaGates = false;       // VanillaPhong + GGXGated: run the two gates
 	bool eyeSuppressConvertedF0 = false;     // VanillaPhong: gate on plain SpecularColor.xyz
 	if (enableVanillaFresnel && applyEyeHandling) {
-		directSpecularRoughness = clamp(SharedData::vanillaFresnelSettings.EyeDirectRoughness, 0.04, 1.0);
-
-		// (48c) Low byte only: bit 8 carries Env Mask: Apply Once (kVFEnvMaskApplyOnce).
-		const uint eyeDirectSpecularMode = SharedData::vanillaFresnelSettings.EyeDirectSpecularMode & 0xFFu;
-		if (eyeDirectSpecularMode == SharedData::EyeDirectSpecularModeVanillaPhong) {
-			// Phong lobe plus both gates, and the gate uses plain SpecularColor.xyz with no
-			// converted-cubemap F0 mixed in. That is exactly what bedec8379 compiled to for an
-			// eye, because EnableGGX and EnableDynamicCubemapsConversion both defaulted off
-			// there. The one branch with a known-correct reference.
-			eyeUseVanillaDirectLobe = true;
-			eyeForceVanillaGates = true;
-			eyeSuppressConvertedF0 = true;
-		} else if (eyeDirectSpecularMode == SharedData::EyeDirectSpecularModeGGXGated) {
-			// GGX lobe, but put the two gates back. Theoretically the better answer --
-			// energy-conserving lobe, and the author's gloss map and env mask respected --
-			// and unverified, which is why it is not the default.
-			eyeForceVanillaGates = true;
-		}
-		// EyeDirectSpecularModeGGXRaw leaves all three false: GGX lobe, gates skipped, i.e.
-		// the batch 9 - batch 14 behaviour, kept for A/B.
+		// (49h) Eyes: Vanilla Phong only (pinned since 48o): phong lobe plus both gates on plain SpecularColor.xyz, exactly what
+		// bedec8379 compiled to for an eye. The GGX Gated / GGX Raw arms and Eye Direct Roughness (GGX only) are retired.
+		eyeUseVanillaDirectLobe = true;
+		eyeForceVanillaGates = true;
+		eyeSuppressConvertedF0 = true;
 	}
 #	else
 	const bool eyeUseVanillaDirectLobe = false;
@@ -3521,10 +3465,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		if defined(CS_SKIN) && !defined(SKIN)
 	if (skinEnabled) {
 		const float charWorldZ = input.WorldPosition.z + FrameBuffer::CameraPosAdjust[eyeIndex].z;
-		float2 dynamicWetness = Skin::GetWetness(charWorldZ, worldNormal.xyz);
-#			if defined(TRUE_PBR)
-		dynamicWetness.x = lerp(dynamicWetness.x, 0.0f, pbrSurfaceProperties.Metallic);
-#			endif
 		[branch] if (Skin::WetPhysical())
 		{
 			float wSwim = 0.0, wManual = 0.0, wSweat = 0.0;
@@ -3658,15 +3598,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 				rainWetness = 0.0;  // Wet Gear off: no character wetness (world surfaces untouched)
 			}
 #			endif
-		}
-		else
-		{
-			float dynamicWetnessValue = clamp(dynamicWetness.x + dynamicWetness.y, 0.f, 2.f);
-#			if defined(HAIR)
-			dynamicWetnessValue = min(SharedData::skinData.skinParams2.y + dynamicWetnessValue, 2.0f);
-#			endif
-			rainWetness += min(dynamicWetnessValue, 1.f);
-		}
+		}  // (49h) the Legacy (pre-42c) hair / gear wetness is retired
 	}
 #		endif
 	float shoreWetness = shoreFactor * SharedData::wetnessEffectsSettings.MaxShoreWetness;
@@ -3953,10 +3885,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		if defined(SKIN) && defined(CS_SKIN)
 	// (44a) The New model always draws the skin film itself (WetSkinFilm below).
 	const bool wetFilmInSkin = (wetFilm || skinWetNew) && skinEnabled;
-	if (wetFilmInSkin && !skinWetNew) {
-		skinSurfaceProperties.WetFilmRoughness = wetFilmRoughness;
-		skinSurfaceProperties.WetFilmEnergy = saturate(max(wetFilmWeight, Skin::GetWetnessOpticalResponse(skinSurfaceProperties.Wetness) * max(skinSurfaceProperties.WetnessFilmStrength, 0.0))) * SharedData::wetnessEffectsSettings.WetFilmStrength;
-	}
+	// (49h) The Legacy film arm (Advanced Skin on, Physical off) is retired.
 #		else
 	const bool wetFilmInSkin = false;
 #		endif
@@ -4184,7 +4113,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	dirDetailShadow *= parallaxShadow;
 	dirLightColor *= dirLightColorMultiplier;
 
-	float3 dirDiffuseColor = dirLightColor * saturate(dirLightAngle) * dirDetailShadow * Color::VanillaDiffuseMult();
+	float3 dirDiffuseColor = dirLightColor * saturate(dirLightAngle) * dirDetailShadow * PhysLight::LodLandDirectMult();  // (49h stage 1, S5) = Color::VanillaDiffuseMult() but on PBR-land LOD
 
 #		if defined(SOFT_LIGHTING)
 	lightsDiffuseColor += dirLightColor * GetSoftLightMultiplier(dirLightAngle) * rimSoftLightColor.xyz * Color::VanillaDiffuseMult() * EYE_SOFT_LIGHTING_SCALE * EYE_BACK_LIGHT_GATE(DirLightDirection) * SUN_SOFT_SHADOW;
@@ -4354,10 +4283,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		else
 
 #			if defined(SSPLS)
-	// (46y) Debug view SSPLS Coverage: per pixel the point light reaching it, by kind of shadow (x RT only, y RT + screen-space for
-	// non-RT casters, z not ray traced: screen-space and / or shadow map, w no shadow), weighted by each light's brightness here.
-	const bool ssplsCoverageView = (SharedData::ssplsSettings.Enable & ScreenSpacePointLightShadows::SettingFlags::CoverageView) != 0;
-	float4 ssplsCoverage = 0.0;
 	// (47h) "Skip Screen-Space Light Shadows on Translucent Surfaces" ((47o) permanent): a forward (blended) fragment that is not the
 	// surface in the depth buffer (the tolerance of RTPointShadows::Get) gets no screen-space light shadows: the search would read the
 	// surfaces behind it. Forward surfaces that are in the depth buffer keep them.
@@ -4389,7 +4314,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #				else
 	const bool ssplsHairOff = false;
 #				endif
-	const bool ssplsBeyond = Perf47p::On(Perf47p::kSsplsDist) && !ssplsCoverageView && viewPosition.z >= SharedData::ssplsSettings.MaxDistance;
+	const bool ssplsBeyond = Perf47p::On(Perf47p::kSsplsDist) && viewPosition.z >= SharedData::ssplsSettings.MaxDistance;
 	[branch] if (SharedData::ssplsSettings.Enable && inWorld && ssplsHere && !ssplsBeyond && !ssplsHairOff)
 	{
 		[loop] for (uint scoreIndex = 0; scoreIndex < totalLightCount; scoreIndex++)
@@ -4508,18 +4433,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			float SSPLSShadow = lerp(1.0, ScreenSpacePointLightShadows::GetShadow(LinearSampler, viewPosition, screenNoise, lightDirectionVS, ssplsSteps, light.radius, eyeIndex, light.lightFlags & LightLimitFix::LightFlags::Shadow, ssplsRtContact), SharedData::ssplsSettings.Strength * ssplsWeight);
 			// (46b) Kept beside a ray-traced shadow: the darker of both (a shadow both see is not doubled).
 			lightShadow = rtShadow ? min(lightShadow, SSPLSShadow) : lightShadow * SSPLSShadow;
-		}
-		[branch] if (ssplsCoverageView)
-		{
-			const float coverageWeight = Color::RGBToLuminance(max(lightColor, 0.0)) * saturate(lightAngle);
-			// (47z) Not when its game shadow map was left out this frame (Skip the Game's Shadow Maps; tag bit 13, RayTracing PointLights.h
-			// kTagMapSkipped): Ray Tracing wrote its mask channel unshadowed where the pixel did not trace it, so that is no shadow (red).
-			const bool shadowMap = (Permutation::PixelShaderDescriptor & Permutation::LightingFlags::DefShadow) && (light.lightFlags & LightLimitFix::LightFlags::Shadow) && !rtApplied &&
-			                       !(light.rtShadow & (1u << 13));
-			if (rtShadow)
-				ssplsCoverage += ssplsRun ? float4(0.0, coverageWeight, 0.0, 0.0) : float4(coverageWeight, 0.0, 0.0, 0.0);
-			else
-				ssplsCoverage += (ssplsRun || shadowMap) ? float4(0.0, 0.0, coverageWeight, 0.0) : float4(0.0, 0.0, 0.0, coverageWeight);
 		}
 #			endif
 
@@ -4752,10 +4665,10 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float skylightingDiffuse = 1;
 	float skylightingFadeOutFactor = 1.0;
 	if (!SharedData::InInterior) {
-		skylightingFadeOutFactor = Skylighting::getFadeOutFactor(input.WorldPosition.xyz);
+		skylightingFadeOutFactor = Skylighting::getFadeOutFactorRaw(input.WorldPosition.xyz);  // (49h stage 1) raw: also the vertex AO hand-off
 		skylightingDiffuse = SphericalHarmonics::FuncProductIntegral(skylightingSH, SphericalHarmonics::EvaluateCosineLobe(ambientNormal)) / Math::PI;
 		skylightingDiffuse = saturate(skylightingDiffuse);
-		skylightingDiffuse = lerp(1.0, skylightingDiffuse, skylightingFadeOutFactor);
+		skylightingDiffuse = lerp(1.0, skylightingDiffuse, PhysLight::On(PhysLight::kFarSkylight) ? 1.0 : skylightingFadeOutFactor);  // (49h stage 1, S4b) far fallback in the probe
 		skylightingDiffuse = Skylighting::mixDiffuse(SharedData::skylightingSettings, skylightingDiffuse);
 	}
 #	endif
@@ -5424,39 +5337,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		endif  // ANISOTROPIC_ALPHA
 
 	psout.Diffuse.w = alpha;
-#	endif
-
-#	if defined(WETNESS_EFFECTS) && defined(CS_SKIN) && !defined(SKIN)
-	// (44c) Character Wetness debug view: tint hair and gear by material class (red cloth, yellow
-	// leather, blue metal, green fur / other, purple hair), shaded by the base colour.
-	[branch] if (charWetNew && Skin::wetCharParams[3].z > 0.5)
-	{
-#		if defined(HAIR)
-		const float3 classTint = float3(0.7, 0.3, 1.0);
-#		else
-		const float3 classTint = lerp(gearClass.x * float3(1.0, 0.15, 0.1) + gearClass.y * float3(1.0, 0.8, 0.1) + gearClass.z * float3(0.15, 0.4, 1.0), float3(0.2, 0.9, 0.2), gearClass.w);
-#		endif
-		color.xyz = classTint * (0.3 + 0.7 * saturate(Color::RGBToLuminance(baseColor.xyz) * 2.0));
-		outputAlbedo = 0.0;
-		specularColor = 0.0;
-	}
-#	endif
-
-#	if defined(SSPLS) && defined(LIGHT_LIMIT_FIX) && !defined(LOD)
-	// (46y) Debug view SSPLS Coverage (Ray Tracing > Diagnostics): green = ray traced only, cyan = ray traced + screen-space for the
-	// non-RT casters, orange = not ray traced (screen-space and / or shadow map), red = no shadow, dark grey = no point light.
-	[branch] if (ssplsCoverageView)
-	{
-		const float coverageTotal = dot(ssplsCoverage, 1.0.xxxx);
-		const float3 coverageTint = coverageTotal > 1e-5 ?
-		                                (ssplsCoverage.x * float3(0.1, 0.9, 0.2) + ssplsCoverage.y * float3(0.1, 0.8, 0.9) + ssplsCoverage.z * float3(1.0, 0.5, 0.05) +
-		                                    ssplsCoverage.w * float3(0.9, 0.05, 0.05)) /
-		                                    coverageTotal :
-		                                float3(0.06, 0.06, 0.06);
-		color.xyz = coverageTint * (0.3 + 0.7 * saturate(Color::RGBToLuminance(baseColor.xyz) * 2.0));
-		outputAlbedo = 0.0;
-		specularColor = 0.0;
-	}
 #	endif
 
 #	if defined(LIGHT_LIMIT_FIX) && defined(LLFDEBUG)

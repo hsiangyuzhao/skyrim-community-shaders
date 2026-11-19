@@ -337,7 +337,7 @@ WetSkin::GPUParams WetSkin::GetGPUParams() const
 	g.c[0] = float4(0.0f, 0.0f, std::clamp(s.HairDryTime, 0.25f, 4.0f), std::clamp(s.HairSweatShare, 0.0f, 1.0f));
 	g.c[1] = float4(isNew && s.HairEnabled ? 1.0f : 0.0f, std::clamp(s.HairDarkening, 0.0f, 1.5f), std::clamp(s.HairSharpness, 0.4f, 1.0f), std::clamp(s.HairHighlightGain, 0.5f, 1.6f));
 	g.c[2] = float4(std::clamp(s.HairSecondaryLoss, 0.0f, 1.0f), std::clamp(s.HairScatterLoss, 0.0f, 1.0f), std::clamp(s.HairClumping, 0.0f, 1.0f), std::clamp(s.HairClumpCount, 16.0f, 128.0f));
-	g.c[3] = float4(std::clamp(s.HairClumpShift, 0.0f, 0.4f), std::clamp(s.HairGapDarkening, 0.0f, 0.7f), isNew && s.DebugClassTint ? 1.0f : 0.0f, 0.0f);
+	g.c[3] = float4(std::clamp(s.HairClumpShift, 0.0f, 0.4f), std::clamp(s.HairGapDarkening, 0.0f, 0.7f), 0.0f /* (49h) DebugClassTint retired */, 0.0f);
 	g.c[4] = float4(gearMode, std::clamp(s.GearSheen, 0.0f, 3.0f), std::clamp(s.GearPatchContrast, 0.0f, 1.0f), std::clamp(s.GearWicking, 0.0f, 16.0f));
 	g.c[5] = float4(std::clamp(s.GearSweatShare, 0.0f, 1.0f), keywords ? std::clamp(s.GearKeywordTrust, 0.0f, 1.0f) : 0.0f, std::clamp(s.LeatherDroplets, 0.0f, 1.0f), std::clamp(s.LeatherRivulets, 0.0f, 1.0f));
 	// (44e) z: Rivulets on Face, w: Between-Trail Dulling (the old Contrast's film half).
@@ -881,17 +881,7 @@ void WetSkin::DrawSettings()
 
 	// (47m) The user presets (46a) were removed.
 
-	// 2. Model. (47f) Saved values: 1 = Legacy, 2 = Physical. (47o) The Simple model (0) was removed; the performance switches
-	// (Skip Invisible Work, Faster Noise & Distance LOD) are permanent.
-	{
-		const char* models[] = { "Legacy", "Physical" };
-		int shown = IsOriginal() ? 0 : 1;
-		if (ImGui::Combo("Wetness Model", &shown, models, IM_ARRAYSIZE(models)))
-			s.Model = shown == 0 ? static_cast<uint32_t>(Model::Original) : static_cast<uint32_t>(Model::Physical);
-		Tooltip({ "Legacy (pre-42c): every character exactly as before the wetness work (41b): skin, hair and gear. Only safety limits are kept.",
-			"Physical: every character carries real amounts of water from sweat, rain and swimming. Water arrives, runs off when",
-			"there is too much, and dries at one pace; how it looks (sheen, beads, trails) follows how much water is where." });
-	}
+	// 2. Model. (49h) Legacy (pre-42c) is retired: Physical only (no combo).
 
 	// (47i) Sweat from stamina (or Dynamic Wetness), for every model (moved here from Advanced Skin).
 	const auto drawSweatSource = [&]() {
@@ -908,25 +898,6 @@ void WetSkin::DrawSettings()
 		Tooltip({ "Stamina share at which the exertion is full." });
 		ImGui::EndDisabled();
 	};
-
-	if (IsOriginal()) {
-		// 5. Legacy's own look, 6. the manual slider (0-2, as before).
-		ImGui::SeparatorText("Legacy (pre-42c)");
-		ImGui::SliderFloat("Wetness Film Strength", &s.FilmStrength, 0.0f, 3.0f, "%.2f");
-		Tooltip({ "Advanced Skin's water film, as before. Its energy is capped at 2 (no mirror-like reflections)." });
-		ImGui::SliderFloat("Wetness Perlin Noise Scale", &s.WetParams.x, 0.0f, 1024.0f, "%1.f");
-		ImGui::SliderFloat("Wetness Perlin Noise Lacunarity", &s.WetParams.y, 0.0f, 2.0f, "%.1f");
-		ImGui::SliderFloat("Wetness Perlin Noise Persistence", &s.WetParams.z, 0.0f, 20.0f, "%.2f");
-		ImGui::SliderFloat("Wetness Normal Scale", &s.WetParams.w, 0.0f, 20.0f, "%.1f");
-		// (47i) Moved here from Advanced Skin.
-		ImGui::SliderFloat("Wetness Fade Out Time", &globals::features::skin.settings.WetFadeTime, 0.0f, 50.0f, "%.2f");
-		Tooltip({ "Legacy only: time for the wetness to go from 1 to 0 after leaving the water (and for sweat to fade)." });
-		drawSweatSource();
-		ImGui::SeparatorText("Manual");
-		ImGui::SliderFloat("Extra Wetness (manual)", &s.ExtraWetness, 0.0f, 2.0f, "%.2f");
-		Tooltip({ "Makes skin and hair this wet (0-2, as before)." });
-		return;
-	}
 
 	if (IsPhysical()) {
 		// (47i) Physical: grouped by what the water does.
@@ -1129,10 +1100,7 @@ void WetSkin::DrawSettings()
 
 	// 8. (47f) Status (read-only); (47m) with the material tint debug view, in a "Diagnostics" node closed by default.
 	if (ImGui::TreeNode("Diagnostics")) {
-		ImGui::BeginDisabled(!s.GearEnabled);
-		ImGui::Checkbox("Debug: Tint by Material Class", reinterpret_cast<bool*>(&s.DebugClassTint));
-		Tooltip({ "Paints characters by what the wetness thinks they are: red cloth, yellow leather, blue metal, green fur / other, purple hair." });
-		ImGui::EndDisabled();
+		// (49h) "Debug: Tint by Material Class" is retired (its Lighting code is gone); the key still loads, unused.
 		DrawStatus();
 		ImGui::TreePop();
 	}
@@ -1198,9 +1166,9 @@ void WetSkin::LoadSettings(json& o_json)
 	} catch (...) {
 	}
 	// (47o) The Simple model (0) is gone: everything but Legacy loads as Physical.
-	if (settings.Model != static_cast<uint32_t>(Model::Original) && settings.Model != static_cast<uint32_t>(Model::Physical)) {
-		if (settings.Model == static_cast<uint32_t>(Model::New))
-			logger::info("[Character Wetness] Simple model removed: switched to Physical");
+	// (49h) Legacy (1) is retired too: every saved model loads as Physical.
+	if (settings.Model != static_cast<uint32_t>(Model::Physical)) {
+		logger::info("[Character Wetness] {} model retired: switched to Physical", settings.Model == static_cast<uint32_t>(Model::Original) ? "Legacy" : "Simple");
 		settings.Model = static_cast<uint32_t>(Model::Physical);
 	}
 	// (44e) Rivulet Contrast reversed. Old key StreakContrast c (0..1): trail threshold lerp(0.48, 0.68, c)

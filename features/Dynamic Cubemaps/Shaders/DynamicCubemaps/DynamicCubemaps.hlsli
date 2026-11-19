@@ -2,6 +2,7 @@
 #define DYNAMICCUBEMAPS_HLSLI
 
 #include "Common/BRDF.hlsli"
+#include "Common/PhysicalLighting.hlsli"
 
 #if defined(SKYLIGHTING)
 #	include "Skylighting/Skylighting.hlsli"
@@ -167,7 +168,12 @@ namespace DynamicCubemaps
 #	else
 
 		float3 finalIrradiance = 0;
-		float directionalAmbientColorSpecular = Color::RGBToLuminance(max(0, mul(SharedData::DirectionalAmbient, float4(R, 1.0)))) * Color::ReflectionNormalisationScale;
+		// (49h stage 1, S7) "Forward Reflections at the Cubemap's Brightness": the weather ambient converted like every other ambient
+		// (Color::Ambient, as GetDynamicCubemapSpecularIrradiance above), and below the cubemap at its own brightness (as the composite's
+		// Reflection Brightness Fix and SSRT's fallback). Off: 49g.
+		const bool rawCubemap = PhysLight::On(PhysLight::kForwardCubemap);
+		const float3 dalcSpecularRaw = max(0, mul(SharedData::DirectionalAmbient, float4(R, 1.0)));
+		float directionalAmbientColorSpecular = Color::RGBToLuminance(rawCubemap ? Color::Ambient(dalcSpecularRaw) : dalcSpecularRaw) * Color::ReflectionNormalisationScale;
 
 #		if defined(IBL) && defined(LIGHTING)
 		const bool inWorld = (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InWorld);
@@ -198,6 +204,8 @@ namespace DynamicCubemaps
 			specularIrradiance = Color::IrradianceToLinear(specularIrradiance);
 
 			finalIrradiance = specularIrradiance;
+			[branch] if (rawCubemap)  // (49h stage 1, S7)
+				finalIrradiance = Color::IrradianceToLinear(EnvTexture.SampleLevel(SampColorSampler, R, level).xyz);
 			return horizon * (F0 * specularBRDF.x + specularBRDF.y) * finalIrradiance;
 		}
 
@@ -242,6 +250,12 @@ namespace DynamicCubemaps
 		}
 
 		finalIrradiance = lerp(specularIrradiance, specularIrradianceReflections, skylightingSpecular);
+		[branch] if (rawCubemap)  // (49h stage 1, S7) no-sky capture + the sky it lacks x the specular sky visibility
+		{
+			const float3 envNoSky = EnvTexture.SampleLevel(SampColorSampler, R, level).xyz;
+			const float3 envWithSky = EnvReflectionsTexture.SampleLevel(SampColorSampler, R, level);
+			finalIrradiance = Color::IrradianceToLinear(envNoSky + max(envWithSky - envNoSky, 0.0) * skylightingSpecular);
+		}
 #		else
 #			if defined(IBL)
 		float3 iblColor = 0;
@@ -257,10 +271,13 @@ namespace DynamicCubemaps
 
 		float specularIrradianceLuminance = Color::RGBToLuminance(EnvReflectionsTexture.SampleLevel(SampColorSampler, R, 15));
 
+		const float3 rawReflections = Color::IrradianceToLinear(specularIrradiance);  // (49h stage 1, S7)
 		specularIrradiance = (specularIrradiance / max(specularIrradianceLuminance, 0.001)) * directionalAmbientColorSpecular;
 		specularIrradiance = Color::IrradianceToLinear(specularIrradiance);
 
 		finalIrradiance = specularIrradiance;
+		[flatten] if (rawCubemap)
+			finalIrradiance = rawReflections;
 #		endif
 		return horizon * (F0 * specularBRDF.x + specularBRDF.y) * finalIrradiance;
 #	endif

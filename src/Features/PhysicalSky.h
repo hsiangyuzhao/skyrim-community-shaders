@@ -153,14 +153,16 @@ struct PhysicalSky final : public Feature
 		float3 masserColor = float3{ 1.0f, 0.6f, 0.6f } * 5e-3f;
 		float3 secundaColor = float3{ 0.8f, 1.0f, 1.0f } * 5e-3f;
 
-		bool proceduralSun = true;
+		// (49h) The procedural sun is retired (Sky.hlsl draws the game's sun with the Sky Fixes halo); the keys are ignored on load.
+		static constexpr bool proceduralSun = false;
 		// (47m) sunDiskRad (the 37a disc size, read only by Legacy (36f)) removed; the old key is ignored on load.
 
 		// (batch 37b) Procedural sun v2. Each follows its own setting (the old master switch is gone).
 		/// Disk centred where the vanilla sun is drawn (Sky Sync's apparent direction, dipped
 		/// with altitude, in the sky root's frame) instead of the raw sun direction. Also moves
 		/// the sky's sun glow and the scattering LUTs onto that direction.
-		bool sunAlignToVanilla = true;
+		/// (49h) Fixed on (it still sets the scattering LUTs' and the light's sun direction); the key is ignored on load.
+		static constexpr bool sunAlignToVanilla = true;
 		/// Disk replaces the vanilla sun texture (upstream 45ad2c6f7 + 735ec68e4): drawn only on
 		/// the sun quad, quad pixels outside the disk cleared.
 		bool sunReplaceVanilla = true;
@@ -201,6 +203,23 @@ struct PhysicalSky final : public Feature
 		/// (49h) "Sun Highlight on Water Follows the Atmosphere" (Celestials, under Transmittance Mix): Water.hlsl's sun highlight x the
 		/// transmittance toward the light (PhysSky::SampleTr), as every surface gets it (NightFlags kNightWaterSunTr). Off = 49g.
 		bool waterSunTransmittance = true;
+		/// (49h stage 1) "Physical Lighting" (Scene Lighting tab): one master and one checkbox per rule (S1-S8, brief-49h-stage1.md).
+		/// Master off = 49h groups 1-7. Saved outside the NLOHMANN macro (key "physicalLighting").
+		struct PhysicalLighting
+		{
+			bool enabled = true;
+			bool sameDirectLight = true;   // S1: clouds / lit effects / moonlight in ground units, weather hides the moon on the ground too
+			bool moonCloudGrey = false;    // S1 option: keep the old partial desaturation of moonlight on clouds
+			bool cloudAmbient = true;      // S2: clouds get the ground's sky ambient (not x the weather cloud colour)
+			bool iblNoFeedback = true;     // S3a: the screen probe is captured without the IBL ambient already in the frame
+			bool iblEnvOcclusion = true;   // S3b: the environment probe's upper hemisphere is blocked by skylighting
+			bool farShadows = true;        // S4a: with RT sun shadows, full objects are shadow-tagged out to the RT trace extent
+			bool farSkylight = true;       // S4b: beyond the skylighting probe volume, a fallback visibility instead of open sky
+			bool lodScale = true;          // S5: LOD land in the near land's light scale (PBR land), LOD gamma on both LOD land techniques
+			bool farFog = true;            // S6: the far height fog continues the volumetric fog's light
+			bool forwardCubemap = true;    // S7: forward cubemap reflections at the cubemap's own brightness, ambient converted
+			bool smallFixes = true;        // S8: small consistency fixes
+		} physicalLighting;
 		/// (48b) Its strength, 0-3. 1: Masser full and high on a clear night keeps about 40% of the Milky Way's light.
 		float moonStarFadeStrength = 1.f;
 		/// (48b) "Moon Planetshine": a faint grey fill on the unlit side of each moon disc (strongest at crescent, none at
@@ -416,6 +435,22 @@ struct PhysicalSky final : public Feature
 		// (49h) Water.hlsl only: its sun highlight x the transmittance toward the light ("Sun Highlight on Water Follows the Atmosphere").
 		kNightWaterSunTr = 1u << 8,
 	};
+	/// (49h stage 1) Physical Lighting rule bits in SharedData::horizonFixData.Flags (HorizonFixCbData::flags, unused since 47m).
+	/// Mirrored by Common/PhysicalLighting.hlsli.
+	enum PhysLightFlags : uint32_t
+	{
+		kPLDirect = 1u << 0,
+		kPLMoonGrey = 1u << 1,
+		kPLCloudAmbient = 1u << 2,
+		kPLIblNoFeedback = 1u << 3,
+		kPLEnvOcclusion = 1u << 4,
+		kPLFarSkylight = 1u << 5,
+		kPLLodScale = 1u << 6,
+		kPLFarFog = 1u << 7,
+		kPLForwardCubemap = 1u << 8,
+		kPLSmallFixes = 1u << 9,
+		kPLLandPbr = 1u << 10,  // information: the loaded land uses True PBR texture sets
+	};
 	struct NightCbData
 	{
 		float3 lutSunDir = { 0.f, 0.f, 1.f };  // F4a/F4b: sun direction the LUTs use
@@ -515,6 +550,11 @@ struct PhysicalSky final : public Feature
 	/// (47g) The clear physical sky's light on a white surface facing up (its cosine-weighted mean radiance, as drawn:
 	/// Sky Fixes' brightness factor, the moons' glow, the night base light), from the CPU model; 0 when it cannot be had.
 	float ComputeFogSkyLight(const RE::NiPoint3& a_lutSunDir);
+	/// (49h stage 1) The Physical Lighting rule bits in effect (0 with the master off).
+	[[nodiscard]] uint32_t PhysLightingFlags() const;
+	/// (49h stage 1) A Physical Lighting rule in effect (master and its checkbox) -- for the C++ side of S1 / S4a.
+	[[nodiscard]] bool PhysLightingOn(bool a_rule) const { return loaded && settings.physicalLighting.enabled && a_rule; }
+	void SettingsSceneLighting();
 	/// (49h) EHF "Stable Fog Colour": Physical Sky's transmittance from the camera toward a_dir (towards the light) as
 	/// PhysSky::SampleTr gives the shaders (Transmittance Mix applied), from the CPU model; 1 while Physical Sky is off or the
 	/// model cannot be had.
@@ -529,15 +569,6 @@ struct PhysicalSky final : public Feature
 	// (47o) The Horizon Fix cloud warp's VS b11 binding is gone (Sky.hlsl no longer declares it).
 
 	/// (batch 37c) "Sun Look" presets.
-	enum SunLook : int
-	{
-		kSunLookCustom = 0,
-		kSunLookBright,   // real size, strong glow: reads as a blinding sun without bloom
-		kSunLookSoft,     // slightly larger, gentle glow
-		kSunLookVanilla,  // procedural sun off: the game's own sun picture
-		kSunLookCount
-	};
-	void ApplySunLook(int a_look);
 
 	eastl::unique_ptr<Texture2D> texTrLut = nullptr;  // transmittance
 	eastl::unique_ptr<Texture2D> texMsLut = nullptr;  // multiscattering

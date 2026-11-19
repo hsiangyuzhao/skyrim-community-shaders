@@ -5,6 +5,7 @@
 #include "Common/Random.hlsli"
 #include "Common/SharedData.hlsli"
 #include "Common/Spherical Harmonics/SphericalHarmonics.hlsli"
+#include "Common/PhysicalLighting.hlsli"
 
 namespace Skylighting
 {
@@ -17,7 +18,16 @@ namespace Skylighting
 	const static float3 ARRAY_SIZE = 4096.f * 2.5f * float3(1, 1, 0.5);
 	const static float3 CELL_SIZE = ARRAY_SIZE / ARRAY_DIM;
 
-	float getFadeOutFactor(float3 positionMS)
+	// (49h stage 1, S4b) "Far Skylight Is Not Open Sky": beyond the probe volume the visibility is no longer the full sky (1) but
+	// f(d) = 0.5 + 0.5 d.z (sky above, ground below): cosine-convolved 0.83 facing up, 0.5 sideways, 0.17 facing down. sample() and
+	// sampleNoBias() blend into it over the volume's last 5 % (the fade getFadeOutFactor gave the callers); getFadeOutFactor then
+	// returns 1, so every caller (forward, composite, grass, distant trees, effects, fog, SSRT) uses the blended probe unchanged.
+	sh2 FarVisibilitySH()
+	{
+		return float4(0.5 * 3.5449077, 0.0, 0.5 * 2.0466534, 0.0);  // a sqrt(4 pi), b 0.4886 (4 pi / 3)
+	}
+
+	float getFadeOutFactorRaw(float3 positionMS)
 	{
 		// (batch 38, upstream 4b5b99783) The probe grid is centred on the snapped cell origin
 		// (PosOffset), not on the camera: measure the edge distance the way sample() addresses
@@ -29,6 +39,11 @@ namespace Skylighting
 		float3 dists = min(uvw, 1 - uvw);
 		float edgeDist = min(dists.x, min(dists.y, dists.z));
 		return saturate(edgeDist * 20);
+	}
+
+	float getFadeOutFactor(float3 positionMS)
+	{
+		return PhysLight::On(PhysLight::kFarSkylight) ? 1.0 : getFadeOutFactorRaw(positionMS);
 	}
 
 	// `visibility` is saturated here rather than at the call sites because three callers
@@ -91,7 +106,11 @@ namespace Skylighting
 		float3 uvw = positionMSAdjusted / ARRAY_SIZE + .5;
 
 		if (any(uvw < 0) || any(uvw > 1))
-			return scaledUnitSH;
+			return PhysLight::On(PhysLight::kFarSkylight) ? FarVisibilitySH() : scaledUnitSH;  // (49h stage 1, S4b)
+		const bool farFallback = PhysLight::On(PhysLight::kFarSkylight);  // (49h stage 1, S4b)
+		const float farFade = farFallback ? getFadeOutFactorRaw(positionMS) : 1.0;
+		[branch] if (farFallback && farFade <= 0.0)
+			return FarVisibilitySH();
 
 		float3 cellVxCoord = uvw * ARRAY_DIM;
 		int3 cell000 = floor(cellVxCoord - 0.5);
@@ -125,7 +144,10 @@ namespace Skylighting
 					wsum += w;
 				}
 
-		return SphericalHarmonics::Scale(sum, rcp(wsum + 1e-10));
+		sh2 result = SphericalHarmonics::Scale(sum, rcp(wsum + 1e-10));
+		[flatten] if (farFallback)
+			result = lerp(FarVisibilitySH(), result, farFade);  // (49h stage 1, S4b)
+		return result;
 	}
 
 	sh2 sampleNoBias(SharedData::SkylightingSettings params, Texture3D<sh2> probeArray, float3 positionMS)
@@ -136,11 +158,16 @@ namespace Skylighting
 		if (SharedData::InInterior)
 			return scaledUnitSH;
 
+		const bool farFallback = PhysLight::On(PhysLight::kFarSkylight);  // (49h stage 1, S4b)
+		const float farFade = farFallback ? getFadeOutFactorRaw(positionMS) : 1.0;
+		[branch] if (farFallback && farFade <= 0.0)
+			return FarVisibilitySH();
+
 		float3 positionMSAdjusted = positionMS - params.PosOffset.xyz;
 		float3 uvw = positionMSAdjusted / ARRAY_SIZE + .5;
 
 		if (any(uvw < 0) || any(uvw > 1))
-			return scaledUnitSH;
+			return PhysLight::On(PhysLight::kFarSkylight) ? FarVisibilitySH() : scaledUnitSH;  // (49h stage 1, S4b)
 
 		float3 cellVxCoord = uvw * ARRAY_DIM;
 		int3 cell000 = floor(cellVxCoord - 0.5);
@@ -171,7 +198,10 @@ namespace Skylighting
 			wsum += w;
 		}
 
-		return SphericalHarmonics::Scale(sum, rcp(wsum + 1e-10));
+		sh2 result = SphericalHarmonics::Scale(sum, rcp(wsum + 1e-10));
+		[flatten] if (farFallback)
+			result = lerp(FarVisibilitySH(), result, farFade);  // (49h stage 1, S4b)
+		return result;
 	}
 }
 
