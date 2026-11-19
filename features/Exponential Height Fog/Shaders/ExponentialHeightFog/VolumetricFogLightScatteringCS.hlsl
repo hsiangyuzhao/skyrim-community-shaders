@@ -205,19 +205,50 @@ float SampleDirectionalShadow(float3 positionWS, uint eyeIndex)
 	return lerp(1.0f, shadow, fadeFactor);
 }
 
+/// (49h) "Stable Fog Colour" (F11 > Lighting > Exponential Height Fog > Volumetric Fog): the sun through Physical Sky's
+/// atmosphere, the sky light by the phase's real directionality, the weather top-up by luminance in the weather fog's hue
+/// against the single scatter as it is really drawn. Off = 49g bit for bit.
+bool StableFogColour()
+{
+	return (asuint(VolumetricFogStableColour.w) & 1u) != 0u;
+}
+
 float3 GetDirectionalLightColor()
 {
 	// Same conversion as Effect.hlsl's lit effects: the scene's directional light, linearised
 	// under Linear Lighting exactly as the surfaces receive it.
 	float llDirLightMult = (SharedData::linearLightingSettings.enableLinearLighting && !SharedData::linearLightingSettings.isDirLightLinear) ? SharedData::linearLightingSettings.dirLightMult : 1.0f;
-	return Color::DirectionalLight(SharedData::DirLightColor.xyz / max(llDirLightMult, 1e-5), SharedData::linearLightingSettings.isDirLightLinear) * llDirLightMult;
+	float3 color = Color::DirectionalLight(SharedData::DirLightColor.xyz / max(llDirLightMult, 1e-5), SharedData::linearLightingSettings.isDirLightLinear) * llDirLightMult;
+	// (49h) x Physical Sky's transmittance toward the light, as every surface, effect and the height fog get it (PhysSky::SampleTr);
+	// the CPU leaves 1 without Physical Sky.
+	[flatten] if (StableFogColour())
+		color *= saturate(VolumetricFogStableColour.rgb);
+	return color;
 }
+
+/// Sky (IBL or vanilla ambient) light arriving from a_direction, unoccluded.
+float3 SkyLightFrom(float3 a_direction)
+{
+	float3 skyLighting;
+	[branch] if (VolumetricFogHasIBL)
+		skyLighting = Color::IrradianceToGamma(ImageBasedLighting::GetIBLColor(a_direction));
+	else
+		skyLighting = Color::Ambient(max(0, mul(SharedData::DirectionalAmbient, float4(a_direction, 1.0f))));
+	return skyLighting;
+}
+
+/// (49h) Stable Fog Colour: the up-facing sky light (SkyLightFrom(0, 0, 1)), the same for every froxel: evaluated once per thread in
+/// main, not in every sample (shader size / registers).
+static float3 gSkyUp = 0.0f.xxx;
 
 /// Sky light reaching a froxel at intensity 1 (x VolumetricFogLighting.y for the scattering).
 float3 ComputeSkyLight(float3 positionWS, float3 viewDirection, uint eyeIndex)
 {
 	float phaseG = VolumetricFogLighting.w;
 	float3 skyDirection = abs(phaseG) > 0.001f ? normalize(-viewDirection * phaseG) : float3(0.0f, 0.0f, 1.0f);
+	// (49h) Stable Fog Colour: a phase of g only leans |g| of the sky light toward one direction; the rest arrives from all
+	// around (the up-facing irradiance, what g = 0 already used). Off: the whole lookup from the single direction (49g).
+	const float directional = (StableFogColour() && abs(phaseG) > 0.001f) ? saturate(abs(phaseG)) : 1.0f;  // g ~ 0: the up lookup already
 	float skyVisibility = 1.0f;
 	if (VolumetricFogHasSkylighting && !SharedData::InInterior) {
 		float3 skylightingPosition = positionWS + FrameBuffer::CameraPosAdjust[eyeIndex].xyz - FrameBuffer::CameraPosAdjust[0].xyz;
@@ -227,11 +258,9 @@ float3 ComputeSkyLight(float3 positionWS, float3 viewDirection, uint eyeIndex)
 		skyVisibility = Skylighting::mixDiffuse(SharedData::skylightingSettings, visibility);
 	}
 
-	float3 skyLighting;
-	[branch] if (VolumetricFogHasIBL)
-		skyLighting = Color::IrradianceToGamma(ImageBasedLighting::GetIBLColor(skyDirection));
-	else
-		skyLighting = Color::Ambient(max(0, mul(SharedData::DirectionalAmbient, float4(skyDirection, 1.0f))));
+	float3 skyLighting = SkyLightFrom(skyDirection);
+	[branch] if (directional < 1.0f)
+		skyLighting = lerp(gSkyUp, skyLighting, directional);
 
 	return skyLighting * skyVisibility;
 }
@@ -260,10 +289,42 @@ float3 GetWeatherFogColor(float viewDepth)
 	return max(color, 0.0f.xxx);
 }
 
+/// (49h) Stable Fog Colour: WeatherFog::PhysicalLuminance for the volumetric fog only (WeatherFog.hlsli itself is included
+/// by Lighting and stays as it is): the sun term in the units of a white surface facing up as the game draws it, i.e.
+/// x the vanilla diffuse factor of Linear Lighting (0.28 by default; 1 without it) and x Physical Sky's transmittance.
+float PhysicalLuminanceStable(float a_height)
+{
+	const float k = 0.75f * (1.0f - 0.85f);
+	const float tau = WeatherFog::Active() ? WeatherFog::VerticalDepth(a_height) : 0.0f;
+	const float mu = saturate(SharedData::DirLightDirection.z);
+	const float3 sunColor = WeatherFog::SunLightLinear() * saturate(VolumetricFogStableColour.rgb) * Color::VanillaDiffuseMult();
+	const float sun = dot(sunColor, float3(0.2126f, 0.7152f, 0.0722f)) * mu / (1.0f + k * tau / max(mu, 0.1f));
+	const float sky = WeatherFog::PhysicalSkyLight() / (1.0f + 2.0f * k * tau);  // diffuse light: mean cosine 0.5
+	const float groundAlbedo = dot(SharedData::physSkyData.groundAlbedo, float3(0.2126f, 0.7152f, 0.0722f));
+	return (sun + sky) * 0.5f * (1.0f + saturate(groundAlbedo));
+}
+
+/// The weather fog colour the top-up aims at: "Physical Fog Brightness" (WeatherFog::PhysicalFogColor), with the sun term in
+/// units while Stable Fog Colour is on.
+float3 GetWeatherTargetColor(float3 a_weatherColor, float a_height)
+{
+	float3 color = a_weatherColor;
+	[branch] if (!StableFogColour())
+		color = WeatherFog::PhysicalFogColor(a_weatherColor, a_height);
+	else if (WeatherFog::PhysicalSkyLight() > 0.0f)
+	{
+		const float y = dot(max(a_weatherColor, 0.0f), float3(0.2126f, 0.7152f, 0.0722f));
+		const float3 hue = y > 1e-4f ? max(a_weatherColor, 0.0f) / y : float3(1.0f, 1.0f, 1.0f);
+		color = hue * PhysicalLuminanceStable(a_height);
+	}
+	return color;
+}
+
 #if !defined(VOLUMETRIC_FOG_FAR_GRID)
 // EHF panel readout: one froxel at the centre of the screen (slice VolumetricFogWeatherFogParams.w), read back by
-// ExponentialHeightFog::ReadVolumetricDebug. [0] = Wfog, sigma_w (0 = no extra source here); [1] = E Ts / 4 pi, view
-// depth; [2] = S, the extra source's share of Wfog (luminance). Writes to an unbound UAV are dropped.
+// ExponentialHeightFog::ReadVolumetricDebug. [0] = Wfog, sigma_w (0 = no extra source here); [1] = the sun's single
+// scatter it is compared with (49g: E Ts / 4 pi), view depth; [2] = the sky's (49g: S), the extra source's share of Wfog
+// (luminance); [3] (49h) = the colour actually added, 1 while Stable Fog Colour is on. Writes to an unbound UAV are dropped.
 RWStructuredBuffer<float4> VolumetricFogDebug : register(u1);
 #endif
 
@@ -285,17 +346,36 @@ float3 ComputeWeatherMultipleScattering(uint3 coord, bool a_readout)
 		const float3 albedo = saturate(VolumetricFogAlbedo.rgb) * VolumetricFogAlbedo.a;
 		// (47g) "Physical Fog Brightness": the weather colour's hue at the brightness of the light reaching this froxel, as the
 		// height fog without cubemaps (WeatherFog::PhysicalFogColor; the weather colour itself while off).
-		const float3 weatherColor = WeatherFog::PhysicalFogColor(GetWeatherFogColor(viewDepth), positionWS.z);
-		const float3 sun = GetDirectionalLightColor() * (WeatherFog::SunTransmittance(positionWS.z) / (4.0f * Math::PI));
-		// The bracket is never negative, so the source never exceeds Wfog; the min keeps it there whatever comes in.
-		const float3 missing = min(max(weatherColor - (sun + skyLight), 0.0f.xxx), weatherColor);
+		const float3 weatherColor = GetWeatherTargetColor(GetWeatherFogColor(viewDepth), positionWS.z);
+		float3 sun;
+		float3 sky = skyLight;
+		float3 missing;
+		[branch] if (StableFogColour())
+		{
+			// (49h) The single scatter as ComputeLightScattering draws it (Sun / Sky Scattering Intensity, the sun's phase toward
+			// this view ray, no shadow), and only the luminance that is missing, in the weather fog's own hue: no channel can
+			// be topped up alone, so the fog cannot drift to purple or cyan when one channel of the sun or sky is low.
+			const float phase = ExponentialHeightFog::HenyeyGreenstein(dot(normalize(SharedData::DirLightDirection.xyz), normalize(positionWS)), VolumetricFogLighting.w);
+			sun = GetDirectionalLightColor() * (WeatherFog::SunTransmittance(positionWS.z) * phase * VolumetricFogLighting.x);
+			sky = skyLight * VolumetricFogLighting.y;
+			const float target = Color::RGBToLuminance(max(weatherColor, 0.0f.xxx));
+			const float single = Color::RGBToLuminance(max(sun + sky, 0.0f.xxx));
+			missing = target > 1e-6f ? max(weatherColor, 0.0f.xxx) * (max(target - single, 0.0f) / target) : 0.0f.xxx;
+		}
+		else
+		{
+			sun = GetDirectionalLightColor() * (WeatherFog::SunTransmittance(positionWS.z) / (4.0f * Math::PI));
+			// The bracket is never negative, so the source never exceeds Wfog; the min keeps it there whatever comes in.
+			missing = min(max(weatherColor - (sun + skyLight), 0.0f.xxx), weatherColor);
+		}
 		result = weatherExtinction * albedo * missing;
 #if !defined(VOLUMETRIC_FOG_FAR_GRID)
 		[branch] if (a_readout)
 		{
 			VolumetricFogDebug[0] = float4(weatherColor, weatherExtinction);
 			VolumetricFogDebug[1] = float4(sun, viewDepth);
-			VolumetricFogDebug[2] = float4(skyLight, Color::RGBToLuminance(missing) / max(Color::RGBToLuminance(weatherColor), 1e-6f));
+			VolumetricFogDebug[2] = float4(sky, Color::RGBToLuminance(missing) / max(Color::RGBToLuminance(weatherColor), 1e-6f));
+			VolumetricFogDebug[3] = float4(missing, StableFogColour() ? 1.0f : 0.0f);
 		}
 #endif
 	}
@@ -440,6 +520,10 @@ float4 ComputeLightScattering(uint3 coord, float3 cellOffset)
 		LightScattering[dispatchID] = 0.0f.xxxx;
 		return;
 	}
+
+	// (49h) Stable Fog Colour: the up-facing sky light for ComputeSkyLight (unused otherwise).
+	[branch] if (StableFogColour() && abs(VolumetricFogLighting.w) > 0.001f)
+		gSkyUp = SkyLightFrom(float3(0.0f, 0.0f, 1.0f));
 
 	// (47e) "Match Weather Fog Brightness": the weather layer's extra source, once per froxel at its centre (it is smooth and
 	// has no jitter). It starts the sample sum below (x the sample count the average divides by), so nothing more stays

@@ -374,6 +374,7 @@ namespace
 	constexpr std::uint32_t kAOFlagGeometryValid = 512u;     // RTAOCommon.hlsli: last frame's geometry / history lengths valid
 	constexpr std::uint32_t kAOFlagDynamicHistory = 1024u;   // (47n) RTAOCommon.hlsli: RTAO: Tight History Near Moving Things
 	constexpr std::uint32_t kAOFlagTileSkip = 2048u;          // (47r) RTAOCommon.hlsli: RTAO: Filter Only Where Traced (t10 = the tile distances)
+	constexpr std::uint32_t kAOFlagContactOnce = 4096u;       // (49h) RTAOCommon.hlsli: RTAO: Count Contact Once
 	constexpr float kAOMinHistoryWeight = 0.1f;   // this frame's weight never below 1 / 10 (a = max(1 / (n + 1), 0.1))
 	constexpr float kAOHistoryFixFrames = 4.0f;   // the history fix fades out over the first 4 frames of a pixel's history
 	constexpr float kAOMaxHistoryLength = 32.0f;  // n is stored up to this (only n < 9 changes the weight)
@@ -1780,6 +1781,7 @@ RayTracingScene::SceneConfig RayTracing::SceneConfigFromSettings() const
 	config.windowMasks = alpha && backend.PointAlphaAvailable() && PointLightsOn() && InteriorsOn();
 	config.spatialChunks = settings.SpatialStaticChunks;  // (47u) a change re-captures the scene
 	config.materials = MaterialsWanted();                 // (48f) likewise
+	config.strictAlpha = settings.HairFaintStrands;        // (49h) likewise
 	return config;
 }
 
@@ -1811,6 +1813,7 @@ void RayTracing::UpdateCharacters()
 	// (45j) Alpha-tested parts (fur trims, cut-out cloth; hair when Hair is ray traced) whenever the
 	// alpha pipeline exists; a change of the first three re-captures the characters.
 	// (46m) Read lanes, scan cache and merged BLASes are always on (47m).
+	characters.SetStrictAlpha(settings.HairFaintStrands);  // (49h) a change re-captures the characters
 	characters.Configure(settings.PhysicsParts, settings.Hair, backend.SkinAlphaAvailable(), settings.FirstPersonPlayer, PerfOptions::settings.RtDropTinyParts);
 	characters.SetBonesTolerant(PerfOptions::settings.RtBonesTolerant);  // (47p)
 	characters.SetBodyOnlyDistance(NpcFullDistance());                   // (47q) the NPC rule
@@ -2073,6 +2076,9 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.ReflectionsHitDistance = read("ReflectionsHitDistance", defaults.ReflectionsHitDistance);
 		settings.ReflectionsLoadingPrep = read("ReflectionsLoadingPrep", defaults.ReflectionsLoadingPrep);  // (48e)
 		settings.ReflectionsCubemapWarmUp = read("ReflectionsCubemapWarmUp", defaults.ReflectionsCubemapWarmUp);
+		settings.PointCloseContact = read("PointCloseContact", defaults.PointCloseContact);  // (49h)
+		settings.HairFaintStrands = read("HairFaintStrands", defaults.HairFaintStrands);    // (49h)
+		settings.AOContactOnce = read("AOContactOnce", defaults.AOContactOnce);  // (49h)
 		settings.ReflectionsMaterials = read("ReflectionsMaterials", defaults.ReflectionsMaterials);  // (48f)
 		settings.ReflectionsOffscreenColor = std::clamp(read("ReflectionsOffscreenColor", defaults.ReflectionsOffscreenColor), 0, 1);  // (48g)
 		settings.ReflectionsOffscreenBrightness = std::clamp(read("ReflectionsOffscreenBrightness", defaults.ReflectionsOffscreenBrightness), 0.25f, 4.0f);
@@ -2247,6 +2253,9 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["ReflectionsHitDistance"] = settings.ReflectionsHitDistance;
 	o_json["ReflectionsLoadingPrep"] = settings.ReflectionsLoadingPrep;  // (48e)
 	o_json["ReflectionsCubemapWarmUp"] = settings.ReflectionsCubemapWarmUp;
+	o_json["PointCloseContact"] = settings.PointCloseContact;  // (49h)
+	o_json["HairFaintStrands"] = settings.HairFaintStrands;    // (49h)
+	o_json["AOContactOnce"] = settings.AOContactOnce;  // (49h)
 	o_json["ReflectionsMaterials"] = settings.ReflectionsMaterials;  // (48f)
 	o_json["ReflectionsOffscreenColor"] = settings.ReflectionsOffscreenColor;  // (48g)
 	o_json["ReflectionsOffscreenBrightness"] = settings.ReflectionsOffscreenBrightness;
@@ -5707,9 +5716,11 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	}
 	// (47w) Adaptive skip coverage counts: (48o) never (Skip the Game's Shadow Maps and Adaptive are fixed off).
 	pointInput.coverageCount = 0;
-	// (48o) Always on: (47x) Trace Lights on Curved Surfaces Reliably, Close-Contact Shadows on Characters; (47z) Window Beams: Respect
-	// Their Range; (48a) Window Beams: Smooth Edges; (48k) Noise Fix: Decorrelated Sampling, Consistent Dark Side.
-	flags |= kPointFlagCurvedRanking | kPointFlagCloseContact | kPointFlagBeamRange | kPointFlagBeamSmooth | kPointFlagNoiseDecorrelate |
+	// (48o) Always on: (47x) Trace Lights on Curved Surfaces Reliably; (47z) Window Beams: Respect Their Range; (48a) Window Beams: Smooth
+	// Edges; (48k) Noise Fix: Decorrelated Sampling, Consistent Dark Side. (49h) Close-Contact Shadows on Characters: a switch again (default on).
+	if (settings.PointCloseContact)
+		flags |= kPointFlagCloseContact;
+	flags |= kPointFlagCurvedRanking | kPointFlagBeamRange | kPointFlagBeamSmooth | kPointFlagNoiseDecorrelate |
 	         kPointFlagNoiseDarkSide;
 	if (wide)  // (48a)
 		flags |= kPointFlagWide | (widePrev ? kPointFlagWidePrev : 0u);
@@ -7129,6 +7140,8 @@ void RayTracing::DrawAmbientOcclusionImpl()
 	cb.Size[2] = (contact ? kAOFlagContact : 0u) | (aoModeThisFrame == static_cast<int>(AOModeKind::Darker) ? kAOFlagDarker : 0u) |
 	             (historyValid ? kAOFlagHistory : 0u) | (aoDebugView == AODebugView::Split ? kAOFlagSplit : 0u) |
 	             (detail ? (kAOFlagDetail | kAOFlagValidity) : 0u) | (detailHistoryValid ? kAOFlagDetailHistory : 0u);
+	if (contact && settings.AOContactOnce)
+		cb.Size[2] |= kAOFlagContactOnce;  // (49h)
 	// (47k) The Smooth Normals debug view of this frame (AONormalPrepCS), when it was written at this size.
 	const bool normalDebug = debugOverlay && aoNormalDebug.srv && aoNormalDebugFrame == globals::state->frameCount && aoNormalDebugWidth == width &&
 	                         aoNormalDebugHeight == height;
@@ -8149,8 +8162,8 @@ void RayTracing::DrawLoadingScreens()
 	ImGui::Checkbox("Reserve Shaders and Memory Up Front", &settings.ReserveUpFront);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("Point-light shadows: every filter variant that can be needed is compiled at the main menu and the extra-light textures stay");
-		ImGui::Text("  once made (+16 MB). The cut-out record buffers are made at full size once (about 3 MB each, 8 of them). Advanced Skin does");
-		ImGui::Text("  not search again for optional _wet / _rfaos textures it already found missing. Same picture.");
+		ImGui::Text("  once made (+16 MB). The cut-out record buffers are made at full size once (about 3 MB each, 8 of them). Same picture.");
+		ImGui::Text("  (49h: Advanced Skin always remembers missing optional _wet / _rfaos textures now, whatever this switch.)");
 	}
 	ImGui::Unindent();
 	ImGui::EndDisabled();
@@ -8912,6 +8925,17 @@ void RayTracing::DrawObjectRows()
 		ImGui::BeginDisabled(!settings.Characters);
 		row("Physics parts", settings.PhysicsParts, "Capes, skirts and other HDT-SMP / HDT-PE parts, not hair (default: Ray traced).", nullptr);
 		row("Hair", settings.Hair, "Hair and wigs (default: Shadow map: the hair shader's own shadowing looks better than solid cards).", nullptr);
+		// (49h)
+		ImGui::Indent();
+		ImGui::Checkbox("Hair: Ignore Faint Strands in RT", &settings.HairFaintStrands);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): ray-traced hair only blocks light where the strands are at least half opaque, so the faint fringe of a\n"
+			            "  hair card no longer acts as a solid board (wide dark stripes across the forehead and nose from a nearby lamp).\n"
+			            "  Also: cut-outs whose test is \"greater than\" leave out their fully transparent texels exactly (no visible change\n"
+			            "  expected on fences, leaves and nets).");
+			ImGui::Text("Off: as in 49g. Switching re-captures characters and the ray-traced scene (a second or two).");
+		}
+		ImGui::Unindent();
 		ImGui::Checkbox("Player in first person", &settings.FirstPersonPlayer);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("Off (default): in first person the player keeps the shadow-map shadow (camera mods can hide the arms");
@@ -9106,6 +9130,14 @@ void RayTracing::DrawPointLightPage()
 			ImGui::SliderFloat("Non-RT Casters: RT Caster Contact Length", &settings.PointLightsSSPLSContact, 0.0f, 31.875f, "%.1f x ray offset");
 			if (auto _tt = Util::HoverTooltipWrapper())
 				ImGui::Text("How close to the surface a ray-traced occluder still casts a screen-space contact shadow (the ray tracer starts a little off the surface).");
+			// (49h) Re-exposed (fixed on since 48o).
+			ImGui::Checkbox("Close-Contact Shadows on Characters", &settings.PointCloseContact);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default, as since 48o): a lamp or torch's shadow ray leaves a character's skin only 2 units out, so close contact (a hand on\n"
+				            "  the body, the nose on the cheek) still shadows. The traced face does not follow talking or blinking, so this can leave dark\n"
+				            "  patches on cheeks and lips.");
+				ImGui::Text("Off: 6 units out, like the sun: no such patches, a little less contact shadow on characters from lamps and torches.");
+			}
 			// (48o) Fixed on, no switches any more: (47r) Reuse the Sun's Surface Probe Everywhere; (47x) Smoother Shadow Edges, Trace Lights on
 			// Curved Surfaces Reliably, Close-Contact Shadows on Characters; (48m) Moving Characters: Clean Shadow History; (48k) Point Lights:
 			// Noise Fix with Decorrelated Sampling, Stable Penumbra, Close Blockers: Minimum Blur, Consistent Dark Side; (47z) Window Beams:
@@ -9390,6 +9422,13 @@ void RayTracing::DrawAOPage()
 				}
 			}
 			ImGui::EndDisabled();
+			// (49h)
+			ImGui::Checkbox("Count Contact Once", &settings.AOContactOnce);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): in the RTAO + SSGI contact AO modes, the fine ray-traced detail and SSGI's contact AO see the same small");
+				ImGui::Text("  creases; per pixel only the darker of the two counts, so a crease is not darkened twice (no muddy double darkening).");
+				ImGui::Text("Off: as in 49g (both multiplied). No effect in Darker of both.");
+			}
 			ImGui::Checkbox("Temporal", &settings.AOTemporal);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::Text("On (default): after the edge-aware blur the last frames are blended in (held close to this frame's own values,");
@@ -9917,6 +9956,8 @@ nlohmann::json RayTracing::DescribeJson() const
 	j["characters_rt"] = settings.Characters;
 	j["physics_parts_rt"] = settings.PhysicsParts;
 	j["hair_rt"] = settings.Hair;
+	j["hair_faint_strands"] = settings.HairFaintStrands;  // (49h)
+	j["point_close_contact"] = settings.PointCloseContact;  // (49h)
 	j["first_person_player_rt"] = settings.FirstPersonPlayer;
 	j["denoiser"] = settings.Denoiser;
 	j["rt_contact_scale"] = settings.RtContactScale;

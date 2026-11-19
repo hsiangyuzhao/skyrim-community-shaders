@@ -425,6 +425,8 @@ float CalculateDepthMultFromUV(float2 uv, float depth, uint eyeIndex = 0)
 // (47b) Sky Fixes: PhysicalSky::NightFlags bit 5, named here (SharedData.hlsli untouched). The water surface gets the
 // physical sky's aerial perspective (distant haze) the way forward Lighting does, right after its fog.
 static const uint kWaterAerialPerspectiveFlag = (1 << 5);
+// (49h) PhysicalSky::NightFlags bit 8: "Sun Highlight on Water Follows the Atmosphere".
+static const uint kWaterSunTransmittanceFlag = (1 << 8);
 
 float3 ApplyWaterAerialPerspective(float3 a_color, float3 a_positionWS, float2 a_pxCoord, float a_weatherFogAmount)
 {
@@ -1184,6 +1186,12 @@ PS_OUTPUT main(PS_INPUT input)
 		sunColor *= ShadowSampling::GetWaterShadow(screenNoise, input.WPosition.xyz, eyeIndex);
 #					if defined(EXP_HEIGHT_FOG)
 		sunColor *= WeatherFog::SunlightAttenuation(input.WPosition.z);  // (47d) 1 unless "CS Fog Takes Over" applies
+#					endif
+#					if defined(COMMON_PHYS_SKY_HLSLI)
+		// (49h) "Sun Highlight on Water Follows the Atmosphere" (PhysicalSky::NightFlags bit 8): x the transmittance toward the light,
+		// as Lighting / Effect / grass get it. Off: 49g.
+		[branch] if (SharedData::physSkyData.enabled && (SharedData::physSkyNightData.Flags & kWaterSunTransmittanceFlag))
+			sunColor *= PhysSky::SampleTr(normalize(SharedData::DirLightDirection.xyz), SampColorSampler);
 #					endif
 	}
 

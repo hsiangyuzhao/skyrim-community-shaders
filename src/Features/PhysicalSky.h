@@ -198,6 +198,9 @@ struct PhysicalSky final : public Feature
 		/// from the glow above (Moon Sky Glow Strength). Faint stars and the Milky Way go first. Off = 48a exactly.
 		/// Saved outside the NLOHMANN macro.
 		bool moonFadesStars = true;
+		/// (49h) "Sun Highlight on Water Follows the Atmosphere" (Celestials, under Transmittance Mix): Water.hlsl's sun highlight x the
+		/// transmittance toward the light (PhysSky::SampleTr), as every surface gets it (NightFlags kNightWaterSunTr). Off = 49g.
+		bool waterSunTransmittance = true;
 		/// (48b) Its strength, 0-3. 1: Masser full and high on a clear night keeps about 40% of the Milky Way's light.
 		float moonStarFadeStrength = 1.f;
 		/// (48b) "Moon Planetshine": a faint grey fill on the unlit side of each moon disc (strongest at crescent, none at
@@ -410,6 +413,8 @@ struct PhysicalSky final : public Feature
 		// (48b) Sky.hlsl only (MoonSky), independent of Sky Fixes.
 		kNightMoonFadesStars = 1u << 6,  // "Moonlight Fades Stars": MoonCbData::starFadeHalves
 		kNightPlanetshine = 1u << 7,     // "Moon Planetshine": MoonCbData::planetshineHalves
+		// (49h) Water.hlsl only: its sun highlight x the transmittance toward the light ("Sun Highlight on Water Follows the Atmosphere").
+		kNightWaterSunTr = 1u << 8,
 	};
 	struct NightCbData
 	{
@@ -510,6 +515,10 @@ struct PhysicalSky final : public Feature
 	/// (47g) The clear physical sky's light on a white surface facing up (its cosine-weighted mean radiance, as drawn:
 	/// Sky Fixes' brightness factor, the moons' glow, the night base light), from the CPU model; 0 when it cannot be had.
 	float ComputeFogSkyLight(const RE::NiPoint3& a_lutSunDir);
+	/// (49h) EHF "Stable Fog Colour": Physical Sky's transmittance from the camera toward a_dir (towards the light) as
+	/// PhysSky::SampleTr gives the shaders (Transmittance Mix applied), from the CPU model; 1 while Physical Sky is off or the
+	/// model cannot be had.
+	float3 ComputeLightTransmittance(const float3& a_dir);
 	uint32_t fogSkyLightFrame = UINT32_MAX;
 	float fogSkyLightCached = 0.f;
 	static_assert(sizeof(HorizonFixCbData) == 16);

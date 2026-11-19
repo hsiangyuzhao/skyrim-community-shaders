@@ -62,7 +62,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     NoiseVelocity,
     OffIndoors,
     RTSunShafts,
-    RTLightShadows)
+    RTLightShadows,
+    StableFogColour)
 
 namespace
 {
@@ -358,10 +359,10 @@ void ExponentialHeightFog::SetupResources()
 
     volumetricFogCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<VolumetricFogCB>());
 
-    // (47e) Readout of the "Match Weather Fog Brightness" terms (3 x float4) and its staging ring.
+    // (47e) Readout of the "Match Weather Fog Brightness" terms (4 x float4; 49h: + the added colour) and its staging ring.
     auto debugState = std::make_unique<VolumetricDebugState>();
     D3D11_BUFFER_DESC debugDesc{};
-    debugDesc.ByteWidth = sizeof(float) * 12;
+    debugDesc.ByteWidth = sizeof(float) * 16;
     debugDesc.Usage = D3D11_USAGE_DEFAULT;
     debugDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
     debugDesc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
@@ -370,7 +371,7 @@ void ExponentialHeightFog::SetupResources()
     D3D11_UNORDERED_ACCESS_VIEW_DESC debugUavDesc{};
     debugUavDesc.Format = DXGI_FORMAT_UNKNOWN;
     debugUavDesc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
-    debugUavDesc.Buffer.NumElements = 3;
+    debugUavDesc.Buffer.NumElements = 4;
     DX::ThrowIfFailed(globals::d3d::device->CreateUnorderedAccessView(debugState->buffer.get(), &debugUavDesc, debugState->uav.put()));
     D3D11_BUFFER_DESC stagingDesc = debugDesc;
     stagingDesc.Usage = D3D11_USAGE_STAGING;
@@ -402,6 +403,7 @@ void ExponentialHeightFog::ReadVolumetricDebug()
         std::copy_n(values, 4, debug.weather);
         std::copy_n(values + 4, 4, debug.sun);
         std::copy_n(values + 8, 4, debug.sky);
+        std::copy_n(values + 12, 4, debug.added);
         debug.valid = true;
         context->Unmap(oldest, 0);
     }
@@ -871,6 +873,22 @@ void ExponentialHeightFog::Prepass()
         const double readoutSlice = std::log2(std::max(readoutDepth * p.nearZ.x + p.nearZ.y, 1e-6)) * p.nearZ.z;
         cb.weatherFogParams.w = static_cast<float>(std::clamp(std::floor(readoutSlice), 0.0, static_cast<double>(currentGridSize.z - 1)));
     }
+    // (49h) "Stable Fog Colour": the flag, and Physical Sky's transmittance toward the scene's directional light (sun or moon:
+    // SharedData::DirLightDirection, as the shaders' PhysSky::SampleTr) from the CPU model; 1 without Physical Sky.
+    cb.stableColour = { 1.0f, 1.0f, 1.0f, 0.0f };
+    if (volumetric.StableFogColour) {
+        uint32_t flags = 1u;
+        cb.stableColour.w = std::bit_cast<float>(flags);
+        const auto& shadowSceneNode = globals::game::smState->shadowSceneNode[0];
+        auto* sunLight = shadowSceneNode && shadowSceneNode->GetRuntimeData().sunLight ? skyrim_cast<RE::NiDirectionalLight*>(shadowSceneNode->GetRuntimeData().sunLight->light.get()) : nullptr;
+        if (sunLight && globals::features::physicalSky.loaded) {
+            const auto& direction = sunLight->GetWorldDirection();
+            const float3 tr = globals::features::physicalSky.ComputeLightTransmittance(float3{ -direction.x, -direction.y, -direction.z });
+            cb.stableColour.x = tr.x;
+            cb.stableColour.y = tr.y;
+            cb.stableColour.z = tr.z;
+        }
+    }
     volumetricFogCB->Update(cb);
 
     auto context = globals::d3d::context;
@@ -1301,13 +1319,26 @@ void ExponentialHeightFog::DrawSettings()
         ImGui::SliderFloat("Local Light Scattering Intensity", &volumetric.LocalLightIntensity, 0.0f, 10.0f, "%.2f");
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text("Glow of torches, lanterns and other lights in the fog (needs Light Limit Fix).");
+        // (49h) One switch for the fog colour fixes (default on; off = 49g).
+        ImGui::Checkbox("Stable Fog Colour", &volumetric.StableFogColour);
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "On (default): fixes four ways the 3D fog got the wrong colour or brightness:\n"
+                "- the fog is topped up to the weather's fog brightness in the weather fog's own colour, so it no longer drifts\n"
+                "  to purple or cyan at night when you turn around;\n"
+                "- that top-up counts the sun and sky glow as you set them with the two Scattering Intensity sliders above;\n"
+                "- the sky light only leans toward one direction as much as Scattering Distribution says (0.2 = a fifth);\n"
+                "- the sun in the fog is reddened and dimmed by the atmosphere like the ground (dusk, dawn), and the fog's\n"
+                "  target brightness in daylight is measured like a white wall in the sun (less washed-out white by day).\n"
+                "Off: as in 49g.");
         // (47e) "Match Weather Fog Brightness" (48o) is always on (no switch).
         {
             const bool built = lastBuildFrame != UINT32_MAX && globals::state->frameCount - lastBuildFrame <= 1u;
             if (built && volumetricDebug && volumetricDebug->valid && volumetricDebug->weather[3] > 0.0f) {
                 const auto& d = *volumetricDebug;
-                ImGui::Text("At screen centre, %.0f m: weather fog %.3f %.3f %.3f | sun E*Ts/4pi %.3f %.3f %.3f | sky S %.3f %.3f %.3f | added %.0f%% of fog",
-                    d.sun[3] / 70.0f, d.weather[0], d.weather[1], d.weather[2], d.sun[0], d.sun[1], d.sun[2], d.sky[0], d.sky[1], d.sky[2], d.sky[3] * 100.0f);
+                ImGui::Text("At screen centre, %.0f m: weather fog %.3f %.3f %.3f | sun %.3f %.3f %.3f | sky %.3f %.3f %.3f | added %.3f %.3f %.3f (%.0f%% of fog)%s",
+                    d.sun[3] / 70.0f, d.weather[0], d.weather[1], d.weather[2], d.sun[0], d.sun[1], d.sun[2], d.sky[0], d.sky[1], d.sky[2],
+                    d.added[0], d.added[1], d.added[2], d.sky[3] * 100.0f, d.added[3] > 0.5f ? " [stable]" : "");
             } else if (built && volumetricDebug && volumetricDebug->valid) {
                 ImGui::TextDisabled("Readout: no extra source at screen centre (switch off, clear weather, other mode, indoors, or something closer than 100 m).");
             }

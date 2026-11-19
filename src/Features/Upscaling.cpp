@@ -49,7 +49,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	modelResolutionPercentAfter,
 	residualMode,
 	protectSky,
-	maskSkyValue)
+	maskSkyValue,
+	stabilize)
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	Upscaling::Settings,
@@ -712,7 +713,8 @@ void Upscaling::DrawNeuralRenderingSettings()
 					ImGui::TextUnformatted("After a failure it stays off instead of retrying every frame. The log line says what failed; Reset Neural Rendering tries again.");
 			}
 			if (status == NeuralRendering::RuntimeStatus::Initialized) {
-				ImGui::Text("Runtime %s", NeuralRendering::Runtime::Instance().Version().c_str());
+				ImGui::Text("Runtime %s%s", NeuralRendering::Runtime::Instance().Version().c_str(),
+					NeuralRendering::Runtime::Instance().Is310916() ? " (310.9.16: driven with the 310.8 parameters)" : "");  // (49h)
 			} else {
 				ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
 				ImGui::Text("Runtime %s%s%s", NeuralRendering::ToString(status),
@@ -720,7 +722,7 @@ void Upscaling::DrawNeuralRenderingSettings()
 				ImGui::PopStyleColor();
 			}
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Not included: place nvngx_dlssnr.dll (version 310.8.x) in Data/Shaders/Upscaling/Streamline yourself.");
+				ImGui::TextUnformatted("Not included: place nvngx_dlssnr.dll (version 310.8.x, or 310.9.16 since 49h) in Data/Shaders/Upscaling/Streamline yourself. The log line [DLSSNR] runtime ... shows its version and SHA-256.");
 				ImGui::TextUnformatted("NVIDIA's DLL runs on RTX 50 only; older cards need a community-rebuilt DLL.");
 			}
 
@@ -781,6 +783,13 @@ void Upscaling::DrawNeuralRenderingSettings()
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::TextUnformatted("Keeps the overall brightness and colour of each area as it was, while keeping the model's local lighting and detail.");
 				ImGui::TextUnformatted("0 = the model's result as is. 1 = large-scale tone fully locked to the input. Separate values for before and after upscaling (defaults 0.5 and 0).");
+			}
+
+			// (49h)
+			ImGui::Checkbox("Stabilise Neural Rendering", &nr.stabilize);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("Off (default): the model's result as is.");
+				ImGui::TextUnformatted("On: the change the model makes is blended with last frame's change (following motion, checked against depth, and never outside what nearby pixels show this frame), so its re-lighting flickers and crawls less. Fast motion keeps this frame's change. Costs one small extra pass and two frame-sized textures.");
 			}
 
 			{

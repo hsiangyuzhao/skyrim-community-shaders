@@ -6,6 +6,7 @@
 
 #include "Integration.h"
 #include "Util.h"
+#include "Utils/ContentHash.h"
 
 #include <Windows.h>
 #include <Psapi.h>
@@ -15,6 +16,7 @@
 #include <array>
 #include <cstring>
 #include <format>
+#include <fstream>
 #include <vector>
 
 #include <nvsdk_ngx_helpers.h>
@@ -32,6 +34,30 @@ namespace NeuralRendering
 			"NVSDK_NGX_D3D12_ReleaseFeature",
 			"NVSDK_NGX_D3D12_Shutdown1",
 		};
+
+		/// (49h) SHA-256 of a file, lowercase hex ("" when it cannot be read): which nvngx_dlssnr build is loaded, in the log.
+		std::string FileSha256(const std::filesystem::path& a_path)
+		{
+			std::ifstream file(a_path, std::ios::binary);
+			if (!file)
+				return {};
+			Util::ContentHash::Sha256 sha;
+			std::vector<char> buffer(1 << 20);
+			while (file) {
+				file.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+				const auto got = file.gcount();
+				if (got > 0)
+					sha.Update(buffer.data(), static_cast<size_t>(got));
+			}
+			std::array<uint8_t, 32> digest{};
+			if (!sha.Finish(digest))
+				return {};
+			std::string hex;
+			hex.reserve(64);
+			for (const auto byte : digest)
+				hex += std::format("{:02x}", byte);
+			return hex;
+		}
 
 		using GetUnsignedValue = unsigned int(NVSDK_CONV*)();
 		using InitD3D12 = NVSDK_NGX_Result(NVSDK_CONV*)(unsigned long long, const wchar_t*, ID3D12Device*, NVSDK_NGX_Version, const NVSDK_NGX_Parameter*);
@@ -219,11 +245,21 @@ namespace NeuralRendering
 			return false;
 		}
 		version_ = Util::GetFormattedVersion(*version);
-		if (version->major() != 310 || version->minor() != 8) {
+		// (49h) 310.9.16 (the NBA 2K27 runtime, "Optimized" model by default; an Ada-compatible build is user-made) is accepted besides
+		// 310.8.x. Its parameter names could not be byte-scanned here (no copy of the DLL), so it gets the 310.8 parameter set.
+		const bool is3108 = version->major() == 310 && version->minor() == 8;
+		const bool is310916 = version->major() == 310 && version->minor() == 9 && version->patch() == 16;
+		runtime310916_ = is310916;
+		const std::string sha = FileSha256(path_);
+		logger::info("[DLSSNR] runtime {} version {} SHA-256 {}", Util::WStringToString(path_.wstring()), version_, sha.empty() ? "(unreadable)" : sha);
+		if (!is3108 && !is310916) {
 			status_ = RuntimeStatus::UnsupportedVersion;
-			detail_ = std::format("expected DLSSNR 310.8.x, found {}", version_);
+			detail_ = std::format("expected DLSSNR 310.8.x or 310.9.16, found {}", version_);
 			return false;
 		}
+		if (is310916)
+			logger::warn("[DLSSNR] 310.9.16 loaded: driven with the 310.8 parameter set (its own parameters were not scanned; the model "
+						 "choice stays the DLL's default). If the image is wrong or creation fails, go back to the 310.8 DLL");
 		module_ = LoadLibraryExW(path_.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
 		if (!module_) {
 			status_ = RuntimeStatus::LoadFailed;

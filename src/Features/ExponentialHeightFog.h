@@ -108,6 +108,10 @@ struct ExponentialHeightFog : Feature
 		/// sources per froxel (window beams included) are blocked by walls and objects. Last frame's rays; no data = as before.
 		bool RTSunShafts = true;
 		bool RTLightShadows = true;
+		/// (49h) "Stable Fog Colour": the sun in the fog through Physical Sky's atmosphere, the sky light by the real phase, the weather
+		/// top-up by luminance in the weather fog's hue against the single scatter as drawn (intensities and phase), and Physical Fog
+		/// Brightness's sun term in surface units (volumetric fog only). Off = 49g.
+		bool StableFogColour = true;
 	} volumetric;
 
 	/// (47b) The game's own fog under the height fog. CPU side only; reaches the shaders through
@@ -241,9 +245,10 @@ private:
 		float4 weatherNearColor = {};  // rgb, w = 1: "Match Weather Fog Brightness" on
 		float4 weatherFarColor = {};   // rgb, w = fog power
 		float4 weatherFogParams = {};  // near / (far - near), 1 / (far - near), clamp, debug readout slice
+		float4 stableColour = { 1.0f, 1.0f, 1.0f, 0.0f };  // (49h) rgb = Physical Sky transmittance toward the light, w = flags (as uint)
 	};
 	STATIC_ASSERT_ALIGNAS_16(VolumetricFogCB);
-	static_assert(sizeof(VolumetricFogCB) == 656, "VolumetricFogCB must match VolumetricFogCSCommon.hlsli");
+	static_assert(sizeof(VolumetricFogCB) == 672, "VolumetricFogCB must match VolumetricFogCSCommon.hlsli");
 	static_assert(offsetof(VolumetricFogCB, noiseVelocity) == 592 && offsetof(VolumetricFogCB, weatherFogParams) == 640, "VolumetricFogCB layout");
 
 	/// (47e) EHF panel readout of the "Match Weather Fog Brightness" terms at one froxel (screen centre, ~100 m), read
@@ -253,6 +258,7 @@ private:
 		float weather[4]{};  // Wfog, sigma_w
 		float sun[4]{};      // E Ts / 4 pi, view depth
 		float sky[4]{};      // S, the extra source's share of Wfog
+		float added[4]{};    // (49h) the colour actually added, 1 = Stable Fog Colour on
 		bool valid = false;
 		uint32_t frame = 0;
 		winrt::com_ptr<ID3D11Buffer> buffer;

@@ -290,16 +290,7 @@ PS_OUTPUT main(PS_INPUT input)
 	if (SharedData::physSkyData.enabled)
 		diffuseColor *= PhysSky::SampleTr(normalize(SharedData::DirLightDirection.xyz), SampShadowMaskSampler);
 #			endif
-
-#			if defined(PHYSICAL_SKY)
-	if (SharedData::physSkyData.enabled)
-		diffuseColor *= PhysSky::SampleTr(normalize(SharedData::DirLightDirection.xyz), SampShadowMaskSampler);
-#			endif
-
-#			if defined(PHYSICAL_SKY)
-	if (SharedData::physSkyData.enabled)
-		diffuseColor *= PhysSky::SampleTr(normalize(SharedData::DirLightDirection.xyz), SampShadowMaskSampler);
-#			endif
+// (49h) Once: the two copies after it (a merge leftover: transmittance x3) are gone.
 
 	float3 ddx = ddx_coarse(input.WorldPosition.xyz);
 	float3 ddy = ddy_coarse(input.WorldPosition.xyz);
@@ -383,16 +374,7 @@ PS_OUTPUT main(PS_INPUT input)
 	if (SharedData::physSkyData.enabled)
 		diffuseColor *= PhysSky::SampleTr(normalize(SharedData::DirLightDirection.xyz), SampShadowMaskSampler);
 #			endif
-
-#			if defined(PHYSICAL_SKY)
-	if (SharedData::physSkyData.enabled)
-		diffuseColor *= PhysSky::SampleTr(normalize(SharedData::DirLightDirection.xyz), SampShadowMaskSampler);
-#			endif
-
-#			if defined(PHYSICAL_SKY)
-	if (SharedData::physSkyData.enabled)
-		diffuseColor *= PhysSky::SampleTr(normalize(SharedData::DirLightDirection.xyz), SampShadowMaskSampler);
-#			endif
+// (49h) Once: the two copies after it (a merge leftover: transmittance x3) are gone.
 
 	float3 ddx = ddx_coarse(input.WorldPosition.xyz);
 	float3 ddy = ddy_coarse(input.WorldPosition.xyz);

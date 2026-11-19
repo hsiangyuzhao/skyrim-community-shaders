@@ -120,6 +120,8 @@ public:
 		// (47n) contactAo.cs.hlsl: a depth disocclusion test on the history (its own last-frame view depth, texContactDepth) and a
 		// 4-frame window instead of 8 (SSGICB ContactFlags bit 0). (48o) Always on (the key is ignored).
 		static constexpr bool ContactGhostFix = true;
+		// (49h) "Smooth Contact AO": contactAo.cs.hlsl ContactFlags bit 2 (exp curve, falloff over the reachable radius, cap x render height / 1440).
+		bool SmoothContactAo = true;
 	} settings;
 
 	struct alignas(16) SSGICB

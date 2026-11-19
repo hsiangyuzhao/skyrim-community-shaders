@@ -279,8 +279,15 @@ namespace NeuralRendering
 			workingSet = {};
 			const bool hadDevice = interop.IsInitialized();
 			interop.Shutdown();
+			// (49h) D3D11 destroys released objects lazily (at its next flush): the shared textures made on the D3D11 side would
+			// otherwise still hold their video memory when the "released" figure is taken (and until the game flushes).
+			if (auto* context = globals::d3d::context)
+				context->Flush();
+			// (49h) D3D12CreateDevice hands out one device per adapter: Ray Tracing, frame generation and this pass share it, so the
+			// references left are theirs (not a leak of ours); the 49g wording read as one.
 			if (hadDevice)
-				logger::info("[DLSSNR] D3D12 device teardown: {} other reference(s) left (0 = all its video memory is returned)",
+				logger::info("[DLSSNR] D3D12 teardown: our objects released; the adapter's shared D3D12 device keeps {} reference(s) of other users "
+							 "(Ray Tracing, frame generation: expected, not ours)",
 					interop.LastShutdownOtherReferences());
 			resetPending = { true, true };
 			failureLatched = false;
@@ -290,6 +297,7 @@ namespace NeuralRendering
 			finalizeCS.Reset();
 			toneStatsCS.Reset();
 			ratioCS.Reset();
+			stabilizeCS.Reset();  // (49h)
 			toneCurveCS.Reset();
 			linearClamp.Reset();
 			lastRoute = "";
@@ -434,7 +442,13 @@ namespace NeuralRendering
 					return LatchFailure("tone statistics", E_FAIL);
 				if (!Finalize(context, in, originalSRV, FinalizePass::Frame))
 					return LatchFailure("finalize", E_FAIL);
-				context->CopySubresourceRegion(in.sceneColor, 0, 0, 0, 0, ws.finalScratch.Get(), 0, &box);
+				// (49h) Stabilise Neural Rendering: the result blended with last frame's edit; a failure only turns it off (logged once).
+				ID3D11Resource* finished = ws.finalScratch.Get();
+				if (in.stabilize && Stabilize(context, in, originalSRV))
+					finished = ws.stableResult.Get();
+				else
+					ws.stableHistoryValid = false;
+				context->CopySubresourceRegion(in.sceneColor, 0, 0, 0, 0, finished, 0, &box);
 				lastRoute = "prepare + finalize";
 			}
 			resetPending[0] = false;
@@ -482,6 +496,17 @@ namespace NeuralRendering
 			// scene (38a's decode scratch).
 			Microsoft::WRL::ComPtr<ID3D11Texture2D> finalScratch;
 			Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> finalScratchUAV;
+			// (49h) Stabilise Neural Rendering: finalScratch readable, the stabilised result (scene format) and the edit history
+			// (RGBA16F: log2 ratio rgb, linear depth a; ping-pong), made on first use.
+			Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> finalScratchSRV;
+			Microsoft::WRL::ComPtr<ID3D11Texture2D> stableResult;
+			Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> stableResultUAV;
+			std::array<Microsoft::WRL::ComPtr<ID3D11Texture2D>, 2> stableHistory;
+			std::array<Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>, 2> stableHistorySRV;
+			std::array<Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView>, 2> stableHistoryUAV;
+			std::uint32_t stableHistoryIndex = 0;
+			bool stableHistoryValid = false;
+			bool stableFailed = false;
 			// (batch 38c) After upscaling, shader route: the frame as it was, readable (the bound target
 			// may not be).
 			Microsoft::WRL::ComPtr<ID3D11Texture2D> sceneCopy;
@@ -585,6 +610,24 @@ namespace NeuralRendering
 		static_assert(sizeof(ToneCurveConstants) % 16 == 0);
 		static_assert(sizeof(FinalizeConstants) % 16 == 0);
 
+		// (49h) StabilizeCS.hlsl.
+		struct StabilizeConstants
+		{
+			std::uint32_t extent[2];
+			std::uint32_t motionSourceMax[2];
+			float motionSourceScale[2];
+			float motionOffset[2];
+			std::uint32_t displayEncoded;
+			std::uint32_t historyValid;
+			float cameraNear;
+			float cameraFar;
+			float maxWeight;
+			float motionPixels;
+			float depthTolerance;
+			float ratioClamp;
+		};
+		static_assert(sizeof(StabilizeConstants) == 64);
+
 		bool CreatePlainTexture(const D3D11_TEXTURE2D_DESC& desc, Microsoft::WRL::ComPtr<ID3D11Texture2D>& texture, const char* name)
 		{
 			const HRESULT result = interop.device11_->CreateTexture2D(&desc, nullptr, &texture);
@@ -655,7 +698,7 @@ namespace NeuralRendering
 					in.sceneColorSRV->GetDesc(&sceneViewDesc);
 					viewFormat = sceneViewDesc.Format;
 				}
-				auto scratchDesc = MakeSharedDesc(sceneDesc, in.width, in.height, D3D11_BIND_UNORDERED_ACCESS);
+				auto scratchDesc = MakeSharedDesc(sceneDesc, in.width, in.height, D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE);  // (49h) + SRV (Stabilise)
 				D3D11_UNORDERED_ACCESS_VIEW_DESC scratchViewDesc{};
 				scratchViewDesc.Format = viewFormat;
 				scratchViewDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
@@ -666,6 +709,15 @@ namespace NeuralRendering
 						interop.RecordFailure(result);
 					ws = {};
 					return false;
+				}
+				{
+					// (49h) Best effort: without it Stabilise Neural Rendering stays off (logged once).
+					D3D11_SHADER_RESOURCE_VIEW_DESC scratchSRVDesc{};
+					scratchSRVDesc.Format = viewFormat;
+					scratchSRVDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+					scratchSRVDesc.Texture2D.MipLevels = 1;
+					if (FAILED(device11->CreateShaderResourceView(ws.finalScratch.Get(), &scratchSRVDesc, &ws.finalScratchSRV)))
+						ws.finalScratchSRV.Reset();
 				}
 
 				if (!before) {
@@ -958,6 +1010,81 @@ namespace NeuralRendering
 			return true;
 		}
 
+		/// (49h) Stabilise Neural Rendering (StabilizeCS.hlsl): finalScratch -> stableResult, with the edit history ping-ponged.
+		/// False (and the plain result is used) when it cannot run; the reason is logged once per working set.
+		bool Stabilize(ID3D11DeviceContext* context, const Renderer::PassInput& in, ID3D11ShaderResourceView* original)
+		{
+			auto& ws = workingSet;
+			auto fail = [&](const char* a_why) {
+				if (!ws.stableFailed)
+					logger::warn("[DLSSNR] Stabilise Neural Rendering is off for now: {}", a_why);
+				ws.stableFailed = true;
+				return false;
+			};
+			if (ws.stableFailed)
+				return false;
+			if (!original || !ws.finalScratchSRV || !in.depthSRV || !in.motionSRV || !EnsureSampler())
+				return fail("a view it reads is missing");
+			auto* shader = stabilizeCS.Get(L"Data\\Shaders\\Upscaling\\NeuralRendering\\StabilizeCS.hlsl", {}, "cs_5_0", "main",
+				"NeuralRendering::StabilizeCS");
+			if (!shader)
+				return fail("StabilizeCS.hlsl did not compile");
+			ID3D11Device* device11 = interop.device11_.Get();
+			if (!ws.stableResult) {
+				D3D11_TEXTURE2D_DESC scratchDesc{};
+				ws.finalScratch->GetDesc(&scratchDesc);
+				D3D11_UNORDERED_ACCESS_VIEW_DESC scratchUAVDesc{};
+				ws.finalScratchUAV->GetDesc(&scratchUAVDesc);
+				scratchDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+				D3D11_TEXTURE2D_DESC historyDesc = scratchDesc;
+				historyDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+				historyDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+				HRESULT result = S_OK;
+				bool ok = CreatePlainTexture(scratchDesc, ws.stableResult, "NeuralRendering::StableResult") &&
+				          SUCCEEDED(result = device11->CreateUnorderedAccessView(ws.stableResult.Get(), &scratchUAVDesc, &ws.stableResultUAV));
+				for (std::size_t index = 0; ok && index < ws.stableHistory.size(); ++index)
+					ok = CreatePlainTexture(historyDesc, ws.stableHistory[index], "NeuralRendering::StableHistory") &&
+					     SUCCEEDED(result = device11->CreateShaderResourceView(ws.stableHistory[index].Get(), nullptr, &ws.stableHistorySRV[index])) &&
+					     SUCCEEDED(result = device11->CreateUnorderedAccessView(ws.stableHistory[index].Get(), nullptr, &ws.stableHistoryUAV[index]));
+				if (!ok) {
+					ws.stableResult.Reset();
+					ws.stableResultUAV.Reset();
+					ws.stableHistory = {};
+					ws.stableHistorySRV = {};
+					ws.stableHistoryUAV = {};
+					return fail(std::format("its textures could not be made (0x{:08X})", static_cast<std::uint32_t>(result)).c_str());
+				}
+				ws.stableHistoryValid = false;
+				logger::info("[DLSSNR] Stabilise Neural Rendering: textures made ({}x{})", in.width, in.height);
+			}
+			if (!stabilizeCB)
+				stabilizeCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<StabilizeConstants>());
+			StabilizeConstants constants{};
+			constants.extent[0] = in.width;
+			constants.extent[1] = in.height;
+			constants.motionSourceMax[0] = in.motionSourceWidth - 1;
+			constants.motionSourceMax[1] = in.motionSourceHeight - 1;
+			constants.motionSourceScale[0] = static_cast<float>(in.motionSourceWidth) / static_cast<float>(in.width);
+			constants.motionSourceScale[1] = static_cast<float>(in.motionSourceHeight) / static_cast<float>(in.height);
+			constants.motionOffset[0] = in.motionOffsetX;
+			constants.motionOffset[1] = in.motionOffsetY;
+			constants.displayEncoded = in.placement == Renderer::Placement::AfterUpscaling ? 1u : 0u;
+			constants.historyValid = ws.stableHistoryValid && !resetPending[0] ? 1u : 0u;
+			constants.cameraNear = in.cameraNear;
+			constants.cameraFar = std::max(in.cameraFar, in.cameraNear + 1.0f);
+			constants.maxWeight = 0.65f;
+			constants.motionPixels = 12.0f;
+			constants.depthTolerance = 0.05f;
+			constants.ratioClamp = 3.0f;
+			stabilizeCB->Update(constants);
+			const std::uint32_t read = ws.stableHistoryIndex, write = ws.stableHistoryIndex ^ 1u;
+			Dispatch(context, shader, stabilizeCB->CB(), { original, ws.finalScratchSRV.Get(), in.depthSRV, in.motionSRV, ws.stableHistorySRV[read].Get() },
+				{ ws.stableResultUAV.Get(), ws.stableHistoryUAV[write].Get() }, true, (in.width + 7) / 8, (in.height + 7) / 8);
+			ws.stableHistoryIndex = write;
+			ws.stableHistoryValid = true;
+			return true;
+		}
+
 		/// (batch 42a) The RATIO variant's target: model extent, RGBA16F (log2 ratio rgb, input log luma a).
 		/// Made on first use, kept with the working set.
 		bool EnsureRatioTexture(const Renderer::PassInput& in)
@@ -1085,6 +1212,8 @@ namespace NeuralRendering
 		LazyComputeShader finalizeCS;
 		LazyComputeShader toneStatsCS;
 		LazyComputeShader ratioCS;  // (batch 42a)
+		LazyComputeShader stabilizeCS;  // (49h)
+		std::unique_ptr<ConstantBuffer> stabilizeCB;  // (49h)
 		LazyComputeShader toneCurveCS;
 		Microsoft::WRL::ComPtr<ID3D11SamplerState> linearClamp;
 		std::unique_ptr<ConstantBuffer> guidesCB;

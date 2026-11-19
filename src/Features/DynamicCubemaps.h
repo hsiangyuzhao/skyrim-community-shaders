@@ -106,6 +106,27 @@ public:
 
 	Settings settings;
 	bool enabledAtBoot = false;
+
+	/// (49h) "Reflection Brightness Fix" (this page, Reflections): the composite's cubemap reflection at the cubemap's own
+	/// brightness, as SSRT's miss fallback reads it, instead of its colour at 0.5 x weather ambient + IBL brightness (and the
+	/// weather ambient converted for Linear Lighting in that old formula). Saved under its own key (Settings is left as it is).
+	bool reflectionBrightnessFix = true;
+	/// (49h) Warm-up of the composite's raw cubemap brightness: irradiance passes of each chain since the capture was cleared
+	/// (loading screen) or the weather changed in one step (console / script); CubemapTrust() ramps 0 -> 1 from the 1st to the 5th.
+	uint32_t irradianceSinceReset[2] = { 0, 0 };
+	const RE::TESWeather* trustWeather = nullptr;
+	[[nodiscard]] float CubemapTrust() const;
+	struct alignas(16) CompositeFixCB
+	{
+		uint flags = 0;  // bit 0 = Reflection Brightness Fix
+		float cubemapTrust = 0.0f;
+		float pad[2]{};
+	};
+	STATIC_ASSERT_ALIGNAS_16(CompositeFixCB);
+	std::unique_ptr<ConstantBuffer> compositeFixCB;
+	/// (49h) Updates and binds DeferredCompositeCS's b3 (flags, cubemap trust).
+	void BindCompositeConstants(ID3D11DeviceContext* a_context);
+
 	void UpdateCubemap();
 
 	void PostDeferred();

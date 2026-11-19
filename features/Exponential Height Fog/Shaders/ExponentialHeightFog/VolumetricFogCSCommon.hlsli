@@ -34,6 +34,9 @@ cbuffer VolumetricFogCB : register(b0)
 	float4 VolumetricFogWeatherNearColor;   // rgb = fog near colour (game, 0-1), w = 1: "Match Weather Fog Brightness" on
 	float4 VolumetricFogWeatherFarColor;    // rgb = fog far colour, w = fog power
 	float4 VolumetricFogWeatherFogParams;   // x = near / (far - near), y = 1 / (far - near), z = fog clamp, w = debug slice
+	// (49h) "Stable Fog Colour" (only the light scattering pass reads it): rgb = Physical Sky's atmospheric transmittance toward
+	// the directional light (CPU model; 1 without Physical Sky or while the switch is off), w = flag bits (as uint, bit 0 = on).
+	float4 VolumetricFogStableColour;
 };
 
 #if defined(VOLUMETRIC_FOG_FAR_GRID)

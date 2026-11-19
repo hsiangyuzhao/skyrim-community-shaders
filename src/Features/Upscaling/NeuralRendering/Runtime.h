@@ -74,6 +74,8 @@ namespace NeuralRendering
 
 		/// (batch 42a) Features created this session (each rebuild counts).
 		[[nodiscard]] std::uint32_t FeatureCreations() const { return featureCreations_; }
+		/// (49h) The loaded runtime is 310.9.16 (driven with the 310.8 parameter set).
+		[[nodiscard]] bool Is310916() const { return runtime310916_; }
 
 	private:
 		Runtime() = default;
@@ -82,6 +84,7 @@ namespace NeuralRendering
 		bool featureControlMask_[2]{};
 		std::uint32_t featureCreations_ = 0;
 		bool scalingProbeDone_ = false;
+		bool runtime310916_ = false;  // (49h)
 		// (batch 42a) Process video memory right after the previous creation, and its network size.
 		std::uint64_t lastCreationVramMB_ = 0;
 		std::uint32_t lastCreationWidth_ = 0;

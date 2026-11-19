@@ -125,6 +125,7 @@ void PhysicalSky::LoadSettings(json& o_json)
 		// (47m) horizonFix (47f) removed; the old key is ignored.
 		settings.aerosolPreset = o_json.value("aerosolPreset", defaults.aerosolPreset);  // (47b)
 		settings.moonFadesStars = o_json.value("moonFadesStars", defaults.moonFadesStars);  // (48b)
+		settings.waterSunTransmittance = o_json.value("waterSunTransmittance", defaults.waterSunTransmittance);  // (49h)
 		settings.moonStarFadeStrength = o_json.value("moonStarFadeStrength", defaults.moonStarFadeStrength);
 		settings.moonPlanetshineStrength = o_json.value("moonPlanetshineStrength", defaults.moonPlanetshineStrength);
 	}
@@ -270,6 +271,7 @@ void PhysicalSky::SaveSettings(json& o_json)
 	o_json["moonCloudHalo"] = settings.moonCloudHalo;
 	o_json["aerosolPreset"] = settings.aerosolPreset;  // (47b)
 	o_json["moonFadesStars"] = settings.moonFadesStars;  // (48b)
+	o_json["waterSunTransmittance"] = settings.waterSunTransmittance;  // (49h)
 	o_json["moonStarFadeStrength"] = settings.moonStarFadeStrength;
 	o_json["moonPlanetshineStrength"] = settings.moonPlanetshineStrength;
 }
@@ -515,6 +517,12 @@ void PhysicalSky::SettingsCelestials()
 		ImGui::Text(
 			"Apply additional atmospheric tranmisttance on the directional light.\n"
 			"Introduces natural yellowening at sunset with white sunlight.");
+	// (49h)
+	ImGui::Checkbox("Sun Highlight on Water Follows the Atmosphere", &settings.waterSunTransmittance);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"On (default): the sun's bright highlight on water is reddened and dimmed by the atmosphere like the sunlight on the\n"
+			"ground (Transmittance Mix above), so at dusk and dawn it is no longer a white glare. Off: as in 49g.");
 
 	ImGui::SeparatorText("Sun");
 	{
@@ -1762,6 +1770,8 @@ void PhysicalSky::Reset()
 
 	// (47a) Sky brightness factor, LUT flags and star values (all neutral when off).
 	UpdateSkyFixes(skyFixes, lutSunDir);
+	if (settings.waterSunTransmittance)
+		nightCbData.flags |= kNightWaterSunTr;  // (49h)
 
 	// fixed (47m): Horizon Fix removed; anchorOffset, altitude and flags stay 0 (as with Horizon Fix off).
 	horizonFixCbData = {};
@@ -2162,4 +2172,24 @@ float PhysicalSky::ComputeFogSkyLight(const RE::NiPoint3& a_lutSunDir)
 	if (std::isfinite(light) && light > 0.0)
 		fogSkyLightCached = static_cast<float>(std::clamp(light, 1e-6, 100.0));
 	return fogSkyLightCached;
+}
+
+float3 PhysicalSky::ComputeLightTransmittance(const float3& a_dir)
+{
+	// (49h) As PhysSky::SampleTr: the LUT from the camera toward the light, lerp(1, tr, trMix); 1 while Physical Sky is off.
+	if (!loaded || !cbData.enabled || !(cbData.trMix > 1e-8f) || !UpdateCpuSkyModel())
+		return { 1.f, 1.f, 1.f };
+	const double l = std::sqrt(double(a_dir.x) * a_dir.x + double(a_dir.y) * a_dir.y + double(a_dir.z) * a_dir.z);
+	if (!(l > 1e-9))
+		return { 1.f, 1.f, 1.f };
+	const double cameraRadius = static_cast<double>(cbData.zCameraPlanet) * Util::Units::GAME_UNIT_TO_KM;
+	const auto tr = skyModelCpu.Transmittance(cameraRadius, { a_dir.x / l, a_dir.y / l, a_dir.z / l });
+	const float mix = std::clamp(cbData.trMix, 0.f, 1.f);
+	float3 result;
+	float* out[3] = { &result.x, &result.y, &result.z };
+	for (int c = 0; c < 3; ++c) {
+		const float t = std::isfinite(tr[c]) ? std::clamp(static_cast<float>(tr[c]), 0.f, 1.f) : 1.f;
+		*out[c] = 1.f + (t - 1.f) * mix;
+	}
+	return result;
 }

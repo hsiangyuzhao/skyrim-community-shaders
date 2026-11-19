@@ -8,6 +8,7 @@
 //          strength) -- the far term is the visibility beyond the detail length given the near range is open, so each
 //          occluder is counted once (see TraceAOCS)
 //   mode "RTAO (keeps SSGI contact AO)": rtVis * contact (the contact AO's visibility; SSGI's main AO is replaced)
+//          (49h) kFlagContactOnce: large x min(detail, contact) instead
 //   mode "Darker of RTAO and SSGI AO":   min(rtVis, 1 - SSGI's whole AO)
 //   out    = lerp(SSGI's AO, 1 - mixed, w)
 // Split (debug): the right half keeps SSGI's AO as before, a line marks the middle.
@@ -50,7 +51,8 @@ RWTexture2D<unorm float4> Debug : register(u1);
 	else
 	{
 		const float contact = (Size.z & kFlagContact) ? saturate(Contact[p]) : 1.0;
-		mixed = rtVis * contact;
+		// (49h) Count Contact Once: large x min(detail, contact) (each crease darkened once); off: large x detail x contact (49g).
+		mixed = (Size.z & kFlagContactOnce) ? largeVis * min(detailVis, contact) : rtVis * contact;
 	}
 	float occlusion = lerp(ssgiOcclusion, 1.0 - mixed, weight);
 	const bool rightHalf = (Size.z & kFlagSplit) && dtid.x >= Size.x / 2u;

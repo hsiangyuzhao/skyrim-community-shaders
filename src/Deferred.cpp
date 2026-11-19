@@ -684,6 +684,9 @@ void Deferred::DeferredPasses()
 		}
 		if (compositeSpecOcc)
 			rayTracingSO.BindSpecOccComposite(context);
+		// (49h) b3: Reflection Brightness Fix and the cubemap warm-up (unbound without Dynamic Cubemaps: 49g).
+		if (dynamicCubemaps.loaded)
+			dynamicCubemaps.BindCompositeConstants(context);
 		auto shader = interior ? GetComputeMainCompositeInterior() : GetComputeMainComposite();
 		context->CSSetShader(shader, nullptr, 0);
 
@@ -702,6 +705,7 @@ void Deferred::DeferredPasses()
 		context->CSSetConstantBuffers(12, 1, buffers);
 		context->CSSetConstantBuffers(1, 1, buffers);  // (batch 36f) SSRT composite constants
 		context->CSSetConstantBuffers(2, 1, buffers);  // (49a) RT Specular Occlusion constants
+		context->CSSetConstantBuffers(3, 1, buffers);  // (49h) composite fixes
 
 		ID3D11SamplerState* samplers[2]{ nullptr, nullptr };
 		context->CSSetSamplers(0, ARRAYSIZE(samplers), samplers);

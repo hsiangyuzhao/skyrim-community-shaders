@@ -165,6 +165,9 @@ namespace RayTracingScene
 		// (48f) RT reflections, Capture Materials: per-triangle attributes and a material per shape / terrain quadrant are captured (RT Reflections not
 		// Off and the switch on). A change re-captures the scene (as every other field).
 		bool materials = false;
+		// (49h) "Hair: Ignore Faint Strands in RT" (same switch): a kGreater alpha test keeps alpha > threshold (half an 8-bit step up), not
+		// alpha >= threshold. A change re-captures the scene.
+		bool strictAlpha = false;
 		bool operator==(const SceneConfig&) const = default;
 	};
 
@@ -453,6 +456,7 @@ namespace RayTracingScene
 		{
 			if (!(a_config == config_)) {
 				config_ = a_config;
+				strictAlphaStatic.store(a_config.strictAlpha);  // (49h) read by the static GetAlphaSource
 				RequestFlush();
 			}
 		}
@@ -792,6 +796,8 @@ namespace RayTracingScene
 		};
 		/// (47h) a_allowBlend: also a blend-only shape with a fully opaque material and an alpha channel (threshold 0.5).
 		static bool GetAlphaSource(RE::BSGeometry* a_geometry, AlphaSource& o_source, bool a_allowBlend = false);
+		/// (49h) SceneConfig::strictAlpha for GetAlphaSource (static; set by Configure, read by the capture lanes).
+		static inline std::atomic<bool> strictAlphaStatic{ false };
 		/// (45h) An alpha-tested shape as an object shape (shared non-opaque mesh BLAS, texture,
 		/// record); false = not possible (counted), the caller then applies the 45g rules.
 		bool CaptureAlphaShape(RayTracingRT::Backend& a_backend, RE::BSTriShape* a_shape, bool a_allowNewMeshes, ObjectShape& o_shape);

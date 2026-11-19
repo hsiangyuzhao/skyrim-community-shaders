@@ -27,6 +27,21 @@ std::vector<std::pair<std::string_view, std::string_view>> DynamicCubemaps::GetS
 
 void DynamicCubemaps::DrawSettings()
 {
+	// (49h) Reflections: the cubemap reflection's brightness (composite).
+	if (ImGui::TreeNodeEx("Reflections", ImGuiTreeNodeFlags_DefaultOpen)) {
+		ImGui::Checkbox("Reflection Brightness Fix", &reflectionBrightnessFix);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text(
+				"On (default): reflections that come from the cubemap (with Screen Space Ray Tracing reflections off, past about\n"
+				"80 m, and where a traced ray found nothing) use the cubemap's own brightness, the same way the ray-traced\n"
+				"reflections' fallback does. Shiny stone, wood and metal stop looking washed out and there is no brighter band\n"
+				"at 80 m. Right after a loading screen it eases in over about half a second while the cubemap fills.\n"
+				"Off: as in 49g (the cubemap's colour at the weather ambient's brightness, 2-5x too bright).");
+		if (reflectionBrightnessFix)
+			ImGui::TextDisabled("Cubemap warm-up: %.0f%%", CubemapTrust() * 100.0f);
+		ImGui::TreePop();
+	}
+
 	if (ImGui::TreeNodeEx("Screen Space Reflections", ImGuiTreeNodeFlags_DefaultOpen)) {
 		recompileFlag |= ImGui::Checkbox("Enable Screen Space Reflections", reinterpret_cast<bool*>(&settings.EnabledSSR));
 		if (auto _tt = Util::HoverTooltipWrapper()) {
@@ -135,6 +150,7 @@ void DynamicCubemaps::DrawSettings()
 void DynamicCubemaps::LoadSettings(json& o_json)
 {
 	settings = o_json;
+	reflectionBrightnessFix = o_json.contains("ReflectionBrightnessFix") && o_json["ReflectionBrightnessFix"].is_boolean() ? o_json["ReflectionBrightnessFix"].get<bool>() : true;  // (49h)
 	if (REL::Module::IsVR()) {
 		Util::LoadGameSettings(iniVRCubeMapSettings);
 	}
@@ -144,6 +160,7 @@ void DynamicCubemaps::LoadSettings(json& o_json)
 void DynamicCubemaps::SaveSettings(json& o_json)
 {
 	o_json = settings;
+	o_json["ReflectionBrightnessFix"] = reflectionBrightnessFix;  // (49h)
 	if (REL::Module::IsVR()) {
 		Util::SaveGameSettings(iniVRCubeMapSettings);
 	}
@@ -152,6 +169,7 @@ void DynamicCubemaps::SaveSettings(json& o_json)
 void DynamicCubemaps::RestoreDefaultSettings()
 {
 	settings = {};
+	reflectionBrightnessFix = true;  // (49h)
 	if (REL::Module::IsVR()) {
 		Util::ResetGameSettingsToDefaults(iniVRCubeMapSettings);
 		Util::ResetGameSettingsToDefaults(hiddenVRCubeMapSettings);
@@ -348,6 +366,7 @@ void DynamicCubemaps::UpdateCubemapCapture(bool a_reflections)
 		context->ClearUnorderedAccessViewFloat(uavs[1], clearColor);
 		context->ClearUnorderedAccessViewFloat(uavs[2], clearColor);
 		resetCapture[index] = false;
+		irradianceSinceReset[index] = 0;  // (49h) the composite's raw cubemap brightness warms up again
 	}
 
 	context->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
@@ -444,6 +463,8 @@ void DynamicCubemaps::Inferrence(bool a_reflections)
 void DynamicCubemaps::Irradiance(bool a_reflections)
 {
 	auto context = globals::d3d::context;
+	if (auto& n = irradianceSinceReset[a_reflections ? 1 : 0]; n < 1000u)
+		n++;  // (49h) CubemapTrust
 
 	Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::DynamicCubemaps);
 
@@ -499,6 +520,19 @@ void DynamicCubemaps::Irradiance(bool a_reflections)
 void DynamicCubemaps::UpdateCubemap()
 {
 	TracyD3D11Zone(globals::state->tracyCtx, "Cubemap Update");
+	// (49h) A weather that arrives in one step (console, script: the new weather already at full share) leaves the captures
+	// showing the old sky for ~5 captures; the composite's raw cubemap brightness warms up again (CubemapTrust). Normal
+	// transitions blend slowly enough for the captures to follow.
+	if (const auto* sky = globals::game::sky) {
+		const RE::TESWeather* weather = sky->currentWeather;
+		if (weather != trustWeather) {
+			if (trustWeather && weather && sky->currentWeatherPct > 0.9f) {
+				irradianceSinceReset[0] = std::min(irradianceSinceReset[0], 1u);
+				irradianceSinceReset[1] = std::min(irradianceSinceReset[1], 1u);
+			}
+			trustWeather = weather;
+		}
+	}
 	if (recompileFlag) {
 		logger::debug("Recompiling for Dynamic Cubemaps");
 		auto shaderCache = globals::shaderCache;
@@ -659,6 +693,7 @@ void DynamicCubemaps::SetupResources()
 		envInferredTexture->CreateUAV(uavDesc);
 
 		updateCubemapCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<UpdateCubemapCB>());
+		compositeFixCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<CompositeFixCB>());  // (49h)
 	}
 
 	{
@@ -704,4 +739,27 @@ void DynamicCubemaps::Reset()
 		activeReflections = true;
 		fakeReflections = true;
 	}
+}
+
+float DynamicCubemaps::CubemapTrust() const
+{
+	// (49h) 0 until the first irradiance pass after a clear, 1 from the 5th (each capture blends in by half: ~97% then).
+	auto ramp = [](uint32_t n) { return std::clamp((static_cast<float>(n) - 1.0f) / 4.0f, 0.0f, 1.0f); };
+	float trust = ramp(irradianceSinceReset[0]);
+	if (activeReflections && !Util::IsInterior())
+		trust = std::min(trust, ramp(irradianceSinceReset[1]));
+	return trust;
+}
+
+void DynamicCubemaps::BindCompositeConstants(ID3D11DeviceContext* a_context)
+{
+	// (49h) DeferredCompositeCS b3.
+	if (!compositeFixCB)
+		return;
+	CompositeFixCB data{};
+	data.flags = reflectionBrightnessFix ? 1u : 0u;
+	data.cubemapTrust = reflectionBrightnessFix ? CubemapTrust() : 0.0f;
+	compositeFixCB->Update(data);
+	ID3D11Buffer* buffer = compositeFixCB->CB();
+	a_context->CSSetConstantBuffers(3, 1, &buffer);
 }

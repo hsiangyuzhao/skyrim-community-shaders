@@ -1141,6 +1141,9 @@ namespace RayTracingScene
 		o_source.texture = raw.texture;
 		o_source.view = raw.view;
 		o_source.material.threshold = blendOnly ? kBlendCutoutThreshold : static_cast<float>(alpha->alphaThreshold) / 255.0f;
+		// (49h) Strict "greater" test (same switch as Hair: Ignore Faint Strands in RT): threshold 0 no longer keeps fully transparent texels.
+		if (!blendOnly && strictAlphaStatic.load() && static_cast<RE::NiAlphaProperty::TestFunction>((alpha->alphaFlags >> 10) & 7) == RE::NiAlphaProperty::TestFunction::kGreater)
+			o_source.material.threshold = (static_cast<float>(alpha->alphaThreshold) + 0.5f) / 255.0f;
 		o_source.material.alphaScale = raw.materialAlpha;
 		std::copy_n(raw.uv, 4, o_source.material.uvTransform);
 		// Lighting.hlsl: alpha *= vertex colour alpha, except for tree-animated and LOD shapes.
