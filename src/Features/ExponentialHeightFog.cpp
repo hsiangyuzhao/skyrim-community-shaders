@@ -6,6 +6,7 @@
 #include "Features/InverseSquareLighting.h"
 #include "Features/LightLimitFix.h"
 #include "Features/LinearLighting.h"
+#include "Features/PhysicalBrightness.h"
 #include "Features/PhysicalSky.h"
 #include "Features/RayTracing.h"
 #include "Features/Skylighting.h"
@@ -898,10 +899,10 @@ void ExponentialHeightFog::Prepass()
             cb.weatherFogParams = { fogNear * invRange, invRange, std::clamp(vanillaFogState.fogClamp, 0.0f, 1.0f), 0.0f };
             // (49j, design 3.2 row 21) Physical Brightness: the weather's fog colour is a game colour: x the game-colour factor, through
             // Color::Fog's pow(fogGamma) (k^(1 / fogGamma) here = k after it).
-            if (const auto& physicalSky = globals::features::physicalSky; physicalSky.loaded && physicalSky.physScene.followActive) {
+            if (const auto& pb = *PhysicalBrightness::GetSingleton(); pb.Active()) {
                 const auto& ll = globals::features::linearLighting.settings;
                 const float gamma = ll.enableLinearLighting && std::isfinite(ll.fogGamma) ? std::clamp(ll.fogGamma, 0.1f, 5.0f) : 1.0f;
-                const float k = std::pow(std::max(physicalSky.physScene.rAmb, 0.0f), 1.0f / gamma);
+                const float k = std::pow(std::max(pb.GameColourFactor(), 0.0f), 1.0f / gamma);
                 cb.weatherNearColor.x *= k; cb.weatherNearColor.y *= k; cb.weatherNearColor.z *= k;
                 cb.weatherFarColor.x *= k; cb.weatherFarColor.y *= k; cb.weatherFarColor.z *= k;
             }

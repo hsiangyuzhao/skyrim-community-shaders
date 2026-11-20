@@ -68,6 +68,8 @@ struct PhysicalBrightness
 		float winsorEV = 3.f;             // the auto exposure counts samples brighter than median + this as median + this
 		float darkTrim = 5.f;             // percent of the darkest samples not counted
 		float bloomClamp = 64.f;          // COD Bloom's input clamp (after exposure) while the master is on
+		float calSunVanilla = 1.0e5f;      // lux per unit of the game's sun colour^lightGamma (other exteriors): a clear vanilla noon sun ~1e5 lux
+		float calAmbientVanilla = 1.0e4f;  // cd/m^2 per unit of the game's decoded ambient (other exteriors): sun : ambient ~6 : 1 on a clear day
 		float clearDayReference = 0.12f;  // the game's clear-weather midday reference L_v (0.18 x (ambient + half the sun), game units)
 		bool measuredClouds = true;       // cloud cover from Cloud Shadows' cube (49h T3)
 		bool ambientFit = false;          // "Accurate Ambient Directions" (49i)
@@ -99,6 +101,8 @@ struct PhysicalBrightness
 	// (step 2, design 2.2.5) The game's own brightness as the reference: L_v = 0.18 x (mean ambient + sun x VDM x 0.5 x (1 - cover)), game units.
 	float vanillaNow = 0.f;          // L_v now (blended keys, as the game shows it)
 	float vanillaDay = 0.f;          // L_v of the same weather(s) at their day key
+	float vanillaAmbientNow = 0.f;   // the game's ambient now, decoded (mean luminance)
+	float vanillaSunNow = 0.f;       // the game's sunlight colour now, decoded, x (1 - cover)
 	float vanillaDayLastExterior = 0.f;  // for interiors
 	float weatherDayRatio = 1.f;     // A_w = L_v(day) / clearDayReference: the weather's brightness intent
 	bool vanillaValid = false;
@@ -118,6 +122,13 @@ struct PhysicalBrightness
 	[[nodiscard]] bool OutdoorPhysical() const { return scene == Scene::OutdoorPhysical; }
 	/// The master is on (the model may not be in effect here, e.g. in a menu).
 	[[nodiscard]] bool MasterOn() const;
+	/// (step 5) The game's own ambient x this in interiors and other exteriors (PhysicalSky::ApplyPhysicalAmbient writes it, as k^(1/gamma)).
+	[[nodiscard]] float EngineAmbientScale() const;
+	/// (step 5) Linear Lighting's directionalLightMult for the game's own directional light (interiors, other exteriors); 1 otherwise.
+	[[nodiscard]] float DirectionalLightMult() const;
+	/// The game-colour factor: the game's unlit colours (fog, rain, water, unlit smoke, vanilla sky pieces) x this. The physical ambient / the
+	/// game's ambient outdoors with the physical sky, EngineAmbientScale elsewhere, 1 while not in effect.
+	[[nodiscard]] float GameColourFactor() const;
 	/// Pre-exposure.
 	[[nodiscard]] float GetP() const { return Active() ? P : 1.f; }
 	/// Linear Lighting's pointLightMult while in effect: lamp strength x calLamp x P / (pi x Vanilla Diffuse Mult) (Lighting multiplies the

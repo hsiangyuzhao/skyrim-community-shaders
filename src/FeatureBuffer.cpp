@@ -81,6 +81,7 @@ std::pair<unsigned char*, size_t> GetFeatureBufferData(bool a_inWorld)
 				data.pointLightMult = pb.LampMult();
 				data.emitColorMult = pb.EmissiveMult();
 				data.glowmapMult = pb.EmissiveMult();
+				data.directionalLightMult = pb.DirectionalLightMult();  // (step 5) the game's own sun / interior light; Physical Sky's is linear
 			}
 			return data;
 		}(),

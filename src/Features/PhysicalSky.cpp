@@ -1675,6 +1675,11 @@ void PhysicalSky::Reset()
 		physScene.rAmb = physScene.starScale = physScene.unlitScale = 1.f;
 		horizonFixCbData = {};  // (47f)
 		horizonFixCbData.flags = PhysLightingFlags();  // (49h stage 1) the rules that do not need the physical sky still apply (interiors)
+		// (49j step 5) Physical Brightness in interiors / other exteriors: the game's colours and the stars x the game-colour factor.
+		if (const auto& pb = *PhysicalBrightness::GetSingleton(); pb.Active()) {
+			horizonFixCbData.altitude = pb.GameColourFactor();
+			horizonFixCbData.anchorOffset = pb.GameColourFactor();
+		}
 		cloudCbData = {};
 		linearLighting.isDirLightLinear = false;
 		return;
@@ -2305,7 +2310,9 @@ uint32_t PhysicalSky::PhysLightingFlags() const
 		flags |= pl.forwardCubemap ? kPLForwardCubemap : 0u;
 		flags |= pl.smallFixes ? kPLSmallFixes : 0u;
 	}
-	// Physical Brightness in effect this frame (outdoors with the physical sky; step 5 adds the other scenes' follow bit).
+	// Physical Brightness in effect this frame: outdoors with the physical sky every unit rule; (step 5) elsewhere the game's colours follow.
+	if (PhysicalBrightness::GetSingleton()->Active())
+		flags |= kPLFollow;
 	if (physScene.active) {
 		flags |= kPLDirect | kPLCloudAmbient | kPLRealRatios | kPLPhysAmbient | kPLFollow;
 		flags |= PhysicalBrightness::GetSingleton()->settings.measuredClouds ? kPLMeasuredClouds : 0u;
@@ -3199,9 +3206,22 @@ void PhysicalSky::ApplyPhysicalAmbient()
 		dalcEngine = transform;
 		dalcEngineValid = true;
 	}
+	const auto& pb = *PhysicalBrightness::GetSingleton();
 	if (physScene.ambientActive && physScene.ambientValid) {
 		transform.rotate = dalcPhysical.rotate;
 		transform.translate = dalcPhysical.translate;
+		dalcLastWritten = transform;
+		dalcWritten = true;
+	} else if (pb.Active() && !pb.OutdoorPhysical() && dalcEngineValid) {
+		// (49j step 5, design 3.2 row 7) Interiors and other exteriors: the game's own ambient, calibrated x P. The shaders decode
+		// pow(T + R n, gamma), so the whole transform x k^(1 / gamma) decodes to k x the game's ambient.
+		const auto& ll = globals::features::linearLighting.settings;
+		const float gamma = ll.enableLinearLighting && std::isfinite(ll.ambientGamma) ? std::clamp(ll.ambientGamma, 0.1f, 5.f) : 1.f;
+		const float s = std::pow(std::max(pb.EngineAmbientScale(), 0.f), 1.f / gamma);
+		for (int r = 0; r < 3; ++r)
+			for (int c = 0; c < 3; ++c)
+				transform.rotate.entry[r][c] = dalcEngine.rotate.entry[r][c] * s;
+		transform.translate = dalcEngine.translate * s;
 		dalcLastWritten = transform;
 		dalcWritten = true;
 	} else if (dalcWritten) {

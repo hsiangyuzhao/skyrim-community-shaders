@@ -300,7 +300,7 @@ void LinearLighting::Prepass()
 		// (pad[0]), smoke and the rest x the game-colour factor (unlitSceneScale). The multipliers are art only then.
 		if (const auto& pb = *PhysicalBrightness::GetSingleton(); pb.Active() && !isMainLoadingMenu) {
 			effectScene.flags = 1u | 2u | 4u | 8u;
-			unlitSceneScale = ComputeUnlitSceneScaleWithPhysical();
+			unlitSceneScale = pb.GameColourFactor();
 			effectScene.unlitSceneScale = unlitSceneScale;
 			effectScene.fireMagicMult = pb.settings.fireMagicStrength;
 			effectScene.litSmokeMult = 1.0f;

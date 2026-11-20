@@ -107,9 +107,15 @@ void PhysicalBrightness::BeginFrame()
 	const bool inMenu = ui && (ui->IsMenuOpen(RE::MainMenu::MENU_NAME) || ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME));
 	const auto& ll = globals::features::linearLighting;
 	if (MasterOn() && ll.loaded && ll.settings.enableLinearLighting && !inMenu) {
+		// (step 5, design 5.1 / 9) Every place is in the model: the physical sky's worldspaces; interiors (the game's ambient and lamps, calibrated);
+		// other exteriors (the game's sun, ambient and sky, calibrated).
 		auto& physicalSky = globals::features::physicalSky;
-		if (physicalSky.WillDraw())
+		if (Util::IsInterior())
+			scene = Scene::Interior;
+		else if (physicalSky.WillDraw())
 			scene = Scene::OutdoorPhysical;
+		else
+			scene = Scene::OutdoorVanilla;
 	}
 	if (scene != lastScene) {
 		sceneChangeFrame = globals::state->frameCount;
@@ -128,12 +134,18 @@ void PhysicalBrightness::BeginFrame()
 	// ---- The eye's adapted luminance (cd/m^2) ----
 	// CPU estimate: a grey (0.18) surface in this frame's light (the physical scene of the last frame). Used before the auto exposure has
 	// a Physical Brightness reading and while it is off.
-	{
+	if (scene == Scene::OutdoorPhysical) {
 		const auto& ps = globals::features::physicalSky.physScene;
 		const float sunLum = 0.2126f * globals::features::physicalSky.settings.sunlightColor.x + 0.7152f * globals::features::physicalSky.settings.sunlightColor.y +
 		                     0.0722f * globals::features::physicalSky.settings.sunlightColor.z;
 		const float lux = ps.eReal > 0.f && sunLum > 1e-12f ? ps.eReal * std::max(settings.sunLux, 1.f) / sunLum : 0.f;
 		estimatedLuminance = lux > 0.f ? std::clamp(0.18f * lux / kPi, 1e-5f, 1e5f) : 100.f;  // no scene yet: a dull day
+	} else if (scene == Scene::Interior) {
+		// (step 5) The interior ambient in lamp units (x calLamp: lux) on a grey surface, x 2 for the lamps.
+		estimatedLuminance = std::clamp(2.f * 0.18f * vanillaAmbientNow / VanillaDiffuseMult() * settings.calLamp / kPi, 1e-5f, 1e5f);
+	} else {
+		// (step 5) The game's sun (x calSunVanilla) and ambient (x calAmbientVanilla) on a grey surface.
+		estimatedLuminance = std::clamp(0.18f * (vanillaSunNow * 0.5f * settings.calSunVanilla / kPi + vanillaAmbientNow * settings.calAmbientVanilla), 1e-5f, 1e5f);
 	}
 	float luminance = 0.f;
 	adaptedFromAE = ReadAdaptedLuminance(luminance);
@@ -162,6 +174,39 @@ void PhysicalBrightness::BeginFrame()
 	P = pBase;
 	if (settings.pWobble)
 		P *= std::exp2(std::sin(2.f * kPi * timeSeconds / kWobblePeriod));
+
+	// (step 5) The game-colour factor outside the physical sky: the same factor as the game's ambient takes (EngineAmbientScale).
+	vanillaUnlit = scene == Scene::OutdoorPhysical ? 1.f : EngineAmbientScale();
+}
+
+float PhysicalBrightness::EngineAmbientScale() const
+{
+	// (step 5, design 3.2 row 7, design 4) The game's own ambient (decoded) x this = pipeline luminance of a white surface.
+	// Interior: in lamp units (the same units as the game's lamps: x calLamp / (pi x VDM) x P, so the game's ratio of lamps to ambient
+	// holds), x Interior Ambient. Other exteriors: calAmbientVanilla x P, x Sky Ambient Strength.
+	if (scene == Scene::Interior)
+		return std::clamp(settings.interiorAmbient, 0.f, 4.f) * std::max(settings.calLamp, 0.f) * GetP() / (kPi * VanillaDiffuseMult());
+	if (scene == Scene::OutdoorVanilla)
+		return std::clamp(settings.skyAmbientStrength, 0.f, 4.f) * std::max(settings.calAmbientVanilla, 0.f) * GetP();
+	return 1.f;
+}
+
+float PhysicalBrightness::DirectionalLightMult() const
+{
+	// (step 5) Linear Lighting's directionalLightMult for the game's own directional light (not Physical Sky's): interiors in lamp units,
+	// other exteriors x calSunVanilla / (pi x VDM) x P (Lighting multiplies VDM again: albedo x E / pi x P).
+	if (scene == Scene::Interior)
+		return std::max(settings.calLamp, 0.f) * GetP() / (kPi * VanillaDiffuseMult());
+	if (scene == Scene::OutdoorVanilla)
+		return std::max(settings.calSunVanilla, 0.f) * GetP() / (kPi * VanillaDiffuseMult());
+	return 1.f;
+}
+
+float PhysicalBrightness::GameColourFactor() const
+{
+	if (!Active())
+		return 1.f;
+	return scene == Scene::OutdoorPhysical ? globals::features::physicalSky.physScene.rAmb : vanillaUnlit;
 }
 
 void PhysicalBrightness::AdjustLight(LightLimitFix::LightData& a_light, bool a_isl, bool a_pointLight) const
@@ -232,6 +277,9 @@ void PhysicalBrightness::Load(const json& a_json)
 	get("winsorEV", s.winsorEV);
 	get("darkTrim", s.darkTrim);
 	get("bloomClamp", s.bloomClamp);
+	get("calSunVanilla", s.calSunVanilla);
+	get("calAmbientVanilla", s.calAmbientVanilla);
+	get("clearDayReference", s.clearDayReference);
 	get("measuredClouds", s.measuredClouds);
 	get("ambientFit", s.ambientFit);
 	get("overcastKappa", s.overcastKappa);
@@ -266,6 +314,9 @@ void PhysicalBrightness::Load(const json& a_json)
 	finite(s.winsorEV, 0.5f, 10.f, 3.f);
 	finite(s.darkTrim, 0.f, 40.f, 5.f);
 	finite(s.bloomClamp, 1.f, 65000.f, 64.f);
+	finite(s.calSunVanilla, 1e2f, 1e7f, 1.0e5f);
+	finite(s.calAmbientVanilla, 1.f, 1e7f, 1.0e4f);
+	finite(s.clearDayReference, 1e-3f, 10.f, 0.12f);
 	finite(s.overcastKappa, 0.f, 1.f, 0.25f);
 	finite(s.airglowRatio, 1.f, 1000.f, 25.f);
 	finite(s.smoothingSeconds, 0.1f, 10.f, 1.5f);
@@ -306,6 +357,9 @@ void PhysicalBrightness::Save(json& a_json) const
 		{ "winsorEV", s.winsorEV },
 		{ "darkTrim", s.darkTrim },
 		{ "bloomClamp", s.bloomClamp },
+		{ "calSunVanilla", s.calSunVanilla },
+		{ "calAmbientVanilla", s.calAmbientVanilla },
+		{ "clearDayReference", s.clearDayReference },
 		{ "measuredClouds", s.measuredClouds },
 		{ "ambientFit", s.ambientFit },
 		{ "overcastKappa", s.overcastKappa },
@@ -338,7 +392,7 @@ void PhysicalBrightness::DrawStatus()
 	ImGui::TextDisabled("Pre-exposure P: %+.2f EV%s", std::log2(std::max(GetP(), 1e-30f)), settings.pWobble ? " (wobble test on)" : "");
 	ImGui::TextDisabled("Adapted to: %.3g cd/m2 (%s)", adaptedLuminance, adaptedFromAE ? "auto exposure" : "estimate: auto exposure off or not ready");
 	ImGui::TextDisabled("Night darkness in effect: %+.2f EV on screen (the weather's own: %+.2f EV)", deltaK, deltaKVanilla);
-	ImGui::TextDisabled("Game colours (fog, rain, water, unlit smoke) x%.3g", globals::features::physicalSky.physScene.rAmb);
+	ImGui::TextDisabled("Game colours (fog, rain, water, unlit smoke) x%.3g", GameColourFactor());
 	if (vanillaValid)
 		ImGui::TextDisabled("The game's own brightness (no lamps): now %.3g, day %.3g (game units); weather brightness x%.2f", vanillaNow, vanillaDay, globals::features::physicalSky.physScene.weatherFactor);
 }
@@ -474,6 +528,9 @@ void PhysicalBrightness::DrawSettings()
 		ImGui::SliderFloat("Highlight Cut (winsorize)", &s.winsorEV, 1.f, 8.f, "median + %.1f EV");
 		ImGui::SliderFloat("Ignore Darkest", &s.darkTrim, 0.f, 40.f, "%.0f%%");
 		ImGui::SliderFloat("Bloom Input Clamp", &s.bloomClamp, 4.f, 4096.f, "%.0f", ImGuiSliderFlags_Logarithmic);
+		ImGui::SliderFloat("Vanilla Sun Calibration", &s.calSunVanilla, 1e4f, 3e5f, "%.0f lux / unit", ImGuiSliderFlags_Logarithmic);
+		ImGui::SliderFloat("Vanilla Ambient Calibration", &s.calAmbientVanilla, 1e3f, 1e5f, "%.0f cd/m2 / unit", ImGuiSliderFlags_Logarithmic);
+		ImGui::SliderFloat("Clear Weather Reference", &s.clearDayReference, 0.01f, 1.f, "%.3f", ImGuiSliderFlags_Logarithmic);
 		ImGui::Checkbox("Overcast From Measured Clouds", &s.measuredClouds);
 		ImGui::Checkbox("Accurate Ambient Directions (experimental)", &s.ambientFit);
 		ImGui::SliderFloat("Overcast Pass-Through", &s.overcastKappa, 0.f, 1.f, "%.2f");
@@ -517,6 +574,8 @@ void PhysicalBrightness::ComputeVanillaReference()
 		if (physicalSky.dalcEngineValid) {
 			const auto& t = physicalSky.dalcEngine.translate;
 			vanillaNow = 0.18f * lum(lin(t.x, gammaA), lin(t.y, gammaA), lin(t.z, gammaA));
+			vanillaAmbientNow = vanillaNow / 0.18f;
+			vanillaSunNow = 0.f;
 			vanillaDay = vanillaDayLastExterior > 0.f ? vanillaDayLastExterior : settings.clearDayReference;
 			vanillaValid = true;
 		}
@@ -554,6 +613,8 @@ void PhysicalBrightness::ComputeVanillaReference()
 		const float sunDay = lum(lin(blended(getSun, 0), gammaL), lin(blended(getSun, 1), gammaL), lin(blended(getSun, 2), gammaL)) * vdm * 0.5f * (1.f - cover);
 
 		vanillaNow = 0.18f * (ambNow + sunNow);
+		vanillaAmbientNow = ambNow;
+		vanillaSunNow = lum(lin(sun.red, gammaL), lin(sun.green, gammaL), lin(sun.blue, gammaL)) * (1.f - cover);
 		vanillaDay = 0.18f * (ambDay + sunDay);
 		if (vanillaDay > 1e-6f)
 			vanillaDayLastExterior = vanillaDay;
