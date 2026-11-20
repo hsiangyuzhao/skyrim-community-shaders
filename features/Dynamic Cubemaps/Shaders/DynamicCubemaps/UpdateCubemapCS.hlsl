@@ -78,6 +78,9 @@ cbuffer UpdateData : register(b0)
 {
 	float3 CameraPreviousPosAdjust2;
 	float CaptureWeight;  // (batch 39b) share of a new capture; Dynamic Cubemaps always used 0.5
+	// (49i) "Probe Forgets Out-of-View Light" (plain capture, while Physical Ambient is in effect; DynamicCubemaps::UpdateCubemapCB):
+	// x = multiplier on out-of-view texels' colour this capture (1 = none), y = 1: sky pixels in view are captured as no bounce.
+	float4 ProbeForget;
 }
 
 float smoothbumpstep(float edge0, float edge1, float x)
@@ -117,6 +120,17 @@ float smoothbumpstep(float edge0, float edge1, float x)
 			color += RemoveIblFeedback(ColorTexture.SampleLevel(LinearSampler, uv, 0).rgb, uv);  // (49h stage 1, S3a)
 			weight++;
 		}
+#if !defined(REFLECTIONS)
+		// (49i) The sky in view: no bounce (black, alpha 1: known, so the inference does not fill it with ground colour from the coarser
+		// mips). Its position 10 km out along the direction (out of view later: distance factor 0, colour 0 anyway).
+		else if (ProbeForget.y > 0.5 && depth == 1.0) {
+			const float lerpFactor = CaptureWeight;
+			DynamicCubemapPosition[ThreadID] = lerp(DynamicCubemapPosition[ThreadID], float4(captureDirection * 10.0, 0.0), lerpFactor);
+			DynamicCubemapRaw[ThreadID] = max(0, lerp(DynamicCubemapRaw[ThreadID], float4(0.0, 0.0, 0.0, 1.0), lerpFactor));
+			DynamicCubemap[ThreadID] = max(0, lerp(DynamicCubemap[ThreadID], float4(0.0, 0.0, 0.0, 1.0), lerpFactor));
+			return;
+		}
+#endif
 
 		if (weight > 0.0) {
 			position /= weight;
@@ -143,6 +157,14 @@ float smoothbumpstep(float edge0, float edge1, float x)
 	DynamicCubemapPosition[ThreadID] = position;
 
 	float4 color = DynamicCubemapRaw[ThreadID];
+#if !defined(REFLECTIONS)
+	// (49i) Out of view: the colour fades (alpha kept: a known direction, now without bounce).
+	[branch] if (ProbeForget.x < 1.0)
+	{
+		color.rgb *= ProbeForget.x;
+		DynamicCubemapRaw[ThreadID] = color;
+	}
+#endif
 
 	float distance = length(position.xyz);
 	float distanceFactor = smoothbumpstep(0.0, 2.0, distance);

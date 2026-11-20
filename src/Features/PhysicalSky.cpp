@@ -158,6 +158,7 @@ void PhysicalSky::LoadSettings(json& o_json)
 			pl.cloudsStarsWaterFollow = j.value("cloudsStarsWaterFollow", d.cloudsStarsWaterFollow);
 			pl.groundBounce = j.value("groundBounce", d.groundBounce);  // (49i)
 			pl.ambientFit = j.value("ambientFit", d.ambientFit);        // (49i)
+			pl.probeForget = j.value("probeForget", d.probeForget);     // (49i)
 			auto clampValue = [](float a_value, float a_lo, float a_hi, float a_default) { return std::isfinite(a_value) ? std::clamp(a_value, a_lo, a_hi) : a_default; };
 			pl.compressionK = clampValue(j.value("compressionK", d.compressionK), 0.1f, 1.f, d.compressionK);
 			pl.overcastKappa = clampValue(j.value("overcastKappa", d.overcastKappa), 0.f, 1.f, d.overcastKappa);
@@ -318,7 +319,7 @@ void PhysicalSky::SaveSettings(json& o_json)
 			{ "farShadows", pl.farShadows }, { "farSkylight", pl.farSkylight }, { "lodScale", pl.lodScale }, { "farFog", pl.farFog },
 			{ "forwardCubemap", pl.forwardCubemap }, { "smallFixes", pl.smallFixes },
 			{ "realSkyRatios", pl.realSkyRatios }, { "physicalAmbient", pl.physicalAmbient }, { "measuredClouds", pl.measuredClouds },
-			{ "cloudsStarsWaterFollow", pl.cloudsStarsWaterFollow }, { "groundBounce", pl.groundBounce }, { "ambientFit", pl.ambientFit },
+			{ "cloudsStarsWaterFollow", pl.cloudsStarsWaterFollow }, { "groundBounce", pl.groundBounce }, { "ambientFit", pl.ambientFit }, { "probeForget", pl.probeForget },
 			{ "compressionK", pl.compressionK }, { "overcastKappa", pl.overcastKappa },
 			{ "airglowRatio", pl.airglowRatio }, { "smoothingSeconds", pl.smoothingSeconds }, { "hueSaturationCap", pl.hueSaturationCap } };
 	}
@@ -2380,6 +2381,13 @@ void PhysicalSky::SettingsSceneLighting()
 			"On (default): the game stores the ambient as one colour plus one change per axis, mixed in gamma space; this picks those\n"
 			"numbers so the ambient comes out right on faces pointing in 26 directions (sideways faces were ~10-15%% too dark, upward\n"
 			"faces too bright). Off: as 49h (only the six axis directions, matched before the gamma).");
+	ImGui::Checkbox("Probe Forgets Out-of-View Light", &pl.probeForget);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"On (default): the screen light probe that Image Based Lighting takes the surroundings' bounce from (Dynamic Cubemaps) counts\n"
+			"the sky it sees as no bounce (the sky's light is already in the ambient), and what it saw earlier but no longer sees fades\n"
+			"out over about 3 seconds. Distant mountains no longer keep the colour of torches you looked at a while ago.\n"
+			"Off: as 49h (the sky directions were filled with ground colour, and everything once seen stayed until the next load).");
 	ImGui::EndDisabled();
 	ImGui::Unindent();
 	ImGui::Checkbox("Overcast From Measured Clouds", &pl.measuredClouds);

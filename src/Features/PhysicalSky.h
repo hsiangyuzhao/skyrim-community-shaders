@@ -229,6 +229,7 @@ struct PhysicalSky final : public Feature
 			// (49i) Under Physical Ambient, default on (off = 49h): the ground's bounce light from below, and the ambient's direction fit.
 			bool groundBounce = true;  // keys "groundBounce": rho x (direct + sky on a horizontal face) x (1 - n.z) / 2 added to the ambient
 			bool ambientFit = true;    // "ambientFit": the engine transform fitted so the decoded ambient matches at 26 normals
+			bool probeForget = true;   // "probeForget": the IBL environment probe captures the sky in view as no bounce, out-of-view texels fade
 			float compressionK = 0.3f;           // Developer: E_pipe = E_ref (E_real / E_ref)^k
 			float overcastKappa = 0.25f;         // Developer: light an overcast layer passes on (of the blocked sun + the clear sky)
 			float airglowRatio = 25.f;           // Developer: full-moon sky luminance / airglow luminance
