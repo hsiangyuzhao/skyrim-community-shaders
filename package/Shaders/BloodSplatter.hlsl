@@ -50,6 +50,7 @@ struct PS_OUTPUT
 };
 
 #ifdef PSHADER
+#	include "Common/SharedData.hlsli"  // (49j) horizonFixData: Physical Brightness's game-colour factor
 SamplerState SampBloodColor : register(s0);
 SamplerState SampBloodAlpha : register(s1);
 SamplerState SampFlareColor : register(s2);
@@ -83,6 +84,9 @@ PS_OUTPUT main(PS_INPUT input)
 	float4 colorHDR = TexFlareHDR.Sample(SampFlareHDR, input.TexCoordColor.xy).xyzw;
 
 	psout.Color = (colorHDR * flareMult) * Alpha;
+	// (49j, design 3.2 row 28) Physical Brightness (PhysLightFlags bit 14): the flare's absolute HDR value x the game-colour factor (P units).
+	if ((SharedData::horizonFixData.Flags & (1u << 14)) != 0u)
+		psout.Color.xyz *= max(SharedData::horizonFixData.Altitude, 0.0);
 #	endif
 
 	return psout;

@@ -306,8 +306,11 @@ bool ReflectionFixOn()
 		// sets the DALC-to-probe ratio in the enclosed places where the tint was worst.
 		float3 dalcPart = directionalAmbientColor * albedo;
 #		ifdef COMPOSITE_AMBIENT_SKY
-		dalcPart = Color::IrradianceToGamma(Color::IrradianceToLinear(dalcPart) *
-			Color::MultiBounceAO(Color::IrradianceToLinear(albedo / Color::PBRLightingScale), ambientSkyVisibility));
+		// (49j, design 9-6) As Lighting.hlsl: the ground's bounce is kept out of the sky-visibility occlusion (only its colour share matters
+		// here: Masks.z gives the luminance).
+		const float3 compositeBounce = min(PhysLight::GroundBounce(normalWS) * albedo, max(dalcPart, 0.0));
+		dalcPart = Color::IrradianceToGamma(Color::IrradianceToLinear(dalcPart - compositeBounce) *
+			Color::MultiBounceAO(Color::IrradianceToLinear(albedo / Color::PBRLightingScale), ambientSkyVisibility)) + compositeBounce;
 #		endif
 
 		directionalAmbientColor = dalcPart + iblColor * albedo;

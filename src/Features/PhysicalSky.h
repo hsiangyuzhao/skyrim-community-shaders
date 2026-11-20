@@ -650,6 +650,7 @@ struct PhysicalSky final : public Feature
 		float weatherFactor = 1.f;
 		float weatherFactorLog = 0.f;
 		float3 weatherSkyHue = { 1.f, 1.f, 1.f };  // (49j step 2) the weather's own sky colour (luminance 1), for the relative tint (Sky.hlsl S2 too)
+		float3 bounceRaw = {};  // (49j step 6) ground bounce on a downward face, shader units before S
 	} physScene;
 	/// (49i) Ground Bounce's albedo: Physical Sky's Ground Albedo, toward kSnowAlbedo by Dynamic Snow's accumulated snow at the player
 	/// (o_snow: that share, 0 without Dynamic Snow / outside its cold area).

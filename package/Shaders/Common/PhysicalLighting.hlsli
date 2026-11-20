@@ -21,6 +21,8 @@ namespace PhysLight
 	static const uint kForwardCubemap = 1u << 8;  // S7 forward cubemap reflections at the cubemap's own brightness
 	static const uint kSmallFixes = 1u << 9;      // S8 small consistency fixes
 	static const uint kLandPbr = 1u << 10;        // information: the loaded land uses True PBR texture sets
+	static const uint kPhysAmbient = 1u << 12;    // (49j) Physical Brightness outdoors: the ambient is the physical sky's
+	static const uint kFollow = 1u << 14;         // (49j) Physical Brightness: the game's colours x the game-colour factor (horizonFixData.Altitude)
 
 #if defined(PSHADER) || defined(CSHADER) || defined(COMPUTESHADER)  // as SharedData.hlsli: FeatureData exists in pixel and compute shaders
 	bool On(uint a_bit)
@@ -29,6 +31,26 @@ namespace PhysLight
 	}
 #else
 	bool On(uint a_bit) { return false; }  // vertex shaders: no FeatureData, every rule off (none of them acts there)
+#endif
+
+	/// (49j, design 3.2 rows 20 / 28) Physical Brightness: the game's unlit colours and absolute constants (fog colour, snow rim light, the
+	/// character light) were set against the game's ambient: x the game-colour factor (the ambient now / the game's, in P units). 1 while off.
+#if defined(PSHADER) || defined(CSHADER) || defined(COMPUTESHADER)
+	float GameColourFactor()
+	{
+		return On(kFollow) ? max(SharedData::horizonFixData.Altitude, 0.0) : 1.0;
+	}
+
+	/// (49j, design 9-6) Physical Brightness outdoors: the ground's bounce light from below in the physical ambient, at a face with normal
+	/// a_n (rho E_h (1 - n.z) / 2 / pi x P, shader units), so it can be kept out of the sky-visibility occlusion. Halves packed by
+	/// PhysicalSky::Reset in fields no other shader reads: physSkyData._pad5 = (r, g), physSkyExtData.SunGlowIntensity low half = b.
+	float3 GroundBounce(float3 a_n)
+	{
+		const uint rg = asuint(SharedData::physSkyData._pad5);
+		const uint b = asuint(SharedData::physSkyExtData.SunGlowIntensity);
+		const float3 bounce = max(float3(f16tof32(rg & 0xFFFF), f16tof32(rg >> 16), f16tof32(b & 0xFFFF)), 0.0) * (0.5 * (1.0 - a_n.z));
+		return On(kPhysAmbient) ? bounce : 0.0;  // single exit (no uninitialised-path warning)
+	}
 #endif
 
 	/// S8: Linear Lighting's directional-light multiplier applies (as Lighting.hlsl decides it: not indoors). Off: without the interior check (49g).

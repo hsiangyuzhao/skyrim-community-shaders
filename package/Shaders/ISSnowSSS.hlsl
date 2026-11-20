@@ -63,8 +63,11 @@ PS_OUTPUT main(PS_INPUT input)
 
 		sssColor += iterationParameters[iterationIndex].xyz * lerp(iterationSourceColor, sourceColor, iterationDiffuseFactor);
 	}
-	float sssLuminance = Color::RGBToLuminanceAlternative(sssColor);
-	float3 darkColor = max(0, lerp(g_SSSDarkColor.xyz * g_SSSDarkColor.w, sourceColor, sssLuminance));
+	// (49j, design 3.2 row 28) Physical Brightness (PhysLightFlags bit 14): the dark colour is an absolute game value and the luminance a weight
+	// in game units: both through the game-colour factor (P units), so the result scales with P.
+	const float gameColour = (SharedData::horizonFixData.Flags & (1u << 14)) != 0u ? max(SharedData::horizonFixData.Altitude, 1e-8) : 1.0;
+	float sssLuminance = Color::RGBToLuminanceAlternative(sssColor / gameColour);
+	float3 darkColor = max(0, lerp(g_SSSDarkColor.xyz * g_SSSDarkColor.w * gameColour, sourceColor, sssLuminance));
 	float3 snowColor = lerp(darkColor, sssColor, sssLuminance);
 
 	psout.Color = lerp(sourceColor, snowColor, snowMask);

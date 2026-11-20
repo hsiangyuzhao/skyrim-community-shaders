@@ -4129,7 +4129,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	if (useSnowSpecular && useSnowDecalSpecular) {
 #		if defined(SNOW)
-		lightsSpecularColor += GetSnowSpecularColor(input, worldNormal.xyz, viewDirection);
+		lightsSpecularColor += GetSnowSpecularColor(input, worldNormal.xyz, viewDirection) * PhysLight::GameColourFactor();  // (49j) x the game-colour factor
 #		endif
 	} else {
 #		if defined(HAIR) && defined(CS_HAIR)
@@ -4617,7 +4617,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	if (Permutation::PixelShaderDescriptor & Permutation::LightingFlags::CharacterLight) {
 		float charLightMul = saturate(dot(viewDirection, worldNormal.xyz)) * CharacterLightParams.x + CharacterLightParams.y * saturate(dot(float2(0.164398998, -0.986393988), worldNormal.yz));
 		float charLightColor = min(CharacterLightParams.w, max(0, CharacterLightParams.z * TexCharacterLightProjNoiseSampler.Sample(SampCharacterLightProjNoiseSampler, baseShadowUV).x));
-		diffuseColor += (charLightMul * charLightColor).xxx;
+		diffuseColor += (charLightMul * charLightColor * PhysLight::GameColourFactor()).xxx;  // (49j) x the game-colour factor
 	}
 #	endif
 
@@ -5161,7 +5161,12 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	directionalAmbientColor *= outputAlbedo;
 
 #	if defined(SKYLIGHTING)
+	// (49j, design 9-6) Physical Brightness: the ground's bounce (from below) is not the sky: kept out of the sky-visibility occlusion (it
+	// was occluded twice, an underside kept ~1/10 of it). Local AO still applies (deferred composite).
+	const float3 groundBounce = min(PhysLight::GroundBounce(ambientNormal) * outputAlbedo, max(directionalAmbientColor, 0.0));
+	directionalAmbientColor -= groundBounce;
 	Skylighting::applySkylighting(color.xyz, directionalAmbientColor, outputAlbedo, skylightingDiffuse);
+	directionalAmbientColor += groundBounce;
 #	endif
 
 #	if defined(IBL) && defined(SKYLIGHTING)
@@ -5170,7 +5175,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 #	if !defined(DEFERRED)
 	color.xyz = Color::IrradianceToGamma(Color::IrradianceToLinear(color.xyz) + specularColor);
-	float3 fogColor = Color::Fog(input.FogParam.xyz);
+	float3 fogColor = Color::Fog(input.FogParam.xyz) * PhysLight::GameColourFactor();  // (49j, design 3.2 row 20) x the game-colour factor
 	float fogFactor = Color::FogAlpha(input.FogParam.w);
 	float weatherFogAmount = 0.0;  // (47b) share of the view the game's fog covers under the height fog
 #		if defined(IBL)

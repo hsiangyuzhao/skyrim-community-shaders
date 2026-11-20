@@ -1827,12 +1827,18 @@ void PhysicalSky::Reset()
 	// (49j) Physical Brightness: the clouds' own (weather-coloured) part is a game colour: x the game-colour factor (design 3.2 row 5).
 	if (physScene.followActive)
 		cbData.cloudOriginalMix = settings.cloudOriginalMix * physScene.rAmb;
-	// (49j step 2) Weather Tint Strength on the clouds (Sky.hlsl S2): the weather's sky colour (r, g at luminance 1; b follows) in two fields
-	// no shader reads otherwise (sunDiskCos, _pad5: the retired procedural sun / padding), the strength in extCbData.sunGlowIntensity (retired).
+	// (49j steps 2 / 6) In fields no shader read before (sunDiskCos and sunGlowIntensity: the retired procedural sun; _pad5: padding), as
+	// half pairs: sunDiskCos = the weather's sky colour (r, g at luminance 1; b follows) for the clouds' relative tint (Sky.hlsl S2); _pad5 =
+	// the ground bounce's (r, g) and sunGlowIntensity = (bounce b, Weather Tint Strength) (PhysicalLighting.hlsli GroundBounce, Sky.hlsl).
 	if (physScene.active) {
-		cbData.sunDiskCos = physScene.weatherSkyHue.x;
-		cbData._pad5 = physScene.weatherSkyHue.y;
-		extCbData.sunGlowIntensity = std::clamp(PhysicalBrightness::GetSingleton()->settings.weatherTint, 0.f, 1.f);
+		auto halves = [](float a_low, float a_high) {
+			auto half = [](float v) { return static_cast<uint32_t>(DirectX::PackedVector::XMConvertFloatToHalf(std::isfinite(v) ? std::clamp(v, 0.f, 65000.f) : 0.f)); };
+			return std::bit_cast<float>(half(a_low) | (half(a_high) << 16));
+		};
+		const float3 bounce = physScene.bounceRaw * physScene.S;
+		cbData.sunDiskCos = halves(physScene.weatherSkyHue.x, physScene.weatherSkyHue.y);
+		cbData._pad5 = halves(bounce.x, bounce.y);
+		extCbData.sunGlowIntensity = halves(bounce.z, std::clamp(PhysicalBrightness::GetSingleton()->settings.weatherTint, 0.f, 1.f));
 	}
 
 	// (49j) Physical Brightness needs the direct light to be Physical Sky's (design 9: Override Directional Light forced on).
@@ -2991,6 +2997,7 @@ void PhysicalSky::UpdatePhysicalScene(const RE::NiPoint3& a_lutSunDir, const RE:
 		const bool bounceOn = pbs.groundBounce;
 		ps.bounceAlbedo = bounceOn ? GroundBounceAlbedo(ps.bounceSnow) : float3(0.f, 0.f, 0.f);
 		const float3 bounce = (directBounce + skyUp) * ps.bounceAlbedo;
+		ps.bounceRaw = bounce * toShader;  // (49j step 6) the bounce on a face looking straight down, shader units before S (GroundBounce)
 		const auto& normals = GetFitNormals();
 		for (int a = 0; a < kAmbientNormals; ++a) {
 			const float down = 0.5f * (1.f - static_cast<float>(normals.n[a][2]));
