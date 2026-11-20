@@ -1165,10 +1165,9 @@ PS_OUTPUT main(PS_INPUT input)
 	const bool sceneMaster = EffectScene::Master();
 	const bool followLit = sceneMaster && (EffectSceneFlags & EffectScene::kLit) != 0u && sceneCategory == EffectScene::kLitSmoke && EffectScene::CanFollow();
 	const bool followUnlit = sceneMaster && (EffectSceneFlags & EffectScene::kUnlit) != 0u && sceneCategory == EffectScene::kUnlitSmoke && EffectScene::CanFollowUnlit();
-	// (49h stage 1, S1) "Same Sun and Moon Light Everywhere": lit smoke and mist that follow the scene light never glow brighter than lit -- the
-	// material's emissive multiple (BaseColorScale.x, in BaseColor and in the grayscale-to-colour lookup; mountain clouds 1.5) capped at 1.
-	[branch] if (followLit && PhysLight::On(PhysLight::kDirect) && baseColorScale > 1.0)
-		baseColor.xyz /= baseColorScale;
+	// (49i) The 49h S1 cap divided baseColor by BaseColorScale.x here. BaseColorScale is multiplied into the colour only in the
+	// GrayscaleToColor branch above (and there inside Color::Effect, pow 1.8 with Linear Lighting, so the division left scale^0.8), and the
+	// division switched on above 1.0: an animated emissive multiple flickered the smoke. Replaced by the cap after the lighting below.
 
 	// (48n, official CS #3033) Light only pixels that survive the alpha test.
 #	if defined(LIGHTING)
@@ -1195,6 +1194,14 @@ PS_OUTPUT main(PS_INPUT input)
 #	endif
 
 	float3 lightColor = lerp(baseColor.xyz, propertyColor * baseColor.xyz, lightingInfluence.xxx);
+
+	// (49i, S1 "Same Sun and Moon Light Everywhere") Lit smoke and mist that follow the scene light are never brighter than a lit matte
+	// surface: at most the light a matte surface gets here (propertyColor: the same light, MatteLight / GetLightingColor, + point lights) x a
+	// colour no brighter than white (the effect's own colour, clamped to 1 per channel). Uses no per-frame material constant: the
+	// result is only ever lowered, never divided, so an animated emissive multiple cannot be amplified (49h: it flickered smoke near fires
+	// and the mountain clouds). Night mountain clouds (emissive multiple 1.5, partly self-lit) end at the moonlit matte brightness.
+	[branch] if (followLit && PhysLight::On(PhysLight::kDirect))
+		lightColor = min(lightColor, propertyColor * saturate(baseColor.xyz));
 
 	// (49g) Unlit Smoke and Mist: x the scene's ambient brightness relative to this weather's midday (dims at night and indoors).
 	[branch] if (followUnlit)
