@@ -417,7 +417,7 @@ float3 AcesGuy(float3 val)
 	return val;
 }
 
-float3 LottesFilmic(float3 val)
+float3 LottesFilmicPerChannel(float3 val)
 {
 	val *= tonemapParams[0].x;
 #if defined(HDR_OUTPUT)
@@ -447,6 +447,28 @@ float3 LottesFilmic(float3 val)
 	}
 #endif
 	return val;
+}
+
+/// (49j, design 6.2) "Hue-Preserving Tone Curve" (Physical Sky > Scene Lighting > Screen, while Physical Brightness is on; C++ sets
+/// cinematic.w, which nothing else here reads): the same Lottes curve on the largest channel, the colour scaled by curve(N) / N, so a
+/// bright orange keeps its hue instead of going orange -> yellow -> white channel by channel; near the top (70-100% of the peak: 1, or
+/// peak / paper white in the Native HDR form) it blends toward white, so the very brightest still ends white. Baked into the LUT.
+float3 LottesFilmic(float3 val)
+{
+	// One evaluation of the curve (both forms inline it; two calls overflowed fxc's stack in the HDR LUT variant).
+	const bool huePreserving = cinematic.w > 0.5;
+	const float3 positive = max(val, 0.0);
+	const float n = max(positive.x, max(positive.y, positive.z));
+	const float3 curved = LottesFilmicPerChannel(huePreserving ? n.xxx : val);
+	if (!huePreserving)
+		return curved;
+	float peak = 1.0;
+#if defined(HDR_OUTPUT)
+	if (HDRNative())
+		peak = max(hdrParams.y, 1e-3);
+#endif
+	const float3 huePreserved = n > 1e-10 ? positive * (curved.x / n) : 0.0;
+	return lerp(huePreserved, curved.xxx, smoothstep(0.7, 1.0, curved.x / peak));
 }
 
 float DayCurve(float x, float k)

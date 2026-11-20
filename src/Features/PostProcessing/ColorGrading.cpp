@@ -1,5 +1,6 @@
 #include "ColorGrading.h"
 
+#include "Features/PhysicalBrightness.h"
 #include "State.h"
 #include "Util.h"
 #include "Utils/GpuTimers.h"
@@ -924,7 +925,9 @@ void ColorGrading::Draw(TextureInfo& inout_tex)
             std::lerp(1.f, imageSpaceData.baseData.cinematic.saturation, settings.gameCinematicBlend.x),
             std::lerp(1.f, imageSpaceData.baseData.cinematic.brightness, settings.gameCinematicBlend.y),
             std::lerp(1.f, imageSpaceData.baseData.cinematic.contrast, settings.gameCinematicBlend.z),
-            imageSpaceData.baseAmount
+            // (49j, design 6.2) w: the shader never read the base amount here; it carries Physical Brightness's "Hue-Preserving Tone Curve"
+            // (Lottes only; colorgrading.cs.hlsl LottesFilmic).
+            (PhysicalBrightness::GetSingleton()->Active() && PhysicalBrightness::GetSingleton()->settings.huePreserving) ? 1.f : 0.f
         },
 		.fade = float4{
 			imageSpaceData.modData.data[RE::ImageSpaceModData::kFadeR],
