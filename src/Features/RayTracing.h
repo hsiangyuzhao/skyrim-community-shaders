@@ -336,6 +336,14 @@ public:
 		// where the light grazes or faces away from the depth normal: the terminator). The sun's character ray is unchanged.
 		// (49h) Re-exposed (Point Light Shadows > Point Lights > Advanced), default on (= 48o-49g). Off: the 6-unit start, as the sun.
 		bool PointCloseContact = true;
+		// (49i) Outside the settings macro (keys PointSmoothHardEdges / PointSteadyEdges), Point Light Shadows > Point Lights > Advanced, each
+		// default on, off = 49h. PointDenoiseCS (PL_FIX variant, Stable Penumbra's slots, not on a moving receiver), on pixels whose 3x3
+		// disagrees or whose history is partial:
+		// PointSmoothHardEdges "Smooth Hard Edges": a sharp edge (penumbra formula <= 2.5 px) in the 5x5 -> the fixed 5x5 Gaussian (sigma 1 px)
+		// instead of the rotated 2-px Poisson disc.
+		// PointSteadyEdges "Steady Edges": the history clamp on edge pixels = the 5x5 Gaussian mean +- max(2 sigma, 0.25), static weight 0.1.
+		bool PointSmoothHardEdges = true;
+		bool PointSteadyEdges = true;
 		// (49h) HairFaintStrands "Hair: Ignore Faint Strands in RT" (Objects in Ray Tracing > Characters > Hair): hair cards keep alpha >= 0.5
 		// in the trace (their faint fringe made a solid board), and every kGreater alpha test (characters and cut-out objects) keeps alpha >
 		// threshold instead of >= threshold. A change re-captures characters and the scene.
