@@ -23,6 +23,10 @@ static const uint kNightGroundFix = (1 << 2);  // multiscatter ground bounce x c
 static const uint kNightSkyFixes = (1 << 3);   // Sky Fixes on: the sky brightness factor below applies
 static const uint kNightDistantSea = (1 << 4); // (47b) Sky Fixes: sky-view rays below the planet horizon also see the sky reflected at grazing incidence
 #define SKY_FIXES_SCALE SharedData::physSkyNightData.pad0  // sky brightness factor on the SUN's in-scatter (47a2: not the moons')
+// (49j, design 9-2) The multiscatter LUT is stored x kMsLutScale (fp16: deep-twilight values per unit sun fell below its smallest step
+// and became 0) and read x 1 / kMsLutScale. Only LutGen writes and reads it. CPU replica: PhysicalSkyModel::BuildMs / MsAt.
+static const float kMsLutScale = 16384.0;
+static const float kMsLutRcpScale = 1.0 / 16384.0;
 
 // (47b, Sky Precision) Upstream 35c759765: transmittance quadrature concentrated around the ray's lowest point,
 // where the density changes fastest; a grazing ray gets samples on both sides of it.
@@ -187,10 +191,10 @@ void rayMarch(
 		const float2 lutUvMasser = precision ? MsLutUvPlanet(curr_pos, data.masserDir) : TrLutUvPlanet(curr_pos, data.masserDir);
 		const float2 lutUvSecunda = precision ? MsLutUvPlanet(curr_pos, data.secundaDir) : TrLutUvPlanet(curr_pos, data.secundaDir);
 
-		const float3 psiMsSun = TexMsLut.SampleLevel(SampTr, lutUvSun, 0).rgb * data.sunlightColor;
+		const float3 psiMsSun = TexMsLut.SampleLevel(SampTr, lutUvSun, 0).rgb * (data.sunlightColor * kMsLutRcpScale);
 		float3 psiMs = psiMsSun;
-		psiMs += TexMsLut.SampleLevel(SampTr, lutUvMasser, 0).rgb * data.masserColor;
-		psiMs += TexMsLut.SampleLevel(SampTr, lutUvSecunda, 0).rgb * data.secundaColor;
+		psiMs += TexMsLut.SampleLevel(SampTr, lutUvMasser, 0).rgb * (data.masserColor * kMsLutRcpScale);
+		psiMs += TexMsLut.SampleLevel(SampTr, lutUvSecunda, 0).rgb * (data.secundaColor * kMsLutRcpScale);
 #	endif
 
 		float3 inscatter = (muSRayleigh * phaseRayleighSun + muSAerosol * phaseAerosolSun) * trSun;
@@ -329,7 +333,7 @@ float3 NightSkyBase(float3 rayDir)
 	RWTexOutput[tid.xy] = float4(tr, 1.0);
 
 #elif LUTGEN == 1
-	const uint sqrtSamples = 4;
+	const uint sqrtSamples = 8;  // (49j, design 9-2) 64 directions (were 16)
 	const float rcpSqrtSamples = rcp(sqrtSamples);
 	const float rcpSamples = rcpSqrtSamples * rcpSqrtSamples;
 
@@ -337,8 +341,8 @@ float3 NightSkyBase(float3 rayDir)
 	float3 fMs = 0;
 	// (batch 37b) Upstream c14664115: the azimuth covered only [0, pi), half the sphere. (47o) Always the full circle.
 	const float azimuthRange = 2.0 * Math::PI;
-	for (uint i = 0; i < sqrtSamples; ++i)
-		for (uint j = 0; j < sqrtSamples; ++j) {
+	[loop] for (uint i = 0; i < sqrtSamples; ++i)
+		[loop] for (uint j = 0; j < sqrtSamples; ++j) {
 			const float theta = (i + 0.5) * azimuthRange * rcpSqrtSamples;
 			const float phi = acos(1.0 - 2.0 * (j + 0.5) * rcpSqrtSamples);
 			const float3 rayDir = SphericalDir(theta, phi);
@@ -351,7 +355,7 @@ float3 NightSkyBase(float3 rayDir)
 			fMs += lumFactor;
 			lumTotal += lum;
 		}
-	RWTexOutput[tid.xy] = float4(lumTotal * rcpSamples / (1 - fMs * rcpSamples), 1.0);
+	RWTexOutput[tid.xy] = float4(lumTotal * rcpSamples / (1 - fMs * rcpSamples) * kMsLutScale, 1.0);  // (49j) x kMsLutScale
 
 #elif LUTGEN == 2
 	float3 lum = 0;

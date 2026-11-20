@@ -46,13 +46,11 @@ public:
 	{
 		float3 CameraPreviousPosAdjust;
 		float CaptureWeight;  ///< (batch 39b) share of a new capture (was a fixed 0.5 in the shader)
-		/// (49i) Physical Sky > Scene Lighting > Physical Ambient > "Probe Forgets Out-of-View Light" (plain capture only, while Physical
-		/// Ambient is in effect): x = multiplier on out-of-view texels' colour this capture (exp(-dt / kProbeForgetSeconds); 1 = none),
-		/// y = 1: sky pixels in view are captured as "no bounce" (black, alpha 1). (1, 0, 0, 0) otherwise.
+		/// "Probe Forgets Out-of-View Light" (plain capture only): x = 1: (49j) out-of-view texels whose surface left their direction show a
+		/// physical estimate; y = 1: sky pixels in view are captured as "no bounce" (black, alpha 1); z = history rescale (Physical
+		/// Brightness, P now / P at the chain's last capture). (0, 0, 1, 0) otherwise.
 		float4 ProbeForget;
 	};
-	static constexpr float kProbeForgetSeconds = 3.0f;
-	double probeForgetLastTime = -1.0;
 	STATIC_ASSERT_ALIGNAS_16(UpdateCubemapCB);
 
 	ID3D11ComputeShader* updateCubemapCS = nullptr;

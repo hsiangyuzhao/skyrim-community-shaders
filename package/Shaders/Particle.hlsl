@@ -262,6 +262,13 @@ PS_OUTPUT main(PS_INPUT input)
 #	endif
 
 	float4 sourceColor = TexSourceTexture.Sample(SampSourceTexture, input.TexCoord0);
+#	if defined(ENVCUBE)
+	// (49j, design 9-4) Physical Sky > Scene Lighting "Rain Without Colour" (PhysicalSky::PhysLightFlags bit 15 in horizonFixData.Flags):
+	// rain and snow textures painted with refraction colours (NAT's cyan / brown / purple noise) keep only their brightness; the
+	// vertex colour (the precipitation's tint) is kept.
+	if ((SharedData::horizonFixData.Flags & (1u << 15)) != 0u)
+		sourceColor.xyz = Color::RGBToLuminance(sourceColor.xyz);
+#	endif
 	float4 baseColor = input.Color * sourceColor;
 	baseColor.xyz = Color::Diffuse(baseColor.xyz);
 #	if defined(GRAYSCALE_TO_COLOR)

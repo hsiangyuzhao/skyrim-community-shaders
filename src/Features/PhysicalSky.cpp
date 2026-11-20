@@ -134,6 +134,7 @@ void PhysicalSky::LoadSettings(json& o_json)
 		settings.aerosolPreset = o_json.value("aerosolPreset", defaults.aerosolPreset);  // (47b)
 		settings.moonFadesStars = o_json.value("moonFadesStars", defaults.moonFadesStars);  // (48b)
 		settings.waterSunTransmittance = o_json.value("waterSunTransmittance", defaults.waterSunTransmittance);  // (49h)
+		settings.rainNoColour = o_json.value("rainNoColour", defaults.rainNoColour);  // (49j)
 		// (49h stage 1) Physical Lighting: missing keys keep their defaults.
 		if (const auto it = o_json.find("physicalLighting"); it != o_json.end() && it->is_object()) {
 			auto& pl = settings.physicalLighting;
@@ -312,6 +313,7 @@ void PhysicalSky::SaveSettings(json& o_json)
 	o_json["aerosolPreset"] = settings.aerosolPreset;  // (47b)
 	o_json["moonFadesStars"] = settings.moonFadesStars;  // (48b)
 	o_json["waterSunTransmittance"] = settings.waterSunTransmittance;  // (49h)
+	o_json["rainNoColour"] = settings.rainNoColour;  // (49j)
 	{
 		const auto& pl = settings.physicalLighting;  // (49h stage 1)
 		o_json["physicalLighting"] = { { "enabled", pl.enabled }, { "sameDirectLight", pl.sameDirectLight }, { "moonCloudGrey", pl.moonCloudGrey },
@@ -662,10 +664,10 @@ void PhysicalSky::SettingsCelestials()
 	ImGui::SliderFloat("Planetshine Strength", &settings.moonPlanetshineStrength, 0.f, 0.5f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text(
-			"A faint grey glow on the dark side of each moon, strongest at a thin crescent, none at full moon.\n"
-			"How visible the dark side is. Default 0.10: at a thin crescent the dark side gets a grey of\n"
-			"about 7%% of the lit side's brightness on top of the sky behind it.\n"
-			"Now: Masser %.3f, Secunda %.3f.",
+			"Earthshine: the dark side of each moon, lit by the Earth, strongest at a thin crescent, none at full moon.\n"
+			"(49j) The dark side is a solid disc (it hides the stars behind it) with a sharp edge and the moon's own markings; its\n"
+			"brightness is 1/1000 of the lit side x the Earth's phase at the default 0.10 (the real ratio); 0.20 = twice that.\n"
+			"Now (relative to the real ratio): Masser %.2f, Secunda %.2f.",
 			moonPlanetshineAmount[0], moonPlanetshineAmount[1]);
 
 	// (44h) removed the "New Moon" section ("Hide New Moon Disc"): fixed on (47m: in the code).
@@ -1217,8 +1219,10 @@ void PhysicalSky::UpdateMoonSky(float a_exposure, float a_sunElevation)
 	}
 
 	if (s.moonPlanetshine) {
-		// Opacity of the grey fill on the unlit side: strength x (1 - phase brightness) x night. Thin crescent (phase
-		// 0.25): 0.75 x strength; quarter 0.5x; gibbous 0.25x; full none. A new moon's disc is not drawn at all.
+		// (49j, design 9-3) Earthshine. The value is the dark side's brightness relative to kPlanetshineRatio x the lit disc: strength / 0.1
+		// (the default 0.1 = the real ratio) x the Earth's phase seen from the moon (1 - the moon's lit fraction, from the phase picture) x night.
+		// Sky.hlsl draws the dark side opaque (a real moon hides the stars behind it) with the sky behind plus this grey, sharp-edged and with
+		// the picture's brightness structure. 48b: an opacity of strength x (1 - phase), a grey of 0.25 x the lit disc (10-20x too bright).
 		const float strength = std::clamp(s.moonPlanetshineStrength, 0.f, 0.5f);
 		for (int i = 0; i < 2; ++i) {
 			if (!moons[i] || !(strength > 0.f) || !(dayFade > 0.f))
@@ -1226,8 +1230,8 @@ void PhysicalSky::UpdateMoonSky(float a_exposure, float a_sunElevation)
 			const float phase = SkySync::PhaseFactorFromTexture(moons[i]);
 			if (phase <= SkySync::NewMoonIntensityFactor)
 				continue;
-			const float amount = strength * (1.f - phase) * dayFade;
-			moonPlanetshineAmount[i] = std::isfinite(amount) ? std::clamp(amount, 0.f, 1.f) : 0.f;
+			const float amount = (strength / 0.1f) * (1.f - phase) * dayFade;
+			moonPlanetshineAmount[i] = std::isfinite(amount) ? std::clamp(amount, 0.f, 8.f) : 0.f;
 		}
 		moonCbData.planetshineHalves = toHalves(moonPlanetshineAmount[0], moonPlanetshineAmount[1]);
 		nightCbData.flags |= kNightPlanetshine;
@@ -2249,12 +2253,16 @@ uint32_t PhysicalSky::PhysLightingFlags() const
 {
 	// (49h stage 1) Physical Lighting rule bits for SharedData::horizonFixData.Flags (Common/PhysicalLighting.hlsli).
 	const auto& pl = settings.physicalLighting;
+	// (49j, design 9-4) Independent of the master.
+	const uint32_t independent = (loaded && settings.rainNoColour) ? kPLRainNoColour : 0u;
 	if (!pl.enabled)
-		return 0u;
-	uint32_t flags = 0u;
+		return independent;
+	uint32_t flags = independent;
 	flags |= pl.sameDirectLight ? kPLDirect : 0u;
 	flags |= pl.sameDirectLight && pl.moonCloudGrey ? kPLMoonGrey : 0u;
-	flags |= pl.cloudAmbient ? kPLCloudAmbient : 0u;
+	// (49j, design 9-8) S2 reads the engine ambient (Sky.hlsl): only while that ambient is the physical one, else the clouds are lit in
+	// weather units next to a sky in physical units (mixed units: the overcast night +3.6 EV).
+	flags |= pl.cloudAmbient && physScene.ambientActive ? kPLCloudAmbient : 0u;
 	flags |= pl.iblNoFeedback ? kPLIblNoFeedback : 0u;
 	flags |= pl.iblEnvOcclusion ? kPLEnvOcclusion : 0u;
 	flags |= pl.farSkylight ? kPLFarSkylight : 0u;
@@ -2379,14 +2387,17 @@ void PhysicalSky::SettingsSceneLighting()
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text(
 			"Off (default, as 49h): the game stores the ambient as one colour plus one change per axis, mixed in gamma space.\n"
-			"On: those numbers are fitted so the ambient comes out right on faces pointing in 26 directions. Tested offline it does\n"
-			"not help once Ground Bounce is on (the error is small then); the line \"Ambient direction error\" below shows both.");
+			"On: those numbers are fitted so the ambient comes out right on faces pointing in 26 directions, vertical and upward\n"
+			"faces counting more than undersides. The game's form cannot be exact at dusk and dawn (a bright west and a dark east\n"
+			"share one mean): 50-100%% on single faces then is a limit of the form, with or without the fit (with Ground Bounce the\n"
+			"error is small only while the sun is high). The line \"Ambient direction error\" below shows both.");
 	ImGui::Checkbox("Probe Forgets Out-of-View Light", &pl.probeForget);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text(
 			"On (default): the screen light probe that Image Based Lighting takes the surroundings' bounce from (Dynamic Cubemaps) counts\n"
-			"the sky it sees as no bounce (the sky's light is already in the ambient), and what it saw earlier but no longer sees fades\n"
-			"out over about 3 seconds. Distant mountains no longer keep the colour of torches you looked at a while ago.\n"
+			"the sky it sees as no bounce (the sky's light is already in the ambient). What it saw earlier stays while you only turn\n"
+			"around; once you have moved sideways by more than about a third of its distance it is replaced by an estimate (grey ground\n"
+			"in the ambient and some sun), never black (49i faded everything behind you to black in 3 s).\n"
 			"Off: as 49h (the sky directions were filled with ground colour, and everything once seen stayed until the next load).");
 	ImGui::EndDisabled();
 	ImGui::Unindent();
@@ -2448,6 +2459,12 @@ void PhysicalSky::SettingsSceneLighting()
 		ImGui::Text(
 			"On (default): the sun's bright highlight on water is reddened and dimmed by the atmosphere like the sunlight on the\n"
 			"ground (Celestials > Transmittance Mix), so at dusk and dawn it is no longer a white glare. Off: as in 49g.");
+	ImGui::Checkbox("Rain Without Colour", &settings.rainNoColour);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"On (default): rain and snow streaks keep only the brightness of their texture, tinted by the weather's precipitation colour.\n"
+			"Some weather mods paint the rain texture with refraction colours (cyan, brown, purple noise), which at night showed as\n"
+			"rainbow-coloured streaks. Off: as in 49i.");
 	ImGui::TextDisabled("Also: Lighting > Exponential Height Fog > Stable Fog Colour; Materials > Dynamic Cubemaps > Reflection Brightness Fix.");
 	if (pl.enabled && pl.lodScale)
 		ImGui::TextDisabled("PBR land seen: %s", (PhysLightingFlags() & kPLLandPbr) ? "yes (far land uses the PBR scale)" : "no");
@@ -2682,7 +2699,11 @@ namespace
 				const double v = f > 1e-12 ? std::pow(f, g) : 0.0;
 				const double dv = f > 1e-12 ? g * std::pow(f, g - 1.0) : 0.0;
 				const double t = std::max(static_cast<double>(a_target[k]), 0.0);
-				const double w = 1.0 / ((t + 0.1 * mean) * (t + 0.1 * mean));
+				// (49j, design 9-7 short term) Faces turned down weigh up to 4x less: the "T + R n" form cannot match every face at dusk
+				// (opposite faces share one encoded mean), and the vertical and upward faces are the ones seen lit; undersides sit under
+				// the skylighting occlusion anyway.
+				const double faceWeight = fit.n[k][2] < 0.0 ? 1.0 - 0.75 * (-fit.n[k][2]) : 1.0;
+				const double w = faceWeight / ((t + 0.1 * mean) * (t + 0.1 * mean));
 				const double r = v - t;
 				for (int i = 0; i < 4; ++i) {
 					b[i] -= w * dv * r * phi[i];

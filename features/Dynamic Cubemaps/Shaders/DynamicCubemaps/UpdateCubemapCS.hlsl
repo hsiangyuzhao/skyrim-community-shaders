@@ -78,8 +78,10 @@ cbuffer UpdateData : register(b0)
 {
 	float3 CameraPreviousPosAdjust2;
 	float CaptureWeight;  // (batch 39b) share of a new capture; Dynamic Cubemaps always used 0.5
-	// (49i) "Probe Forgets Out-of-View Light" (plain capture, while Physical Ambient is in effect; DynamicCubemaps::UpdateCubemapCB):
-	// x = multiplier on out-of-view texels' colour this capture (1 = none), y = 1: sky pixels in view are captured as no bounce.
+	// "Probe Forgets Out-of-View Light" (plain capture only; DynamicCubemaps::UpdateCubemapCB): x = 1: (49j, design 9-1) an out-of-view
+	// texel whose stored surface no longer lies in its direction (the camera moved sideways by more than ~30% of its distance) shows a
+	// physical estimate instead (0.2 albedo in this direction's ambient and half the sun), never black; y = 1: sky pixels in view are
+	// captured as no bounce (49i); z = history rescale this capture (Physical Brightness: P now / P at this chain's last capture; 1 = none).
 	float4 ProbeForget;
 }
 
@@ -87,6 +89,23 @@ float smoothbumpstep(float edge0, float edge1, float x)
 {
 	x = 1.0 - abs(saturate((x - edge0) / (edge1 - edge0)) - 0.5) * 2.0;
 	return x * x * (3.0 - x - x);
+}
+
+// (49j, design 9-1) What a surface seen in direction a_dir is roughly lit by: 0.2 albedo, facing back along a_dir, in the ambient (DALC)
+// of that normal and half the directional light (its shadow is unknown). Shader units, as the captured MAIN colour.
+float3 BounceEstimate(float3 a_dir)
+{
+	const float3 n = -a_dir;
+	const float3 ambient = Color::Ambient(max(0, mul(SharedData::DirectionalAmbient, float4(n, 1))));
+	const float3 sun = Color::DirectionalLight(SharedData::DirLightColor.xyz, SharedData::linearLightingSettings.isDirLightLinear) * Color::VanillaDiffuseMult() *
+	                   (0.5 * saturate(dot(n, SharedData::DirLightDirection.xyz)));
+	return 0.2 * (ambient + sun);
+}
+
+// (49j) Physical Brightness: a stored value brought from the pre-exposure of its capture to this capture's (ProbeForget.z).
+float4 HistoryRescale(float4 a_value)
+{
+	return float4(a_value.rgb * ProbeForget.z, a_value.a);
 }
 
 [numthreads(8, 8, 1)] void main(uint3 ThreadID
@@ -126,8 +145,8 @@ float smoothbumpstep(float edge0, float edge1, float x)
 		else if (ProbeForget.y > 0.5 && depth == 1.0) {
 			const float lerpFactor = CaptureWeight;
 			DynamicCubemapPosition[ThreadID] = lerp(DynamicCubemapPosition[ThreadID], float4(captureDirection * 10.0, 0.0), lerpFactor);
-			DynamicCubemapRaw[ThreadID] = max(0, lerp(DynamicCubemapRaw[ThreadID], float4(0.0, 0.0, 0.0, 1.0), lerpFactor));
-			DynamicCubemap[ThreadID] = max(0, lerp(DynamicCubemap[ThreadID], float4(0.0, 0.0, 0.0, 1.0), lerpFactor));
+			DynamicCubemapRaw[ThreadID] = max(0, lerp(HistoryRescale(DynamicCubemapRaw[ThreadID]), float4(0.0, 0.0, 0.0, 1.0), lerpFactor));
+			DynamicCubemap[ThreadID] = max(0, lerp(HistoryRescale(DynamicCubemap[ThreadID]), float4(0.0, 0.0, 0.0, 1.0), lerpFactor));
 			return;
 		}
 #endif
@@ -142,11 +161,11 @@ float smoothbumpstep(float edge0, float edge1, float x)
 			float lerpFactor = CaptureWeight;
 
 			DynamicCubemapPosition[ThreadID] = lerp(DynamicCubemapPosition[ThreadID], positionFinal, lerpFactor);
-			DynamicCubemapRaw[ThreadID] = max(0, lerp(DynamicCubemapRaw[ThreadID], colorFinal, lerpFactor));
+			DynamicCubemapRaw[ThreadID] = max(0, lerp(HistoryRescale(DynamicCubemapRaw[ThreadID]), colorFinal, lerpFactor));
 
 			colorFinal *= sqrt(saturate(0.5 * length(position.xyz)));
 
-			DynamicCubemap[ThreadID] = max(0, lerp(DynamicCubemap[ThreadID], colorFinal, lerpFactor));
+			DynamicCubemap[ThreadID] = max(0, lerp(HistoryRescale(DynamicCubemap[ThreadID]), colorFinal, lerpFactor));
 
 			return;
 		}
@@ -157,12 +176,23 @@ float smoothbumpstep(float edge0, float edge1, float x)
 	DynamicCubemapPosition[ThreadID] = position;
 
 	float4 color = DynamicCubemapRaw[ThreadID];
-#if !defined(REFLECTIONS)
-	// (49i) Out of view: the colour fades (alpha kept: a known direction, now without bounce).
-	[branch] if (ProbeForget.x < 1.0)
+	// (49j) Physical Brightness: the stored colour is in the pre-exposure of its capture; brought to this capture's.
+	[branch] if (ProbeForget.z != 1.0)
 	{
-		color.rgb *= ProbeForget.x;
+		color.rgb *= ProbeForget.z;
 		DynamicCubemapRaw[ThreadID] = color;
+	}
+#if !defined(REFLECTIONS)
+	// (49j, design 9-1) Forgotten by position, not by time (49i faded every out-of-view texel to black within 3 s, camera still or not):
+	// the stored point has moved off this direction by r = sideways offset / distance; from r 0.3 to 0.8 the texel goes over to the
+	// physical estimate. Nothing is written: coming back restores it.
+	[branch] if (ProbeForget.x > 0.5)
+	{
+		const float storedDistance = length(position.xyz);
+		const float along = dot(position.xyz, captureDirection);
+		const float sideways = length(position.xyz - along * captureDirection);
+		const float r = along > 0.0 ? sideways / max(storedDistance, 1e-4) : 1.0;
+		color.rgb = lerp(BounceEstimate(captureDirection), color.rgb, 1.0 - smoothstep(0.3, 0.8, r));
 	}
 #endif
 

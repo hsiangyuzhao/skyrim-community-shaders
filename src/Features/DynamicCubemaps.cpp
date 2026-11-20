@@ -385,17 +385,12 @@ void DynamicCubemaps::UpdateCubemapCapture(bool a_reflections)
 	// (49i) "Probe Forgets Out-of-View Light": the plain capture (the IBL environment probe) while Physical Ambient is in effect. The sky in
 	// view is no bounce (the physical ambient already holds the sky), what has left the view fades with kProbeForgetSeconds (it kept
 	// e.g. a torch-lit wall's colour until the next load).
-	updateData.ProbeForget = { 1.0f, 0.0f, 0.0f, 0.0f };
-	{
-		const double now = static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()) * 1e-6;
-		if (!a_reflections) {
-			const auto& physicalSky = globals::features::physicalSky;
-			if (physicalSky.PhysicalAmbientActive() && physicalSky.PhysLightingOn(physicalSky.settings.physicalLighting.probeForget)) {
-				const double dt = probeForgetLastTime >= 0.0 ? std::clamp(now - probeForgetLastTime, 0.0, 1.0) : 0.0;
-				updateData.ProbeForget = { static_cast<float>(std::exp(-dt / kProbeForgetSeconds)), 1.0f, 0.0f, 0.0f };
-			}
-			probeForgetLastTime = now;
-		}
+	// (49j, design 9-1) Out-of-view texels are forgotten by the camera's displacement (UpdateCubemapCS), toward a physical estimate.
+	updateData.ProbeForget = { 0.0f, 0.0f, 1.0f, 0.0f };
+	if (!a_reflections) {
+		const auto& physicalSky = globals::features::physicalSky;
+		if (physicalSky.PhysicalAmbientActive() && physicalSky.PhysLightingOn(physicalSky.settings.physicalLighting.probeForget))
+			updateData.ProbeForget = { 1.0f, 1.0f, 1.0f, 0.0f };
 	}
 
 	auto eyePosition = Util::GetEyePosition(0);

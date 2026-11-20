@@ -8,6 +8,7 @@ namespace PhysicalSkyModel
 	{
 		constexpr double kPi = std::numbers::pi;
 		constexpr double kHorizonCos = -0.414;  // TrLutUv / LUTGEN 0-1: cos of the lowest zenith angle stored
+		constexpr double kMsLutScale = 16384.0;  // (49j) LutGen.cs.hlsl kMsLutScale
 
 		double Dot(const Vec3& a, const Vec3& b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
 		double Length(const Vec3& a) { return std::sqrt(Dot(a, a)); }
@@ -245,7 +246,7 @@ namespace PhysicalSkyModel
 	void Model::BuildMs()
 	{
 		ms.assign(static_cast<size_t>(MsW) * MsH, Vec3{ 0.0, 0.0, 0.0 });
-		constexpr int steps = 20, sqrtSamples = 4;
+		constexpr int steps = 20, sqrtSamples = 8;  // (49j) as LutGen.cs.hlsl: 64 directions
 		const double azimuthRange = atmo.multiScatterFix ? 2.0 * kPi : kPi;
 		for (int y = 0; y < MsH; ++y) {
 			const double v = (y + 0.5) / MsH;
@@ -316,7 +317,7 @@ namespace PhysicalSkyModel
 					const double denom = 1.0 - fMs[c] * rcpSamples;
 					out[c] = denom > 1e-6 ? lumTotal[c] * rcpSamples / denom : 0.0;
 				}
-				ms[y * MsW + x] = ToHalf(out);
+				ms[y * MsW + x] = Scale(ToHalf(Scale(out, kMsLutScale)), 1.0 / kMsLutScale);  // (49j) stored x kMsLutScale in fp16, as the GPU
 			}
 		}
 	}
