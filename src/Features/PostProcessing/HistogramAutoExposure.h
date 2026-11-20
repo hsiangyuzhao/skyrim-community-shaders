@@ -88,6 +88,9 @@ struct HistogramAutoExposure : public PostProcessFeature
 	std::string DescribeForTrace() const;
 	/// (49h stage 2) The last exposure multiplier as EV (0.18 x compensation / divisor), from the readback.
 	[[nodiscard]] float LastExposureEV() const;
+	/// (49i) The compensation (linear) and the adaptation range (linear luminance) of the last Draw, for LastExposureEV.
+	float lastAppliedCompensation = 1.f;
+	float2 lastAppliedRange = { 0.f, 1e30f };
 
 	// buffers
 	struct alignas(16) AutoExposureCB
@@ -100,7 +103,12 @@ struct HistogramAutoExposure : public PostProcessFeature
 		float PurkinjeMaxEV;
 		float PurkinjeStrength;
 
-		float pad[3];
+		// (49i) Mirrors HLSL's packing of common.hlsli's `float pad[3]`: an array in a cbuffer starts on a 16-byte register and every
+		// element takes one register (offsets 48 / 64 / 80, 36 bytes), so the Phys* fields start at byte 84 there. 49h declared a plain
+		// float[3] here (bytes 36-48): every Phys* value landed 9 floats early and the last nine past the 128-byte buffer (read as 0),
+		// which pinned the Physical adaptation to EV 0 (clamp [-3 + 0, -3 + 0] in log2 L) with no compensation.
+		float padAlign[3];     // bytes 36-48: up to HLSL's register boundary
+		float padHlslArray[9]; // bytes 48-84: HLSL's float pad[3] (three registers, the last one partly)
 
 		// (49h stage 2) Physical mode (common.hlsli); Classic leaves them 0 and never reads them.
 		float PhysMinLogLum;
@@ -123,8 +131,14 @@ struct HistogramAutoExposure : public PostProcessFeature
 		float PhysAdaptMinEV;
 		float PhysAdaptMaxEV;
 		uint PhysFlags;
+		float padTail[3];
 	};
-	static_assert(sizeof(AutoExposureCB) == 128);
+	// (49i) Offsets as fxc reports them for common.hlsli (histogram.cs.hlsl /Fc listing): PhysMinLogLum 84, PhysMode 92, PhysFlags 160.
+	static_assert(offsetof(AutoExposureCB, PurkinjeStrength) == 32);
+	static_assert(offsetof(AutoExposureCB, PhysMinLogLum) == 84);
+	static_assert(offsetof(AutoExposureCB, PhysMode) == 92);
+	static_assert(offsetof(AutoExposureCB, PhysFlags) == 160);
+	static_assert(sizeof(AutoExposureCB) == 176);
 	std::unique_ptr<ConstantBuffer> autoExposureCB = nullptr;
 	std::unique_ptr<StructuredBuffer> histogramSB = nullptr;
 	std::unique_ptr<StructuredBuffer> adaptationSB = nullptr;

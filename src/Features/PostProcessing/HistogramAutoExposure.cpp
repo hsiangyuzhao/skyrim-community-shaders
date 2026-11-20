@@ -49,9 +49,12 @@ bool HistogramAutoExposure::PhysicalMode() const
 
 float HistogramAutoExposure::LastExposureEV() const
 {
+	// (49i) The exposure the adapt pass applied: 0.18 x the compensation in effect / clamp(divisor, adaptation range in effect), as
+	// exposure.hlsli ExposeColor (the range is +-40 EV in Physical mode, i.e. no clamp; Classic clamps to its own range).
 	if (!readbackValid || !(readback[0] > 0.f))
 		return 0.f;
-	return std::log2(0.18f * std::exp2(settings.ExposureCompensation) / readback[0]);
+	const float divisor = std::clamp(readback[0], std::min(lastAppliedRange.x, lastAppliedRange.y), std::max(lastAppliedRange.x, lastAppliedRange.y));
+	return std::log2(0.18f * lastAppliedCompensation / std::max(divisor, 1e-30f));
 }
 
 std::string HistogramAutoExposure::DescribeForTrace() const
@@ -502,6 +505,9 @@ void HistogramAutoExposure::Draw(TextureInfo& inout_tex)
 		}
 	}
 	autoExposureCB->Update(cbData);
+	// (49i) What LastExposureEV reports (the "Now" line, F7): the compensation and range this pass applies.
+	lastAppliedCompensation = cbData.ExposureCompensation;
+	lastAppliedRange = cbData.AdaptationRange;
 	// (49h stage 2) Local Exposure pivots around the middle grey this pass targets: x the compensation curve in Physical mode
 	// (read back 2-3 frames late; it changes slowly).
 	lastExposureCompensation = cbData.ExposureCompensation * (physical && readbackValid && readbackPhysical && readback[3] > 0.f ? readback[3] : 1.f);
