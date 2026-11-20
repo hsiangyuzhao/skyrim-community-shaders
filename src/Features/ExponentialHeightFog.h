@@ -284,6 +284,11 @@ private:
 	std::unique_ptr<Texture3D> lightScatteringFarHistory;
 	std::unique_ptr<Texture3D> integratedLightScattering;
 	std::unique_ptr<Texture3D> integratedLightScatteringFar;
+	// (49i) S6: the medium's radiance at the far end of each grid (VolumetricFogIntegrationCS u1; RGBA16F, the grid's xy), the far one bound
+	// at PS t24 while the far grid runs, else the near one (volumeEndFar).
+	std::unique_ptr<Texture2D> volumeEnd;
+	std::unique_ptr<Texture2D> volumeEndFar;
+	bool volumeEndUseFar = false;
 	std::unique_ptr<ConstantBuffer> volumetricFogCB;
 	winrt::com_ptr<ID3D11SamplerState> linearSampler;
 	winrt::com_ptr<ID3D11SamplerState> shadowSampler;

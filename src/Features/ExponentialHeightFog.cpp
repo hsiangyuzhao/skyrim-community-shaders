@@ -550,6 +550,31 @@ void ExponentialHeightFog::EnsureVolumetricResources()
     lightScatteringFar = make3D(farGridSize, true);
     lightScatteringFarHistory = make3D(farGridSize, false);
     integratedLightScatteringFar = make3D(farGridSize, true);
+    // (49i) S6: the far-end colour of each grid (VolumetricFogIntegrationCS u1, PS t24).
+    auto makeEnd = [](const DirectX::XMUINT4& a_size) {
+        D3D11_TEXTURE2D_DESC texDesc{};
+        texDesc.Width = a_size.x;
+        texDesc.Height = a_size.y;
+        texDesc.MipLevels = 1;
+        texDesc.ArraySize = 1;
+        texDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        texDesc.SampleDesc.Count = 1;
+        texDesc.Usage = D3D11_USAGE_DEFAULT;
+        texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+        auto tex = std::make_unique<Texture2D>(texDesc);
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+        srvDesc.Format = texDesc.Format;
+        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MipLevels = 1;
+        tex->CreateSRV(srvDesc);
+        D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+        uavDesc.Format = texDesc.Format;
+        uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+        tex->CreateUAV(uavDesc);
+        return tex;
+    };
+    volumeEnd = makeEnd(gridSize);
+    volumeEndFar = makeEnd(farGridSize);
 
     hasLightScatteringHistory = false;
     hasConservativeDepthHistory = false;
@@ -578,6 +603,8 @@ void ExponentialHeightFog::ReleaseVolumetricResources()
     lightScatteringFarHistory.reset();
     integratedLightScattering.reset();
     integratedLightScatteringFar.reset();
+    volumeEnd.reset();  // (49i)
+    volumeEndFar.reset();
     currentGridSize = {};
     ReleaseRTFogResources();
     currentFarGridSize = {};
@@ -598,6 +625,10 @@ void ExponentialHeightFog::BindIntegratedLightScattering(bool a_valid)
         a_valid && integratedLightScatteringFar ? integratedLightScatteringFar->srv.get() : nullptr
     };
     globals::d3d::context->PSSetShaderResources(21, 2, srvs);
+    // (49i) PS t24: S6's far-end colour of the grid that ends the volume (the far grid while it runs).
+    Texture2D* end = volumeEndUseFar ? volumeEndFar.get() : volumeEnd.get();
+    ID3D11ShaderResourceView* endSrv = a_valid && end ? end->srv.get() : nullptr;
+    globals::d3d::context->PSSetShaderResources(24, 1, &endSrv);
 }
 
 // (49b) RT fog visibility
@@ -953,6 +984,7 @@ void ExponentialHeightFog::Prepass()
         Texture3D* scattering;
         Texture3D* scatteringHistory;  // may be null
         Texture3D* integrated;
+        Texture2D* volumeEnd;  // (49i) u1 of the integration
         ID3D11ComputeShader* materialSetupCS;
         ID3D11ComputeShader* conservativeDepthCS;
         ID3D11ComputeShader* lightScatteringCS;
@@ -1013,13 +1045,14 @@ void ExponentialHeightFog::Prepass()
 
         {
             ID3D11ShaderResourceView* srvs[5]{ a_pass.scattering->srv.get(), nullptr, nullptr, nullptr, nullptr };
-            ID3D11UnorderedAccessView* uav = a_pass.integrated->uav.get();
+            ID3D11UnorderedAccessView* integrationUavs[2]{ a_pass.integrated->uav.get(), a_pass.volumeEnd ? a_pass.volumeEnd->uav.get() : nullptr };  // (49i) u1
+            ID3D11UnorderedAccessView* nullIntegrationUavs[2]{};
             timers->Begin(Util::GpuBucket::VolumetricFogIntegrate);
             context->CSSetShaderResources(0, 5, srvs);
-            context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+            context->CSSetUnorderedAccessViews(0, 2, integrationUavs, nullptr);
             context->CSSetShader(a_pass.integrationCS, nullptr, 0);
             context->Dispatch(groupX, groupY, 1);
-            context->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
+            context->CSSetUnorderedAccessViews(0, 2, nullIntegrationUavs, nullptr);
             srvs[0] = nullptr;
             context->CSSetShaderResources(0, 1, srvs);
             timers->End(Util::GpuBucket::VolumetricFogIntegrate);
@@ -1034,6 +1067,7 @@ void ExponentialHeightFog::Prepass()
         lightScattering.get(),
         temporalHistoryValid ? lightScatteringHistory.get() : nullptr,
         integratedLightScattering.get(),
+        volumeEnd.get(),
         materialCS, depthCS, scatteringCS, integrateCS,
         Util::GpuBucket::VolumetricFogNear, true });
 
@@ -1046,6 +1080,7 @@ void ExponentialHeightFog::Prepass()
             lightScatteringFar.get(),
             temporalHistoryValidFar ? lightScatteringFarHistory.get() : nullptr,
             integratedLightScatteringFar.get(),
+            volumeEndFar.get(),
             farMaterialCS, farDepthCS, farScatteringCS, farIntegrateCS,
             Util::GpuBucket::VolumetricFogFar, false });
     } else {
@@ -1104,6 +1139,7 @@ void ExponentialHeightFog::Prepass()
         hasConservativeDepthFarHistory = false;
     }
 
+    volumeEndUseFar = p.farEnabled;  // (49i) S6: which grid's far-end colour t24 gets
     lastPrepassFrame = globals::state->frameCount;
     lastBuildFrame = globals::state->frameCount;
     lastBuildHadShadows = hasShadowMap;
