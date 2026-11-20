@@ -133,6 +133,25 @@ static const uint kPLFlagFixCloseBlur = 1024u;
 static const float kFixMinRadiusPx = 2.0;
 static const float kFixCloseRadiusPx = 3.0;
 static const float kFixCloseQ = 0.35;
+// (49i) Two edge switches (Point Lights > Advanced), read by the PL_FIX variant only, on Stable Penumbra's slots (not on a moving receiver:
+// Clean Shadow History keeps its strict path there). Both look at the slot's 5x5 neighbourhood, loaded only where the 3x3 disagrees or the
+// history is partial (kBeamHistLo .. kBeamHistHi), i.e. on and next to edges:
+//   kPLFlagSmoothHard "Smooth Hard Edges": where the 5x5 holds lit and blocked samples and the penumbra formula gives at most kHardEdgeMaxPx
+//     (a sharp shadow edge, e.g. a contact shadow: the formula's width is below a pixel there), the slot's spatial value is the fixed 5x5
+//     Gaussian (sigma kHardEdgeSigmaPx, plane-weighted) instead of the 2-px rotated Poisson disc: every pixel within 2 px of the edge gets a
+//     filtered value (48k: only the pixels whose 3x3 disagreed, the next ones stayed 0 / 1), and no per-frame tap rotation (12 taps
+//     rounded to whole pixels at a 2 px radius landed on other pixels every frame: the value at the edge jumped frame to frame);
+//   kPLFlagSteadyEdges "Steady Edges": on those edge pixels the history clamp is the 5x5 Gaussian mean +- max(2 sigma of that mean,
+//     kSteadyBandMin) (48k: the filtered mean +- 2 sigma, at least 0.05, which snapped a pixel whose 3x3 happened to agree to 0 / 1:
+//     the camera jitter moves the 1-sample edge by up to half a pixel per frame, so edge pixels flipped between snapped and filtered),
+//     so the jittered samples average over frames (the temporal anti-aliasing of the edge); a static light weighs this frame
+//     kBeamStaticWeight there. Clean Shadow History's strong-change rule (a history more than kCleanStrongChange from the 3x3 mean takes
+//     the 3x3 clamp) still applies after it: a moving caster's shadow arriving / leaving replaces the history at once.
+static const uint kPLFlagSmoothHard = 16384u;
+static const uint kPLFlagSteadyEdges = 32768u;
+static const float kHardEdgeMaxPx = 2.5;
+static const float kHardEdgeSigmaPx = 1.0;
+static const float kSteadyBandMin = 0.25;
 // (48m) PL_CLEAN = "Moving Characters: Clean Shadow History" (Point Lights > Advanced, outside the Noise Fix group; any combination with
 // PL_WIDE / PL_BEAM / PL_FIX). All its code is inside #if defined(PL_CLEAN) blocks: the preprocessed source of the other variants is the
 // 48k one (48j with the Noise Fix master off). kPLFlagCleanDetect: the motion vectors are bound at t6 (whatever Keep Shadow History says) and
@@ -513,6 +532,79 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw)
 	if (cleanMoving)
 		radiusPx = min(radiusPx, kCleanMaxRadiusPx);  // (48m) the 46b wide pass at most kCleanMaxRadiusPx on a moving receiver
 #endif
+	// (49i) Smooth Hard Edges / Steady Edges: the 5x5 of Stable Penumbra's slots on and next to edges (see kPLFlagSmoothHard).
+	const bool smoothHard = kVariantFix && (flags & kPLFlagSmoothHard) != 0u;
+	const bool steadyEdges = kVariantFix && (flags & kPLFlagSteadyEdges) != 0u;
+	bool4 edge5 = false;     // the slot's 5x5 holds lit and blocked samples (and was loaded)
+	bool4 hardSlot = false;  // ... and its edge is sharp: the 5x5 Gaussian is its spatial value
+	float4 mean5 = 0.0, neff5 = 1.0;
+	[branch] if (smoothHard || steadyEdges)
+	{
+		bool4 want5 = false;
+		[unroll] for (uint ws = 0u; ws < 4u; ++ws)
+		{
+			const float hMean5 = hw[ws] >= 0.05 ? hv[ws] / max(hw[ws], 0.05) : -1.0;
+			want5[ws] = fixSlot[ws] && (hi[ws] > lo[ws] || (hMean5 > kBeamHistLo && hMean5 < kBeamHistHi));
+#if defined(PL_CLEAN)
+			want5[ws] = want5[ws] && !cleanMoving;
+#endif
+		}
+		[branch] if (any(want5))
+		{
+			float4 gSum = 0.0, gW = 0.0, gW2 = 0.0, lo5 = 2.0, hi5 = -1.0, q5Sum = 0.0, q5Count = 0.0;
+			const float invTwoSigma2 = 1.0 / (2.0 * kHardEdgeSigmaPx * kHardEdgeSigmaPx);
+			[loop] for (uint k5 = 0u; k5 < 25u; ++k5)
+			{
+				const int2 o5 = int2(int(k5 % 5u) - 2, int(k5 / 5u) - 2);
+				const int2 q = clamp(p + o5, int2(0, 0), maxP);
+				const float dq = abs(DepthMask[q]);
+				float wPlane = 0.0;
+				if (!RTIsSky(dq))
+					wPlane = exp(-abs(dot(N, RTPosition(q, dq) - P)) / planeTolerance);
+				[branch] if (wPlane >= 0.05)
+				{
+					const uint4 idq = Ids(PLIdx[q]);
+					const float4 vq = PLVis[q];
+					const float4 wq = WideAt(q, flags);
+					const float wG = wPlane * exp(-float(o5.x * o5.x + o5.y * o5.y) * invTwoSigma2);
+					[unroll] for (uint s5 = 0u; s5 < 4u; ++s5)
+					{
+						float r;
+						if (want5[s5] && MatchWide(idq, vq, wq, ids[s5], r)) {
+							const float v = Lit(r);
+							gSum[s5] += v * wG;
+							gW[s5] += wG;
+							gW2[s5] += wG * wG;
+							lo5[s5] = min(lo5[s5], v);
+							hi5[s5] = max(hi5[s5], v);
+							if (v < 0.5) {
+								const float t = r * (255.0 / 254.0);
+								q5Sum[s5] += t * t;
+								q5Count[s5] += 1.0;
+							}
+						}
+					}
+				}
+			}
+			[unroll] for (uint e5 = 0u; e5 < 4u; ++e5)
+			{
+				[branch] if (want5[e5] && gW[e5] > 0.0 && hi5[e5] > lo5[e5])
+				{
+					edge5[e5] = true;
+					mean5[e5] = gSum[e5] / gW[e5];
+					neff5[e5] = gW[e5] * gW[e5] / max(gW2[e5], 1e-6);
+					const float qEdge = q5Count[e5] > 0.0 ? q5Sum[e5] / q5Count[e5] : 0.0;
+					[branch] if (smoothHard && FixPointRadius(ids[e5], qEdge, footprint) <= kHardEdgeMaxPx)
+					{
+						hardSlot[e5] = true;
+						spatial[e5] = mean5[e5];
+						beamRadius[e5] = 0.0;  // no Poisson pass and no probe for this slot
+						beamProbe[e5] = false;
+					}
+				}
+			}
+		}
+	}
 	// The per-pixel rotation of the taps (per frame), and the fixed one (47y Smooth When No History).
 	// (48k) Decorrelated Sampling: both from the hash instead (not the trace's IGN).
 	const bool fixDecorrelate = kVariantFix && (flags & kPLFlagFixDecorrelate) != 0u;
@@ -669,6 +761,11 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw)
 		}
 	}
 
+	// (49i) Smooth Hard Edges: the effective sample count of the 5x5 Gaussian for the clamp band.
+	[unroll] for (uint hn = 0u; hn < 4u; ++hn)
+		if (hardSlot[hn])
+			beamNeff[hn] = neff5[hn];
+
 	// 3b. History blend (taps read by the caller; hw = 0 without usable history).
 	float4 result = spatial;
 #if defined(PL_CLEAN)
@@ -704,8 +801,11 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw)
 				// (48a) The filtered mean +- k sigma of that mean (binary samples: sigma^2 = m (1 - m)); static beams keep more history,
 				// but only while it lies inside that band (a history that had to be clamped, e.g. a character's shadow moving over the
 				// floor, is replaced at the normal rate: no longer trails).
-				const float m = spatial[sh];
-				const float band = max(kBeamClampK * sqrt(saturate(m * (1.0 - m)) / max(beamNeff[sh], 1.0)), kBeamClampMin);
+				// (49i) Steady Edges: on an edge pixel the clamp is the 5x5 Gaussian mean +- max(2 sigma of it, kSteadyBandMin).
+				const bool steadySlot = steadyEdges && edge5[sh];
+				const float m = steadySlot ? mean5[sh] : spatial[sh];
+				const float neffBand = steadySlot ? neff5[sh] : beamNeff[sh];
+				const float band = max(kBeamClampK * sqrt(saturate(m * (1.0 - m)) / max(neffBand, 1.0)), steadySlot ? kSteadyBandMin : kBeamClampMin);
 				lo3 = m - band;
 				hi3 = m + band;
 				const float hRaw = hv[sh] / hw[sh];
@@ -721,7 +821,8 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw)
 						hi3 = (hi[sh] >= 0.0 ? hi[sh] : spatial[sh]) + 0.1;
 						weight = max(PLParams.y, kCleanStaticWeight);
 					} else if (drop <= 0.0 && inBand) {
-						weight = lerp(kBeamStaticWeight, PLParams.y, saturate(abs(hRaw - m) / band * 2.0 - 1.0));
+						// (49i) Steady Edges: the jittered edge samples average at the static weight across the whole band.
+						weight = steadySlot ? kBeamStaticWeight : lerp(kBeamStaticWeight, PLParams.y, saturate(abs(hRaw - m) / band * 2.0 - 1.0));
 					}
 				}
 				current = lerp(weight, 1.0, drop);

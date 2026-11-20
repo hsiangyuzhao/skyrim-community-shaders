@@ -334,6 +334,8 @@ namespace
 	constexpr std::uint32_t kPointDenoiseNoiseDecorrelate = 256u, kPointDenoiseNoiseStable = 512u, kPointDenoiseNoiseCloseBlur = 1024u;
 	// (48m) PointDenoiseCS PL_CLEAN: Moving Characters: Clean Shadow History used / its moving test runs (t6 bound; also for the debug views).
 	constexpr std::uint32_t kPointDenoiseClean = 4096u, kPointDenoiseCleanDetect = 8192u;
+	// (49i) PointDenoiseCS PL_FIX: Smooth Hard Edges / Steady Edges (Point Lights > Advanced).
+	constexpr std::uint32_t kPointDenoiseSmoothHard = 16384u, kPointDenoiseSteadyEdges = 32768u;
 	// (47w) Adaptive skip thresholds (per frame, read back). Bad: more than 1 % of its lit pixels uncovered (and at least 32 pixels, so a
 	// light lighting a handful of pixels does not flip on noise), or 4096 uncovered pixels whatever the share. Good: under 0.25 % and
 	// under 1024 pixels. Skip again after kCoverageEnterFrames good frames (first time) or kCoverageRestoreFrames (after a bad frame);
@@ -2077,6 +2079,8 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.ReflectionsLoadingPrep = read("ReflectionsLoadingPrep", defaults.ReflectionsLoadingPrep);  // (48e)
 		settings.ReflectionsCubemapWarmUp = read("ReflectionsCubemapWarmUp", defaults.ReflectionsCubemapWarmUp);
 		settings.PointCloseContact = read("PointCloseContact", defaults.PointCloseContact);  // (49h)
+		settings.PointSmoothHardEdges = read("PointSmoothHardEdges", defaults.PointSmoothHardEdges);  // (49i)
+		settings.PointSteadyEdges = read("PointSteadyEdges", defaults.PointSteadyEdges);              // (49i)
 		settings.HairFaintStrands = read("HairFaintStrands", defaults.HairFaintStrands);    // (49h)
 		settings.AOContactOnce = read("AOContactOnce", defaults.AOContactOnce);  // (49h)
 		settings.ReflectionsMaterials = read("ReflectionsMaterials", defaults.ReflectionsMaterials);  // (48f)
@@ -2254,6 +2258,8 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["ReflectionsLoadingPrep"] = settings.ReflectionsLoadingPrep;  // (48e)
 	o_json["ReflectionsCubemapWarmUp"] = settings.ReflectionsCubemapWarmUp;
 	o_json["PointCloseContact"] = settings.PointCloseContact;  // (49h)
+	o_json["PointSmoothHardEdges"] = settings.PointSmoothHardEdges;  // (49i)
+	o_json["PointSteadyEdges"] = settings.PointSteadyEdges;          // (49i)
 	o_json["HairFaintStrands"] = settings.HairFaintStrands;    // (49h)
 	o_json["AOContactOnce"] = settings.AOContactOnce;  // (49h)
 	o_json["ReflectionsMaterials"] = settings.ReflectionsMaterials;  // (48f)
@@ -5911,6 +5917,11 @@ void RayTracing::FinishPointLights()
 	// (48m) Moving Characters: Clean Shadow History (only read by the PL_CLEAN variant).
 	if (clean)
 		flags |= kPointDenoiseCleanDetect | kPointDenoiseClean;
+	// (49i) Smooth Hard Edges / Steady Edges (only read by the PL_FIX variant).
+	if (noiseFix) {
+		flags |= settings.PointSmoothHardEdges ? kPointDenoiseSmoothHard : 0u;
+		flags |= settings.PointSteadyEdges ? kPointDenoiseSteadyEdges : 0u;
+	}
 	// (48a) Lights per pixel 5 - 6: their history only when last frame denoised them too and the main history is valid.
 	const bool wideHistory = wide && pointWideHistoryValid && (flags & kPointDenoiseHistory);
 	flags |= (wide ? kPointDenoiseWide : 0u) | (wideHistory ? kPointDenoiseWideHistory : 0u);
@@ -9138,6 +9149,20 @@ void RayTracing::DrawPointLightPage()
 				            "  patches on cheeks and lips.");
 				ImGui::Text("Off: 6 units out, like the sun: no such patches, a little less contact shadow on characters from lamps and torches.");
 			}
+			// (49i) Two switches against stair-stepped, flickering point-light shadow edges (PointDenoiseCS kPLFlagSmoothHard / kPLFlagSteadyEdges).
+			ImGui::Checkbox("Smooth Hard Edges", &settings.PointSmoothHardEdges);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): sharp point-light shadow edges (contact shadows, close blockers) are blurred over about 2 pixels around the edge with a\n"
+				            "  fixed pattern: no stair steps one pixel high, no edge that jumps between frames. Edges a little softer.");
+				ImGui::Text("Off: as 49h (only the pixels right at the edge were blurred, with a pattern that turned every frame).");
+			}
+			ImGui::Checkbox("Steady Edges", &settings.PointSteadyEdges);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): next to a shadow edge the shadow's history from the previous frames is kept as long as it fits the area around\n"
+				            "  the pixel, so the slightly shifted samples of each frame average into a smooth, still edge. A shadow that moves (someone\n"
+				            "  walking past a lamp) still replaces its history at once.");
+				ImGui::Text("Off: as 49h (the history was snapped to fully lit / fully dark wherever the closest pixels agreed: the edge flickered).");
+			}
 			// (48o) Fixed on, no switches any more: (47r) Reuse the Sun's Surface Probe Everywhere; (47x) Smoother Shadow Edges, Trace Lights on
 			// Curved Surfaces Reliably, Close-Contact Shadows on Characters; (48m) Moving Characters: Clean Shadow History; (48k) Point Lights:
 			// Noise Fix with Decorrelated Sampling, Stable Penumbra, Close Blockers: Minimum Blur, Consistent Dark Side; (47z) Window Beams:
@@ -9966,6 +9991,8 @@ nlohmann::json RayTracing::DescribeJson() const
 	j["hair_rt"] = settings.Hair;
 	j["hair_faint_strands"] = settings.HairFaintStrands;  // (49h)
 	j["point_close_contact"] = settings.PointCloseContact;  // (49h)
+	j["point_smooth_hard_edges"] = settings.PointSmoothHardEdges;  // (49i)
+	j["point_steady_edges"] = settings.PointSteadyEdges;            // (49i)
 	j["first_person_player_rt"] = settings.FirstPersonPlayer;
 	j["denoiser"] = settings.Denoiser;
 	j["rt_contact_scale"] = settings.RtContactScale;
