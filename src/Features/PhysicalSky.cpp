@@ -2375,12 +2375,12 @@ void PhysicalSky::SettingsSceneLighting()
 			"On (default): the ground lights things from below with the light it reflects (the atmosphere's ground albedo, 0.2, more\n"
 			"on snow with Dynamic Snow): undersides, walls and faces in shade get the bounce from the sunlit ground, the full amount\n"
 			"facing down, half facing sideways. Off: as 49h (no light from below: shade was far too dark).");
-	ImGui::Checkbox("Accurate Ambient Directions", &pl.ambientFit);
+	ImGui::Checkbox("Accurate Ambient Directions (experimental)", &pl.ambientFit);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text(
-			"On (default): the game stores the ambient as one colour plus one change per axis, mixed in gamma space; this picks those\n"
-			"numbers so the ambient comes out right on faces pointing in 26 directions (sideways faces were ~10-15%% too dark, upward\n"
-			"faces too bright). Off: as 49h (only the six axis directions, matched before the gamma).");
+			"Off (default, as 49h): the game stores the ambient as one colour plus one change per axis, mixed in gamma space.\n"
+			"On: those numbers are fitted so the ambient comes out right on faces pointing in 26 directions. Tested offline it does\n"
+			"not help once Ground Bounce is on (the error is small then); the line \"Ambient direction error\" below shows both.");
 	ImGui::Checkbox("Probe Forgets Out-of-View Light", &pl.probeForget);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text(
