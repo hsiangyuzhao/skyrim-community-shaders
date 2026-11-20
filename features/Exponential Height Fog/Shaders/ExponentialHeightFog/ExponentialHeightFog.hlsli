@@ -22,6 +22,8 @@
 
 Texture3D<float4> ExponentialHeightFogIntegratedLightScattering : register(t21);
 Texture3D<float4> ExponentialHeightFogIntegratedLightScatteringFar : register(t22);
+// (49i) S6: the volumetric fog medium's radiance at the far end of its range (VolumetricFogIntegrationCS u1), a = blend weight.
+Texture2D<float4> ExponentialHeightFogVolumeEnd : register(t24);
 
 namespace ExponentialHeightFog
 {
@@ -255,21 +257,21 @@ namespace ExponentialHeightFog
     }
 
     /// (49h stage 1, S6) "Far Fog Continues the Near Fog": the light the volumetric fog's medium sends toward the camera at the far end
-    /// of its range along this pixel's ray (sun x phase x shadow, sky light, the weather top-up: everything the froxels scatter), from
-    /// the integrated volume's last two slices: S = (L_N - L_N-1) / (T_N-1 - T_N). The analytical fog beyond takes this colour, so
-    /// it continues the volume without a seam. False where the last slice holds (almost) no medium.
-    bool GetVolumeEndColor(float3 positionWS, uint eyeIndex, out float3 a_color)
+    /// of its range along this pixel's ray (sun x phase x shadow, sky light, the weather top-up: everything the froxels scatter). The
+    /// analytical fog beyond takes this colour, so it continues the volume without a seam.
+    /// (49i) Read from t24, written by VolumetricFogIntegrationCS at the last layer (scattering / extinction in fp32; the far grid when it is
+    /// on, else the near one: ExponentialHeightFog::BindIntegratedLightScattering). 49h derived it from the integrated volume's last two
+    /// fp16 slices, (L_N - L_N-1) / (T_N-1 - T_N): a tiny difference of large fp16 values (bands across the sky), with a hard
+    /// dT > 1e-4 gate (edges where it flipped). Returns the weight to blend it in with (0 = no medium at the far end / no volume),
+    /// smooth in the last layer's optical depth.
+    float GetVolumeEndColor(float3 positionWS, uint eyeIndex, out float3 a_color)
     {
         a_color = 0.0f;
-        bool valid = false;
+        float weight = 0.0f;
         const float4 clipPosition = mul(FrameBuffer::CameraViewProj[eyeIndex], float4(positionWS, 1.0f));
-        const bool far = SharedData::volumetricFogSettings.FarEnabled != 0;
-        uint width = 0, height = 0, depth = 0;
-        [branch] if (far)
-            ExponentialHeightFogIntegratedLightScatteringFar.GetDimensions(width, height, depth);
-        else
-            ExponentialHeightFogIntegratedLightScattering.GetDimensions(width, height, depth);
-        [branch] if (clipPosition.w > 0.0f && width != 0 && height != 0 && depth >= 2)
+        uint width = 0, height = 0;
+        ExponentialHeightFogVolumeEnd.GetDimensions(width, height);
+        [branch] if (clipPosition.w > 0.0f && width != 0 && height != 0)
         {
             float2 uv = saturate(clipPosition.xy / clipPosition.w * float2(0.5f, -0.5f) + 0.5f);
             uv = Stereo::ConvertToStereoUV(uv, eyeIndex);
@@ -281,27 +283,14 @@ namespace ExponentialHeightFog
             uvMax.x -= eyeIndex == 0 ? 0.5f : 0.0f;
 #endif
             uv = clamp(uv, uvMin, uvMax);
-            const float zLast = 1.0f - 0.5f / float(depth);
-            const float zPrev = 1.0f - 1.5f / float(depth);
-            float4 last = 0.0f, prev = 0.0f;
-            [branch] if (far)
+            const float4 endColor = ExponentialHeightFogVolumeEnd.SampleLevel(SampColorSampler, uv, 0);
+            [branch] if (all(isfinite(endColor)))
             {
-                last = ExponentialHeightFogIntegratedLightScatteringFar.SampleLevel(SampColorSampler, float3(uv, zLast), 0);
-                prev = ExponentialHeightFogIntegratedLightScatteringFar.SampleLevel(SampColorSampler, float3(uv, zPrev), 0);
-            }
-            else
-            {
-                last = ExponentialHeightFogIntegratedLightScattering.SampleLevel(SampColorSampler, float3(uv, zLast), 0);
-                prev = ExponentialHeightFogIntegratedLightScattering.SampleLevel(SampColorSampler, float3(uv, zPrev), 0);
-            }
-            const float dT = prev.a - last.a;
-            [branch] if (dT > 1e-4f)
-            {
-                a_color = max((last.rgb - prev.rgb) / dT, 0.0f);
-                valid = all(isfinite(a_color));
+                a_color = max(endColor.rgb, 0.0f);
+                weight = saturate(endColor.a);
             }
         }
-        return valid;
+        return weight;
     }
 
     /// Height fog with the volumetric fog in front of it. The analytical fog only covers the
@@ -326,9 +315,13 @@ namespace ExponentialHeightFog
 
         float4 analyticalFog = GetAnalyticalHeightFog(positionWS, cameraWS, fogColor, excludeDistance);
         // (49h stage 1, S6) beyond the volume: its far-end colour (no extra glow: the froxels already scattered the sun with their phase).
-        float3 volumeEndColor;
-        [branch] if (applied && PhysLight::On(PhysLight::kFarFog) && GetVolumeEndColor(positionWS, eyeIndex, volumeEndColor))
-            analyticalFog.rgb = volumeEndColor;
+        // (49i) blended by the smooth weight (49h: replaced where a hard test passed).
+        [branch] if (applied && PhysLight::On(PhysLight::kFarFog))
+        {
+            float3 volumeEndColor;
+            const float endWeight = GetVolumeEndColor(positionWS, eyeIndex, volumeEndColor);
+            analyticalFog.rgb = lerp(analyticalFog.rgb, volumeEndColor, endWeight);
+        }
 
         float4 result = analyticalFog;
         [branch] if (applied)
@@ -403,11 +396,12 @@ namespace ExponentialHeightFog
         const float3 baseColor = GetInscatteringColor(positionWS, fogColor, directional);
         float3 weatherColor = (baseColor + directional * WeatherFog::SunTransmittance(0.0f)) * a_fade;
         // (49h stage 1, S6) beyond the volume both layers take its far-end colour (the weather layer is in the volume too).
-        float3 volumeEndColor;
-        [branch] if (applied && PhysLight::On(PhysLight::kFarFog) && GetVolumeEndColor(positionWS, eyeIndex, volumeEndColor))
+        [branch] if (applied && PhysLight::On(PhysLight::kFarFog))
         {
-            heightFogColored.rgb = volumeEndColor;
-            weatherColor = volumeEndColor * a_fade;
+            float3 volumeEndColor;
+            const float endWeight = GetVolumeEndColor(positionWS, eyeIndex, volumeEndColor);  // (49i) smooth weight
+            heightFogColored.rgb = lerp(heightFogColored.rgb, volumeEndColor, endWeight);
+            weatherColor = lerp(weatherColor, volumeEndColor * a_fade, endWeight);
         }
 
         // One fog: opacities combine as 1 - (1 - aw)(1 - ae), colours by each layer's share.

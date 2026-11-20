@@ -2,6 +2,12 @@
 // each froxel column (upstream 87d4e6c2a + 08faccd51 far-volume start).
 Texture3D<float4> LightScattering : register(t0);
 RWTexture3D<float4> IntegratedLightScattering : register(u0);
+// (49i) S6 "Far Fog Continues the Near Fog": the medium's own radiance at the volume's far end, per froxel column: scattering / extinction of
+// the last layer in fp32 (what the integrated volume approaches; 49h took it as the difference of the last two fp16 slices: banding),
+// a = a smooth weight on that layer's optical depth (0 without medium there, 1 from kEndOpticalDepthFull up). Read by the pixel shaders at
+// t24 (ExponentialHeightFog.hlsli GetVolumeEndColor). Unbound (null UAV): the write is dropped.
+RWTexture2D<float4> VolumeEndColor : register(u1);
+static const float kEndOpticalDepthFull = 1e-3;
 
 #include "ExponentialHeightFog/VolumetricFogCSCommon.hlsli"
 
@@ -45,5 +51,12 @@ RWTexture3D<float4> IntegratedLightScattering : register(u0);
 		accumulatedTransmittance *= lerp(1.0f, transmittance, fadeIn);
 
 		IntegratedLightScattering[layerCoordinate] = float4(max(accumulatedLighting, 0.0f.xxx), saturate(accumulatedTransmittance));
+
+		[branch] if (layerIndex + 1u == VolumetricFogGridSize.z)
+		{
+			const float3 endColor = max(scatteringAndExtinction.rgb, 0.0f.xxx) / max(extinction, 1e-30f);
+			const float endWeight = smoothstep(0.0f, kEndOpticalDepthFull, extinction * stepLength);
+			VolumeEndColor[dispatchID.xy] = (endWeight > 0.0f && all(isfinite(endColor))) ? float4(min(endColor, 60000.0f), endWeight) : float4(0.0f, 0.0f, 0.0f, 0.0f);
+		}
 	}
 }
