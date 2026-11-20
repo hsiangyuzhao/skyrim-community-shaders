@@ -226,6 +226,9 @@ struct PhysicalSky final : public Feature
 			bool physicalAmbient = true;         // T2: the engine ambient (DALC) rewritten from the physical sky with the weather's hue
 			bool measuredClouds = true;          // T3: cloud cover and the clouds in front of the sun / moons from Cloud Shadows' cube
 			bool cloudsStarsWaterFollow = true;  // T4: stars and the water's body colour follow the physical night
+			// (49i) Under Physical Ambient, default on (off = 49h): the ground's bounce light from below, and the ambient's direction fit.
+			bool groundBounce = true;  // keys "groundBounce": rho x (direct + sky on a horizontal face) x (1 - n.z) / 2 added to the ambient
+			bool ambientFit = true;    // "ambientFit": the engine transform fitted so the decoded ambient matches at 26 normals
 			float compressionK = 0.3f;           // Developer: E_pipe = E_ref (E_real / E_ref)^k
 			float overcastKappa = 0.25f;         // Developer: light an overcast layer passes on (of the blocked sun + the clear sky)
 			float airglowRatio = 25.f;           // Developer: full-moon sky luminance / airglow luminance
@@ -585,6 +588,8 @@ struct PhysicalSky final : public Feature
 	static constexpr float kOvercastVerticalRatio = 0.396f;
 	/// Number of upper-hemisphere directions of the CPU sky integration.
 	static constexpr int kSceneDirections = 60;
+	/// (49i) Normals the physical ambient is evaluated and fitted at: the 6 axes (engine order), 12 edge and 8 corner diagonals.
+	static constexpr int kAmbientNormals = 26;
 	/// Real brightness of a moon phase picture relative to full (the picture factor 0.05 new .. 0.25 crescent .. 1 full).
 	static float RealMoonPhase(float a_pictureFactor);
 	/// The physical scene of this frame (Reset). All neutral while inactive.
@@ -604,7 +609,7 @@ struct PhysicalSky final : public Feature
 		bool coverMeasured = false;   // from the cube (else the weather estimate)
 		float3 moonReal[2] = {};      // full-phase moon irradiance at the real ratio (sun units), the moon colour's hue
 		float realPhase[2] = { 1.f, 1.f };
-		float3 ambient[6] = {};       // physical ambient per axis (+x -x +y -y +z -z), linear, shader units (smoothed)
+		float3 ambient[kAmbientNormals] = {};  // physical ambient per fit normal ((49i) the first six: +x -x +y -y +z -z), linear, shader units (smoothed)
 		bool ambientValid = false;
 		float rAmb = 1.f;             // physical ambient / the engine's (luminance)
 		float starScale = 1.f;        // physical night base / the stage-1 night base (luminance)
@@ -618,14 +623,28 @@ struct PhysicalSky final : public Feature
 		float anchorSunLum = -1.f;
 		float anchorFullMoonSky = 0.f;
 		float anchorAmbientMean = 0.f;
-		float3 targetAmbient[6] = {};
+		float3 targetAmbient[kAmbientNormals] = {};
+		// (49i) Readouts of the Scene Lighting tab: the sky (clouds applied) and the direct sun / moons on a horizontal face (luminance, sun
+		// units, unscaled), the ground bounce's albedo and snow share, and the ambient fit's largest error at the 26 normals (49h's
+		// construction / what is applied).
+		float skyUpLum = 0.f;
+		float directLum = 0.f;
+		float3 bounceAlbedo = {};
+		float bounceSnow = 0.f;
+		float fitErrorOld = 0.f;
+		float fitErrorNew = 0.f;
+		bool fitApplied = false;
 	} physScene;
+	/// (49i) Ground Bounce's albedo: Physical Sky's Ground Albedo, toward kSnowAlbedo by Dynamic Snow's accumulated snow at the player
+	/// (o_snow: that share, 0 without Dynamic Snow / outside its cold area).
+	float3 GroundBounceAlbedo(float& o_snow) const;
+	static constexpr float kSnowAlbedo = 0.7f;
 	/// Fills physScene (S, the ambient, the ratios). a_*Dir: the LUTs' sun and the moons' glow directions (world).
 	void UpdatePhysicalScene(const RE::NiPoint3& a_lutSunDir, const RE::NiPoint3& a_masserDir, const RE::NiPoint3& a_secundaDir, float a_cameraRadiusKm);
 	/// T2: writes the physical ambient into the engine's directional ambient (State::UpdateSharedData, before it is copied), or puts the
 	/// engine's own value back once after it is switched off.
 	void ApplyPhysicalAmbient();
-	/// T2 in effect this frame (the IBL upload overrides: DALCAmount 1, SkyIBLScale 0, EnvIBLScale 1; the fog's sky light from the ambient).
+	/// T2 in effect this frame (the IBL upload overrides: DALCAmount 1, SkyIBLScale 0 ((49i) EnvIBLScale no longer); the fog's sky light from the ambient).
 	[[nodiscard]] bool PhysicalAmbientActive() const { return physScene.ambientActive; }
 	/// T1 in effect this frame (Sky Sync: no sun residual below the horizon, the moons at the real ratio and phase, no day fade).
 	[[nodiscard]] bool RealSkyRatiosActive() const { return physScene.active; }

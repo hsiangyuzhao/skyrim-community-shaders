@@ -3,10 +3,12 @@
 #include "Deferred.h"
 #include "DynamicCubemaps.h"
 #include "JiayeStatement.h"
+#include "PhysicalSky.h"
 #include "Shadercache.h"
 #include "State.h"
 
 #include <DDSTextureLoader.h>
+#include <DirectXPackedVector.h>
 #include <DirectXTex.h>
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
@@ -33,39 +35,54 @@ void IBL::DrawSettings()
 	ImGui::Checkbox("Enable Diffuse IBL", (bool*)&settings.EnableDiffuseIBL);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text("Adds ambient light coloured by the real surroundings and sky (IBL, image-based lighting) alongside Skyrim's flat ambient light (see DALC Amount).");
+	// (49i) Slider order (user decision): the three scales, the three saturations, DALC Amount. While Physical Sky's Physical Ambient is in
+	// effect, Sky IBL Scale / Saturation and DALC Amount are overridden at upload (FeatureBuffer.cpp: SkyIBLScale 0, DALCAmount 1): drawn
+	// disabled with a note. Env IBL Scale / Saturation stay live (no override since 49i).
+	const bool takenOver = globals::features::physicalSky.PhysicalAmbientActive();
+	auto takenOverNote = [takenOver]() {
+		if (takenOver)
+			ImGui::TextDisabled("  Taken over by Sky > Physical Sky > Scene Lighting > Physical Ambient");
+	};
 	ImGui::SliderFloat("Diffuse IBL Scale", &settings.DiffuseIBLScale, 0.0f, 10.0f, "%.2f");
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text("Overall brightness of the IBL ambient light. Higher = brighter shadows and ambient areas.");
-	ImGui::SliderFloat("Diffuse IBL Saturation", &settings.IBLSaturation, 0.0f, 2.0f, "%.2f");
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text("Colour strength of the IBL ambient light. 0 = grey, 1 = unchanged, above 1 = more colourful.");
-
-	// (B7) The two halves the ambient probe is split into, trimmable independently. The pair
-	// above stays the master gate on the combined result; these four sit underneath it.
+	// (B7) The two halves the ambient probe is split into, trimmable independently. The Diffuse pair stays the master gate on the
+	// combined result; the Env / Sky ones sit underneath it.
 	ImGui::SliderFloat("Env IBL Scale", &settings.EnvIBLScale, 0.0f, 10.0f, "%.2f");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text(
 			"Brightness of light bounced from surrounding objects (not the sky). It isn't blocked by cover, so it lights shaded spots\n"
 			"like arches, eaves and alleys. Lower it if those look too bright or too tinted by nearby walls.");
 	}
+	ImGui::BeginDisabled(takenOver);
 	ImGui::SliderFloat("Sky IBL Scale", &settings.SkyIBLScale, 0.0f, 10.0f, "%.2f");
+	ImGui::EndDisabled();
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text(
 			"Brightness of light from the sky. Strongest in the open and on upward-facing surfaces, fading out under cover.\n"
 			"Lower it if open outdoor areas look too blue.");
 	}
+	takenOverNote();
+	ImGui::SliderFloat("Diffuse IBL Saturation", &settings.IBLSaturation, 0.0f, 2.0f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Colour strength of the IBL ambient light. 0 = grey, 1 = unchanged, above 1 = more colourful.");
 	ImGui::SliderFloat("Env IBL Saturation", &settings.EnvIBLSaturation, 0.0f, 2.0f, "%.2f");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("Colour strength of the bounced (surroundings) light only. 0 = grey, 1 = unchanged.");
 	}
+	ImGui::BeginDisabled(takenOver);
 	ImGui::SliderFloat("Sky IBL Saturation", &settings.SkyIBLSaturation, 0.0f, 2.0f, "%.2f");
+	ImGui::EndDisabled();
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("Colour strength of the sky light only. 0 = grey, 1 = unchanged.");
 	}
-
+	takenOverNote();
+	ImGui::BeginDisabled(takenOver);
 	ImGui::SliderFloat("DALC Amount", &settings.DALCAmount, 0.0f, 1.0f, "%.2f");
+	ImGui::EndDisabled();
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text("How much of Skyrim's own ambient light (DALC, directional ambient lighting) is kept when IBL is on. 1 = all of it.");
+	takenOverNote();
 	ImGui::Checkbox("Enable Interior", (bool*)&settings.EnableInterior);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text("Also use IBL indoors. Off = interiors keep vanilla ambient light.");
@@ -186,6 +203,94 @@ void IBL::Prepass()
 		ID3D11ShaderResourceView* views[2]{ diffuseIBLTexture->srv.get(), diffuseSkyIBLTexture->srv.get() };
 		context->PSSetShaderResources(76, 2, views);
 	}
+
+	QueueSkyProbeReadback();  // (49i)
+}
+
+void IBL::QueueSkyProbeReadback()
+{
+	// (49i) Every 8th frame while Physical Sky's readout asked for it in the last second: copy the 3x1 probe, read the oldest copy without waiting.
+	if (!skyProbeWanted || !diffuseSkyIBLTexture)
+		return;
+	const uint32_t frame = globals::state->frameCount;
+	if (frame - skyProbeWantedFrame > 120u) {
+		skyProbeWanted = false;
+		return;
+	}
+	if (frame - skyProbeReadFrame < 8u)
+		return;
+	skyProbeReadFrame = frame;
+	auto context = globals::d3d::context;
+	auto device = globals::d3d::device;
+	const uint32_t slot = skyProbeIndex % kSkyProbeReadbackCount;
+	const uint32_t oldest = (skyProbeIndex + 1) % kSkyProbeReadbackCount;
+	if (skyProbeStaging[oldest] && skyProbePending[oldest]) {
+		D3D11_MAPPED_SUBRESOURCE mapped{};
+		if (SUCCEEDED(context->Map(skyProbeStaging[oldest].get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped)) && mapped.pData) {
+			const auto* halves = static_cast<const DirectX::PackedVector::HALF*>(mapped.pData);
+			float values[3][4];
+			bool finite = true;
+			for (int t = 0; t < 3; ++t)
+				for (int c = 0; c < 4; ++c) {
+					values[t][c] = DirectX::PackedVector::XMConvertHalfToFloat(halves[t * 4 + c]);
+					finite = finite && std::isfinite(values[t][c]);
+				}
+			context->Unmap(skyProbeStaging[oldest].get(), 0);
+			skyProbePending[oldest] = false;
+			if (finite) {
+				std::memcpy(skyProbeSH, values, sizeof(values));
+				skyProbeValid = true;
+			}
+		}
+	}
+	if (!skyProbeStaging[slot]) {
+		D3D11_TEXTURE2D_DESC desc{};
+		diffuseSkyIBLTexture->resource->GetDesc(&desc);
+		desc.BindFlags = 0;
+		desc.Usage = D3D11_USAGE_STAGING;
+		desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		desc.MiscFlags = 0;
+		if (FAILED(device->CreateTexture2D(&desc, nullptr, skyProbeStaging[slot].put())))
+			return;
+	}
+	context->CopyResource(skyProbeStaging[slot].get(), diffuseSkyIBLTexture->resource.get());
+	skyProbePending[slot] = true;
+	++skyProbeIndex;
+}
+
+void IBL::RequestSkyProbeReadback()
+{
+	skyProbeWantedFrame = globals::state->frameCount;
+	skyProbeWanted = true;
+}
+
+bool IBL::GetSkyProbeUp(float3& o_value) const
+{
+	// (49i) SphericalHarmonics::SHHallucinateZH3Irradiance(sh, dir) / pi at dir = (0, 0, -1) (callers pass -N; N = up), per channel.
+	if (!skyProbeValid || !skyProbeWanted)
+		return false;
+	constexpr float kPi = 3.14159265358979f;
+	const float dir[3] = { 0.f, 0.f, -1.f };
+	float out[3];
+	for (int c = 0; c < 3; ++c) {
+		const float* sh = skyProbeSH[c];  // x = L0, y = L1 (M -1), z = L1 (M 0), w = L1 (M +1)
+		float axis[3] = { -sh[3], -sh[1], sh[2] };
+		const float axisLen = std::sqrt(axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]);
+		if (axisLen > 0.f)
+			for (float& a : axis)
+				a /= axisLen;
+		const float ratio = axisLen / std::max(std::abs(sh[0]), 1e-5f);
+		const float zonalL2 = sh[0] * (0.08f * ratio + 0.6f * ratio * ratio);
+		const float fZ = axis[0] * dir[0] + axis[1] * dir[1] + axis[2] * dir[2];
+		const float zhDir = std::sqrt(5.f / (16.f * kPi)) * (3.f * fZ * fZ - 1.f);
+		// EvaluateCosineLobe(dir): (0.886227, -1.023327 dir.y, 1.023327 dir.z, -1.023327 dir.x)
+		const float lobe[4] = { 0.8862269254527580137f, -1.0233267079464884885f * dir[1], 1.0233267079464884885f * dir[2], -1.0233267079464884885f * dir[0] };
+		float result = sh[0] * lobe[0] + sh[1] * lobe[1] + sh[2] * lobe[2] + sh[3] * lobe[3];
+		result += 0.25f * kPi * zonalL2 * zhDir;
+		out[c] = std::max(result, 0.f) / kPi;
+	}
+	o_value = { out[0], out[1], out[2] };
+	return true;
 }
 
 void IBL::SetupResources()

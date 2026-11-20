@@ -71,4 +71,20 @@ public:
 	eastl::unique_ptr<Texture2D> staticSpecularIBLTexture = nullptr;
 
 	ID3D11ComputeShader* GetDiffuseIBLCS();
+
+	/// (49i) Physical Sky's Scene Lighting readout "CPU sky vs the IBL sky probe": the sky probe (DiffuseSkyIBLTexture, 3 texels = the R / G / B
+	/// SH) copied to a staging texture and read back without waiting (a few frames late), only while the readout is drawn.
+	void RequestSkyProbeReadback();
+	/// The probe's value for an upward face as the shaders evaluate it (IBL.hlsli GetSkyDiffuseIBL(-N) with N = up: irradiance / pi).
+	bool GetSkyProbeUp(float3& o_value) const;
+	void QueueSkyProbeReadback();
+	static constexpr int kSkyProbeReadbackCount = 3;
+	winrt::com_ptr<ID3D11Texture2D> skyProbeStaging[kSkyProbeReadbackCount];
+	bool skyProbePending[kSkyProbeReadbackCount] = {};
+	uint32_t skyProbeIndex = 0;
+	float skyProbeSH[3][4] = {};
+	bool skyProbeValid = false;
+	bool skyProbeWanted = false;
+	uint32_t skyProbeWantedFrame = 0;
+	uint32_t skyProbeReadFrame = 0;
 };

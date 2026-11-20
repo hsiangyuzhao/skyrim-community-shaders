@@ -5,6 +5,8 @@
 #include <imgui_stdlib.h>
 
 #include "CloudShadows.h"
+#include "DynamicSnow.h"
+#include "IBL.h"
 #include "ExponentialHeightFog.h"
 #include "Deferred.h"
 #include "LinearLighting.h"
@@ -154,6 +156,8 @@ void PhysicalSky::LoadSettings(json& o_json)
 			pl.physicalAmbient = j.value("physicalAmbient", d.physicalAmbient);
 			pl.measuredClouds = j.value("measuredClouds", d.measuredClouds);
 			pl.cloudsStarsWaterFollow = j.value("cloudsStarsWaterFollow", d.cloudsStarsWaterFollow);
+			pl.groundBounce = j.value("groundBounce", d.groundBounce);  // (49i)
+			pl.ambientFit = j.value("ambientFit", d.ambientFit);        // (49i)
 			auto clampValue = [](float a_value, float a_lo, float a_hi, float a_default) { return std::isfinite(a_value) ? std::clamp(a_value, a_lo, a_hi) : a_default; };
 			pl.compressionK = clampValue(j.value("compressionK", d.compressionK), 0.1f, 1.f, d.compressionK);
 			pl.overcastKappa = clampValue(j.value("overcastKappa", d.overcastKappa), 0.f, 1.f, d.overcastKappa);
@@ -314,7 +318,8 @@ void PhysicalSky::SaveSettings(json& o_json)
 			{ "farShadows", pl.farShadows }, { "farSkylight", pl.farSkylight }, { "lodScale", pl.lodScale }, { "farFog", pl.farFog },
 			{ "forwardCubemap", pl.forwardCubemap }, { "smallFixes", pl.smallFixes },
 			{ "realSkyRatios", pl.realSkyRatios }, { "physicalAmbient", pl.physicalAmbient }, { "measuredClouds", pl.measuredClouds },
-			{ "cloudsStarsWaterFollow", pl.cloudsStarsWaterFollow }, { "compressionK", pl.compressionK }, { "overcastKappa", pl.overcastKappa },
+			{ "cloudsStarsWaterFollow", pl.cloudsStarsWaterFollow }, { "groundBounce", pl.groundBounce }, { "ambientFit", pl.ambientFit },
+			{ "compressionK", pl.compressionK }, { "overcastKappa", pl.overcastKappa },
 			{ "airglowRatio", pl.airglowRatio }, { "smoothingSeconds", pl.smoothingSeconds }, { "hueSaturationCap", pl.hueSaturationCap } };
 	}
 	o_json["moonStarFadeStrength"] = settings.moonStarFadeStrength;
@@ -2360,6 +2365,23 @@ void PhysicalSky::SettingsSceneLighting()
 			"weather's colour: shade, fog, grass, distant trees, lit smoke and the cubemap all follow the sky. Image Based\n"
 			"Lighting then adds only the light bounced off the surroundings (its weather-ambient and sky values are overridden\n"
 			"while this is on; your saved values come back when it is off). Off: the weather's ambient as before.");
+	// (49i) Under Physical Ambient.
+	ImGui::Indent();
+	ImGui::BeginDisabled(!pl.physicalAmbient);
+	ImGui::Checkbox("Ground Bounce", &pl.groundBounce);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"On (default): the ground lights things from below with the light it reflects (the atmosphere's ground albedo, 0.2, more\n"
+			"on snow with Dynamic Snow): undersides, walls and faces in shade get the bounce from the sunlit ground, the full amount\n"
+			"facing down, half facing sideways. Off: as 49h (no light from below: shade was far too dark).");
+	ImGui::Checkbox("Accurate Ambient Directions", &pl.ambientFit);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"On (default): the game stores the ambient as one colour plus one change per axis, mixed in gamma space; this picks those\n"
+			"numbers so the ambient comes out right on faces pointing in 26 directions (sideways faces were ~10-15%% too dark, upward\n"
+			"faces too bright). Off: as 49h (only the six axis directions, matched before the gamma).");
+	ImGui::EndDisabled();
+	ImGui::Unindent();
 	ImGui::Checkbox("Overcast From Measured Clouds", &pl.measuredClouds);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text(
@@ -2382,6 +2404,32 @@ void PhysicalSky::SettingsSceneLighting()
 				1.f - ps.coverTr[0]);
 		if (ps.ambientActive || ps.followActive)
 			ImGui::TextDisabled("Ambient now / weather ambient (R_amb): %.2f; stars x%.2f; unlit smoke x%.2f", ps.rAmb, ps.starScale, ps.unlitScale);
+		// (49i) Two readouts: the sky against the direct light on a horizontal face, and the CPU sky against the IBL sky probe.
+		if (ps.ambientActive || ps.active) {
+			if (ps.directLum > 1e-9f)
+				ImGui::TextDisabled("Sky / direct on a horizontal surface: %.3f (1/%.1f) (clear sky ~1/8 with the sun at 60 deg, ~1/5 at 30 deg, 1 or more near sunset)",
+					ps.skyUpLum / ps.directLum, ps.skyUpLum > 1e-12f ? ps.directLum / ps.skyUpLum : 0.f);
+			else
+				ImGui::TextDisabled("Sky / direct on a horizontal surface: no direct sun or moon now (sky only)");
+			if (pl.groundBounce && ps.ambientActive)
+				ImGui::TextDisabled("Ground bounce: albedo %.2f (snow %.0f%%)", 0.2126f * ps.bounceAlbedo.x + 0.7152f * ps.bounceAlbedo.y + 0.0722f * ps.bounceAlbedo.z, ps.bounceSnow * 100.f);
+			if (ps.ambientActive)
+				ImGui::TextDisabled("Ambient direction error (largest of 26 directions): %.0f%% %s; 49h construction %.0f%%", ps.fitErrorNew * 100.f,
+					ps.fitApplied ? "(fitted)" : "(49h construction)", ps.fitErrorOld * 100.f);
+			auto& ibl = globals::features::ibl;
+			ibl.RequestSkyProbeReadback();
+			float3 probe;
+			if (ibl.GetSkyProbeUp(probe)) {
+				const float cpu = ps.skyUpLum * ps.S / RE::NI_PI;
+				const float gpu = 0.2126f * probe.x + 0.7152f * probe.y + 0.0722f * probe.z;
+				if (gpu > 1e-9f)
+					ImGui::TextDisabled("CPU sky vs the IBL sky probe (upward face, irradiance / pi): %.3g vs %.3g = %.2f", cpu, gpu, cpu / gpu);
+				else
+					ImGui::TextDisabled("CPU sky vs the IBL sky probe: probe is black (%.3g on the CPU)", cpu);
+			} else {
+				ImGui::TextDisabled("CPU sky vs the IBL sky probe: waiting for the probe (Image Based Lighting on?)");
+			}
+		}
 	}
 	ImGui::Unindent();
 	ImGui::EndDisabled();
@@ -2498,6 +2546,180 @@ namespace
 			if (c > 0.0)
 				a_E[a] += a_L * static_cast<float>(c * a_omega);
 		}
+	}
+
+	/// (49i) The normals the physical ambient is evaluated at: the six axes in the engine's order (+x -x +y -y +z -z, so index 4 is up),
+	/// the 12 edge diagonals and the 8 corner diagonals (a symmetric set: the normals sum to 0, sum n_j^2 = 26 / 3 per axis).
+	struct FitNormals
+	{
+		std::array<std::array<double, 3>, PhysicalSky::kAmbientNormals> n{};
+		FitNormals()
+		{
+			int k = 0;
+			for (int a = 0; a < 6; ++a, ++k)
+				n[k] = { kAxes[a][0], kAxes[a][1], kAxes[a][2] };
+			const double e = 1.0 / std::sqrt(2.0);
+			for (int i = 0; i < 3; ++i)
+				for (int j = i + 1; j < 3; ++j)
+					for (int si = -1; si <= 1; si += 2)
+						for (int sj = -1; sj <= 1; sj += 2, ++k) {
+							n[k] = { 0.0, 0.0, 0.0 };
+							n[k][i] = si * e;
+							n[k][j] = sj * e;
+						}
+			const double c = 1.0 / std::sqrt(3.0);
+			for (int sx = -1; sx <= 1; sx += 2)
+				for (int sy = -1; sy <= 1; sy += 2)
+					for (int sz = -1; sz <= 1; sz += 2, ++k)
+						n[k] = { sx * c, sy * c, sz * c };
+		}
+	};
+	const FitNormals& GetFitNormals()
+	{
+		static const FitNormals normals;
+		return normals;
+	}
+	/// (49i) Adds radiance a_L from direction a_d (solid angle a_omega) to the irradiance at every fit normal.
+	void AddToNormals(float3 a_E[PhysicalSky::kAmbientNormals], const PhysicalSkyModel::Vec3& a_d, const float3& a_L, double a_omega)
+	{
+		const auto& fit = GetFitNormals();
+		for (int k = 0; k < PhysicalSky::kAmbientNormals; ++k) {
+			const double c = fit.n[k][0] * a_d[0] + fit.n[k][1] * a_d[1] + fit.n[k][2] * a_d[2];
+			if (c > 0.0)
+				a_E[k] += a_L * static_cast<float>(c * a_omega);
+		}
+	}
+	/// (49i) A CIE overcast sky's irradiance on a plane with normal a_n relative to the horizontal one: 1 up, kOvercastVerticalRatio
+	/// sideways (as 49h's axis shape), 0 down; linear in n.z between (the axes reproduce 49h exactly).
+	float OvercastShape(const std::array<double, 3>& a_n)
+	{
+		const float z = static_cast<float>(a_n[2]);
+		return z >= 0.f ? PhysicalSky::kOvercastVerticalRatio + (1.f - PhysicalSky::kOvercastVerticalRatio) * z : PhysicalSky::kOvercastVerticalRatio * (1.f + z);
+	}
+
+	/// (49i) Solves the 4x4 system a_A x = a_b (Gaussian elimination, partial pivoting). False if singular or not finite.
+	bool Solve4(double a_A[4][4], double a_b[4], double a_x[4])
+	{
+		for (int c = 0; c < 4; ++c) {
+			int pivot = c;
+			for (int r = c + 1; r < 4; ++r)
+				if (std::abs(a_A[r][c]) > std::abs(a_A[pivot][c]))
+					pivot = r;
+			if (!(std::abs(a_A[pivot][c]) > 1e-300))
+				return false;
+			if (pivot != c) {
+				for (int k = 0; k < 4; ++k)
+					std::swap(a_A[c][k], a_A[pivot][k]);
+				std::swap(a_b[c], a_b[pivot]);
+			}
+			for (int r = c + 1; r < 4; ++r) {
+				const double f = a_A[r][c] / a_A[c][c];
+				for (int k = c; k < 4; ++k)
+					a_A[r][k] -= f * a_A[c][k];
+				a_b[r] -= f * a_b[c];
+			}
+		}
+		for (int r = 3; r >= 0; --r) {
+			double s = a_b[r];
+			for (int k = r + 1; k < 4; ++k)
+				s -= a_A[r][k] * a_x[k];
+			a_x[r] = s / a_A[r][r];
+		}
+		for (int k = 0; k < 4; ++k)
+			if (!std::isfinite(a_x[k]))
+				return false;
+		return true;
+	}
+
+	/// (49i) "Accurate Ambient Directions". The engine ambient is T + R n in gamma-encoded space, decoded per pixel as
+	/// pow(max(0, T + R n), g) (Lighting.hlsl Color::Ambient(max(0, mul(DirectionalAmbient, float4(n, 1))))). For one colour channel:
+	/// T (o_p[0]) and R (o_p[1..3]) minimising the weighted squared error of the DECODED value against a_target at all fit normals
+	/// (weight 1 / (target + 0.1 x mean)^2: relative error, the dark side not ignored). Start: the least-squares fit in encoded space;
+	/// then Gauss-Newton. Returns false (o_p = the start) if it does not stay finite.
+	bool FitAmbientChannel(const float a_target[PhysicalSky::kAmbientNormals], float a_gamma, double o_p[4])
+	{
+		const auto& fit = GetFitNormals();
+		const double g = std::max(static_cast<double>(a_gamma), 0.1);
+		double mean = 0.0;
+		double enc[PhysicalSky::kAmbientNormals];
+		for (int k = 0; k < PhysicalSky::kAmbientNormals; ++k) {
+			const double t = std::max(static_cast<double>(a_target[k]), 0.0);
+			mean += t;
+			enc[k] = std::pow(t, 1.0 / g);
+		}
+		mean /= PhysicalSky::kAmbientNormals;
+		// Start: encoded least squares (symmetric set: T = mean, R_j = sum t n_j / sum n_j^2).
+		double start[4] = { 0.0, 0.0, 0.0, 0.0 };
+		double nn[3] = { 0.0, 0.0, 0.0 };
+		for (int k = 0; k < PhysicalSky::kAmbientNormals; ++k) {
+			start[0] += enc[k];
+			for (int j = 0; j < 3; ++j) {
+				start[1 + j] += enc[k] * fit.n[k][j];
+				nn[j] += fit.n[k][j] * fit.n[k][j];
+			}
+		}
+		start[0] /= PhysicalSky::kAmbientNormals;
+		for (int j = 0; j < 3; ++j)
+			start[1 + j] /= nn[j];
+		for (int i = 0; i < 4; ++i)
+			o_p[i] = start[i];
+		if (!(mean > 1e-12))
+			return true;
+		double p[4] = { start[0], start[1], start[2], start[3] };
+		for (int iter = 0; iter < 10; ++iter) {
+			double H[4][4] = {}, b[4] = {};
+			for (int k = 0; k < PhysicalSky::kAmbientNormals; ++k) {
+				const double phi[4] = { 1.0, fit.n[k][0], fit.n[k][1], fit.n[k][2] };
+				const double f = p[0] + p[1] * phi[1] + p[2] * phi[2] + p[3] * phi[3];
+				const double v = f > 1e-12 ? std::pow(f, g) : 0.0;
+				const double dv = f > 1e-12 ? g * std::pow(f, g - 1.0) : 0.0;
+				const double t = std::max(static_cast<double>(a_target[k]), 0.0);
+				const double w = 1.0 / ((t + 0.1 * mean) * (t + 0.1 * mean));
+				const double r = v - t;
+				for (int i = 0; i < 4; ++i) {
+					b[i] -= w * dv * r * phi[i];
+					for (int j = 0; j < 4; ++j)
+						H[i][j] += w * dv * dv * phi[i] * phi[j];
+				}
+			}
+			const double damping = 1e-9 * (H[0][0] + H[1][1] + H[2][2] + H[3][3]) + 1e-30;
+			for (int i = 0; i < 4; ++i)
+				H[i][i] += damping;
+			double step[4];
+			if (!Solve4(H, b, step))
+				break;
+			for (int i = 0; i < 4; ++i)
+				p[i] += step[i];
+		}
+		for (int i = 0; i < 4; ++i)
+			if (!std::isfinite(p[i]))
+				return false;
+		for (int i = 0; i < 4; ++i)
+			o_p[i] = p[i];
+		return true;
+	}
+
+	/// (49i) The largest error of the decoded ambient (luminance) at the fit normals, relative to max(target, 0.1 x mean target).
+	/// a_R[j] = the colour of column j (axis j) of the rotate matrix.
+	float AmbientFitError(const float3 a_target[PhysicalSky::kAmbientNormals], const float3& a_T, const float3 a_R[3], float a_gamma)
+	{
+		const auto& fit = GetFitNormals();
+		auto lum = [](const float3& c) { return 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z; };
+		float mean = 0.f;
+		for (int k = 0; k < PhysicalSky::kAmbientNormals; ++k)
+			mean += lum(a_target[k]);
+		mean /= PhysicalSky::kAmbientNormals;
+		float worst = 0.f;
+		for (int k = 0; k < PhysicalSky::kAmbientNormals; ++k) {
+			const float n[3] = { static_cast<float>(fit.n[k][0]), static_cast<float>(fit.n[k][1]), static_cast<float>(fit.n[k][2]) };
+			const float3 e = a_T + a_R[0] * n[0] + a_R[1] * n[1] + a_R[2] * n[2];
+			const float3 decoded = { std::pow(std::max(e.x, 0.f), a_gamma), std::pow(std::max(e.y, 0.f), a_gamma), std::pow(std::max(e.z, 0.f), a_gamma) };
+			const float t = lum(a_target[k]);
+			const float err = std::abs(lum(decoded) - t) / std::max(std::max(t, 0.1f * mean), 1e-12f);
+			if (std::isfinite(err))
+				worst = std::max(worst, err);
+		}
+		return worst;
 	}
 }
 
@@ -2712,7 +2934,7 @@ void PhysicalSky::UpdatePhysicalScene(const RE::NiPoint3& a_lutSunDir, const RE:
 	// ---- The sky now (every 4th frame, and on a snap) ----
 	if (snap || ps.heavyFrame == UINT32_MAX || frame - ps.heavyFrame >= 4u) {
 		ps.heavyFrame = frame;
-		float3 Eclear[6] = {};
+		float3 Eclear[kAmbientNormals] = {};  // (49i) at every fit normal (the first six: the axes in the engine's order, as 49h)
 		float3 direct[3] = {};  // horizontal direct irradiance of the sun and the moons, clear sky (sun units)
 		if (wantRatios) {
 			// The real sources: the sun, the moons at the real ratio x real phase x visibility; no sky brightness factor.
@@ -2726,7 +2948,7 @@ void PhysicalSky::UpdatePhysicalScene(const RE::NiPoint3& a_lutSunDir, const RE:
 				// The airglow: zenith Lz, horizon 2 Lz, as the night base gradient (LutGen).
 				const float mix = SkySync::SmoothStep(0.f, 0.5f, dirs.elevationSin[k]);
 				L += (hueHorizon * 2.f + (hueUpper - hueHorizon * 2.f) * mix) * ps.airglowZenith;
-				AddToAxes(Eclear, dirs.dir[k], L, dirs.solidAngle[k]);
+				AddToNormals(Eclear, dirs.dir[k], L, dirs.solidAngle[k]);
 			}
 			const float sunElevation = DirectX::XMConvertToDegrees(std::asin(std::clamp(static_cast<float>(UnitVec(a_lutSunDir)[2]), -1.f, 1.f)));
 			const float3 sunTr = ComputeLightTransmittance({ a_lutSunDir.x, a_lutSunDir.y, a_lutSunDir.z });
@@ -2753,7 +2975,7 @@ void PhysicalSky::UpdatePhysicalScene(const RE::NiPoint3& a_lutSunDir, const RE:
 					const float mix = SkySync::SmoothStep(0.f, 0.5f, dirs.elevationSin[k]);
 					L += nightCbData.baseHorizon + (nightCbData.baseUpper - nightCbData.baseHorizon) * mix;
 				}
-				AddToAxes(Eclear, dirs.dir[k], L, dirs.solidAngle[k]);
+				AddToNormals(Eclear, dirs.dir[k], L, dirs.solidAngle[k]);
 			}
 		}
 
@@ -2780,9 +3002,27 @@ void PhysicalSky::UpdatePhysicalScene(const RE::NiPoint3& a_lutSunDir, const RE:
 			directNow += direct[i] * tr[i];
 		}
 		const float3 overcast = (blocked + Eclear[4]) * (cover * kappa);
-		constexpr float shape[6] = { kOvercastVerticalRatio, kOvercastVerticalRatio, kOvercastVerticalRatio, kOvercastVerticalRatio, 1.f, 0.f };
-		for (int a = 0; a < 6; ++a)
-			ps.targetAmbient[a] = Finite3((Eclear[a] * (1.f - cover) + overcast * shape[a]) * toShader);
+		// (49i) "Ground Bounce": the ground below reflects the light it gets (Lambertian, albedo rho): a uniform lower hemisphere of radiance
+		// rho E_h / pi, E_h = the horizontal direct sun and moons through the clouds + the sky (clouds applied) on an upward face. Its
+		// irradiance on a face with normal n is rho E_h (1 - n.z) / 2: all of it facing down, half sideways, none facing up (49h: 0 everywhere).
+		// With Real Sky Ratios off direct[] is not filled (49h): the sun alone is added for the bounce, as drawn (S = 1, no moons).
+		const float3 skyUp = Eclear[4] * (1.f - cover) + overcast;
+		float3 directBounce = directNow;
+		if (!wantRatios) {
+			const float sunElevation = DirectX::XMConvertToDegrees(std::asin(std::clamp(static_cast<float>(UnitVec(a_lutSunDir)[2]), -1.f, 1.f)));
+			const float3 sunTr = ComputeLightTransmittance({ a_lutSunDir.x, a_lutSunDir.y, a_lutSunDir.z });
+			directBounce = sunColor * sunTr * (std::max(static_cast<float>(UnitVec(a_lutSunDir)[2]), 0.f) * SkySync::SmoothStep(-0.5f, 0.5f, sunElevation) * tr[0]);
+		}
+		ps.skyUpLum = Luminance3(skyUp);
+		ps.directLum = Luminance3(directBounce);
+		const bool bounceOn = PhysLightingOn(pl.groundBounce);
+		ps.bounceAlbedo = bounceOn ? GroundBounceAlbedo(ps.bounceSnow) : float3(0.f, 0.f, 0.f);
+		const float3 bounce = (directBounce + skyUp) * ps.bounceAlbedo;
+		const auto& normals = GetFitNormals();
+		for (int a = 0; a < kAmbientNormals; ++a) {
+			const float down = 0.5f * (1.f - static_cast<float>(normals.n[a][2]));
+			ps.targetAmbient[a] = Finite3((Eclear[a] * (1.f - cover) + overcast * OvercastShape(normals.n[a]) + bounce * down) * toShader);
+		}
 
 		if (wantRatios) {
 			ps.eReal = std::max(Luminance3(directNow) + Luminance3(ps.targetAmbient[4]) / std::max(toShader, 1e-8f), 0.f);
@@ -2805,7 +3045,7 @@ void PhysicalSky::UpdatePhysicalScene(const RE::NiPoint3& a_lutSunDir, const RE:
 		ps.sLog += (std::log(ps.sTarget) - ps.sLog) * follow;
 	ps.sValid = true;
 	ps.S = wantRatios ? std::clamp(std::exp(ps.sLog), 1e-3f, 2e5f) : 1.f;
-	for (int a = 0; a < 6; ++a)
+	for (int a = 0; a < kAmbientNormals; ++a)
 		ps.ambient[a] = (snap || !ps.ambientValid) ? ps.targetAmbient[a] : ps.ambient[a] + (ps.targetAmbient[a] - ps.ambient[a]) * follow;
 	ps.ambientValid = true;
 	ps.active = wantRatios;
@@ -2813,14 +3053,29 @@ void PhysicalSky::UpdatePhysicalScene(const RE::NiPoint3& a_lutSunDir, const RE:
 	ps.followActive = wantFollow;
 
 	// ---- Physical ambient x S with the weather's hue per axis, and the engine transform built from it ----
-	float3 ambient[6];
+	// (49i) At every fit normal: the axes as 49h; a diagonal takes the weather colour blended from the axes by n_axis^2 (the weights sum to 1).
+	float3 ambient[kAmbientNormals];
 	float3 engineMean = {};
+	float3 engineAxis[6];
 	for (int a = 0; a < 6; ++a) {
-		const float3 physical = ps.ambient[a] * ps.S;
 		const auto& e = sky->directionalAmbientColors[a / 2][a % 2];
-		const float3 engineGamma = Finite3({ e.red, e.green, e.blue });
+		engineAxis[a] = Finite3({ e.red, e.green, e.blue });
+	}
+	const auto& fitNormals = GetFitNormals();
+	for (int a = 0; a < kAmbientNormals; ++a) {
+		const float3 physical = ps.ambient[a] * ps.S;
+		float3 engineGamma = {};
+		if (a < 6) {
+			engineGamma = engineAxis[a];
+		} else {
+			for (int x = 0; x < 6; ++x) {
+				const double c = std::max(fitNormals.n[a][0] * kAxes[x][0] + fitNormals.n[a][1] * kAxes[x][1] + fitNormals.n[a][2] * kAxes[x][2], 0.0);
+				engineGamma += engineAxis[x] * static_cast<float>(c * c);
+			}
+		}
 		const float3 engineLinear = { std::pow(engineGamma.x, ambientGamma), std::pow(engineGamma.y, ambientGamma), std::pow(engineGamma.z, ambientGamma) };
-		engineMean += engineLinear;
+		if (a < 6)
+			engineMean += engineLinear;
 		const float confidence = std::clamp(Luminance3(engineGamma) * 255.f / 8.f, 0.f, 1.f);
 		const float3 skyHue = HueOf(Luminance3(physical) > 0.f ? physical : ps.ambient[4], 1.f);
 		const float3 hue = HueOf(skyHue + (HueOf(engineLinear, 1.f) - skyHue) * confidence, hueCap);
@@ -2855,8 +3110,55 @@ void PhysicalSky::UpdatePhysicalScene(const RE::NiPoint3& a_lutSunDir, const RE:
 			}
 		t.translate = { *channel[0], *channel[1], *channel[2] };
 		t.scale = 1.f;
+		float3 oldR[3];
+		for (int j = 0; j < 3; ++j)
+			oldR[j] = { t.rotate.entry[0][j], t.rotate.entry[1][j], t.rotate.entry[2][j] };
+		ps.fitErrorOld = AmbientFitError(ambient, mean, oldR, ambientGamma);
+		// (49i) "Accurate Ambient Directions": T and R fitted so the DECODED ambient matches at all 26 normals (FitAmbientChannel); off = the
+		// 49h construction above (only the six axes, matched in encoded space).
+		bool fitted = false;
+		if (PhysLightingOn(pl.ambientFit)) {
+			double p[3][4];
+			bool ok = true;
+			for (int c = 0; c < 3; ++c) {
+				float target[kAmbientNormals];
+				for (int a = 0; a < kAmbientNormals; ++a)
+					target[a] = c == 0 ? ambient[a].x : c == 1 ? ambient[a].y : ambient[a].z;
+				ok = FitAmbientChannel(target, ambientGamma, p[c]) && ok;
+			}
+			if (ok) {
+				const float3 fitT = { static_cast<float>(p[0][0]), static_cast<float>(p[1][0]), static_cast<float>(p[2][0]) };
+				float3 fitR[3];
+				for (int j = 0; j < 3; ++j)
+					fitR[j] = { static_cast<float>(p[0][1 + j]), static_cast<float>(p[1][1 + j]), static_cast<float>(p[2][1 + j]) };
+				ps.fitErrorNew = AmbientFitError(ambient, fitT, fitR, ambientGamma);
+				for (int c = 0; c < 3; ++c)
+					for (int j = 0; j < 3; ++j)
+						t.rotate.entry[c][j] = c == 0 ? fitR[j].x : c == 1 ? fitR[j].y : fitR[j].z;
+				t.translate = { fitT.x, fitT.y, fitT.z };
+				fitted = true;
+			}
+		}
+		if (!fitted)
+			ps.fitErrorNew = ps.fitErrorOld;
+		ps.fitApplied = fitted;
 		dalcPhysical = t;
 	}
+}
+
+float3 PhysicalSky::GroundBounceAlbedo(float& o_snow) const
+{
+	// (49i) Physical Sky's ground albedo (settings.groundAlbedo, no slider; 0.2), toward kSnowAlbedo by Dynamic Snow's accumulated snow at the player.
+	const float3 base = { std::clamp(std::isfinite(settings.groundAlbedo.x) ? settings.groundAlbedo.x : 0.2f, 0.f, 1.f),
+		std::clamp(std::isfinite(settings.groundAlbedo.y) ? settings.groundAlbedo.y : 0.2f, 0.f, 1.f),
+		std::clamp(std::isfinite(settings.groundAlbedo.z) ? settings.groundAlbedo.z : 0.2f, 0.f, 1.f) };
+	o_snow = 0.f;
+	const auto& snow = globals::features::dynamicSnow;
+	if (snow.loaded && snow.status.exterior && snow.AccumulationActive()) {
+		const float share = snow.status.amount * snow.status.playerMask;
+		o_snow = std::isfinite(share) ? std::clamp(share, 0.f, 1.f) : 0.f;
+	}
+	return base + (float3(kSnowAlbedo, kSnowAlbedo, kSnowAlbedo) - base) * o_snow;
 }
 
 void PhysicalSky::NightWeatherColors(float3& a_upper, float3& a_horizon, float3& a_lower) const

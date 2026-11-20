@@ -59,12 +59,12 @@ std::pair<unsigned char*, size_t> GetFeatureBufferData(bool a_inWorld)
 		globals::features::terrainVariation.settings,
 		[] {
 			// (49h stage 2) Physical Sky "Physical Ambient": the ambient is the physical sky, so IBL adds only the surroundings' bounce
-			// (values only, at upload; the saved settings are untouched).
+			// (values only, at upload; the saved settings are untouched). (49i) Env IBL Scale is no longer overridden (49h forced 1): the
+			// user's value applies (the IBL page draws Sky IBL Scale / Saturation and DALC Amount disabled while this is in effect).
 			auto ibl = globals::features::ibl.settings;
 			if (globals::features::physicalSky.PhysicalAmbientActive()) {
 				ibl.DALCAmount = 1.0f;
 				ibl.SkyIBLScale = 0.0f;
-				ibl.EnvIBLScale = 1.0f;
 			}
 			return ibl;
 		}(),
