@@ -68,6 +68,7 @@ struct PhysicalBrightness
 		float winsorEV = 3.f;             // the auto exposure counts samples brighter than median + this as median + this
 		float darkTrim = 5.f;             // percent of the darkest samples not counted
 		float bloomClamp = 64.f;          // COD Bloom's input clamp (after exposure) while the master is on
+		float clearDayReference = 0.12f;  // the game's clear-weather midday reference L_v (0.18 x (ambient + half the sun), game units)
 		bool measuredClouds = true;       // cloud cover from Cloud Shadows' cube (49h T3)
 		bool ambientFit = false;          // "Accurate Ambient Directions" (49i)
 		float overcastKappa = 0.25f;      // light an overcast layer passes on
@@ -95,6 +96,17 @@ struct PhysicalBrightness
 	float deltaK = 0.f;              // display key offset, EV (CPU copy of the auto exposure's)
 	float deltaKVanilla = 0.f;       // the vanilla reference's night offset, EV (step 2)
 	float vanillaUnlit = 1.f;        // pipeline factor for the game's unlit colours (fog, rain, water, unlit smoke): the ambient now / the game's ambient
+	// (step 2, design 2.2.5) The game's own brightness as the reference: L_v = 0.18 x (mean ambient + sun x VDM x 0.5 x (1 - cover)), game units.
+	float vanillaNow = 0.f;          // L_v now (blended keys, as the game shows it)
+	float vanillaDay = 0.f;          // L_v of the same weather(s) at their day key
+	float vanillaDayLastExterior = 0.f;  // for interiors
+	float weatherDayRatio = 1.f;     // A_w = L_v(day) / clearDayReference: the weather's brightness intent
+	bool vanillaValid = false;
+	/// Fills vanillaNow / vanillaDay / deltaKVanilla / weatherDayRatio from the game's weather (outdoors) or interior ambient.
+	void ComputeVanillaReference();
+	/// Weather Brightness Strength (design 12-4): physical sources x (A_w / A_phys)^strength, A_phys = the physical light with the clouds
+	/// / without them (PhysicalSky::UpdatePhysicalScene). Clamped 1/16 .. 4.
+	[[nodiscard]] float WeatherBrightnessFactor(float a_physicalCloudRatio) const;
 	float timeSeconds = 0.f;
 	Scene lastScene = Scene::None;
 	uint32_t sceneChangeFrame = 0;

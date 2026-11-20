@@ -122,6 +122,9 @@ void PhysicalBrightness::BeginFrame()
 		return;
 	}
 
+	// (step 2) The game's own brightness: the Night Darkness curve's vanilla end and the Minimum Visibility reference.
+	ComputeVanillaReference();
+
 	// ---- The eye's adapted luminance (cd/m^2) ----
 	// CPU estimate: a grey (0.18) surface in this frame's light (the physical scene of the last frame). Used before the auto exposure has
 	// a Physical Brightness reading and while it is off.
@@ -336,6 +339,8 @@ void PhysicalBrightness::DrawStatus()
 	ImGui::TextDisabled("Adapted to: %.3g cd/m2 (%s)", adaptedLuminance, adaptedFromAE ? "auto exposure" : "estimate: auto exposure off or not ready");
 	ImGui::TextDisabled("Night darkness in effect: %+.2f EV on screen (the weather's own: %+.2f EV)", deltaK, deltaKVanilla);
 	ImGui::TextDisabled("Game colours (fog, rain, water, unlit smoke) x%.3g", globals::features::physicalSky.physScene.rAmb);
+	if (vanillaValid)
+		ImGui::TextDisabled("The game's own brightness (no lamps): now %.3g, day %.3g (game units); weather brightness x%.2f", vanillaNow, vanillaDay, globals::features::physicalSky.physScene.weatherFactor);
 }
 
 void PhysicalBrightness::DrawSettings()
@@ -488,4 +493,86 @@ bool PhysicalBrightness::LocalAdaptationRuns() const
 	if (!pipe || !pipe->RuntimeGateOpen())
 		return false;
 	return Active() ? settings.localAdaptation > 1e-4f : pipe->enabled;
+}
+
+void PhysicalBrightness::ComputeVanillaReference()
+{
+	// (49j step 2, design 2.2.5) The game's own brightness, in its own units, as the reference for Night Darkness (relative: now / the same
+	// weather's day key) and Minimum Visibility. Lamps are left out on purpose: the reference is how bright the game wants the places no lamp
+	// reaches. Outdoors: the six directional ambient colours as the engine blended them (Sky::directionalAmbientColors; Physical Brightness
+	// rewrites the shaders' transform, not these) linearised with Linear Lighting's ambient gamma, plus the weather's sunlight colour
+	// (skyColor[kSunlight]) linearised with the light gamma x VDM x 0.5 (mean cosine) x (1 - cloud cover). Day: the same of the weather's
+	// kDay keyframes (blended through a transition like the game blends).
+	const auto* sky = globals::game::sky;
+	const auto& ll = globals::features::linearLighting.settings;
+	const float gammaA = ll.enableLinearLighting && std::isfinite(ll.ambientGamma) ? std::clamp(ll.ambientGamma, 0.1f, 5.f) : 1.f;
+	const float gammaL = ll.enableLinearLighting && std::isfinite(ll.lightGamma) ? std::clamp(ll.lightGamma, 0.1f, 5.f) : 1.f;
+	const float vdm = VanillaDiffuseMult();
+	auto lum = [](float r, float g, float b) { return 0.2126f * r + 0.7152f * g + 0.0722f * b; };
+	auto lin = [](float v, float g) { return std::pow(std::isfinite(v) ? std::max(v, 0.f) : 0.f, g); };
+
+	if (scene == Scene::Interior) {
+		// The interior's ambient as the engine set it before Physical Brightness rewrote it (PhysicalSky::dalcEngine), vs the last exterior day.
+		const auto& physicalSky = globals::features::physicalSky;
+		if (physicalSky.dalcEngineValid) {
+			const auto& t = physicalSky.dalcEngine.translate;
+			vanillaNow = 0.18f * lum(lin(t.x, gammaA), lin(t.y, gammaA), lin(t.z, gammaA));
+			vanillaDay = vanillaDayLastExterior > 0.f ? vanillaDayLastExterior : settings.clearDayReference;
+			vanillaValid = true;
+		}
+	} else if (sky && sky->currentWeather) {
+		float ambNow = 0.f;
+		for (int axis = 0; axis < 3; ++axis)
+			for (int side = 0; side < 2; ++side) {
+				const auto& c = sky->directionalAmbientColors[axis][side];
+				ambNow += lum(lin(c.red, gammaA), lin(c.green, gammaA), lin(c.blue, gammaA));
+			}
+		ambNow /= 6.f;
+		const float cover = std::clamp(globals::features::physicalSky.physScene.cover, 0.f, 1.f);
+		const auto& sun = sky->skyColor[RE::TESWeather::ColorTypes::kSunlight];
+		const float sunNow = lum(lin(sun.red, gammaL), lin(sun.green, gammaL), lin(sun.blue, gammaL)) * vdm * 0.5f * (1.f - cover);
+
+		const float pct = std::isfinite(sky->currentWeatherPct) ? std::clamp(sky->currentWeatherPct, 0.f, 1.f) : 1.f;
+		const RE::TESWeather* last = (sky->lastWeather && sky->lastWeather != sky->currentWeather && pct < 1.f) ? sky->lastWeather : nullptr;
+		auto channel = [](const RE::Color& c, int i) { return (i == 0 ? c.red : i == 1 ? c.green : c.blue) * (1.f / 255.f); };
+		auto blended = [&](auto&& a_get, int i) {
+			const float cur = channel(a_get(sky->currentWeather), i);
+			return last ? std::lerp(channel(a_get(last), i), cur, pct) : cur;
+		};
+		float ambDay = 0.f;
+		for (int axis = 0; axis < 3; ++axis)
+			for (int side = 0; side < 2; ++side) {
+				auto get = [&](const RE::TESWeather* w) -> const RE::Color& {
+					const auto& d = w->directionalAmbientLightingColors[RE::TESWeather::ColorTime::kDay].directional;
+					const auto& mm = axis == 0 ? d.x : axis == 1 ? d.y : d.z;
+					return side == 0 ? mm.max : mm.min;
+				};
+				ambDay += lum(lin(blended(get, 0), gammaA), lin(blended(get, 1), gammaA), lin(blended(get, 2), gammaA));
+			}
+		ambDay /= 6.f;
+		auto getSun = [](const RE::TESWeather* w) -> const RE::Color& { return w->colorData[RE::TESWeather::ColorTypes::kSunlight][RE::TESWeather::ColorTime::kDay]; };
+		const float sunDay = lum(lin(blended(getSun, 0), gammaL), lin(blended(getSun, 1), gammaL), lin(blended(getSun, 2), gammaL)) * vdm * 0.5f * (1.f - cover);
+
+		vanillaNow = 0.18f * (ambNow + sunNow);
+		vanillaDay = 0.18f * (ambDay + sunDay);
+		if (vanillaDay > 1e-6f)
+			vanillaDayLastExterior = vanillaDay;
+		vanillaValid = vanillaDay > 1e-6f;
+	}
+	if (vanillaValid && vanillaDay > 1e-6f) {
+		deltaKVanilla = std::clamp(std::log2(std::max(vanillaNow, 1e-9f) / vanillaDay), -8.f, 0.f);
+		weatherDayRatio = std::clamp(vanillaDay / std::max(settings.clearDayReference, 1e-4f), 1.f / 64.f, 64.f);
+	} else {
+		deltaKVanilla = 0.f;
+		weatherDayRatio = 1.f;
+	}
+}
+
+float PhysicalBrightness::WeatherBrightnessFactor(float a_physicalCloudRatio) const
+{
+	const float strength = std::clamp(settings.weatherBrightness, 0.f, 1.f);
+	if (!(strength > 0.f) || !(a_physicalCloudRatio > 0.f))
+		return 1.f;
+	const float factor = std::pow(weatherDayRatio / a_physicalCloudRatio, strength);
+	return std::isfinite(factor) ? std::clamp(factor, 1.f / 16.f, 4.f) : 1.f;
 }

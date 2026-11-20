@@ -1822,6 +1822,13 @@ void PhysicalSky::Reset()
 	// (49j) Physical Brightness: the clouds' own (weather-coloured) part is a game colour: x the game-colour factor (design 3.2 row 5).
 	if (physScene.followActive)
 		cbData.cloudOriginalMix = settings.cloudOriginalMix * physScene.rAmb;
+	// (49j step 2) Weather Tint Strength on the clouds (Sky.hlsl S2): the weather's sky colour (r, g at luminance 1; b follows) in two fields
+	// no shader reads otherwise (sunDiskCos, _pad5: the retired procedural sun / padding), the strength in extCbData.sunGlowIntensity (retired).
+	if (physScene.active) {
+		cbData.sunDiskCos = physScene.weatherSkyHue.x;
+		cbData._pad5 = physScene.weatherSkyHue.y;
+		extCbData.sunGlowIntensity = std::clamp(PhysicalBrightness::GetSingleton()->settings.weatherTint, 0.f, 1.f);
+	}
 
 	// (49j) Physical Brightness needs the direct light to be Physical Sky's (design 9: Override Directional Light forced on).
 	if (settings.overrideDirLight || physScene.active) {
@@ -2969,6 +2976,11 @@ void PhysicalSky::UpdatePhysicalScene(const RE::NiPoint3& a_lutSunDir, const RE:
 		}
 		ps.skyUpLum = Luminance3(skyUp);
 		ps.directLum = Luminance3(directBounce);
+		// (49j step 2) Weather Brightness Strength: the physical light with the clouds over the same without them (A_phys).
+		{
+			const float clear = Luminance3(direct[0] + direct[1] + direct[2]) + Luminance3(Eclear[4]);
+			ps.cloudRatio = clear > 1e-12f ? std::clamp((ps.directLum + ps.skyUpLum) / clear, 1e-3f, 1.f) : 1.f;
+		}
 		const bool bounceOn = pbs.groundBounce;
 		ps.bounceAlbedo = bounceOn ? GroundBounceAlbedo(ps.bounceSnow) : float3(0.f, 0.f, 0.f);
 		const float3 bounce = (directBounce + skyUp) * ps.bounceAlbedo;
@@ -2992,7 +3004,13 @@ void PhysicalSky::UpdatePhysicalScene(const RE::NiPoint3& a_lutSunDir, const RE:
 	const float follow = snap ? 1.f : 1.f - std::exp(-dt / std::clamp(pbs.smoothingSeconds, 0.1f, 10.f));
 	ps.sValid = true;
 	// (49j) This frame's P (not smoothed: every light of the frame takes the same P, the auto exposure divides it out).
-	ps.S = wantRatios ? pb.SunUnitsToPipeline(sunLum) : 1.f;
+	// (49j step 2) x the weather's brightness intent relative to the physical clouds (Weather Brightness Strength), smoothed in log.
+	{
+		const float target = std::log(pb.WeatherBrightnessFactor(ps.cloudRatio));
+		ps.weatherFactorLog = snap ? target : ps.weatherFactorLog + (target - ps.weatherFactorLog) * follow;
+		ps.weatherFactor = std::exp(ps.weatherFactorLog);
+	}
+	ps.S = wantRatios ? pb.SunUnitsToPipeline(sunLum) * ps.weatherFactor : 1.f;
 	ps.sLog = std::log(std::max(ps.S, 1e-30f));
 	for (int a = 0; a < kAmbientNormals; ++a)
 		ps.ambient[a] = (snap || !ps.ambientValid) ? ps.targetAmbient[a] : ps.ambient[a] + (ps.targetAmbient[a] - ps.ambient[a]) * follow;
@@ -3011,6 +3029,19 @@ void PhysicalSky::UpdatePhysicalScene(const RE::NiPoint3& a_lutSunDir, const RE:
 		engineAxis[a] = Finite3({ e.red, e.green, e.blue });
 	}
 	const auto& fitNormals = GetFitNormals();
+	// (49j step 2, design 7) Weather Tint Strength, relative: per direction the physical sky's colour x (the weather ambient's colour / the
+	// weather's own sky colour)^tint. A grey weather ambient under a grey weather sky adds no tint; 0 = the physical colour. Replaces 49h's
+	// confidence rule (which took the weather's colour wholesale above 8/255). The weather sky: 0.5 SkyUpper + 0.25 SkyLower + 0.25 Horizon
+	// as the engine blends them now, linearised as the sky colours are. Black has no colour: then no tint (weight by luminance / 1e-4).
+	const float tint = std::clamp(pbs.weatherTint, 0.f, 1.f);
+	{
+		const auto& ll2 = globals::features::linearLighting.settings;
+		const float skyGamma = ll2.enableLinearLighting && std::isfinite(ll2.skyGamma) ? std::clamp(ll2.skyGamma, 0.1f, 5.f) : 1.f;
+		auto linColor = [skyGamma](const RE::NiColor& c) { return float3(std::pow(std::max(c.red, 0.f), skyGamma), std::pow(std::max(c.green, 0.f), skyGamma), std::pow(std::max(c.blue, 0.f), skyGamma)); };
+		using CT = RE::TESWeather::ColorTypes;
+		const float3 weatherSky = linColor(sky->skyColor[CT::kSkyUpper]) * 0.5f + linColor(sky->skyColor[CT::kSkyLower]) * 0.25f + linColor(sky->skyColor[CT::kHorizon]) * 0.25f;
+		ps.weatherSkyHue = Luminance3(weatherSky) > 1e-6f ? HueOf(weatherSky, 1.f) : float3(1.f, 1.f, 1.f);
+	}
 	for (int a = 0; a < kAmbientNormals; ++a) {
 		const float3 physical = ps.ambient[a] * ps.S;
 		float3 engineGamma = {};
@@ -3025,9 +3056,13 @@ void PhysicalSky::UpdatePhysicalScene(const RE::NiPoint3& a_lutSunDir, const RE:
 		const float3 engineLinear = { std::pow(engineGamma.x, ambientGamma), std::pow(engineGamma.y, ambientGamma), std::pow(engineGamma.z, ambientGamma) };
 		if (a < 6)
 			engineMean += engineLinear;
-		const float confidence = std::clamp(Luminance3(engineGamma) * 255.f / 8.f, 0.f, 1.f);
 		const float3 skyHue = HueOf(Luminance3(physical) > 0.f ? physical : ps.ambient[4], 1.f);
-		const float3 hue = HueOf(skyHue + (HueOf(engineLinear, 1.f) - skyHue) * confidence, hueCap);
+		const float defined = std::clamp(Luminance3(engineLinear) / 1e-4f, 0.f, 1.f) * tint;
+		const float3 weatherHue = HueOf(engineLinear, 1.f);
+		auto relative = [&](float a_w, float a_s) { return std::pow(std::clamp(a_w / std::max(a_s, 1e-3f), 1e-3f, 1e3f), defined); };
+		const float3 hue = HueOf(float3(skyHue.x * relative(weatherHue.x, ps.weatherSkyHue.x), skyHue.y * relative(weatherHue.y, ps.weatherSkyHue.y),
+											skyHue.z * relative(weatherHue.z, ps.weatherSkyHue.z)),
+			hueCap);
 		ambient[a] = hue * Luminance3(physical);
 	}
 	float3 physicalMean = {};

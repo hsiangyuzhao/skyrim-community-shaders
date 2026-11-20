@@ -593,7 +593,17 @@ PS_OUTPUT main(PS_INPUT input)
 		const float weatherLuma = Color::RGBToLuminance(weatherCloud);
 		const float3 hue = weatherLuma > 1e-4 ? weatherCloud / weatherLuma : float3(1.0, 1.0, 1.0);
 		const float3 ambient = Color::Ambient(max(0, mul(SharedData::DirectionalAmbient, float4(0, 0, 0, 1))));
-		psout.Color.xyz += cloudAlbedo * Color::RGBToLuminance(ambient) * hue * SharedData::physSkyCloudData.SkyAmbient;
+		// (49j step 2, design 7) S2 is part of Physical Brightness: the ambient is the physical one (its colour already carries the relative
+		// weather tint), and the weather's cloud colour tints it relative to the weather's own sky colour (C++ PhysicalSky::Reset: r, g of
+		// that colour at luminance 1 in physSkyData.sunDiskCos / _pad5, Weather Tint Strength in physSkyExtData.SunGlowIntensity; fields
+		// no other shader reads). A cloud as grey as its weather's sky adds no tint.
+		const float2 skyRG = float2(SharedData::physSkyData.sunDiskCos, SharedData::physSkyData._pad5);
+		float3 weatherSkyHue = float3(1.0, 1.0, 1.0);
+		if (skyRG.x > 0.0 && skyRG.y > 0.0)
+			weatherSkyHue = max(float3(skyRG, (1.0 - 0.2126 * skyRG.x - 0.7152 * skyRG.y) / 0.0722), 1e-3);
+		float3 relativeTint = pow(clamp(hue / weatherSkyHue, 1e-3, 1e3), saturate(SharedData::physSkyExtData.SunGlowIntensity));
+		relativeTint /= max(Color::RGBToLuminance(relativeTint), 1e-4);
+		psout.Color.xyz += cloudAlbedo * ambient * relativeTint * SharedData::physSkyCloudData.SkyAmbient;
 	}
 #			endif
 #		endif

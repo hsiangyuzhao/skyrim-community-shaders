@@ -645,6 +645,11 @@ struct PhysicalSky final : public Feature
 		float fitErrorOld = 0.f;
 		float fitErrorNew = 0.f;
 		bool fitApplied = false;
+		// (49j step 2) Weather Brightness Strength: the physical light with clouds / without (A_phys) and the factor in effect.
+		float cloudRatio = 1.f;
+		float weatherFactor = 1.f;
+		float weatherFactorLog = 0.f;
+		float3 weatherSkyHue = { 1.f, 1.f, 1.f };  // (49j step 2) the weather's own sky colour (luminance 1), for the relative tint (Sky.hlsl S2 too)
 	} physScene;
 	/// (49i) Ground Bounce's albedo: Physical Sky's Ground Albedo, toward kSnowAlbedo by Dynamic Snow's accumulated snow at the player
 	/// (o_snow: that share, 0 without Dynamic Snow / outside its cold area).
