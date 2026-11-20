@@ -42,7 +42,11 @@ cbuffer LocalExposureCB : register(b1)
 	float LogLuminanceMin;
 	float LogLuminanceMax;
 	float MiddleGreyCompensation;  // auto exposure's Exposure Compensation (linear), else 1
-	float Padding1;
+	uint Flags;                    // (49j) Physical Brightness: 1 pivot = 0.18 x AEAdaptation[3] (t4), 2 Minimum Visibility floor, 4 night vision
+
+	float FloorLog;      // (49j) log2(Minimum Visibility x 0.18) + the vanilla night offset: no area's exposed base below it
+	float NightVision;   // (49j) night vision colour strength (per-pixel mesopic desaturation and Cao blue shift)
+	float2 DepthUvScale; // (49j) output UV -> the render-resolution depth's UV (t5); 0 = no depth (the sky is not left out of the floor)
 };
 
 Texture2D<float4> TexColor : register(t0);
@@ -52,11 +56,16 @@ Texture2D<float> TexBlurredLuminance : register(t3);
 SamplerState LinearSampler : register(s0);
 SamplerState MirrorSampler : register(s1);
 
+// (49j) Physical Brightness: the auto exposure's adaptation buffer (t4; also bound without the fold while Flags & 1) and the scene depth
+// (t5, render resolution) for the sky test of the Minimum Visibility floor. The Cao model (exposure.hlsli) for the night vision colour.
+StructuredBuffer<float> AEAdaptation : register(t4);
+Texture2D<float> TexDepth : register(t5);
+#include "PostProcessing/HistogramAutoExposure/exposure.hlsli"
+
 #if defined(FOLD_AUTO_EXPOSURE)
 // (44e) Histogram Auto Exposure's adapt pass folded in: its per-pixel exposure (and Purkinje shift)
 // is applied here on load instead of being written to a full-resolution copy first. Same math
 // (exposure.hlsli), same alpha (1) as the adapt pass wrote.
-#	include "PostProcessing/HistogramAutoExposure/exposure.hlsli"
 cbuffer AutoExposureFoldCB : register(b2)
 {
 	float2 AEAdaptArea;
@@ -67,7 +76,6 @@ cbuffer AutoExposureFoldCB : register(b2)
 	float AEPurkinjeMaxEV;
 	float AEPurkinjeStrength;
 };
-StructuredBuffer<float> AEAdaptation : register(t4);
 
 float4 LoadSceneColor(uint2 tid)
 {
@@ -225,16 +233,20 @@ float RemapBaseContrast(float centeredBase)
 	return isHighlight ? remappedMagnitude : -remappedMagnitude;
 }
 
-float ComputeLocalExposure(float sceneLogLuminance, float baseLogLuminance, float globalExposure, float middleGreyCompensation)
+float ComputeLocalExposure(float sceneLogLuminance, float baseLogLuminance, float globalExposure, float middleGreyCompensation, float floorLift = 0.0)
 {
 	float logGlobalExposure = log2(max(globalExposure, 1e-5));
 	float exposedLogLuminance = sceneLogLuminance + logGlobalExposure;
 	float exposedBase = baseLogLuminance + logGlobalExposure;
 	float detail = exposedLogLuminance - exposedBase;
-	float middleGrey = log2(0.18 * middleGreyCompensation) + MiddleGreyBias;
+	// (49j, design 5.2) Physical Brightness: the pivot is the display key this frame (0.18 x 2^dK = AEAdaptation[3]), read on the GPU.
+	float middleGrey = ((Flags & 1u) != 0u ? log2(0.18 * max(AEAdaptation[3], 1e-8)) : log2(0.18 * middleGreyCompensation)) + MiddleGreyBias;
 	float remappedBase = middleGrey + RemapBaseContrast(exposedBase - middleGrey);
 	float targetLogLuminance = remappedBase + detail * DetailStrength;
 	float logAdjustment = (targetLogLuminance - exposedLogLuminance) * Strength;
+	// (49j, design 5.4) Minimum Visibility: no area's displayed base below FloorLog, only lifted, at most 4 EV (independent of Strength).
+	if ((Flags & 2u) != 0u)
+		logAdjustment += clamp(FloorLog - (exposedBase + (remappedBase - exposedBase) * Strength), 0.0, 4.0) * floorLift;
 	return exp2(clamp(logAdjustment, -8.0, 8.0));
 }
 
@@ -265,8 +277,37 @@ RWTexture2D<float4> RWTexColorOutput : register(u0);
 
 	float baseLogLuminance = lerp(bilateralBase, broadBase, BaseBlend);
 
-	// Local adjustment (upstream Composite), from the full-precision scene luminance as upstream does.
-	float localExposure = ComputeLocalExposure(SceneLogLuminance(sceneColor.rgb), baseLogLuminance, GlobalExposure, MiddleGreyCompensation);
+	// (49j) Minimum Visibility leaves the sky out (a lifted night sky turns grey): the render-resolution depth at this UV, far plane = sky.
+	float floorLift = 1.0;
+	[branch] if ((Flags & 2u) != 0u && DepthUvScale.x > 0.0)
+		floorLift = TexDepth.SampleLevel(LinearSampler, uv * DepthUvScale, 0) >= 0.99999 ? 0.0 : 1.0;
 
-	RWTexColorOutput[tid] = float4(sceneColor.rgb * localExposure, sceneColor.a);
+	// Local adjustment (upstream Composite), from the full-precision scene luminance as upstream does.
+	float localExposure = ComputeLocalExposure(SceneLogLuminance(sceneColor.rgb), baseLogLuminance, GlobalExposure, MiddleGreyCompensation, floorLift);
+
+	float3 color = sceneColor.rgb;
+	// (49j, design 5.3) Night vision per pixel (replaces the global Purkinje): the physical luminance of the pixel and of its surroundings (the
+	// base) from the exposed colour (L = exposed x L_a / (0.18 x 2^dK)); the rods' share by the mesopic range of CIE 191:2010 (0.005 - 5
+	// cd/m^2) on the local adaptation luminance; the Cao (2008) blue shift fed the retinal illuminance (L x pupil area, Moon & Spencer 1944)
+	// instead of a fixed x380; then a desaturation toward a slightly blue grey. Lamp-lit areas stay above the range: no change there.
+	[branch] if ((Flags & 4u) != 0u)
+	{
+		const float toPhysical = max(AEAdaptation[1], 1e-12) / (0.18 * max(AEAdaptation[3], 1e-8));
+		const float localLuminance = exp2(baseLogLuminance) * toPhysical;
+		const float rods = 1.0 - smoothstep(log10(0.005), log10(5.0), log10(max(localLuminance, 1e-9)));
+		const float rodMix = rods * NightVision;
+		[branch] if (rodMix > 1e-3)
+		{
+			const float adapted = max(AEAdaptation[1], 1e-9);
+			const float pupil = 4.9 - 3.0 * tanh(0.4 * log10(adapted));  // mm
+			const float area = 3.14159265 * 0.25 * pupil * pupil;          // mm^2
+			const float toTrolands = toPhysical * area / AutoExposureMath::logExposure;
+			color = AutoExposureMath::PurkinjeShift(color * toTrolands, rodMix) / max(toTrolands, 1e-12);
+			const float3 nightTint = float3(0.86, 0.96, 1.25);
+			const float y = Color::RGBToLuminance(max(color, 0.0));
+			color = lerp(color, y * nightTint / Color::RGBToLuminance(nightTint), rodMix);
+		}
+	}
+
+	RWTexColorOutput[tid] = float4(max(color, 0.0) * localExposure, sceneColor.a);
 }

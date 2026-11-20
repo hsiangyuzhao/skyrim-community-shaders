@@ -22,6 +22,11 @@ struct PostProcessFeature
 	/// @brief (batch 38) False = a batch master switch keeps this effect from running (and from
 	/// holding memory), whatever its own checkbox says.
 	virtual bool RuntimeGateOpen() const { return true; }
+	///  (49j) Another feature may decide this effect's switch for a while (Physical Brightness runs Local Exposure as the eye's local
+	/// adaptation): a_enabled is the effect's own checkbox. Default: the checkbox.
+	virtual bool EnabledOverride(bool a_enabled) const { return a_enabled; }
+	///  (49j) The switch in effect: the checkbox, or what EnabledOverride makes of it.
+	bool EffectiveEnabled() const { return EnabledOverride(enabled); }
 
 	/// @brief Allocate this effect's GPU memory (textures, buffers, samplers).
 	///

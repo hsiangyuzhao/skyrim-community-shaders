@@ -529,7 +529,7 @@ void PostProcessing::ReleaseIdleResources()
 		if (!pipe || !pipe->resourcesResident)
 			continue;
 
-		if (pipe->enabled && pipe->RuntimeGateOpen()) {
+		if (pipe->EffectiveEnabled() && pipe->RuntimeGateOpen()) {  // (49j) the switch in effect
 			pipe->disabledSince = {};
 			continue;
 		}
@@ -649,7 +649,7 @@ void PostProcessing::DrawBeforeUpscaling()
 	PostProcessFeature::TextureInfo lastTexColor = { gameTexMain.texture, gameTexMain.SRV };
 
 	auto drawsHere = [&](const std::unique_ptr<PostProcessFeature>& a_pipe) {
-		return a_pipe && a_pipe->enabled && a_pipe->RuntimeGateOpen() && !a_pipe->DrawAfterColorGrading() &&
+		return a_pipe && a_pipe->EffectiveEnabled() && a_pipe->RuntimeGateOpen() && !a_pipe->DrawAfterColorGrading() &&
 		       !(inMainLoadingMenu && a_pipe->DisableInMainLoadingMenu()) && a_pipe->DrawBeforeUpscaling();
 	};
 
@@ -727,7 +727,7 @@ void PostProcessing::PreProcess()
 	// The draw order is unchanged: every regular effect in pipeline order, then every
 	// after-colour-grading one. Collected first so the last effect of the chain is known.
 	auto drawsHere = [&](const std::unique_ptr<PostProcessFeature>& a_pipe, bool a_afterColorGrading) {
-		return a_pipe && a_pipe->enabled && a_pipe->RuntimeGateOpen() && a_pipe->DrawAfterColorGrading() == a_afterColorGrading && !(inMainLoadingMenu && a_pipe->DisableInMainLoadingMenu()) &&
+		return a_pipe && a_pipe->EffectiveEnabled() && a_pipe->RuntimeGateOpen() && a_pipe->DrawAfterColorGrading() == a_afterColorGrading && !(inMainLoadingMenu && a_pipe->DisableInMainLoadingMenu()) &&
 		       (!a_pipe->DrawBeforeUpscaling() || !upscaling.loaded);
 	};
 	std::vector<PostProcessFeature*> chain;

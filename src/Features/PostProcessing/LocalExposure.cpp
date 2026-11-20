@@ -1,5 +1,6 @@
 #include "LocalExposure.h"
 
+#include "Features/PhysicalBrightness.h"
 #include "Features/PostProcessing.h"
 #include "Menu.h"
 #include "State.h"
@@ -34,8 +35,16 @@ namespace
 	}
 }
 
+bool LocalExposure::EnabledOverride(bool a_enabled) const
+{
+	const auto& pb = *PhysicalBrightness::GetSingleton();
+	return pb.Active() ? pb.settings.localAdaptation > 1e-4f : a_enabled;
+}
+
 void LocalExposure::DrawSettings()
 {
+	if (PhysicalBrightness::GetSingleton()->MasterOn())
+		ImGui::TextDisabled("Physical Brightness is on: this is the eye's local adaptation. On / off and Strength come from Sky > Physical Sky >\nScene Lighting > Eye > Local Adaptation Strength; Highlight Contrast is at most 0.60 (threshold +1 EV) there.");
 	if (!GetActiveAutoExposure()) {
 		ImGui::SliderFloat("Exposure", &settings.Exposure, 0.f, 4.f, "%.2f");
 		if (auto _tt = Util::HoverTooltipWrapper())
@@ -373,6 +382,9 @@ void LocalExposure::Draw(TextureInfo& inout_tex)
 	// After Histogram Auto Exposure the image is already exposed: global exposure 1, middle grey
 	// 0.18 x its compensation. Without it, Exposure is the assumed exposure (never applied).
 	const auto* autoExposure = GetActiveAutoExposure();
+	// (49j) The scene depth at render resolution (the prepass copy; far plane = sky) and its UV scale under dynamic resolution.
+	ID3D11ShaderResourceView* depthSrv = globals::game::renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY].depthSRV;
+	const float2 depthUvScale = Util::ConvertToDynamic(float2(1.f, 1.f));
 
 	LocalExposureCB cbData = {
 		.GlobalExposure = autoExposure ? 1.f : std::max(settings.Exposure, 1e-3f),
@@ -394,8 +406,34 @@ void LocalExposure::Draw(TextureInfo& inout_tex)
 		.LogLuminanceMin = -13.f,
 		.LogLuminanceMax = 18.f,
 		.MiddleGreyCompensation = autoExposure ? std::max(autoExposure->lastExposureCompensation, 1e-3f) : 1.f,
-		.pad = 0.f,
+		.Flags = 0u,
+		.FloorLog = 0.f,
+		.NightVision = 0.f,
+		.DepthUvScale = { 0.f, 0.f },
 	};
+	// (49j, design 5.2-5.4) Physical Brightness: local adaptation. Strength = Local Adaptation Strength, highlights compressed (contrast <= 0.6
+	// from +1 EV) so a deep-twilight horizon band fits the screen; the pivot is the auto exposure's display key, read on the GPU (t4, not
+	// the 2-3 frame old readback); the Minimum Visibility floor (sky left out by the render-resolution depth); per-pixel night vision.
+	ID3D11ShaderResourceView* adaptationSrv = nullptr;
+	if (const auto& pb = *PhysicalBrightness::GetSingleton(); pb.Active()) {
+		cbData.Strength = std::clamp(pb.settings.localAdaptation, 0.f, 1.f);
+		cbData.HighlightContrast = std::min(cbData.HighlightContrast, 0.6f);
+		cbData.HighlightThreshold = 1.f;
+		if (autoExposure && autoExposure->PhysicalMode() && autoExposure->adaptationSB) {
+			adaptationSrv = autoExposure->adaptationSB->SRV();
+			cbData.Flags |= 1u;
+			if (pb.settings.minVisibility > 1e-4f) {
+				cbData.Flags |= 2u;
+				cbData.FloorLog = std::log2(pb.settings.minVisibility * 0.18f) + pb.deltaKVanilla;
+			}
+			if (pb.settings.nightVision > 1e-4f) {
+				cbData.Flags |= 4u;
+				cbData.NightVision = std::clamp(pb.settings.nightVision, 0.f, 1.f);
+			}
+			if (depthSrv)
+				cbData.DepthUvScale = depthUvScale;
+		}
+	}
 	localExposureCB->Update(cbData);
 
 	ID3D11Buffer* cb = localExposureCB->CB();
@@ -409,6 +447,11 @@ void LocalExposure::Draw(TextureInfo& inout_tex)
 		context->CSSetConstantBuffers(2, 1, &aeCB);
 		ID3D11ShaderResourceView* aeSrv = fused.aeAdaptation;
 		context->CSSetShaderResources(4, 1, &aeSrv);
+	} else if (adaptationSrv) {
+		context->CSSetShaderResources(4, 1, &adaptationSrv);  // (49j) the pivot without the fold
+	}
+	if (cbData.Flags & 2u) {
+		context->CSSetShaderResources(5, 1, &depthSrv);  // (49j) Minimum Visibility's sky test
 	}
 
 	std::array<ID3D11SamplerState*, 2> samplers = { linearSampler.get(), mirrorSampler.get() };
@@ -496,9 +539,11 @@ void LocalExposure::Draw(TextureInfo& inout_tex)
 	context->CSSetConstantBuffers(1, 1, &cb);
 	if (fold) {
 		context->CSSetConstantBuffers(2, 1, &cb);
-		ID3D11ShaderResourceView* nullSrv = nullptr;
-		context->CSSetShaderResources(4, 1, &nullSrv);
 		fused.exposure = false;
+	}
+	{
+		ID3D11ShaderResourceView* nullSrvs[2] = { nullptr, nullptr };
+		context->CSSetShaderResources(4, 2, nullSrvs);
 	}
 	samplers.fill(nullptr);
 	context->CSSetSamplers(0, (uint)samplers.size(), samplers.data());

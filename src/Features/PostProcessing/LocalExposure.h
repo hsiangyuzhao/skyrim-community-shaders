@@ -34,6 +34,9 @@ struct LocalExposure : public PostProcessFeature
 	}
 	virtual inline bool DisableInMainLoadingMenu() const override { return true; }
 	virtual bool SupportsVR() const override { return false; }
+	/// (49j) Physical Brightness runs this effect as the eye's local adaptation: on while its Local Adaptation Strength is above 0, whatever the
+	/// checkbox says (and off at 0); the checkbox decides again with Physical Brightness off.
+	virtual bool EnabledOverride(bool a_enabled) const override;
 
 	struct Settings
 	{
@@ -76,7 +79,11 @@ struct LocalExposure : public PostProcessFeature
 		float LogLuminanceMin;
 		float LogLuminanceMax;
 		float MiddleGreyCompensation;  // auto exposure's Exposure Compensation (linear), else 1
-		float pad;
+		uint Flags;                    // (49j) 1 pivot from the auto exposure's buffer, 2 Minimum Visibility floor, 4 night vision
+
+		float FloorLog;                // (49j) log2(Minimum Visibility x 0.18) + the vanilla night offset
+		float NightVision;             // (49j) night vision colour strength
+		float2 DepthUvScale;           // (49j) output UV -> render-resolution depth UV (0: no depth)
 	};
 	STATIC_ASSERT_ALIGNAS_16(LocalExposureCB);
 
