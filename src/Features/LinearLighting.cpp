@@ -1,4 +1,5 @@
 #include "LinearLighting.h"
+#include "Features/PhysicalBrightness.h"
 #include "PhysicalSky.h"
 
 #include "JiayeStatement.h"
@@ -294,6 +295,18 @@ void LinearLighting::Prepass()
 		effectScene.litSmokeMult = settings.litSmokeEffectMult;
 		effectScene.unlitSmokeMult = settings.unlitSmokeEffectMult;
 		effectScene.unlitSceneScale = unlitSceneScale;
+		// (49j, design 3.2 rows 10-12) Physical Brightness: effects follow the scene (forced), and Effect.hlsl splits an effect's colour into
+		// its lit part (the light already carries P) and its self-lit part, which takes P here: fire and magic x calFire x min(P, P_cap)
+		// (pad[0]), smoke and the rest x the game-colour factor (unlitSceneScale). The multipliers are art only then.
+		if (const auto& pb = *PhysicalBrightness::GetSingleton(); pb.Active() && !isMainLoadingMenu) {
+			effectScene.flags = 1u | 2u | 4u | 8u;
+			unlitSceneScale = ComputeUnlitSceneScaleWithPhysical();
+			effectScene.unlitSceneScale = unlitSceneScale;
+			effectScene.fireMagicMult = pb.settings.fireMagicStrength;
+			effectScene.litSmokeMult = 1.0f;
+			effectScene.unlitSmokeMult = 1.0f;
+			effectScene.pad[0] = pb.FireSelfLitScale();
+		}
 		EffectSceneCB->Update(effectScene);
 	}
 

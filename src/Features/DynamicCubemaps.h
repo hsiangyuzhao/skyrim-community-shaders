@@ -83,6 +83,10 @@ public:
 	bool fakeReflections = false;
 
 	bool resetCapture[2] = { true, true };
+	/// (49j) Physical Brightness: the pre-exposure P each capture chain's history is in (plain, reflections), and whether the model was in
+	/// effect then (a switch starts the history over: 49i units and P units do not convert).
+	float capturePreExposure[2] = { 1.f, 1.f };
+	bool captureBrightnessActive[2] = { false, false };
 	bool recompileFlag = false;
 
 	enum class NextTask

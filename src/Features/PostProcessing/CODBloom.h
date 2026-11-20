@@ -28,6 +28,8 @@ struct CODBloom : public PostProcessFeature
 		float UpsampleRadius;
 		float UpsampleMult;  // in composite: bloom mult
 		float CurrentMipMult;
+		float InputClamp;  ///< (49j) Physical Brightness: luminance clamp before the threshold (bloom.cs.hlsl)
+		float pad[3];
 	};
 	std::unique_ptr<ConstantBuffer> bloomCB = nullptr;
 

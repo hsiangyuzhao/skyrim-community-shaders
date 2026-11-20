@@ -106,6 +106,9 @@ struct PhysicalSky final : public Feature
 	};
 	/// What Reset() decides for the current worldspace, also used by the menu.
 	WorldspaceStatus GetWorldspaceStatus(float& a_zBottom) const;
+	/// (49j) Reset() will draw the physical sky this frame (master, shaders, Sky Sync, worldspace, not in the main / loading menu): Physical
+	/// Brightness decides its scene before the features' Reset.
+	bool WillDraw();
 
 	/// (42b) "Cloud Lighting".
 	enum CloudLighting : int

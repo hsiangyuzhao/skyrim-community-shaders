@@ -8,8 +8,9 @@
 #include "Common/Color.hlsli"
 
 RWStructuredBuffer<uint> RWBufferHistogram : register(u0);
-// (49h stage 2) Four floats: [0] the divisor the adapt pass uses (Classic: the adapted luminance), [1] the adapted scene
-// luminance (Purkinje, readouts), [2] the filtered target, [3] the compensation curve (linear; Classic 1).
+// (49h stage 2) Four floats: [0] the divisor the adapt pass uses (Classic: the adapted luminance; (49j) Physical Brightness: 0.18 / the
+// exposure, in pipeline units), [1] the adapted luminance (Physical Brightness: cd/m^2), [2] the filtered target (same units), [3] the
+// display key 2^dK (Classic 1).
 RWStructuredBuffer<float> RWBufferAdaptation : register(u1);
 
 Texture2D<float4> TexColor : register(t0);
@@ -20,10 +21,11 @@ const static float RcpLogLumRange = rcp(LogLumRange);
 
 // Increased thread count per group for better occupancy
 groupshared uint histogramShared[256];
-// (49h stage 2) Physical mode: prefix sums and the trimmed mean's two sums.
+// (49h stage 2) Physical mode: prefix sums and the trimmed mean's two sums. (49j) + the median bin.
 groupshared float scanShared[256];
 groupshared float sumShared[256];
 groupshared float weightShared[256];
+groupshared float medianShared;
 
 // Optimized hash function using fewer operations
 float2 hash2D(float2 p)
@@ -91,9 +93,9 @@ float4 ComputeBoxBounds(float2 dims)
 		}
 		else
 		{
-			// (49h stage 2) Physical: the wide range from the cbuffer; black counts as the darkest bin (the trim drops it); an
-			// optional centre weight (x1 at the corners up to x3 in the middle).
-			const float logLuma = (log2(max(luma, 1e-30)) - PhysMinLogLum) / PhysLogLumRange;
+			// (49j) Physical Brightness: the physical luminance (pipeline / P) over the wide range from the cbuffer; black counts as the
+			// darkest bin (the trim drops it); an optional centre weight (x1 at the corners up to x3 in the middle).
+			const float logLuma = (log2(max(luma / max(PhysPreExposure, 1e-30), 1e-30)) - PhysMinLogLum) / PhysLogLumRange;
 			const uint bin = uint(lerp(1, 255, saturate(logLuma)));
 			const float2 centre = (float2(pxCoord) / float2(dims) - 0.5) * 2.0;
 			const float weight = 1.0 + 2.0 * PhysCentreWeight * exp(-dot(centre, centre) / (2.0 * 0.3 * 0.3 * 2.0));
@@ -109,13 +111,18 @@ float4 ComputeBoxBounds(float2 dims)
 	}
 };
 
-float Softplus(float x)
+/// log2(1 + 2^x) without overflow (design 2.2.2 "softplus2").
+float Softplus2(float x)
 {
-	return x > 20.0 ? x : log(1.0 + exp(x));
+	return x > 30.0 ? x : log2(1.0 + exp2(x));
 }
 
-/// (49h stage 2) Physical mode: the trimmed log mean of this frame's histogram, the filtered target, the asymmetric log-domain
-/// adaptation and the compensation curve. One group of 256 threads, one bin each.
+/// (49j) Physical Brightness (design 2.2 / 5.1): the eye's global adaptation on the physical luminance and the display key.
+/// Target: the log mean of this frame's histogram with the darkest PhysTrimLow dropped and every sample above median + PhysWinsorEV counted
+/// as median + PhysWinsorEV (lamps, windows and a bright horizon band lift the adaptation only a little). Then the 0.2 s prefilter, the
+/// asymmetric log-domain adaptation with slew limits and the deadband, snap / hold. Display key offset
+///   dK = (1 - t) dK_vanilla + t (-s softplus2(log2(L_full / L_a))) + beta softplus2(log2(L_a / L_bright)) + EC,
+/// final exposure E = 0.18 2^dK / (L_a P). One group of 256 threads, one bin each.
 void PhysicalAverage(uint gidx)
 {
 	const float count = float(RWBufferHistogram[gidx]);
@@ -132,14 +139,24 @@ void PhysicalAverage(uint gidx)
 		GroupMemoryBarrierWithGroupSync();
 	}
 	const float total = scanShared[255];
-	const float lo = total * PhysTrimLow;
-	const float hi = total * (1.0 - PhysTrimHigh);
 	const float binEnd = scanShared[gidx];
 	const float binStart = binEnd - count;
-	const float w = max(min(binEnd, hi) - max(binStart, lo), 0.0);
 	// Bin i holds log luminance in [(i - 1) / 254, i / 254) of the range: its middle.
 	const float binLog = PhysMinLogLum + ((float(gidx) - 0.5) / 254.0) * PhysLogLumRange;
-	sumShared[gidx] = gidx > 0u ? w * binLog : 0.0;
+
+	// The median: the bin where the running count passes half of all samples (bin 0 is never filled).
+	if (gidx == 0)
+		medianShared = PhysMinLogLum;
+	GroupMemoryBarrierWithGroupSync();
+	const float half = total * 0.5;
+	if (gidx > 0u && count > 0.0 && binStart <= half && binEnd > half)
+		medianShared = binLog;
+	GroupMemoryBarrierWithGroupSync();
+	const float cap = medianShared + PhysWinsorEV;
+
+	const float lo = total * PhysTrimLow;
+	const float w = max(binEnd - max(binStart, lo), 0.0);
+	sumShared[gidx] = gidx > 0u ? w * min(binLog, cap) : 0.0;
 	weightShared[gidx] = gidx > 0u ? w : 0.0;
 	GroupMemoryBarrierWithGroupSync();
 	[unroll] for (uint stride = 128; stride > 0; stride >>= 1)
@@ -152,14 +169,14 @@ void PhysicalAverage(uint gidx)
 	}
 
 	if (gidx == 0) {
-		const float logLumMin = log2(0.125) + PhysAdaptMinEV;
-		const float logLumMax = log2(0.125) + PhysAdaptMaxEV;
+		const float logLumMin = PhysAdaptMinLog;
+		const float logLumMax = PhysAdaptMaxLog;
 		const float previousAdapted = RWBufferAdaptation[1];
 		const float previousTarget = RWBufferAdaptation[2];
 		const bool historyValid = previousAdapted > 0.0 && previousTarget > 0.0 && !isinf(previousAdapted) && !isinf(previousTarget) &&
 		                          !isnan(previousAdapted) && !isnan(previousTarget);
 		const bool haveTarget = weightShared[0] > 0.0;
-		float target = haveTarget ? clamp(sumShared[0] / weightShared[0], logLumMin, logLumMax) : (historyValid ? log2(previousTarget) : log2(0.125));
+		float target = haveTarget ? clamp(sumShared[0] / weightShared[0], logLumMin, logLumMax) : (historyValid ? log2(previousTarget) : 0.0);
 
 		float adapted;
 		float filtered;
@@ -189,13 +206,20 @@ void PhysicalAverage(uint gidx)
 		adapted = clamp(adapted, logLumMin, logLumMax);
 		filtered = clamp(filtered, logLumMin, logLumMax);
 
-		// Compensation curve on the adapted scene EV (log2 of luminance / 0.125), the adaptation held at EV_min.
-		const float ev = max(adapted - log2(0.125), PhysEVMin);
-		const float compensation = -PhysAlpha * Softplus(PhysEVRef - ev) + PhysBeta * Softplus(ev - PhysEVHi);
-		RWBufferAdaptation[0] = exp2(ev + log2(0.125) - compensation);
+		// Display key offset (design 2.2.2).
+		const float t = saturate(PhysNightDarkness);
+		const float keyPhysical = -PhysSlope * Softplus2(PhysLogFullAdapt - adapted);
+		float keyOffset = (1.0 - t) * PhysKeyVanilla + t * keyPhysical + PhysBrightBoost * Softplus2(adapted - PhysLogBright) + PhysCompensation;
+		// Without Local Exposure, Minimum Visibility is a floor for the whole picture (design 5.2).
+		if ((PhysFlags & 4u) != 0u)
+			keyOffset = max(keyOffset, PhysFloorLog + PhysKeyVanilla);
+		keyOffset = clamp(keyOffset, -12.0, 4.0);
+
+		// The divisor the adapt pass uses: colour x 0.18 / [0] = colour x E, E = 0.18 2^dK / (L_a P).
+		RWBufferAdaptation[0] = exp2(adapted - keyOffset) * max(PhysPreExposure, 1e-30);
 		RWBufferAdaptation[1] = exp2(adapted);
 		RWBufferAdaptation[2] = exp2(filtered);
-		RWBufferAdaptation[3] = exp2(compensation);
+		RWBufferAdaptation[3] = exp2(keyOffset);
 	}
 }
 

@@ -60,16 +60,16 @@ struct HistogramAutoExposure : public PostProcessFeature
 		kExposurePhysical,
 		kExposureModeCount
 	};
-	/// (49h stage 2) The mode in effect this frame (Auto resolved).
+	/// (49h stage 2) The mode in effect this frame. (49j) Physical Brightness mode while Physical Brightness is in effect, else Classic (the
+	/// Exposure Mode setting is kept in the file but no longer read: 49h's Physical mode is replaced).
 	[[nodiscard]] bool PhysicalMode() const;
-	/// (49h stage 2) Compensation curve constants that are not in the menu.
-	static constexpr float kPhysEVHi = 1.5f;
-	static constexpr float kPhysAdaptMinEV = -9.5f;
-	static constexpr float kPhysAdaptMaxEV = 5.f;
+	/// (49j) Physical Brightness mode constants (design 2.2.1): histogram over log2 cd/m^2 -18 .. +16, adaptation clamp, slew limits.
+	static constexpr float kPhysAdaptMinLog = -16.f;
+	static constexpr float kPhysAdaptMaxLog = 15.f;
 	static constexpr float kPhysSlewDark = 1.5f;    // EV per second
 	static constexpr float kPhysSlewBright = 3.f;
-	static constexpr float kPhysMinLogLum = -15.f;  // EV -12 .. +11
-	static constexpr float kPhysLogLumRange = 23.f;
+	static constexpr float kPhysMinLogLum = -18.f;
+	static constexpr float kPhysLogLumRange = 34.f;
 	/// (49h stage 2) Snap / hold bookkeeping (loads, fast travel, time skips, first frame, mode switch; menus hold).
 	int snapFrames = 2;
 	bool lastModePhysical = false;
@@ -79,6 +79,7 @@ struct HistogramAutoExposure : public PostProcessFeature
 	static constexpr int kReadbackCount = 3;
 	winrt::com_ptr<ID3D11Buffer> readbackBuffers[kReadbackCount];
 	bool readbackPending[kReadbackCount] = {};
+	bool readbackSlotPhysical[kReadbackCount] = {};  // (49j) the mode each copy was made in
 	uint32_t readbackIndex = 0;
 	float readback[4] = { 0.f, 0.f, 0.f, 1.f };
 	bool readbackValid = false;
@@ -110,35 +111,40 @@ struct HistogramAutoExposure : public PostProcessFeature
 		float padAlign[3];     // bytes 36-48: up to HLSL's register boundary
 		float padHlslArray[9]; // bytes 48-84: HLSL's float pad[3] (three registers, the last one partly)
 
-		// (49h stage 2) Physical mode (common.hlsli); Classic leaves them 0 and never reads them.
+		// (49j) Physical Brightness mode (common.hlsli; replaces 49h's Physical mode); Classic leaves them 0 and never reads them.
 		float PhysMinLogLum;
 		float PhysLogLumRange;
 		uint PhysMode;
 		float PhysDeltaTime;
 		float PhysTrimLow;
-		float PhysTrimHigh;
+		float PhysWinsorEV;
 		float PhysCentreWeight;
 		float PhysDeadband;
 		float PhysTauDark;
 		float PhysTauBright;
 		float PhysSlewDark;
 		float PhysSlewBright;
-		float PhysAlpha;
-		float PhysEVRef;
-		float PhysEVMin;
-		float PhysBeta;
-		float PhysEVHi;
-		float PhysAdaptMinEV;
-		float PhysAdaptMaxEV;
+		float PhysPreExposure;
+		float PhysNightDarkness;
+		float PhysSlope;
+		float PhysLogFullAdapt;
+		float PhysBrightBoost;
+		float PhysLogBright;
+		float PhysKeyVanilla;
 		uint PhysFlags;
+		float PhysCompensation;
+		float PhysFloorLog;
+		float PhysAdaptMinLog;
+		float PhysAdaptMaxLog;
 		float padTail[3];
 	};
-	// (49i) Offsets as fxc reports them for common.hlsli (histogram.cs.hlsl /Fc listing): PhysMinLogLum 84, PhysMode 92, PhysFlags 160.
+	// (49i) Offsets as fxc packs common.hlsli (the array pad[3] takes three registers): PhysMinLogLum 84, PhysMode 92; (49j) PhysFlags 160.
 	static_assert(offsetof(AutoExposureCB, PurkinjeStrength) == 32);
 	static_assert(offsetof(AutoExposureCB, PhysMinLogLum) == 84);
 	static_assert(offsetof(AutoExposureCB, PhysMode) == 92);
 	static_assert(offsetof(AutoExposureCB, PhysFlags) == 160);
-	static_assert(sizeof(AutoExposureCB) == 176);
+	static_assert(offsetof(AutoExposureCB, PhysAdaptMaxLog) == 176);
+	static_assert(sizeof(AutoExposureCB) == 192);
 	std::unique_ptr<ConstantBuffer> autoExposureCB = nullptr;
 	std::unique_ptr<StructuredBuffer> histogramSB = nullptr;
 	std::unique_ptr<StructuredBuffer> adaptationSB = nullptr;

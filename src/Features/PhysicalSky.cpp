@@ -10,6 +10,7 @@
 #include "ExponentialHeightFog.h"
 #include "Deferred.h"
 #include "LinearLighting.h"
+#include "PhysicalBrightness.h"
 #include "SkySync.h"
 #include "TerrainShadows.h"
 
@@ -112,6 +113,7 @@ void PhysicalSky::DataLoaded()
 void PhysicalSky::RestoreDefaultSettings()
 {
 	settings = {};
+	PhysicalBrightness::GetSingleton()->Load(json::object());  // (49j)
 	UpdateEffective();
 }
 
@@ -170,6 +172,11 @@ void PhysicalSky::LoadSettings(json& o_json)
 		settings.moonStarFadeStrength = o_json.value("moonStarFadeStrength", defaults.moonStarFadeStrength);
 		settings.moonPlanetshineStrength = o_json.value("moonPlanetshineStrength", defaults.moonPlanetshineStrength);
 	}
+	// (49j) Physical Brightness: its own key (an independent module).
+	if (const auto it = o_json.find("physicalBrightness"); it != o_json.end())
+		PhysicalBrightness::GetSingleton()->Load(*it);
+	else
+		PhysicalBrightness::GetSingleton()->Load(json::object());
 	settings.aerosolPreset = std::clamp(settings.aerosolPreset, 0, kAerosolPresetCount - 1);
 	settings.nightBaseLight = std::clamp(settings.nightBaseLight, 0.f, 1.f);
 	settings.twilightLength = std::clamp(settings.twilightLength, 1.f, 3.f);
@@ -327,6 +334,7 @@ void PhysicalSky::SaveSettings(json& o_json)
 	}
 	o_json["moonStarFadeStrength"] = settings.moonStarFadeStrength;
 	o_json["moonPlanetshineStrength"] = settings.moonPlanetshineStrength;
+	PhysicalBrightness::GetSingleton()->Save(o_json["physicalBrightness"]);  // (49j)
 }
 
 void PhysicalSky::GetUploadedAerosol(float3& a_scatter, float3& a_absorption, float& a_phaseG) const
@@ -1155,8 +1163,10 @@ void PhysicalSky::UpdateMoonData(float a_exposure, float a_sunElevation, float3&
 			return std::clamp(irradiance / std::max(solidAngle, 1e-6f), 1.f, cap);
 		};
 		if (physScene.active) {
-			moonCbData.masserDiskScale = discScaleAt(sky->masser, settings.masserColor) * realRatio(0, settings.masserColor);
-			moonCbData.secundaDiskScale = discScaleAt(sky->secunda, settings.secundaColor) * realRatio(1, settings.secundaColor);
+			// (49j) Physical Brightness: the disc at the full moon's real luminance (~2500 cd/m^2, the same at every phase) x min(P, P_cap).
+			(void)discScaleAt;
+			(void)realRatio;
+			moonCbData.masserDiskScale = moonCbData.secundaDiskScale = PhysicalBrightness::GetSingleton()->MoonDiscScale();
 		} else {
 			moonCbData.masserDiskScale = discScale(sky->masser, settings.masserColor);
 			moonCbData.secundaDiskScale = discScale(sky->secunda, settings.secundaColor);
@@ -1250,13 +1260,10 @@ std::string PhysicalSky::DescribeForTrace() const
 		s.enabled && cbData.enabled ? "on" : (s.enabled ? "on (not drawn here)" : "off"), SkyFixesActive() ? "on" : "off", s.moonGlowStrength,
 		s.moonFadesStars ? "on" : "off", s.moonStarFadeStrength, moonStarFadeAmount[0], moonStarFadeAmount[1],
 		s.moonPlanetshine ? "on" : "off", s.moonPlanetshineStrength, moonPlanetshineAmount[0], moonPlanetshineAmount[1]);
-	// (49h stage 2) Physical outdoor lighting.
-	const auto& pl = s.physicalLighting;
+	// (49j) The physical scene (Physical Brightness outdoors) and the Lighting Fixes master.
 	const auto& ps = physScene;
-	text += std::format("; physical lighting {} (sky ratios {}, physical ambient {}, measured clouds {}, follow {}): S {:+.2f} EV, scene light {:+.2f} EV vs anchor, cloud cover {:.2f} ({}), R_amb {:.2f}, stars x{:.2f}",
-		pl.enabled ? "on" : "off", ps.active ? "in effect" : (pl.realSkyRatios ? "on (not here)" : "off"), ps.ambientActive ? "in effect" : (pl.physicalAmbient ? "on (not here)" : "off"),
-		pl.measuredClouds ? (ps.coverMeasured ? "measured" : "on (estimate)") : "off", ps.followActive ? "in effect" : (pl.cloudsStarsWaterFollow ? "on (not here)" : "off"),
-		std::log2(std::max(ps.S, 1e-6f)), ps.eRef > 0.f && ps.eReal > 0.f ? std::log2(ps.eReal / ps.eRef) : 0.f, ps.cover, ps.coverMeasured ? "measured" : "estimate", ps.rAmb, ps.starScale);
+	text += std::format("; lighting fixes {}; physical scene {}: S (P x lux per sun unit) {:+.2f} EV, cloud cover {:.2f} ({}), game-colour factor {:.3g}, stars x{:.3g}",
+		s.physicalLighting.enabled ? "on" : "off", ps.active ? "in effect" : "off", std::log2(std::max(ps.S, 1e-30f)), ps.cover, ps.coverMeasured ? "measured" : "estimate", ps.rAmb, ps.starScale);
 	return text;
 }
 
@@ -1566,7 +1573,8 @@ void PhysicalSky::UpdateCloudData(float a_exposure, float a_sunElevation)
 		sunlightScale = !globals::game::isVR ? imageSpaceManager->GetRuntimeData().data.baseData.hdr.sunlightScale : imageSpaceManager->GetVRRuntimeData().data.baseData.hdr.sunlightScale;
 	if (!std::isfinite(sunlightScale) || sunlightScale < 0.f)
 		sunlightScale = 1.f;
-	const float scale = a_exposure * sunlightScale / pbrCompensation;
+	// (49j) Physical Brightness: the ground's light colour is E / (pi x VDM) (Reset), so the clouds' (S1: x 2 x VDM) end at 2 / pi.
+	const float scale = a_exposure * sunlightScale / pbrCompensation / (physScene.active ? RE::NI_PI * PhysicalBrightness::VanillaDiffuseMult() : 1.f);
 
 	// The sun: no horizon factor here. Sky.hlsl applies the transmittance and the planet's shadow
 	// at the cloud, which is what keeps high clouds lit after sunset.
@@ -1617,6 +1625,22 @@ void PhysicalSky::UpdateEffective()
 		effective.twilightLength = 1.f;
 }
 
+bool PhysicalSky::WillDraw()
+{
+	// (49j) As Reset()'s allGood below.
+	if (!loaded)
+		return false;
+	const auto& skySync = globals::features::skySync;
+	if (!settings.enabled || !ShadersOK() || !skySync.loaded || !skySync.settings.Enabled)
+		return false;
+	const bool inMainLoadingMenu = globals::game::ui && (globals::game::ui->IsMenuOpen(RE::MainMenu::MENU_NAME) || globals::game::ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME));
+	if (inMainLoadingMenu)
+		return false;
+	float zBottom = 0.f;
+	const auto status = GetWorldspaceStatus(zBottom);
+	return status == WorldspaceStatus::Whitelist || status == WorldspaceStatus::AllExteriors;
+}
+
 void PhysicalSky::Reset()
 {
 	UpdateEffective();
@@ -1644,15 +1668,15 @@ void PhysicalSky::Reset()
 			skySync.lightColors = std::nullopt;
 		skyScaleSmoothed = -1.f;  // (47a) snap when the sky comes back
 		cbData.enabled = allGood;
-		horizonFixCbData = {};  // (47f)
-		horizonFixCbData.flags = PhysLightingFlags();  // (49h stage 1) the rules that do not need the physical sky still apply (interiors)
-		cloudCbData = {};
-		linearLighting.isDirLightLinear = false;
-		// (49h stage 2) Interiors and other worldspaces: no ambient rewrite, S = 1 (the auto exposure curve still applies).
+		// (49h stage 2) Interiors and other worldspaces: no ambient rewrite, S = 1. (49j) Reset before the flags below read it.
 		physScene.active = physScene.ambientActive = physScene.followActive = false;
 		physScene.sValid = false;
 		physScene.S = 1.f;
 		physScene.rAmb = physScene.starScale = physScene.unlitScale = 1.f;
+		horizonFixCbData = {};  // (47f)
+		horizonFixCbData.flags = PhysLightingFlags();  // (49h stage 1) the rules that do not need the physical sky still apply (interiors)
+		cloudCbData = {};
+		linearLighting.isDirLightLinear = false;
 		return;
 	}
 
@@ -1795,10 +1819,18 @@ void PhysicalSky::Reset()
 		.silverLiningMix = settings.silverLiningMix,
 		.silverLiningSpread = settings.silverLiningSpread,
 	};
+	// (49j) Physical Brightness: the clouds' own (weather-coloured) part is a game colour: x the game-colour factor (design 3.2 row 5).
+	if (physScene.followActive)
+		cbData.cloudOriginalMix = settings.cloudOriginalMix * physScene.rAmb;
 
-	if (settings.overrideDirLight) {
+	// (49j) Physical Brightness needs the direct light to be Physical Sky's (design 9: Override Directional Light forced on).
+	if (settings.overrideDirLight || physScene.active) {
 		linearLighting.isDirLightLinear = true;
-		const float pbrCompensationMult = linearLighting.settings.enableLinearLighting ? 1.0f : RE::NI_PI;  // Colors should match PBR values when not using linear lighting
+		float pbrCompensationMult = linearLighting.settings.enableLinearLighting ? 1.0f : RE::NI_PI;  // Colors should match PBR values when not using linear lighting
+		// (49j, design 2.1) Physical Brightness: the light colour is E x P / (pi x Vanilla Diffuse Mult), so Lighting's colour x VDM x N.L x albedo
+		// is albedo x E cos / pi x P (the sky pixels are radiance x 1: 49h's 0.28 against 1 / pi, 12% apart, is gone).
+		if (physScene.active)
+			pbrCompensationMult *= RE::NI_PI * PhysicalBrightness::VanillaDiffuseMult();
 		auto LightConvFn = [pbrCompensationMult](float3 color) {
 			color /= pbrCompensationMult;
 			return RE::NiColor(color.x, color.y, color.z);
@@ -2251,30 +2283,26 @@ float3 PhysicalSky::ComputeLightTransmittance(const float3& a_dir)
 
 uint32_t PhysicalSky::PhysLightingFlags() const
 {
-	// (49h stage 1) Physical Lighting rule bits for SharedData::horizonFixData.Flags (Common/PhysicalLighting.hlsli).
+	// (49h stage 1) Rule bits for SharedData::horizonFixData.Flags (Common/PhysicalLighting.hlsli).
+	// (49j) Two owners now: "Lighting Fixes" (the 49h master, kept for S3a-S8: they do not change units) and Physical Brightness, which
+	// alone sets the unit rules S1 / S2 and "follow" (kPLFollow: the game's unlit colours x the game-colour factor in Altitude, the
+	// stars x AnchorOffset). With Physical Brightness off none of them is set: brightness as before 49h.
 	const auto& pl = settings.physicalLighting;
-	// (49j, design 9-4) Independent of the master.
-	const uint32_t independent = (loaded && settings.rainNoColour) ? kPLRainNoColour : 0u;
-	if (!pl.enabled)
-		return independent;
-	uint32_t flags = independent;
-	flags |= pl.sameDirectLight ? kPLDirect : 0u;
-	flags |= pl.sameDirectLight && pl.moonCloudGrey ? kPLMoonGrey : 0u;
-	// (49j, design 9-8) S2 reads the engine ambient (Sky.hlsl): only while that ambient is the physical one, else the clouds are lit in
-	// weather units next to a sky in physical units (mixed units: the overcast night +3.6 EV).
-	flags |= pl.cloudAmbient && physScene.ambientActive ? kPLCloudAmbient : 0u;
-	flags |= pl.iblNoFeedback ? kPLIblNoFeedback : 0u;
-	flags |= pl.iblEnvOcclusion ? kPLEnvOcclusion : 0u;
-	flags |= pl.farSkylight ? kPLFarSkylight : 0u;
-	flags |= pl.lodScale ? kPLLodScale : 0u;
-	flags |= pl.farFog ? kPLFarFog : 0u;
-	flags |= pl.forwardCubemap ? kPLForwardCubemap : 0u;
-	flags |= pl.smallFixes ? kPLSmallFixes : 0u;
-	// (49h stage 2) In effect this frame (outdoors with the physical sky; 0 indoors).
-	flags |= physScene.active ? kPLRealRatios : 0u;
-	flags |= physScene.ambientActive ? kPLPhysAmbient : 0u;
-	flags |= physScene.active && pl.measuredClouds ? kPLMeasuredClouds : 0u;
-	flags |= physScene.followActive ? kPLFollow : 0u;
+	uint32_t flags = (loaded && settings.rainNoColour) ? kPLRainNoColour : 0u;  // (49j, design 9-4) independent
+	if (pl.enabled) {
+		flags |= pl.iblNoFeedback ? kPLIblNoFeedback : 0u;
+		flags |= pl.iblEnvOcclusion ? kPLEnvOcclusion : 0u;
+		flags |= pl.farSkylight ? kPLFarSkylight : 0u;
+		flags |= pl.lodScale ? kPLLodScale : 0u;
+		flags |= pl.farFog ? kPLFarFog : 0u;
+		flags |= pl.forwardCubemap ? kPLForwardCubemap : 0u;
+		flags |= pl.smallFixes ? kPLSmallFixes : 0u;
+	}
+	// Physical Brightness in effect this frame (outdoors with the physical sky; step 5 adds the other scenes' follow bit).
+	if (physScene.active) {
+		flags |= kPLDirect | kPLCloudAmbient | kPLRealRatios | kPLPhysAmbient | kPLFollow;
+		flags |= PhysicalBrightness::GetSingleton()->settings.measuredClouds ? kPLMeasuredClouds : 0u;
+	}
 	// True PBR land drawn in the last ~2 s (the near land's light scale is 1 / pi then).
 	const uint32_t frame = globals::state->frameCount;
 	const uint32_t lastPbr = TruePBR::lastPbrLandFrame.load(std::memory_order_relaxed);
@@ -2285,36 +2313,22 @@ uint32_t PhysicalSky::PhysLightingFlags() const
 
 void PhysicalSky::SettingsSceneLighting()
 {
-	// (49h stage 1) Physical Lighting: one light model for the ground, the sky, clouds, effects, fog and the far scenery.
-	InfoBox("One light model for everything: the ground, clouds, lit smoke, fog, reflections and the far scenery get the sun, the moon and the sky in the same units.");
+	// (49j) Physical Brightness (an independent module, PhysicalBrightness.cpp) first, organised by the four layers; then the 49h fixes that do
+	// not change units (their own master, "Lighting Fixes"), then the related switches.
+	InfoBox("Physical Brightness: real light units for everything, an eye that adapts, a screen curve that keeps colours. Lighting Fixes below work either way.");
+	PhysicalBrightness::GetSingleton()->DrawSettings();
+
+	ImGui::SeparatorText("Lighting Fixes");
+	ImGui::TextDisabled("Fixes that do not change the light units: they work with Physical Brightness on or off.");
 	auto& pl = settings.physicalLighting;
-	ImGui::Checkbox("Physical Lighting", &pl.enabled);
+	ImGui::Checkbox("Lighting Fixes", &pl.enabled);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text(
-			"On (default): the rules below (each can be switched alone). Off: everything as in 49h before this tab existed.\n"
-			"Shown in game where it matters most: night clouds against the moonlit ground, snow in the open, forest edges,\n"
-			"the edge of the loaded area, and fog in the distance.");
+			"On: the fixes below (each can be switched alone). Off: none of them (as 49h groups 1-7).\n"
+			"(49j) This was the \"Physical Lighting\" master of 49h; its unit rules (Same Sun and Moon Light Everywhere, Clouds Get the Sky's\n"
+			"Ambient Light, Real Sky Ratios, Physical Ambient, Clouds / Stars / Water Follow) are part of Physical Brightness now.");
 	ImGui::BeginDisabled(!pl.enabled);
 	ImGui::Indent();
-	ImGui::Checkbox("Same Sun and Moon Light Everywhere", &pl.sameDirectLight);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text(
-			"Sunlit clouds are as bright as a white wall in the same sun (were ~1.8x brighter). Moonlight on clouds is the same light\n"
-			"as on the ground (no extra strength factor, not counted twice). Lit smoke and mist never glow brighter than lit\n"
-			"(mountain clouds were x1.5). A weather that hides the moon also takes the moonlight off the ground, and the moon fades\n"
-			"in and out at the same height on the ground and on the clouds.");
-	ImGui::Indent();
-	ImGui::BeginDisabled(!pl.sameDirectLight);
-	ImGui::Checkbox("Greyer Moonlight on Clouds", &pl.moonCloudGrey);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text("Off (default): clouds get the moonlight's own colour, as the ground does. On: partly grey, as before (Moon Cloud Saturation).");
-	ImGui::EndDisabled();
-	ImGui::Unindent();
-	ImGui::Checkbox("Clouds Get the Sky's Ambient Light", &pl.cloudAmbient);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text(
-			"Clouds are lit by the same sky light that lights the ground in shade (were multiplied by the weather's near-black\n"
-			"night cloud colour, so night clouds had almost none). The weather's cloud colour only tints them.");
 	ImGui::Checkbox("Screen Light Probe Without Feedback", &pl.iblNoFeedback);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text(
@@ -2357,101 +2371,24 @@ void PhysicalSky::SettingsSceneLighting()
 			"Unlit effects counted the surroundings' light twice and the weather ambient unconverted; distant billboard trees got\n"
 			"the weather ambient through roofs and canopies; the deferred ambient used another upward boost than the surfaces;\n"
 			"indoors a few passes scaled the sun differently.");
-	// (49h stage 2) Physical outdoor lighting (design-49h-stage2.md).
-	ImGui::Checkbox("Real Sky Ratios", &pl.realSkyRatios);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text(
-			"The sun, the moons, the sky, the clouds and the night sky keep their real brightness ratios, squeezed by one factor\n"
-			"(S below) so they fit the screen: a clear sky with the sun at 30 degrees looks as before, nights are much darker\n"
-			"before the eye adapts (Post Processing > Histogram Auto Exposure, Exposure Mode Auto / Physical). The moon is the\n"
-			"real moon (a crescent ~1/40 of full), its sky glow and its light on clouds at full strength, the moonless sky a faint\n"
-			"airglow in the weather's night colour; dusk fades continuously into night. Needs Override Directional Light.\n"
-			"Off: as stage 1 (no scaling).");
-	ImGui::Checkbox("Physical Ambient", &pl.physicalAmbient);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text(
-			"The game's ambient light (the light in shade) comes from the physical sky now, through the clouds, keeping only the\n"
-			"weather's colour: shade, fog, grass, distant trees, lit smoke and the cubemap all follow the sky. Image Based\n"
-			"Lighting then adds only the light bounced off the surroundings (its weather-ambient and sky values are overridden\n"
-			"while this is on; your saved values come back when it is off). Off: the weather's ambient as before.");
-	// (49i) Under Physical Ambient.
-	ImGui::Indent();
-	ImGui::BeginDisabled(!pl.physicalAmbient);
-	ImGui::Checkbox("Ground Bounce", &pl.groundBounce);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text(
-			"On (default): the ground lights things from below with the light it reflects (the atmosphere's ground albedo, 0.2, more\n"
-			"on snow with Dynamic Snow): undersides, walls and faces in shade get the bounce from the sunlit ground, the full amount\n"
-			"facing down, half facing sideways. Off: as 49h (no light from below: shade was far too dark).");
-	ImGui::Checkbox("Accurate Ambient Directions (experimental)", &pl.ambientFit);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text(
-			"Off (default, as 49h): the game stores the ambient as one colour plus one change per axis, mixed in gamma space.\n"
-			"On: those numbers are fitted so the ambient comes out right on faces pointing in 26 directions, vertical and upward\n"
-			"faces counting more than undersides. The game's form cannot be exact at dusk and dawn (a bright west and a dark east\n"
-			"share one mean): 50-100%% on single faces then is a limit of the form, with or without the fit (with Ground Bounce the\n"
-			"error is small only while the sun is high). The line \"Ambient direction error\" below shows both.");
-	ImGui::Checkbox("Probe Forgets Out-of-View Light", &pl.probeForget);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text(
-			"On (default): the screen light probe that Image Based Lighting takes the surroundings' bounce from (Dynamic Cubemaps) counts\n"
-			"the sky it sees as no bounce (the sky's light is already in the ambient). What it saw earlier stays while you only turn\n"
-			"around; once you have moved sideways by more than about a third of its distance it is replaced by an estimate (grey ground\n"
-			"in the ambient and some sun), never black (49i faded everything behind you to black in 3 s).\n"
-			"Off: as 49h (the sky directions were filled with ground colour, and everything once seen stayed until the next load).");
-	ImGui::EndDisabled();
 	ImGui::Unindent();
-	ImGui::Checkbox("Overcast From Measured Clouds", &pl.measuredClouds);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text(
-			"How cloudy it is and whether a cloud covers the sun or a moon is measured from the clouds actually drawn (Cloud\n"
-			"Shadows' cloud map). Off, or without Cloud Shadows: estimated from the weather type (clear / cloudy / rain / snow).");
-	ImGui::Checkbox("Clouds, Stars and Water Follow", &pl.cloudsStarsWaterFollow);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text(
-			"Stars and the Milky Way keep their brightness against the night sky (they are fixed-brightness pictures), and the\n"
-			"water's own colour follows the ambient light. Clouds already follow through the two boxes above.");
+	ImGui::EndDisabled();
 	{
+		// (49i) Readouts of the physical scene (Physical Brightness outdoors).
 		const auto& ps = physScene;
-		if (ps.active)
-			ImGui::TextDisabled("Sky compression S: %+.2f EV; scene light %+.2f EV against a clear sky with the sun at 30 degrees",
-				std::log2(std::max(ps.S, 1e-6f)), ps.eRef > 0.f && ps.eReal > 0.f ? std::log2(ps.eReal / ps.eRef) : 0.f);
-		else if (pl.enabled && pl.realSkyRatios)
-			ImGui::TextDisabled("Sky compression: not in effect here (interior, no physical sky, or Override Directional Light off)");
-		if (ps.active || ps.ambientActive)
-			ImGui::TextDisabled("Cloud cover %.2f (%s); cloud in front of the sun %.2f", ps.cover, ps.coverMeasured ? "measured" : "weather estimate",
-				1.f - ps.coverTr[0]);
-		if (ps.ambientActive || ps.followActive)
-			ImGui::TextDisabled("Ambient now / weather ambient (R_amb): %.2f; stars x%.2f; unlit smoke x%.2f", ps.rAmb, ps.starScale, ps.unlitScale);
-		// (49i) Two readouts: the sky against the direct light on a horizontal face, and the CPU sky against the IBL sky probe.
-		if (ps.ambientActive || ps.active) {
+		if (ps.ambientActive) {
 			if (ps.directLum > 1e-9f)
 				ImGui::TextDisabled("Sky / direct on a horizontal surface: %.3f (1/%.1f) (clear sky ~1/8 with the sun at 60 deg, ~1/5 at 30 deg, 1 or more near sunset)",
 					ps.skyUpLum / ps.directLum, ps.skyUpLum > 1e-12f ? ps.directLum / ps.skyUpLum : 0.f);
 			else
 				ImGui::TextDisabled("Sky / direct on a horizontal surface: no direct sun or moon now (sky only)");
-			if (pl.groundBounce && ps.ambientActive)
+			ImGui::TextDisabled("Cloud cover %.2f (%s); cloud in front of the sun %.2f", ps.cover, ps.coverMeasured ? "measured" : "weather estimate", 1.f - ps.coverTr[0]);
+			if (PhysicalBrightness::GetSingleton()->settings.groundBounce)
 				ImGui::TextDisabled("Ground bounce: albedo %.2f (snow %.0f%%)", 0.2126f * ps.bounceAlbedo.x + 0.7152f * ps.bounceAlbedo.y + 0.0722f * ps.bounceAlbedo.z, ps.bounceSnow * 100.f);
-			if (ps.ambientActive)
-				ImGui::TextDisabled("Ambient direction error (largest of 26 directions): %.0f%% %s; 49h construction %.0f%%", ps.fitErrorNew * 100.f,
-					ps.fitApplied ? "(fitted)" : "(49h construction)", ps.fitErrorOld * 100.f);
-			auto& ibl = globals::features::ibl;
-			ibl.RequestSkyProbeReadback();
-			float3 probe;
-			if (ibl.GetSkyProbeUp(probe)) {
-				const float cpu = ps.skyUpLum * ps.S / RE::NI_PI;
-				const float gpu = 0.2126f * probe.x + 0.7152f * probe.y + 0.0722f * probe.z;
-				if (gpu > 1e-9f)
-					ImGui::TextDisabled("CPU sky vs the IBL sky probe (upward face, irradiance / pi): %.3g vs %.3g = %.2f", cpu, gpu, cpu / gpu);
-				else
-					ImGui::TextDisabled("CPU sky vs the IBL sky probe: probe is black (%.3g on the CPU)", cpu);
-			} else {
-				ImGui::TextDisabled("CPU sky vs the IBL sky probe: waiting for the probe (Image Based Lighting on?)");
-			}
+			ImGui::TextDisabled("Ambient direction error (largest of 26 directions): %.0f%% %s; 49h construction %.0f%%", ps.fitErrorNew * 100.f,
+				ps.fitApplied ? "(fitted)" : "(49h construction)", ps.fitErrorOld * 100.f);
 		}
 	}
-	ImGui::Unindent();
-	ImGui::EndDisabled();
 
 	ImGui::SeparatorText("Related (own switches)");
 	ImGui::Checkbox("Sun Highlight on Water Follows the Atmosphere", &settings.waterSunTransmittance);
@@ -2469,25 +2406,6 @@ void PhysicalSky::SettingsSceneLighting()
 	if (pl.enabled && pl.lodScale)
 		ImGui::TextDisabled("PBR land seen: %s", (PhysLightingFlags() & kPLLandPbr) ? "yes (far land uses the PBR scale)" : "no");
 
-	// (49h stage 2) Engineering constants, collapsed. Not look controls (the look control is Dark Scene Compensation in the auto exposure).
-	if (ImGui::TreeNodeEx("Developer", ImGuiTreeNodeFlags_None)) {
-		ImGui::SliderFloat("Compression k", &pl.compressionK, 0.1f, 1.f, "%.2f");
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("Screen light = anchor x (real light / anchor)^k. 1 = no compression (real ratios), 0.3 = default.");
-		ImGui::SliderFloat("Overcast Pass-Through", &pl.overcastKappa, 0.f, 1.f, "%.2f");
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("Share of the blocked sunlight and of the clear sky that a full cloud cover still lets through as diffuse light.");
-		ImGui::SliderFloat("Full Moon Sky / Airglow", &pl.airglowRatio, 5.f, 100.f, "%.0f");
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("The moonless night sky is the full-moon sky's brightness divided by this.");
-		ImGui::SliderFloat("Smoothing", &pl.smoothingSeconds, 0.1f, 10.f, "%.1f s");
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("S and the ambient follow the sky with this time constant (jumps after loads and time skips).");
-		ImGui::SliderFloat("Weather Hue Saturation Cap", &pl.hueSaturationCap, 0.f, 1.f, "%.2f");
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("The weather's ambient and night-sky colours are used at most this saturated.");
-		ImGui::TreePop();
-	}
 }
 
 ////////////////////////////////////////////////// (49h stage 2) Physical outdoor lighting (design-49h-stage2.md 0 / A)
@@ -2801,7 +2719,7 @@ float PhysicalSky::WeatherCloudCover()
 void PhysicalSky::DispatchCloudCover()
 {
 	// (49h stage 2) T3: the cube reduce (CloudCoverCS.hlsl) and a non-blocking readback 2-3 frames late.
-	if (!csCloudCover || !cloudCoverSB || !cloudCoverCB || !PhysLightingOn(settings.physicalLighting.measuredClouds))
+	if (!csCloudCover || !cloudCoverSB || !cloudCoverCB || !PhysicalBrightness::GetSingleton()->OutdoorPhysical() || !PhysicalBrightness::GetSingleton()->settings.measuredClouds)
 		return;
 	auto& cloudShadows = globals::features::cloudShadows;
 	if (!cloudShadows.loaded || !cloudShadows.texCubemapCloudOccCopy || cloudShadows.FramesSinceCapture() > CloudShadows::kCaptureMaxAgeFrames)
@@ -2878,9 +2796,13 @@ void PhysicalSky::UpdatePhysicalScene(const RE::NiPoint3& a_lutSunDir, const RE:
 {
 	auto& ps = physScene;
 	const auto& pl = settings.physicalLighting;
-	const bool wantRatios = PhysLightingOn(pl.realSkyRatios) && settings.overrideDirLight;  // the direct light must be Physical Sky's to scale it
-	const bool wantAmbient = PhysLightingOn(pl.physicalAmbient);
-	const bool wantFollow = PhysLightingOn(pl.cloudsStarsWaterFollow);
+	// (49j) Physical Brightness replaces 49h's Real Sky Ratios / Physical Ambient / Follow boxes: all three are its scene layer outdoors (one
+	// switch, no mixed units). S is no longer a compression: it is P x lux per sun unit (PhysicalBrightness::SunUnitsToPipeline).
+	const auto& pb = *PhysicalBrightness::GetSingleton();
+	const auto& pbs = pb.settings;
+	const bool wantRatios = pb.OutdoorPhysical();
+	const bool wantAmbient = wantRatios;
+	const bool wantFollow = wantRatios;
 	auto neutral = [&ps]() {
 		ps.active = ps.ambientActive = ps.followActive = false;
 		ps.S = ps.sTarget = 1.f;
@@ -2903,7 +2825,10 @@ void PhysicalSky::UpdatePhysicalScene(const RE::NiPoint3& a_lutSunDir, const RE:
 	const float ambientGamma = ll.enableLinearLighting && std::isfinite(ll.ambientGamma) ? std::clamp(ll.ambientGamma, 0.1f, 5.f) : 1.f;
 	const float pbrCompensation = ll.enableLinearLighting ? 1.f : RE::NI_PI;
 	const float diffuseMult = ll.enableLinearLighting && std::isfinite(ll.vanillaDiffuseMult) ? std::max(ll.vanillaDiffuseMult, 0.f) : 1.f;
-	const float toShader = diffuseMult / pbrCompensation;  // irradiance (light-colour units) -> the shaders' ambient (as the direct light x NdotL x 0.28)
+	(void)diffuseMult;
+	(void)pbrCompensation;
+	// (49j, design 2.1) Irradiance -> the shaders' ambient: E / pi (a white surface's luminance), x Sky Ambient Strength (art). 49h: x VDM.
+	const float toShader = std::clamp(pbs.skyAmbientStrength, 0.f, 4.f) / RE::NI_PI;
 	const float hueCap = std::clamp(pl.hueSaturationCap, 0.f, 1.f);
 
 	// The moons at the real ratio: the user's colours give only the hue.
@@ -2958,7 +2883,7 @@ void PhysicalSky::UpdatePhysicalScene(const RE::NiPoint3& a_lutSunDir, const RE:
 		moon60.color = ToVec3(ps.moonReal[0]);
 		ps.anchorFullMoonSky = std::max(LuminanceV(skyModelCpu.SkyRay(cameraRadius, { 0.0, 0.0, 1.0 }, &moon60, 1)), 0.f);
 	}
-	ps.airglowZenith = ps.anchorFullMoonSky / std::clamp(pl.airglowRatio, 1.f, 1000.f);
+	ps.airglowZenith = ps.anchorFullMoonSky / std::clamp(pbs.airglowRatio, 1.f, 1000.f);
 
 	// ---- The sky now (every 4th frame, and on a snap) ----
 	if (snap || ps.heavyFrame == UINT32_MAX || frame - ps.heavyFrame >= 4u) {
@@ -3009,7 +2934,7 @@ void PhysicalSky::UpdatePhysicalScene(const RE::NiPoint3& a_lutSunDir, const RE:
 		}
 
 		// ---- Clouds: cover c and the transmission toward each body; overcast = kappa x (the blocked direct + the clear sky) ----
-		const bool measured = PhysLightingOn(pl.measuredClouds) && cloudMeasuredFrame != UINT32_MAX && frame - cloudMeasuredFrame < 60u;
+		const bool measured = pbs.measuredClouds && cloudMeasuredFrame != UINT32_MAX && frame - cloudMeasuredFrame < 60u;
 		float cover, tr[3];
 		if (measured) {
 			cover = cloudMeasured[0];
@@ -3024,7 +2949,7 @@ void PhysicalSky::UpdatePhysicalScene(const RE::NiPoint3& a_lutSunDir, const RE:
 		ps.coverMeasured = measured;
 		for (int i = 0; i < 3; ++i)
 			ps.coverTr[i] = tr[i];
-		const float kappa = std::clamp(pl.overcastKappa, 0.f, 1.f);
+		const float kappa = std::clamp(pbs.overcastKappa, 0.f, 1.f);
 		float3 blocked = {}, directNow = {};
 		for (int i = 0; i < 3; ++i) {
 			blocked += direct[i] * (1.f - tr[i]);
@@ -3044,7 +2969,7 @@ void PhysicalSky::UpdatePhysicalScene(const RE::NiPoint3& a_lutSunDir, const RE:
 		}
 		ps.skyUpLum = Luminance3(skyUp);
 		ps.directLum = Luminance3(directBounce);
-		const bool bounceOn = PhysLightingOn(pl.groundBounce);
+		const bool bounceOn = pbs.groundBounce;
 		ps.bounceAlbedo = bounceOn ? GroundBounceAlbedo(ps.bounceSnow) : float3(0.f, 0.f, 0.f);
 		const float3 bounce = (directBounce + skyUp) * ps.bounceAlbedo;
 		const auto& normals = GetFitNormals();
@@ -3055,10 +2980,7 @@ void PhysicalSky::UpdatePhysicalScene(const RE::NiPoint3& a_lutSunDir, const RE:
 
 		if (wantRatios) {
 			ps.eReal = std::max(Luminance3(directNow) + Luminance3(ps.targetAmbient[4]) / std::max(toShader, 1e-8f), 0.f);
-			const float ratio = std::max(ps.eReal / ps.eRef, 1e-12f);
-			const float k = std::clamp(pl.compressionK, 0.05f, 1.f);
-			const float target = std::pow(ratio, k - 1.f);
-			ps.sTarget = std::isfinite(target) ? std::clamp(target, 1e-3f, 2e5f) : 1.f;
+			ps.sTarget = 1.f;  // (49j) no compression: S below is P x lux per sun unit
 		} else {
 			ps.eReal = 0.f;
 			ps.sTarget = 1.f;
@@ -3067,13 +2989,11 @@ void PhysicalSky::UpdatePhysicalScene(const RE::NiPoint3& a_lutSunDir, const RE:
 
 	// ---- Smoothing (log S, the unscaled ambient) ----
 	const float dt = globals::game::deltaTime ? std::clamp(*globals::game::deltaTime, 0.f, 1.f) : 0.f;
-	const float follow = snap ? 1.f : 1.f - std::exp(-dt / std::clamp(pl.smoothingSeconds, 0.1f, 10.f));
-	if (snap)
-		ps.sLog = std::log(ps.sTarget);
-	else
-		ps.sLog += (std::log(ps.sTarget) - ps.sLog) * follow;
+	const float follow = snap ? 1.f : 1.f - std::exp(-dt / std::clamp(pbs.smoothingSeconds, 0.1f, 10.f));
 	ps.sValid = true;
-	ps.S = wantRatios ? std::clamp(std::exp(ps.sLog), 1e-3f, 2e5f) : 1.f;
+	// (49j) This frame's P (not smoothed: every light of the frame takes the same P, the auto exposure divides it out).
+	ps.S = wantRatios ? pb.SunUnitsToPipeline(sunLum) : 1.f;
+	ps.sLog = std::log(std::max(ps.S, 1e-30f));
 	for (int a = 0; a < kAmbientNormals; ++a)
 		ps.ambient[a] = (snap || !ps.ambientValid) ? ps.targetAmbient[a] : ps.ambient[a] + (ps.targetAmbient[a] - ps.ambient[a]) * follow;
 	ps.ambientValid = true;
@@ -3114,12 +3034,15 @@ void PhysicalSky::UpdatePhysicalScene(const RE::NiPoint3& a_lutSunDir, const RE:
 	for (int a = 0; a < 6; ++a)
 		physicalMean += ambient[a];
 	const float engineLum = Luminance3(engineMean) / 6.f;
-	ps.rAmb = engineLum > 1e-6f ? std::clamp(Luminance3(physicalMean) / 6.f / engineLum, 0.01f, 100.f) : 1.f;
-	ps.unlitScale = std::clamp(Luminance3(physicalMean) / 6.f / ps.anchorAmbientMean, LinearLighting::kMinUnlitSceneScale, 1.f);
+	// (49j) The game-colour factor (design 3.2 rows 10, 13, 17, 20): the game's unlit colours (fog, rain, water, unlit smoke, the vanilla sky
+	// pieces) were drawn against the game's ambient; x (the ambient now / the game's ambient) they keep that ratio to the scene, in P units.
+	// The game's ambient is floored at 1e-4 (near-black night keys of some weathers).
+	ps.rAmb = std::clamp(Luminance3(physicalMean) / 6.f / std::max(engineLum, 1e-4f), 1e-6f, 1e6f);
+	ps.unlitScale = ps.rAmb;
 	{
 		// Stars: the physical night base now over the stage-1 night base (weather night zenith x Night Sky Base Light) they were set against.
 		const float stageOne = Luminance3(nightUpper) * std::clamp(effective.nightBaseLight, 0.f, 1.f);
-		ps.starScale = (wantRatios && stageOne > 1e-8f) ? std::clamp(ps.airglowZenith * ps.S / stageOne, 0.05f, 20.f) : 1.f;
+		ps.starScale = (wantRatios && stageOne > 1e-8f) ? std::clamp(ps.airglowZenith * ps.S / stageOne, 1e-6f, 1e6f) : 1.f;
 	}
 	{
 		float3 encoded[6];
@@ -3146,7 +3069,7 @@ void PhysicalSky::UpdatePhysicalScene(const RE::NiPoint3& a_lutSunDir, const RE:
 		// (49i) "Accurate Ambient Directions": T and R fitted so the DECODED ambient matches at all 26 normals (FitAmbientChannel); off = the
 		// 49h construction above (only the six axes, matched in encoded space).
 		bool fitted = false;
-		if (PhysLightingOn(pl.ambientFit)) {
+		if (pbs.ambientFit) {
 			double p[3][4];
 			bool ok = true;
 			for (int c = 0; c < 3; ++c) {

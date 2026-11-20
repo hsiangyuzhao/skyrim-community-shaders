@@ -180,6 +180,9 @@ PS_OUTPUT main(PS_INPUT input)
 	float fogDistanceFactor = (2 * CameraNearFar.x * CameraNearFar.y) / ((CameraNearFar.y + CameraNearFar.x) - (2 * (1.01 * depth - 0.01) - 1) * (CameraNearFar.y - CameraNearFar.x));
 	float fogFactor = min(FogParam.w, pow(saturate(fogDistanceFactor * FogParam.y - FogParam.x), FogParam.z));
 	float3 fogColor = Color::Fog(lerp(FogNearColor.xyz, FogFarColor.xyz, fogFactor));
+	// (49j, design 3.2 row 20) Physical Brightness (PhysicalSky::PhysLightFlags bit 14): the game's fog colour x the game-colour factor (P units).
+	if ((SharedData::horizonFixData.Flags & (1u << 14)) != 0u)
+		fogColor *= max(SharedData::horizonFixData.Altitude, 0.0);
 	fogFactor = Color::FogAlpha(fogFactor);
 #		if defined(IBL)
 	if (SharedData::iblSettings.EnableDiffuseIBL && !SharedData::InInterior) {

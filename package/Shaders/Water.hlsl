@@ -757,6 +757,13 @@ WaterNormalData GetWaterNormal(PS_INPUT input, float distanceFactor, float norma
 	return result;
 }
 
+/// (49j, design 3.2 rows 17 / 19 / 20) Physical Brightness (PhysicalSky::PhysLightFlags bit 14): the game's water and fog colours are game
+/// colours drawn against the game's ambient: x the game-colour factor (horizonFixData.Altitude, P units). 1 while off.
+float GameColourFactor()
+{
+	return (SharedData::horizonFixData.Flags & (1u << 14)) != 0u ? max(SharedData::horizonFixData.Altitude, 0.0) : 1.0;
+}
+
 float3 GetWaterSpecularColor(PS_INPUT input, float3 normal, float3 viewDirection,
 	float distanceFactor, float refractionsDepthFactor, uint eyeIndex = 0)
 {
@@ -854,7 +861,7 @@ float3 GetWaterSpecularColor(PS_INPUT input, float3 normal, float3 viewDirection
 		float3 finalReflectionColor = Color::IrradianceToGamma(lerp(Color::IrradianceToLinear(reflectionColor), Color::IrradianceToLinear(finalSsrReflectionColor), ssrFraction));
 		return finalReflectionColor;
 	}
-	return ReflectionColor.xyz * VarAmounts.y;
+	return ReflectionColor.xyz * VarAmounts.y * GameColourFactor();  // (49j) the fallback reflection colour is a game colour
 }
 
 float GetScreenDepthWater(float2 screenPosition, uint a_useVR = 0)
@@ -901,7 +908,7 @@ struct DiffuseOutput
 /// (horizonFixData.Altitude, padding since 47m; PhysicalSky::PhysLightFlags bit 14, named here). 1 while off.
 float WaterAmbientFollow()
 {
-	return (SharedData::horizonFixData.Flags & (1u << 14)) != 0u ? clamp(SharedData::horizonFixData.Altitude, 0.0, 100.0) : 1.0;
+	return GameColourFactor();  // (49j) Physical Brightness: the game-colour factor (no longer clamped to 100: it carries P)
 }
 
 DiffuseOutput GetWaterDiffuseColor(PS_INPUT input, float3 normal, float3 viewDirection, inout float4 distanceMul, float refractionsDepthFactor, float fresnel, uint eyeIndex, float3 viewPosition, float noise, float depth)
@@ -1205,7 +1212,7 @@ PS_OUTPUT main(PS_INPUT input)
 #					if defined(VC)
 	float specularFraction = lerp(1, fresnel * diffuseOutput.refractionMul, distanceFactor);
 	float3 finalColorPreFog = lerp(diffuseColor, specularColor, specularFraction) + sunColor * depthControl.w;
-	float3 fogColor = Color::Fog(input.FogParam.xyz);
+	float3 fogColor = Color::Fog(input.FogParam.xyz) * GameColourFactor();  // (49j)
 	float fogFactor = Color::FogAlpha(input.FogParam.w);
 	float weatherFogAmount = 0.0;  // (47b)
 #						if defined(IBL)
@@ -1243,7 +1250,7 @@ PS_OUTPUT main(PS_INPUT input)
 #					else
 	float specularFraction = lerp(1, fresnel, distanceFactor);
 	float3 finalColorPreFog = lerp(diffuseOutput.refractionDiffuseColor, specularColor, specularFraction) + sunColor * depthControl.w;
-	float3 preFogColor = Color::Fog(input.FogParam.xyz);
+	float3 preFogColor = Color::Fog(input.FogParam.xyz) * GameColourFactor();  // (49j)
 	float preFogFactor = Color::FogAlpha(input.FogParam.w);
 	float weatherFogAmount = 0.0;  // (47b)
 #						if defined(IBL)
@@ -1276,7 +1283,7 @@ PS_OUTPUT main(PS_INPUT input)
 	float3 refractionColor = diffuseOutput.refractionColor;
 
 	float fogFactor = min(FogParam.w, pow(saturate(-diffuseOutput.depth * FogParam.y - FogParam.x), FogParam.z));
-	float3 fogColor = Color::Fog(lerp(FogNearColor.xyz, FogFarColor.xyz, fogFactor));
+	float3 fogColor = Color::Fog(lerp(FogNearColor.xyz, FogFarColor.xyz, fogFactor)) * GameColourFactor();  // (49j)
 #						if defined(EXP_HEIGHT_FOG)
 	if (SharedData::exponentialHeightFogSettings.enabled) {
 		fogFactor = 0;

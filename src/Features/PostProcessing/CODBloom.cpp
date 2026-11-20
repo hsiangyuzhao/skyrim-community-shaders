@@ -1,4 +1,5 @@
 #include "CODBloom.h"
+#include "Features/PhysicalBrightness.h"
 
 #include "State.h"
 #include "Util.h"
@@ -242,7 +243,10 @@ void CODBloom::Draw(TextureInfo& inout_tex)
 		.Threshold = exp2(settings.Threshold) * .125f,
 		.UpsampleRadius = settings.UpsampleRadius,
 		.UpsampleMult = 1.f,
-		.CurrentMipMult = 1.f
+		.CurrentMipMult = 1.f,
+		// (49j) Physical Brightness: real-unit emitters are clamped before the bloom (the bloom is a wide blur, not an eye's glare).
+		.InputClamp = PhysicalBrightness::GetSingleton()->Active() ? PhysicalBrightness::GetSingleton()->settings.bloomClamp : 3.0e38f,
+		.pad = {}
 	};
 	bloomCB->Update(cbData);
 

@@ -1,4 +1,5 @@
 #include "LightLimitFix.h"
+#include "PhysicalBrightness.h"
 #include "InverseSquareLighting.h"
 #include "LinearLighting.h"
 #include "RayTracing.h"
@@ -278,6 +279,7 @@ void LightLimitFix::BSLightingShader_SetupGeometry_GeometrySetupConstantPointLig
 		}
 
 		light.fade *= bsLight->lodDimmer;
+		PhysicalBrightness::GetSingleton()->AdjustLight(light, isl.loaded, bsLight->pointLight);  // (49j)
 
 		SetLightPosition(light, niLight->world.translate, inWorld);
 
@@ -353,6 +355,7 @@ void LightLimitFix::FillLightData(RE::BSLight* a_bsLight, RE::NiLight* a_niLight
 	}
 
 	o_light.fade *= a_bsLight->lodDimmer;
+	PhysicalBrightness::GetSingleton()->AdjustLight(o_light, isl.loaded, a_bsLight->pointLight);  // (49j)
 
 	if (a_bsLight->IsShadowLight()) {
 		auto* shadowLight = static_cast<RE::BSShadowLight*>(a_bsLight);

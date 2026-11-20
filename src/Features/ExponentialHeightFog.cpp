@@ -896,6 +896,15 @@ void ExponentialHeightFog::Prepass()
             cb.weatherNearColor = { nearColor.red, nearColor.green, nearColor.blue, 1.0f };
             cb.weatherFarColor = { farColor.red, farColor.green, farColor.blue, std::max(vanillaFogState.fogPower, 0.05f) };
             cb.weatherFogParams = { fogNear * invRange, invRange, std::clamp(vanillaFogState.fogClamp, 0.0f, 1.0f), 0.0f };
+            // (49j, design 3.2 row 21) Physical Brightness: the weather's fog colour is a game colour: x the game-colour factor, through
+            // Color::Fog's pow(fogGamma) (k^(1 / fogGamma) here = k after it).
+            if (const auto& physicalSky = globals::features::physicalSky; physicalSky.loaded && physicalSky.physScene.followActive) {
+                const auto& ll = globals::features::linearLighting.settings;
+                const float gamma = ll.enableLinearLighting && std::isfinite(ll.fogGamma) ? std::clamp(ll.fogGamma, 0.1f, 5.0f) : 1.0f;
+                const float k = std::pow(std::max(physicalSky.physScene.rAmb, 0.0f), 1.0f / gamma);
+                cb.weatherNearColor.x *= k; cb.weatherNearColor.y *= k; cb.weatherNearColor.z *= k;
+                cb.weatherFarColor.x *= k; cb.weatherFarColor.y *= k; cb.weatherFarColor.z *= k;
+            }
             for (auto* value : { &cb.weatherNearColor.x, &cb.weatherNearColor.y, &cb.weatherNearColor.z, &cb.weatherFarColor.x, &cb.weatherFarColor.y,
                      &cb.weatherFarColor.z, &cb.weatherFarColor.w, &cb.weatherFogParams.x, &cb.weatherFogParams.y, &cb.weatherFogParams.z }) {
                 if (!std::isfinite(*value))

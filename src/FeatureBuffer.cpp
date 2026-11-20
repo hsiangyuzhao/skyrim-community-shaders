@@ -12,6 +12,7 @@
 #include "Features/LODBlending.h"
 #include "Features/LightLimitFix.h"
 #include "Features/LinearLighting.h"
+#include "Features/PhysicalBrightness.h"
 #include "Features/PhysicalSky.h"
 #include "Features/PostProcessing.h"
 #include "Features/Skin.h"
@@ -65,11 +66,24 @@ std::pair<unsigned char*, size_t> GetFeatureBufferData(bool a_inWorld)
 			if (globals::features::physicalSky.PhysicalAmbientActive()) {
 				ibl.DALCAmount = 1.0f;
 				ibl.SkyIBLScale = 0.0f;
+				// (49j, design 7) Physical Brightness: the bounce's strength outdoors is its "Bounce Strength" (default 1; your Env IBL Scale indoors).
+				ibl.EnvIBLScale = PhysicalBrightness::GetSingleton()->settings.envBounceStrength;
 			}
 			return ibl;
 		}(),
 		globals::features::extendedTranslucency.GetCommonBufferData(),
-		globals::features::linearLighting.GetCommonBufferData(),
+		[a_inWorld] {
+			// (49j, design 3.2 rows 8-9) Physical Brightness: lamps and emissives in calibrated units x P; Linear Lighting's general light
+			// multiplier is not applied on top. Not for menus and item previews (design 3.2 row 29).
+			auto data = globals::features::linearLighting.GetCommonBufferData();
+			if (const auto& pb = *PhysicalBrightness::GetSingleton(); a_inWorld && pb.Active() && data.enableLinearLighting) {
+				data.lightMult = 1.0f;
+				data.pointLightMult = pb.LampMult();
+				data.emitColorMult = pb.EmissiveMult();
+				data.glowmapMult = pb.EmissiveMult();
+			}
+			return data;
+		}(),
 		globals::features::postProcessing.settings,
 		globals::features::skin.GetCommonBufferData(),
 		globals::features::screenSpacePointLightShadows.GetCommonBufferData(),

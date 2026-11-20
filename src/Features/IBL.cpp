@@ -39,21 +39,26 @@ void IBL::DrawSettings()
 	// effect, Sky IBL Scale / Saturation and DALC Amount are overridden at upload (FeatureBuffer.cpp: SkyIBLScale 0, DALCAmount 1): drawn
 	// disabled with a note. Env IBL Scale / Saturation stay live (no override since 49i).
 	const bool takenOver = globals::features::physicalSky.PhysicalAmbientActive();
+	// (49j) The takeover is Physical Brightness's outdoors (the sky's light is its physical ambient; interiors keep every slider).
 	auto takenOverNote = [takenOver]() {
 		if (takenOver)
-			ImGui::TextDisabled("  Taken over by Sky > Physical Sky > Scene Lighting > Physical Ambient");
+			ImGui::TextDisabled("  Set by Physical Brightness outdoors: Sky > Physical Sky > Scene Lighting > Sky Ambient Strength");
 	};
 	ImGui::SliderFloat("Diffuse IBL Scale", &settings.DiffuseIBLScale, 0.0f, 10.0f, "%.2f");
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text("Overall brightness of the IBL ambient light. Higher = brighter shadows and ambient areas.");
 	// (B7) The two halves the ambient probe is split into, trimmable independently. The Diffuse pair stays the master gate on the
 	// combined result; the Env / Sky ones sit underneath it.
+	ImGui::BeginDisabled(takenOver);
 	ImGui::SliderFloat("Env IBL Scale", &settings.EnvIBLScale, 0.0f, 10.0f, "%.2f");
+	ImGui::EndDisabled();
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text(
 			"Brightness of light bounced from surrounding objects (not the sky). It isn't blocked by cover, so it lights shaded spots\n"
 			"like arches, eaves and alleys. Lower it if those look too bright or too tinted by nearby walls.");
 	}
+	if (takenOver)
+		ImGui::TextDisabled("  Set by Physical Brightness outdoors: Sky > Physical Sky > Scene Lighting > Bounce Strength (this value applies indoors)");
 	ImGui::BeginDisabled(takenOver);
 	ImGui::SliderFloat("Sky IBL Scale", &settings.SkyIBLScale, 0.0f, 10.0f, "%.2f");
 	ImGui::EndDisabled();
@@ -82,7 +87,8 @@ void IBL::DrawSettings()
 	ImGui::EndDisabled();
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text("How much of Skyrim's own ambient light (DALC, directional ambient lighting) is kept when IBL is on. 1 = all of it.");
-	takenOverNote();
+	if (takenOver)
+		ImGui::TextDisabled("  Set by Night Darkness (Physical Brightness) outdoors; indoors this value applies");
 	ImGui::Checkbox("Enable Interior", (bool*)&settings.EnableInterior);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text("Also use IBL indoors. Off = interiors keep vanilla ambient light.");

@@ -17,6 +17,9 @@ cbuffer BloomCB : register(b1)
 	float UpsampleRadius : packoffset(c0.y);
 	float UpsampleMult : packoffset(c0.z);  // in composite: bloom mult
 	float CurrentMipMult : packoffset(c0.w);
+	// (49j) Physical Brightness: each pixel's luminance is clamped at this before the threshold (after exposure, so the clamp does not
+	// depend on P): a moon disc or a flame in real units stays a bright spot instead of flooding the screen. Very large while off.
+	float InputClamp : packoffset(c1.x);
 };
 
 SamplerState SampColor : register(s0);
@@ -40,6 +43,10 @@ float3 ThresholdColor(float3 col, float threshold)
 	float luma = Color::RGBToLuminance(col);
 	if (luma < 1e-3)
 		return 0;
+	if (luma > InputClamp) {  // (49j)
+		col *= InputClamp / luma;
+		luma = InputClamp;
+	}
 	return col * (max(0, luma - threshold) / luma);
 }
 

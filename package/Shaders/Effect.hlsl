@@ -604,7 +604,7 @@ cbuffer EffectSceneCB : register(b7)
 	float EffectLitSmokeMult;     // Lit Smoke and Mist Multiplier
 	float EffectUnlitSmokeMult;   // Unlit Smoke and Mist Multiplier
 	float EffectUnlitSceneScale;  // the scene's ambient brightness now / this weather's midday, clamped (C++)
-	float3 EffectScenePad;
+	float3 EffectScenePad;        // (49j) x: Physical Brightness self-lit scale of fire and magic (calFire x min(P, P_cap)), flag 8
 };
 
 namespace EffectScene
@@ -612,6 +612,7 @@ namespace EffectScene
 	static const uint kMaster = 1u;
 	static const uint kLit = 2u;
 	static const uint kUnlit = 4u;
+	static const uint kBrightness = 8u;  // (49j) Physical Brightness: the self-lit part of every effect takes P (SelfLitScale)
 
 	static const uint kFireMagic = 0u;
 	static const uint kLitSmoke = 1u;
@@ -644,6 +645,24 @@ namespace EffectScene
 		return false;
 #	else
 		return true;
+#	endif
+	}
+
+	/// (49j, design 3.2 row 12) Physical Brightness in effect: an effect's colour is split into its lit part (propertyColor: the scene's light,
+	/// already x P) and its self-lit part, which takes P here (fire and magic: their calibration x min(P, P_cap); smoke and every other
+	/// effect: the game-colour factor, the ambient now / the game's ambient, as the game drew them against its ambient).
+	bool Brightness()
+	{
+		return ENABLE_LL && (EffectSceneFlags & kBrightness) != 0u;
+	}
+	float SelfLitScale(uint a_category)
+	{
+#	if defined(MULTBLEND) || defined(MULTBLEND_DECAL)
+		return 1.0;  // a multiplicative blend's colour is a ratio, not a light
+#	else
+		if (!Brightness() || !(Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InWorld))
+			return 1.0;  // menus and item previews are not in the model (design 3.2 row 29)
+		return a_category == kFireMagic ? EffectScenePad.x : EffectUnlitSceneScale;
 #	endif
 	}
 
@@ -1193,7 +1212,7 @@ PS_OUTPUT main(PS_INPUT input)
 	}
 #	endif
 
-	float3 lightColor = lerp(baseColor.xyz, propertyColor * baseColor.xyz, lightingInfluence.xxx);
+	float3 lightColor = lerp(baseColor.xyz * EffectScene::SelfLitScale(sceneCategory), propertyColor * baseColor.xyz, lightingInfluence.xxx);  // (49j) self-lit part x P
 
 	// (49i, S1 "Same Sun and Moon Light Everywhere") Lit smoke and mist that follow the scene light are never brighter than a lit matte
 	// surface: at most the light a matte surface gets here (propertyColor: the same light, MatteLight / GetLightingColor, + point lights) x a
@@ -1204,7 +1223,8 @@ PS_OUTPUT main(PS_INPUT input)
 		lightColor = min(lightColor, propertyColor * saturate(baseColor.xyz));
 
 	// (49g) Unlit Smoke and Mist: x the scene's ambient brightness relative to this weather's midday (dims at night and indoors).
-	[branch] if (followUnlit)
+	// (49j) With Physical Brightness the scale is already in the self-lit part (SelfLitScale).
+	[branch] if (followUnlit && !EffectScene::Brightness())
 		lightColor *= EffectUnlitSceneScale;
 
 	float effectNormalization = 1.0;
@@ -1254,6 +1274,9 @@ PS_OUTPUT main(PS_INPUT input)
 #	if !defined(MOTIONVECTORS_NORMALS)
 	float fogFactor = Color::FogAlpha(input.FogParam.w);
 	float3 fogColor = Color::Fog(input.FogParam.xyz);
+	// (49j, design 3.2 row 20) Physical Brightness: the game's fog colour x the game-colour factor (it was drawn against the game's ambient).
+	if (EffectScene::Brightness() && (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InWorld))
+		fogColor *= EffectUnlitSceneScale;
 #		if defined(IBL)
 	if (SharedData::iblSettings.EnableDiffuseIBL && !SharedData::InInterior) {
 		fogColor = ImageBasedLighting::GetFogIBLColor(fogColor);

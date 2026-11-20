@@ -1,4 +1,5 @@
 #include "DynamicCubemaps.h"
+#include "Features/PhysicalBrightness.h"
 
 #include <DDSTextureLoader.h>
 #include <DirectXTex.h>
@@ -365,7 +366,17 @@ void DynamicCubemaps::UpdateCubemapCapture(bool a_reflections)
 		uavs[2] = envCapturePositionTexture->uav.get();
 	}
 
+	// (49j) Physical Brightness switched on or off since this chain's last capture: start over.
+	{
+		const bool brightnessActive = PhysicalBrightness::GetSingleton()->Active();
+		if (brightnessActive != captureBrightnessActive[index]) {
+			resetCapture[index] = true;
+			captureBrightnessActive[index] = brightnessActive;
+		}
+	}
+	const float preExposure = PhysicalBrightness::GetSingleton()->GetP();
 	if (resetCapture[index]) {
+		capturePreExposure[index] = preExposure;
 		float clearColor[4]{ 0, 0, 0, 0 };
 		context->ClearUnorderedAccessViewFloat(uavs[0], clearColor);
 		context->ClearUnorderedAccessViewFloat(uavs[1], clearColor);
@@ -389,9 +400,12 @@ void DynamicCubemaps::UpdateCubemapCapture(bool a_reflections)
 	updateData.ProbeForget = { 0.0f, 0.0f, 1.0f, 0.0f };
 	if (!a_reflections) {
 		const auto& physicalSky = globals::features::physicalSky;
-		if (physicalSky.PhysicalAmbientActive() && physicalSky.PhysLightingOn(physicalSky.settings.physicalLighting.probeForget))
+		if (physicalSky.PhysicalAmbientActive() && PhysicalBrightness::GetSingleton()->settings.probeForget)
 			updateData.ProbeForget = { 1.0f, 1.0f, 1.0f, 0.0f };
 	}
+	// (49j) Physical Brightness: the history (Raw, the capture) brought from its P to this frame's (UpdateCubemapCS HistoryRescale).
+	updateData.ProbeForget.z = capturePreExposure[index] > 0.f ? std::clamp(preExposure / capturePreExposure[index], 1e-6f, 1e6f) : 1.0f;
+	capturePreExposure[index] = preExposure;
 
 	auto eyePosition = Util::GetEyePosition(0);
 

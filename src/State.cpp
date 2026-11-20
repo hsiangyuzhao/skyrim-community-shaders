@@ -11,6 +11,7 @@
 #include "FeatureIssues.h"
 #include "Features/CloudShadows.h"
 #include "Features/PerformanceOverlay.h"
+#include "Features/PhysicalBrightness.h"
 #include "Features/PhysicalSky.h"
 #include "Features/RayTracing.h"
 #include "Features/Skin.h"
@@ -197,6 +198,8 @@ void State::Debug()
 
 void State::Reset()
 {
+	// (49j) Physical Brightness decides its scene and the pre-exposure P for the whole frame, before any feature uses them.
+	PhysicalBrightness::GetSingleton()->BeginFrame();
 	for (auto* feature : Feature::GetFeatureList())
 		if (feature->loaded)
 			feature->Reset();

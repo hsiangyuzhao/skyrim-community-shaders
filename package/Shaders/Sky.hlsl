@@ -414,6 +414,13 @@ namespace PhysFollow
 	{
 		return (SharedData::horizonFixData.Flags & FollowFlag) != 0u ? max(SharedData::horizonFixData.AnchorOffset, 0.0) : 1.0;
 	}
+	/// (49j, design 3.2 row 16) Physical Brightness: the game's sky pieces (the vanilla sky dome and its dither, the sun and glare quads,
+	/// clouds not relit by the physical sky, the moons outside it, the additive sky term) are game colours: x the game-colour factor
+	/// (horizonFixData.Altitude, P units). 1 while off.
+	float VanillaScale()
+	{
+		return (SharedData::horizonFixData.Flags & FollowFlag) != 0u ? max(SharedData::horizonFixData.Altitude, 0.0) : 1.0;
+	}
 }
 
 // (48b) "Moonlight Fades Stars" and "Moon Planetshine": PhysicalSky::NightFlags bits 6 / 7 and the two spare floats of
@@ -547,6 +554,7 @@ PS_OUTPUT main(PS_INPUT input)
 	psout.Color.xyz = (yyy + Color::Sky(input.Color.xyz)) + noiseGrad;
 	psout.Color.w = input.Color.w;
 #			endif  // TEX
+	psout.Color.xyz *= PhysFollow::VanillaScale();  // (49j) the vanilla sky dome (with its dither) in P units
 
 #		elif defined(MOONMASK)
 	psout.Color.xyzw = baseColor;
@@ -562,6 +570,18 @@ PS_OUTPUT main(PS_INPUT input)
 #		else
 	psout.Color.w = input.Color.w * baseColor.w;
 	psout.Color.xyz = Color::Sky(input.Color.xyz) * baseColor.xyz + yyy;
+	// (49j) Physical Brightness: clouds relit by the physical sky are already in P units (their light is), the weather colour only tints
+	// them: just the additive sky term takes the factor. Moons in the physical sky take their disc scale below. Everything else here (the sun
+	// and glare quads, clouds and moons without the physical sky) is a game colour.
+#			if defined(PS_CLOUDS) && defined(CLOUD_SHADOWS)
+	if (SharedData::physSkyData.enabled)
+		psout.Color.xyz += yyy * (PhysFollow::VanillaScale() - 1.0);
+	else
+		psout.Color.xyz *= PhysFollow::VanillaScale();
+#			else
+	if (!(SharedData::physSkyData.enabled && (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsMoon)))
+		psout.Color.xyz *= PhysFollow::VanillaScale();
+#			endif
 #			if defined(PS_CLOUDS) && defined(CLOUD_SHADOWS)
 	psout.Color.xyz += cloudMoonLight;  // (44h) not dimmed by the (near-black night) weather cloud colour
 	// (49h stage 1, S2) "Clouds Get the Sky's Ambient Light": the ambient a white ground surface gets (the weather ambient's mean over

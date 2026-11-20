@@ -283,6 +283,10 @@ PS_OUTPUT main(PS_INPUT input)
 #	endif
 
 	psout.Color.xyz = ColorScale * baseColor.xyz;
+	// (49j, design 3.2 row 13) Physical Brightness (PhysicalSky::PhysLightFlags bit 14 "follow"): rain, snow and the other particles are
+	// game colours drawn against the game's ambient: x the game-colour factor (the ambient now / the game's, in P units; horizonFixData.Altitude).
+	if ((SharedData::horizonFixData.Flags & (1u << 14)) != 0u)
+		psout.Color.xyz *= max(SharedData::horizonFixData.Altitude, 0.0);
 	psout.Color.w = baseColor.w;
 	psout.Normal.w = baseColor.w;
 	psout.Normal.xyz = float3(0, 1, 0);
