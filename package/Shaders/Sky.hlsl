@@ -513,6 +513,21 @@ namespace Stage2
 		const float3 ambient = Color::Ambient(max(0, mul(SharedData::DirectionalAmbient, float4(0, 0, 0, 1))));
 		return a_albedo * Color::RGBToLuminance(ambient) * hue * SharedData::physSkyCloudData.MoonCloudSaturation;
 	}
+	// (51a) "Clouds Lit by CS Light Only" (CloudFlags bit 4, with bit 3): no weather cloud colour; the sky's own light from the sky-view LUT
+	// (RelightCloudMulti's 5 taps: the zenith and four directions 15 degrees up) x the cloud texture's colour, the cloud's alpha once (the
+	// blend applies it), at the clear-noon calibration x the user's Cloud Sky Ambient (C++, carried in MoonCloudSaturation).
+	static const uint CsLightOnlyFlag = (1 << 4);
+	bool CsLightOnlyOn() { return (SharedData::physSkyCloudData.Flags & CsLightOnlyFlag) != 0; }
+	float3 SkyAmbient(float3 a_albedo)
+	{
+		const float c15 = 0.9659258, s15 = 0.2588190;
+		float3 sky = 0.3 * PhysSky::TexSvLut.SampleLevel(PhysSky::SampSv, PhysSky::SkyPrecision() ? float2(0.0, 0.5 / PhysSky::SV_LUT_HEIGHT) : float2(0.0, 0.01), 0).rgb;
+		sky += 0.175 * PhysSky::TexSvLut.SampleLevel(PhysSky::SampSv, PhysSky::SkyViewLutUv(float3(c15, 0, s15)), 0).rgb;
+		sky += 0.175 * PhysSky::TexSvLut.SampleLevel(PhysSky::SampSv, PhysSky::SkyViewLutUv(float3(-c15, 0, s15)), 0).rgb;
+		sky += 0.175 * PhysSky::TexSvLut.SampleLevel(PhysSky::SampSv, PhysSky::SkyViewLutUv(float3(0, c15, s15)), 0).rgb;
+		sky += 0.175 * PhysSky::TexSvLut.SampleLevel(PhysSky::SampSv, PhysSky::SkyViewLutUv(float3(0, -c15, s15)), 0).rgb;
+		return a_albedo * max(sky, 0.0) * SharedData::physSkyCloudData.MoonCloudSaturation;
+	}
 #		endif
 }
 #	endif
@@ -606,9 +621,13 @@ PS_OUTPUT main(PS_INPUT input)
 	psout.Color.w = input.Color.w * baseColor.w;
 	psout.Color.xyz = Color::Sky(input.Color.xyz) * baseColor.xyz + yyy;
 #			if defined(PS_CLOUDS) && defined(CLOUD_SHADOWS)
+	// (51a) "Clouds Lit by CS Light Only": the relit cloud without the weather's cloud colour, and the physical sky's light instead of the ground's.
+	const bool cloudCsOnly = SharedData::physSkyData.enabled && Stage2::CsLightOnlyOn();
+	[branch] if (cloudCsOnly)
+		psout.Color.xyz = baseColor.xyz + yyy + Stage2::SkyAmbient(cloudAlbedo);
 	psout.Color.xyz += cloudMoonLight;  // (44h) not dimmed by the (near-black night) weather cloud colour
 	// (50b) Stage 2 "Clouds Lit Like the Ground": the ground's ambient, also not dimmed by it (the sky-view LUT term is off on this path).
-	[branch] if (SharedData::physSkyData.enabled && Stage2::LikeGroundOn())
+	[branch] if (SharedData::physSkyData.enabled && Stage2::LikeGroundOn() && !cloudCsOnly)
 		psout.Color.xyz += Stage2::Ambient(cloudAlbedo, Color::Sky(input.Color.xyz));
 #			endif
 #		endif
