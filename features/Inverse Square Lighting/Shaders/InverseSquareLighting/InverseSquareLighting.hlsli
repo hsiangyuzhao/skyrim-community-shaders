@@ -20,6 +20,9 @@ namespace InverseSquareLighting
 		float intensityFactor = saturate(distance * light.invRadius);
 		float reg = 1.0f - intensityFactor * intensityFactor;
 
-		return lerp(reg, invSq, isInvSq) * isEnabled;
+		// (50c) Lamp Falloff: pad1 = half floats (t << 16 | t x k), set by InverseSquareLighting::ApplyLampFalloff for game-curve lights:
+		// (1 - t) x reg + t x k x invSq. 0 (knob at Game, inverse-square lights, window light): the old value exactly (+ 0).
+		float2 falloff = f16tof32(uint2(light.pad1 >> 16, light.pad1));
+		return (lerp(reg, invSq, isInvSq) + (falloff.y * invSq - falloff.x * reg)) * isEnabled;
 	}
 }

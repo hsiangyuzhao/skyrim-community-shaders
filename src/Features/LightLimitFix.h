@@ -60,7 +60,7 @@ public:
 		stl::enumeration<LightFlags> lightFlags;
 		uint32_t shadowMaskIndex = 0;
 		uint32_t rtShadow = 0;  ///< (46b) Ray Tracing point-light shadow tag (RayTracing::PointLightTag; 0 = none); was pad0
-		uint pad1;
+		uint falloffBlend = 0;  ///< (50c) Lamp Falloff: half floats (blend t << 16 | t x calibration k); 0 = the light's own curve (hlsli: pad1)
 	};
 	STATIC_ASSERT_ALIGNAS_16(LightData);
 	static_assert(sizeof(LightData) == 96);  // LightLimitFix/Common.hlsli Light

@@ -1,11 +1,47 @@
 #include "InverseSquareLighting.h"
 #include "Features/InverseSquareLighting/Common.h"
 #include "LightLimitFix.h"
+#include <DirectXPackedVector.h>
 #include <numbers>
+
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
+	InverseSquareLighting::Settings,
+	lampFalloff)  // (50c)
 
 void InverseSquareLighting::DrawSettings()
 {
+	// (50c) Lamp Falloff.
+	settings.lampFalloff = std::isfinite(settings.lampFalloff) ? std::clamp(settings.lampFalloff, 0.0f, 1.0f) : 0.0f;
+	ImGui::SliderFloat("Lamp Falloff", &settings.lampFalloff, 0.0f, 1.0f, settings.lampFalloff <= 0.0f ? "Game" : (settings.lampFalloff >= 1.0f ? "Inverse Square" : "%.2f"));
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"How a lamp's light fades with distance.\n"
+			"Game (left): the game's curve, which fades smoothly to zero at the light's radius (exactly as before).\n"
+			"Inverse Square (right): real-world falloff - much brighter close to the lamp, darker further away. Both curves are equally bright "
+			"at half the radius, so a room's overall brightness changes little. In between: a blend of the two.\n"
+			"For torches, candles, lamps and spells handled by Light Limit Fix. Lights a mod already made inverse-square and window light keep "
+			"their own curve.");
+	ImGui::Spacing();
+	ImGui::Separator();
+	ImGui::Spacing();
 	editor.DrawSettings();
+}
+
+void InverseSquareLighting::LoadSettings(json& o_json)
+{
+	// "Inverse Square Lighting": null in settings saved before 50c: the defaults.
+	if (o_json.is_object())
+		settings = o_json;
+}
+
+void InverseSquareLighting::SaveSettings(json& o_json)
+{
+	o_json = settings;
+}
+
+void InverseSquareLighting::RestoreDefaultSettings()
+{
+	settings = {};
 }
 
 void InverseSquareLighting::EarlyPrepass()
@@ -75,6 +111,35 @@ void InverseSquareLighting::ProcessLight(LightLimitFix::LightData& light, RE::BS
 		// light.color *= runtimeData->fade;
 		light.fade = runtimeData->fade;
 	}
+}
+
+void InverseSquareLighting::ApplyLampFalloff(LightLimitFix::LightData& light) const
+{
+	// (50c) Lamp Falloff. The shader (InverseSquareLighting.hlsli GetAttenuation) adds falloff.y x invSq - falloff.x x reg to its result, where
+	// reg = 1 - (d / r)^2 (the game's curve) and invSq = ScaledUnitsSq / (d^2 + sizeBias) x smoothstep((r - d) x fadeZone) (ISL's curve).
+	// falloffBlend = 0 (knob at Game, inverse-square lights): exactly the old value. Else (t, t x k) with k matching both curves at r / 2:
+	// result = (1 - t) reg + t k invSq. The light keeps its radius (cluster culling, the fade to zero at the radius); the inverse-square shape
+	// is ISL's default for a light without its own size (size sqrt 2: sizeBias = ScaledUnitsSq) and ISL's fade zone.
+	const float t = settings.lampFalloff;
+	if (!(t > 0.0f) || light.lightFlags.any(LightLimitFix::LightFlags::InverseSquare))
+		return;
+	const float radius = light.radius;
+	if (!(radius > 1.0f) || !std::isfinite(radius))
+		return;
+	const float sizeBias = ScaledUnitsSq;
+	const float fadeZone = 1.0f / (radius * std::clamp(FadeZoneBase / radius, 0.0f, 1.0f));
+	const float half = std::clamp(0.5f * radius * fadeZone, 0.0f, 1.0f);
+	const float window = half * half * (3.0f - 2.0f * half);
+	const float invSqHalf = ScaledUnitsSq / (0.25f * radius * radius + sizeBias) * window;
+	if (!(invSqHalf > 1e-6f))
+		return;
+	const float k = 0.75f / invSqHalf;  // the game's curve is 0.75 at r / 2
+	const float blend = std::min(t, 1.0f);
+	light.sizeBias = sizeBias;
+	light.fadeZone = fadeZone;
+	const uint32_t hi = DirectX::PackedVector::XMConvertFloatToHalf(blend);
+	const uint32_t lo = DirectX::PackedVector::XMConvertFloatToHalf(std::min(blend * k, 65000.0f));
+	light.falloffBlend = (hi << 16) | lo;
 }
 
 float InverseSquareLighting::CalculateRadius(const float intensity, const bool shadowCaster, const float cutoffOverride, const float size)

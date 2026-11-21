@@ -448,6 +448,54 @@ void SkySync::GetSunDirectionAtHour(const RE::Sky* sky, const float hour, RE::Ni
 	outDist = std::lerp(SunHorizonDistance, SunPeakDistance, std::max(static_cast<float>(sinPhi), 0.0f));
 }
 
+float SkySync::SunElevationDegAtHour(const RE::Sky* a_sky, const float a_hour)
+{
+	if (!a_sky || !a_sky->currentClimate || !std::isfinite(a_hour))
+		return -90.0f;
+	RE::NiPoint3 dir{ 0.0f, 0.0f, 1.0f };
+	float dist = 0.0f;
+	if (settings.UseAlternateSunPath && SkyFixesActive()) {
+		GetSunDirectionAtHour(a_sky, a_hour, dir, dist);
+	} else {
+		// The 46y formula with this climate's timing (read here: timings is only refreshed while Sky Sync is on).
+		ClimateTimings t{};
+		t.Update(a_sky->currentClimate);
+		float sunrise = t.sunrise, sunset = t.sunset;
+		if (!(sunset - sunrise > 0.1f) || !std::isfinite(sunrise) || !std::isfinite(sunset)) {
+			sunrise = 6.0f;
+			sunset = 18.0f;
+		}
+		const float tilt = settings.UseAlternateSunPath ? sunAngle : VanillaSunAngle;
+		CalculateAlternateSunDirectionAndDistance(dir, dist, a_hour, sunrise, sunset, tilt);
+	}
+	return DirectX::XMConvertToDegrees(std::asin(std::clamp(dir.z, -1.0f, 1.0f)));
+}
+
+float SkySync::MoonElevationDeg(const RE::Moon* a_moon, const RE::Sky* a_sky) const
+{
+	if (!a_moon || !a_sky)
+		return -90.0f;
+	static const bool verified = !REL::Module::IsVR() && REL::Module::get().version() == SKSE::RUNTIME_SSE_1_5_97;
+	const auto calendar = RE::Calendar::GetSingleton();
+	const double hour = static_cast<double>(a_sky->currentGameHour);
+	if (verified && settings.Enabled && !moonAndStarsLoaded && calendar && std::isfinite(hour) && hour >= 0.0 && hour <= 24.0) {
+		// SetMoonAngle's Stable orbit: angle = 90 + speed x 60 x (whole days x 24 + hour); disc direction z = sin(angle) cos(zOffset).
+		const double hours = static_cast<double>(calendar->GetHoursPassed());
+		const double speed = static_cast<double>(a_moon->speed);
+		if (std::isfinite(hours) && hours >= 0.0 && std::isfinite(speed)) {
+			const double days = std::floor((hours - hour) / 24.0 + 0.5);
+			const double angle = (90.0 + speed * 60.0 * (days * 24.0 + hour)) * (std::numbers::pi / 180.0);
+			const double tilt = static_cast<double>(a_moon->zOffset) * (std::numbers::pi / 180.0);
+			const double z = std::sin(angle) * std::cos(tilt);
+			return static_cast<float>(std::asin(std::clamp(z, -1.0, 1.0)) * (180.0 / std::numbers::pi));
+		}
+	}
+	if (!a_moon->root)
+		return -90.0f;
+	const auto dir = a_moon->root->local.rotate.GetVectorY();
+	return DirectX::XMConvertToDegrees(std::asin(std::clamp(dir.z, -1.0f, 1.0f)));
+}
+
 void SkySync::FadeSunAtHorizon(const RE::Sky* sky, const float sunElevationDeg)
 {
 	if (!sky || !sky->sun)

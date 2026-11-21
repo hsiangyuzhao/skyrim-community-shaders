@@ -325,6 +325,15 @@ public:
 	/// (47a) GMST fDaytimeColorExtension (0.5 if missing).
 	static float GetDaytimeColorExtension();
 
+	/// (50c) Window Light: the sun's true elevation (degrees) at a_hour on the current sun path, the way ProcessSun places it, but
+	/// callable in any cell (Update returns early in interiors without sunlight shadows, so the sun's own node is not used): the
+	/// alternate path through the warp (Sky Fixes) or the 46y formula; the vanilla path (alternate off) uses the 46y formula at the
+	/// vanilla tilt (95 degrees, an approximation of the game's arc). Works with Sky Sync switched off (climate timing read here).
+	float SunElevationDegAtHour(const RE::Sky* a_sky, float a_hour);
+	/// (50c) Window Light: a moon's true elevation (degrees) now. The Stable orbit's angle (as SetMoonAngle writes it) where Sky Sync
+	/// drives the moons on 1.5.97; otherwise the moon's own rotation (which may be stale indoors). -90 when unknown.
+	float MoonElevationDeg(const RE::Moon* a_moon, const RE::Sky* a_sky) const;
+
 private:
 	inline static RE::Setting* gDaytimeColorExtension = nullptr;
 	/// (47a) Sky Fixes: alternate-path sun direction (sky-local) and quad distance at an hour, through

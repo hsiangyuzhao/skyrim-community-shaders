@@ -9,6 +9,7 @@
 #include "Utils/GpuTimers.h"
 #include "Utils/FrameTrace.h"
 #include "Utils/LightCensus.h"
+#include "WindowLight.h"
 
 static constexpr uint CLUSTER_MAX_LIGHTS = 128;
 static constexpr uint MAX_LIGHTS = 1024;
@@ -268,9 +269,12 @@ void LightLimitFix::BSLightingShader_SetupGeometry_GeometrySetupConstantPointLig
 		LightData light{};
 		light.color = { runtimeData.diffuse.red, runtimeData.diffuse.green, runtimeData.diffuse.blue };
 		light.lightFlags = std::bit_cast<LightFlags>(runtimeData.ambient.red);
+		WindowLight::ApplyToLight(niLight, light.color);  // (50c) window light: this frame's window colour (others untouched)
 
 		if (isl.loaded) {
 			isl.ProcessLight(light, bsLight, niLight);
+			if (!WindowLight::IsWindowLight(niLight))
+				isl.ApplyLampFalloff(light);  // (50c) Lamp Falloff (0 = Game: nothing changes)
 		} else {
 			light.radius = runtimeData.radius.x;
 			// light.color *= runtimeData.fade;
@@ -343,9 +347,12 @@ void LightLimitFix::FillLightData(RE::BSLight* a_bsLight, RE::NiLight* a_niLight
 
 	o_light.color = { runtimeData.diffuse.red, runtimeData.diffuse.green, runtimeData.diffuse.blue };
 	o_light.lightFlags = std::bit_cast<LightFlags>(runtimeData.ambient.red);
+	WindowLight::ApplyToLight(a_niLight, o_light.color);  // (50c) window light: this frame's window colour (others untouched)
 
 	if (isl.loaded) {
 		isl.ProcessLight(o_light, a_bsLight, a_niLight);
+		if (!WindowLight::IsWindowLight(a_niLight))
+			isl.ApplyLampFalloff(o_light);  // (50c) Lamp Falloff (0 = Game: nothing changes)
 	} else {
 		o_light.radius = runtimeData.radius.x;
 		// light.color *= runtimeData.fade;
@@ -445,6 +452,9 @@ namespace RE
 
 void LightLimitFix::UpdateLights()
 {
+	// (50c) Window Light: this frame's window colours and region-tied lights, before any light is read below (or by Ray Tracing).
+	WindowLight::BeginFrame();
+
 	auto smState = globals::game::smState;
 
 	auto shadowSceneNode = smState->shadowSceneNode[0];

@@ -31,7 +31,18 @@ public:
 
 	inline bool HasShaderDefine(RE::BSShader::Type) override { return true; };
 
+	struct Settings
+	{
+		/// (50c) Lamp Falloff: 0 = the game's curve (1 - (d / r)^2, exactly as before), 1 = inverse square matched to it at half the radius;
+		/// in between the two curves are blended. Light Limit Fix lights only; lights already authored for inverse square and window light
+		/// (WindowLight) keep their own curve.
+		float lampFalloff = 0.0f;
+	} settings;
+
 	virtual void DrawSettings() override;
+	virtual void LoadSettings(json& o_json) override;
+	virtual void SaveSettings(json& o_json) override;
+	virtual void RestoreDefaultSettings() override;
 
 	virtual void EarlyPrepass() override;
 
@@ -42,6 +53,9 @@ public:
 	static float CalculateRadius(float intensity, bool shadowCaster, float cutoffOverride, float size);
 
 	void ProcessLight(LightLimitFix::LightData& light, RE::BSLight* bsLight, RE::NiLight* niLight) const;
+	/// (50c) Lamp Falloff on a light ProcessLight filled: sets its falloffBlend (and the inverse-square shape it blends to: sizeBias, fadeZone)
+	/// for game-curve lights while the knob is above 0. Nothing changes at 0 or for inverse-square lights.
+	void ApplyLampFalloff(LightLimitFix::LightData& light) const;
 
 	static float GetAttenuation(float distance, float radius, float size);
 

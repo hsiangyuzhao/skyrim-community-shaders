@@ -69,6 +69,12 @@ struct LinearLighting : Feature
 		float fireMagicEffectMult = 1.0f;
 		float litSmokeEffectMult = 1.0f;
 		float unlitSmokeEffectMult = 1.0f;
+
+		// (50c) Window Light (lights and glass tied to a region's emittance; WindowLight.h). Three switches off + Mod's Keys: the engine's colour exactly.
+		bool windowNoExtraSaturation = true;  ///< the light gamma on each key's luminance only (its colour is not saturated further)
+		bool windowFollowSun = true;          ///< key blend from the sun's true elevation instead of the climate clock
+		int windowBrightness = 0;             ///< 0 Smooth (brightness from the sun's elevation only), 1 Mod's Keys
+		bool windowFollowWeather = true;      ///< x outdoor direct light now / the same under a clear sky (moon phase and height at night)
 	} settings;
 
 	/** (49g) Effect.hlsl EffectSceneCB (PS b7), bound for every effect draw. */

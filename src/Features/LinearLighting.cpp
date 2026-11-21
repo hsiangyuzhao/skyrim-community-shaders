@@ -1,6 +1,7 @@
 #include "LinearLighting.h"
 
 #include "JiayeStatement.h"
+#include "WindowLight.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	LinearLighting::Settings,
@@ -39,7 +40,11 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	effectsFollowUnlit,
 	fireMagicEffectMult,
 	litSmokeEffectMult,
-	unlitSmokeEffectMult)
+	unlitSmokeEffectMult,
+	windowNoExtraSaturation,
+	windowFollowSun,
+	windowBrightness,
+	windowFollowWeather)
 
 void LinearLighting::DrawSettings()
 {
@@ -180,6 +185,43 @@ void LinearLighting::DrawSettings()
 		ImGui::TreePop();
 	}
 
+	// (50c) Window Light: lights and glass whose glow is tied to a region (e.g. Window Shadows Ultimate's beams). WindowLight.cpp.
+	ImGui::SeparatorText("Window Light");
+	ImGui::Checkbox("No Extra Saturation", &settings.windowNoExtraSaturation);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"Window light beams and window glass whose colour comes from a weather region (sunrise, day, sunset and night colours set by the mod).\n"
+			"On: Light Gamma only changes how bright each of those colours is, not how saturated: dusk stays the mod's orange instead of deep red, "
+			"dawn is peach instead of salmon. Noon is slightly less warm, night slightly less blue.\n"
+			"Off: the game's conversion (every colour channel raised to Light Gamma).");
+	ImGui::Checkbox("Follow the Real Sun", &settings.windowFollowSun);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"On: the change between the night, sunrise / sunset and day colours follows how high the sun really is. The night blue is gone by the "
+			"time the sun reaches the horizon (no pink-mauve dawn), and the light does not stay on the sunset colour after the sun has set.\n"
+			"The change spans the same part of the day the weather itself uses (12 degrees below the horizon up to where the sun is when the "
+			"weather reaches its day colours).\n"
+			"Off: the game's clock times from the climate.");
+	{
+		static const char* kBrightness[] = { "Smooth", "Mod's Keys" };
+		int mode = std::clamp(settings.windowBrightness, 0, 1);
+		if (ImGui::Combo("Transition Brightness", &mode, kBrightness, IM_ARRAYSIZE(kBrightness)))
+			settings.windowBrightness = mode;
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text(
+				"Smooth: brightness depends only on how high the sun is, rising smoothly from the mod's night level to its day level, the same at dawn "
+				"and dusk (about 30%% of noon with the sun on the horizon). The sunrise and sunset colours only give the colour.\n"
+				"Mod's Keys: the mod's own sunrise and sunset brightness (with Window Shadows Ultimate: dawn very dim, dusk bright), for comparison.");
+	}
+	ImGui::Checkbox("Follow the Outdoor Weather", &settings.windowFollowWeather);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"On: window light is as strong as the sun (or moon) outside is now compared with a clear sky: unchanged in clear weather, weaker when "
+			"overcast, raining or snowing. At night it also follows the moons: weaker at new moon or with no moon up (down to a quarter).\n"
+			"The outdoor weather is the one the game keeps while you are inside; it changes smoothly over a few seconds.");
+	ImGui::TextDisabled("Interiors only. Window glass tied to the same weather region follows the same switches. The three switches off with Mod's Keys: the game's colours exactly.");
+	WindowLight::DrawStatus();
+
 	JiayeStatement::GetSingleton()->DrawJSInfo();
 }
 
@@ -268,6 +310,8 @@ float LinearLighting::ComputeUnlitSceneScale()
 
 void LinearLighting::Prepass()
 {
+	WindowLight::BeginFrame();  // (50c) idempotent per frame (Light Limit Fix calls it too, before its light upload)
+
 	bool isMainLoadingMenu = globals::game::ui && (globals::game::ui->IsMenuOpen(RE::MainMenu::MENU_NAME) || globals::game::ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME));
 
 	// (49g) Effects Follow Scene Light: this frame's effect constants (Effect.hlsl EffectSceneCB).
@@ -305,6 +349,7 @@ struct LinearLighting::Hooks
 		{
 			globals::features::linearLighting.BSLightingShader_SetupGeometry(Pass);
 			func(This, Pass, RenderFlags);
+			WindowLight::RestoreGlass();  // (50c) the engine's emissive colour pointer back on a window-glass shape
 		}
 		static inline REL::Relocation<decltype(thunk)> func;
 	};
@@ -375,6 +420,7 @@ void LinearLighting::BSLightingShader_SetupGeometry(RE::BSRenderPass* a_pass)
 	auto lightProperty = property1 && property1->GetRTTI() == globals::rtti::BSLightingShaderPropertyRTTI.get() ? static_cast<RE::BSLightingShaderProperty*>(property1.get()) : nullptr;
 
 	if (lightProperty != nullptr) {
+		WindowLight::SetupGlass(a_pass, lightProperty);  // (50c) window glass: this frame's window colour
 		float emissiveMult = 1.0f;
 		if (settings.enableLinearLighting) {
 			emissiveMult = lightProperty->emissiveMult;
