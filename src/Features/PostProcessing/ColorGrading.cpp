@@ -45,7 +45,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     outputColorSpace,
 	colorSpaceTransform,
 	invColorSpaceTransform,
-	tonemapHDR
+	tonemapHDR,
+	huePreservingCurve
 )
 
 template <int num = 3>
@@ -475,6 +476,17 @@ void ColorGrading::DrawSettings()
         tonemappers[tonemapperType].draw_settings_func(settings.tonemapParams);
         ImGui::PopID();
 
+        // (50a) Physical lighting redo, display layer: works with every tone mapper above (not the display-space ones: ACES, Frostbite,
+        // Hermite Spline, PsychoV, whose output is in another colour space; nor GT7's Native HDR form, which has its own path).
+        ImGui::Checkbox("Hue-Preserving Tone Curve", &settings.huePreservingCurve);
+        if (auto _tt = Util::HoverTooltipWrapper()) {
+            ImGui::Text("On: the tone curve keeps each colour's hue and saturation: it compresses the colour's brightest channel and scales");
+            ImGui::Text("  the colour with it, so orange torch light stays orange instead of turning yellow-white, and bright saturated colours");
+            ImGui::Text("  keep their tint. Close to the curve's white the colours still bleach to white, as before. Works with the selected");
+            ImGui::Text("  tone mapper (except ACES, Frostbite, Hermite Spline, PsychoV and GT7 in Native HDR, which keep their own behaviour).");
+            ImGui::Text("Off (default): every colour channel through the curve separately, as before.");
+        }
+
         // (44a) HDR: this page owns the curve in SDR and in HDR.
         {
             const std::string tmName(tonemappers[tonemapperType].name);
@@ -781,7 +793,9 @@ void ColorGrading::ClearShaderCache()
 		&colorgradingHdrCS,
 		&lutgenHdrCS,
 		&colorgradingFusedCS,
-		&colorgradingHdrFusedCS
+		&colorgradingHdrFusedCS,
+		&lutgenHueCS,     // (50a)
+		&lutgenHdrHueCS
 	};
 
 	for (auto shader : shaderPtrs)
@@ -815,6 +829,8 @@ void ColorGrading::CompileComputeShaders()
 		};
 	// (44e) COD Bloom fused into the apply.
 	shaderInfos.push_back({ &colorgradingFusedCS, "colorgrading.cs.hlsl", { { "TONEMAP_FUNC", tonemappers[tonemapperType].func_name.data() }, { "BLOOM_FUSED", "" } }, "CSColorGrading" });
+	// (50a) Hue-Preserving Tone Curve: the bake only (compiled whatever the switch, so switching it costs no compile).
+	shaderInfos.push_back({ &lutgenHueCS, "colorgrading.cs.hlsl", { { "TONEMAP_FUNC", tonemappers[tonemapperType].func_name.data() }, { "HUE_PRESERVE", "" } }, "CSLUTGen" });
 	// (47r) The RenoDX tone mappers: their library and the display-space rule, in every variant (only theirs).
 	const bool renodx = UsesRenoDX(tonemappers[tonemapperType].name);
 	if (renodx)
@@ -831,6 +847,9 @@ void ColorGrading::CompileComputeShaders()
 			hdrDefines.insert(hdrDefines.end(), { { "TONEMAP_RENODX", "" }, { "TONEMAP_DISPLAY_SPACE", "" } });  // (47r)
 		shaderInfos.push_back({ &colorgradingHdrCS, "colorgrading.cs.hlsl", hdrDefines, "CSColorGrading" });
 		shaderInfos.push_back({ &lutgenHdrCS, "colorgrading.cs.hlsl", hdrDefines, "CSLUTGen" });
+		auto hueDefines = hdrDefines;  // (50a)
+		hueDefines.push_back({ "HUE_PRESERVE", "" });
+		shaderInfos.push_back({ &lutgenHdrHueCS, "colorgrading.cs.hlsl", hueDefines, "CSLUTGen" });
 		auto fusedDefines = hdrDefines;
 		fusedDefines.push_back({ "BLOOM_FUSED", "" });
 		shaderInfos.push_back({ &colorgradingHdrFusedCS, "colorgrading.cs.hlsl", fusedDefines, "CSColorGrading" });
@@ -997,10 +1016,14 @@ void ColorGrading::Draw(TextureInfo& inout_tex)
 	// the hard dependency between it and the full-screen apply below that samples texLUT.
 	// ColorCB is float4s plus a four-uint tail, so it has no padding and memcmp is exact; a
 	// false "changed" would only cost a redundant bake, never a stale LUT.
-	if (!lutValid || std::memcmp(&bakedColorCBData, &colorCBData, sizeof(ColorCB)) != 0) {
+	// (50a) Hue-Preserving Tone Curve: its bake variant (when compiled); switching it rebakes.
+	auto* hueBake = hdrGrading ? lutgenHdrHueCS.get() : lutgenHueCS.get();
+	const bool hue = settings.huePreservingCurve && settings.enableTonemap && hueBake;
+	if (!lutValid || hue != bakedHue || std::memcmp(&bakedColorCBData, &colorCBData, sizeof(ColorCB)) != 0) {
 		uav = texLUT->uav.get();
 		context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
-		context->CSSetShader(hdrGrading ? lutgenHdrCS.get() : lutgenCS.get(), nullptr, 0);
+		context->CSSetShader(hue ? hueBake : (hdrGrading ? lutgenHdrCS.get() : lutgenCS.get()), nullptr, 0);
+		bakedHue = hue;
 		context->Dispatch(LUTDim >> 3, LUTDim >> 3, LUTDim >> 3);
 
 		uav = nullptr;

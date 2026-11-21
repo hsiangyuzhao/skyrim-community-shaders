@@ -54,6 +54,7 @@ struct ColorGrading : public PostProcessFeature
     {
         bool useToDInterior = false;
         bool skipLDR = false;
+        bool huePreservingCurve = false;  // (50a) Hue-Preserving Tone Curve (colorgrading.cs.hlsl HUE_PRESERVE; here: no padding change)
         std::array<ColorProfile, 8> profiles = {};
         std::string currentTonemapper = "GT7";
         std::array<float4, 2> tonemapParams = { float4{ 1.f, 2.f, 0.f, 0.f }, float4{ 0.f, 0.f, 0.f, 0.f } };
@@ -132,6 +133,7 @@ struct ColorGrading : public PostProcessFeature
     /// @brief False whenever texLUT's contents cannot be trusted -- before the first bake, and
     /// after the texture or the LUT-gen shader is recreated.
     bool lutValid = false;
+    bool bakedHue = false;  // (50a) the LUT in texLUT was baked with the hue-preserving variant (Hue-Preserving Tone Curve)
 
 	std::unique_ptr<Texture2D> texColor = nullptr;
     std::unique_ptr<Texture3D> texLUT = nullptr;
@@ -146,6 +148,9 @@ struct ColorGrading : public PostProcessFeature
     // tone-maps the frame. The SDR pair above is the pre-43 code.
     winrt::com_ptr<ID3D11ComputeShader> colorgradingHdrCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> lutgenHdrCS = nullptr;
+    // (50a) HUE_PRESERVE variants of the LUT bake (Hue-Preserving Tone Curve); the apply is unchanged (it only reads the LUT).
+    winrt::com_ptr<ID3D11ComputeShader> lutgenHueCS = nullptr;
+    winrt::com_ptr<ID3D11ComputeShader> lutgenHdrHueCS = nullptr;
     // (44e) BLOOM_FUSED variants of the apply: COD Bloom's composite added on load.
     winrt::com_ptr<ID3D11ComputeShader> colorgradingFusedCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> colorgradingHdrFusedCS = nullptr;

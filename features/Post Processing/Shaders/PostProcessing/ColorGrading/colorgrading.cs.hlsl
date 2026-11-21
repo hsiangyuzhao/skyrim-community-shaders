@@ -1087,6 +1087,36 @@ float3 LogToLinearSpace(float3 val, uint logType)
 
 ////////////////////////////////////////////////////////////////////////
 
+#if defined(HUE_PRESERVE)
+// (50a) "Hue-Preserving Tone Curve" (physical lighting redo, display layer): wraps WHICHEVER tone curve is selected (TONEMAP_FUNC). The curve
+// is applied to one scalar of the colour, its max channel n, and the colour is scaled by curve(n) / n, so the channel ratios (hue and
+// saturation) stay; per channel the curve squeezes each channel separately and bright saturated colours drift toward the primaries'
+// yellow / cyan / magenta and white. Max channel, not luminance: then no channel ever exceeds curve(n) <= the curve's peak (a luminance
+// norm would push a saturated colour's largest channel past white and clip it there, shifting the hue at the clip). As curve(n) approaches
+// the curve's own peak (its output for a very large input, so SDR curves and the Native HDR forms alike) the result blends toward the
+// per-channel one with weight (curve(n) / peak)^4, so very bright colours still reach white. Neutral colours are unchanged.
+// Not for the display-space tone mappers (TONEMAP_DISPLAY_SPACE: their output is in another colour space than their input).
+float3 TonemapHuePreserving(float3 color)
+{
+	const float3 perChannel = TONEMAP_FUNC(color);
+#	if defined(TONEMAP_DISPLAY_SPACE)
+	return perChannel;
+#	else
+	const float n = max(max(color.r, color.g), color.b);
+	const float3 curveN3 = TONEMAP_FUNC(n.xxx);
+	const float curveN = max(max(curveN3.r, curveN3.g), curveN3.b);
+	const float3 peak3 = TONEMAP_FUNC(65536.0.xxx);
+	const float peak = max(max(max(peak3.r, peak3.g), peak3.b), 1e-6);
+	const float3 hue = n > 1e-6 ? max(color, 0.0) * (curveN / n) : perChannel;
+	const float w = pow(saturate(curveN / peak), 4.0);
+	return lerp(hue, perChannel, w);
+#	endif
+}
+#	define TONEMAP_APPLY(c) TonemapHuePreserving(c)
+#else
+#	define TONEMAP_APPLY(c) TONEMAP_FUNC(c)
+#endif
+
 #if defined(HDR_OUTPUT)
 float3 ColorGrading(float3 color, HDRKnee hdrKnee, out float hdrScale)
 {
@@ -1143,16 +1173,16 @@ float3 ColorGrading(float3 color)
 				hdrScale = HDRGT7Scale(exposed, color);
 #	else
 			// Lottes, Neutwo: the tone mapper's own HDR form (see the function).
-			color = TONEMAP_FUNC(color);
+			color = TONEMAP_APPLY(color);  // (50a) Hue-Preserving Tone Curve when compiled in
 #	endif
 		} else {
 			const float3 preTonemap = color;
-			color = TONEMAP_FUNC(color);
+			color = TONEMAP_APPLY(color);
 			[branch] if (hdrParams.x > 0.5)
 				hdrScale = HDRExtendScale(preTonemap, hdrKnee);
 		}
 #else
-        color = TONEMAP_FUNC(color);
+        color = TONEMAP_APPLY(color);
 #endif
     }
 
