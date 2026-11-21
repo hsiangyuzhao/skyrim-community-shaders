@@ -331,6 +331,11 @@ namespace
 	// Dark Side (a ray from a traced surface whose smoothed normal faces away from the light is blocked). PointDenoiseCS (PL_FIX variant):
 	// Decorrelated Sampling (taps rotated by a hash), Stable Penumbra (the beam path for every point slot), Close Blockers: Minimum Blur.
 	constexpr std::uint32_t kPointFlagNoiseDecorrelate = 262144u, kPointFlagNoiseDarkSide = 524288u;
+	// (49m) TracePointLightsCS: Dark Side Test Tolerant, Grazing-Angle Offset, Smooth Shadow Edges (extra rays), Soft Hand-Off for Weak Lights.
+	constexpr std::uint32_t kPointFlagDarkTolerant = 1048576u, kPointFlagGrazeOffset = 2097152u, kPointFlagEdgeRays = 4194304u,
+							kPointFlagSoftCut = 8388608u;
+	// (49m) PointDenoiseCS: the trace wrote the fractional encoding (kFlagEdgeRays / kFlagSoftCut).
+	constexpr std::uint32_t kPointDenoiseFractional = 65536u;
 	constexpr std::uint32_t kPointDenoiseNoiseDecorrelate = 256u, kPointDenoiseNoiseStable = 512u, kPointDenoiseNoiseCloseBlur = 1024u;
 	// (48m) PointDenoiseCS PL_CLEAN: Moving Characters: Clean Shadow History used / its moving test runs (t6 bound; also for the debug views).
 	constexpr std::uint32_t kPointDenoiseClean = 4096u, kPointDenoiseCleanDetect = 8192u;
@@ -2081,6 +2086,10 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.PointCloseContact = read("PointCloseContact", defaults.PointCloseContact);  // (49h)
 		settings.PointSmoothHardEdges = read("PointSmoothHardEdges", defaults.PointSmoothHardEdges);  // (49i)
 		settings.PointSteadyEdges = read("PointSteadyEdges", defaults.PointSteadyEdges);              // (49i)
+		settings.PointDarkSideTest = std::clamp(read("PointDarkSideTest", defaults.PointDarkSideTest), 0, 2);  // (49m)
+		settings.PointGrazingOffset = read("PointGrazingOffset", defaults.PointGrazingOffset);
+		settings.PointEdgeRays = read("PointEdgeRays", defaults.PointEdgeRays);
+		settings.PointSoftCut = read("PointSoftCut", defaults.PointSoftCut);
 		settings.HairFaintStrands = read("HairFaintStrands", defaults.HairFaintStrands);    // (49h)
 		settings.AOContactOnce = read("AOContactOnce", defaults.AOContactOnce);  // (49h)
 		settings.ReflectionsMaterials = read("ReflectionsMaterials", defaults.ReflectionsMaterials);  // (48f)
@@ -2260,6 +2269,10 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["PointCloseContact"] = settings.PointCloseContact;  // (49h)
 	o_json["PointSmoothHardEdges"] = settings.PointSmoothHardEdges;  // (49i)
 	o_json["PointSteadyEdges"] = settings.PointSteadyEdges;          // (49i)
+	o_json["PointDarkSideTest"] = settings.PointDarkSideTest;        // (49m)
+	o_json["PointGrazingOffset"] = settings.PointGrazingOffset;
+	o_json["PointEdgeRays"] = settings.PointEdgeRays;
+	o_json["PointSoftCut"] = settings.PointSoftCut;
 	o_json["HairFaintStrands"] = settings.HairFaintStrands;    // (49h)
 	o_json["AOContactOnce"] = settings.AOContactOnce;  // (49h)
 	o_json["ReflectionsMaterials"] = settings.ReflectionsMaterials;  // (48f)
@@ -5726,8 +5739,20 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	// Edges; (48k) Noise Fix: Decorrelated Sampling, Consistent Dark Side. (49h) Close-Contact Shadows on Characters: a switch again (default on).
 	if (settings.PointCloseContact)
 		flags |= kPointFlagCloseContact;
-	flags |= kPointFlagCurvedRanking | kPointFlagBeamRange | kPointFlagBeamSmooth | kPointFlagNoiseDecorrelate |
-	         kPointFlagNoiseDarkSide;
+	flags |= kPointFlagCurvedRanking | kPointFlagBeamRange | kPointFlagBeamSmooth | kPointFlagNoiseDecorrelate;
+	// (49m) Dark Side Test (0 Off / 1 Original = 48k-49j / 2 Tolerant), Grazing-Angle Offset, Smooth Shadow Edges (extra rays), Soft Hand-Off
+	// for Weak Lights. The last two switch the trace to the fractional encoding, which the denoiser of this frame must read too.
+	if (settings.PointDarkSideTest >= 1)
+		flags |= kPointFlagNoiseDarkSide;
+	if (settings.PointDarkSideTest >= 2)
+		flags |= kPointFlagDarkTolerant;
+	if (settings.PointGrazingOffset)
+		flags |= kPointFlagGrazeOffset;
+	if (settings.PointEdgeRays)
+		flags |= kPointFlagEdgeRays;
+	if (settings.PointSoftCut)
+		flags |= kPointFlagSoftCut;
+	pointFractionalThisFrame = settings.PointEdgeRays || settings.PointSoftCut;
 	if (wide)  // (48a)
 		flags |= kPointFlagWide | (widePrev ? kPointFlagWidePrev : 0u);
 	if (extra)  // (48c)
@@ -5922,6 +5947,9 @@ void RayTracing::FinishPointLights()
 		flags |= settings.PointSmoothHardEdges ? kPointDenoiseSmoothHard : 0u;
 		flags |= settings.PointSteadyEdges ? kPointDenoiseSteadyEdges : 0u;
 	}
+	// (49m) The trace wrote the fractional encoding (Smooth Shadow Edges (extra rays) / Soft Hand-Off for Weak Lights): every variant reads it.
+	if (pointFractionalThisFrame)
+		flags |= kPointDenoiseFractional;
 	// (48a) Lights per pixel 5 - 6: their history only when last frame denoised them too and the main history is valid.
 	const bool wideHistory = wide && pointWideHistoryValid && (flags & kPointDenoiseHistory);
 	flags |= (wide ? kPointDenoiseWide : 0u) | (wideHistory ? kPointDenoiseWideHistory : 0u);
@@ -9163,9 +9191,41 @@ void RayTracing::DrawPointLightPage()
 				            "  walking past a lamp) still replaces its history at once.");
 				ImGui::Text("Off: as 49h (the history was snapped to fully lit / fully dark wherever the closest pixels agreed: the edge flickered).");
 			}
+			// (49m) Shattered dark islands on characters lit from the side, and stair-stepped edges (TracePointLightsCS).
+			{
+				const char* kDarkModes[3] = { "Off", "Original (48k)", "Tolerant" };
+				settings.PointDarkSideTest = std::clamp(settings.PointDarkSideTest, 0, 2);
+				ImGui::Combo("Dark Side Test", &settings.PointDarkSideTest, kDarkModes, 3);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("Where a ray-traced surface faces away from a lamp it counts as in its own shadow without tracing a ray.");
+					ImGui::Text("  Tolerant (default): only where it clearly faces away (a little past the edge between lit and dark side, more on curved or\n"
+					            "    faceted spots), judged from a smoothed surface direction: no dark islands on skin and clothes lit from the side.");
+					ImGui::Text("  Original (48k - 49l): decided exactly at the edge, per small flat facet of the body: a mosaic of dark islands where a\n"
+					            "    lamp or torch grazes a character.");
+					ImGui::Text("  Off: no such test (before 48k): lit specks can appear along the edge between lit and dark side.");
+				}
+			}
+			ImGui::Checkbox("Grazing-Angle Offset", &settings.PointGrazingOffset);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): where a lamp's light grazes a surface, its shadow ray starts a little farther from the surface (on characters\n"
+				            "  up to 6 units instead of 2), so the surface does not shadow itself in patches. Contact shadows lit head-on stay as they were.");
+				ImGui::Text("Off: as 49l.");
+			}
+			ImGui::Checkbox("Smooth Shadow Edges (extra rays)", &settings.PointEdgeRays);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): pixels on a shadow edge trace 3 more rays from inside the pixel and keep the share that is lit, so a sharp\n"
+				            "  shadow edge is smooth already before the clean-up (fewer stair steps, less flicker). A little slower (only edge pixels).");
+				ImGui::Text("Off: one ray per light and pixel, as 49l.");
+			}
+			ImGui::Checkbox("Soft Hand-Off for Weak Lights", &settings.PointSoftCut);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): a lamp that only just counts for a pixel (a few %% of the light there) fades its ray-traced shadow in, instead\n"
+				            "  of a hard line where the pixels next to it stop tracing that lamp. Its shadow is a little weaker right at that line.");
+				ImGui::Text("Off: as 49l.");
+			}
 			// (48o) Fixed on, no switches any more: (47r) Reuse the Sun's Surface Probe Everywhere; (47x) Smoother Shadow Edges, Trace Lights on
 			// Curved Surfaces Reliably, Close-Contact Shadows on Characters; (48m) Moving Characters: Clean Shadow History; (48k) Point Lights:
-			// Noise Fix with Decorrelated Sampling, Stable Penumbra, Close Blockers: Minimum Blur, Consistent Dark Side; (47z) Window Beams:
+			// Noise Fix with Decorrelated Sampling, Stable Penumbra, Close Blockers: Minimum Blur ((49m) Consistent Dark Side: Dark Side Test above); (47z) Window Beams:
 			// Respect Their Range, Stable Light Choice When the Camera Moves, (48c) its Jitter Fix. Fixed off: (46c) Skip the Game's Shadow
 			// Maps for RT-Shadowed Lights and its (47w) Adaptive child.
 			if (pointCleanFailed)
@@ -9993,6 +10053,10 @@ nlohmann::json RayTracing::DescribeJson() const
 	j["point_close_contact"] = settings.PointCloseContact;  // (49h)
 	j["point_smooth_hard_edges"] = settings.PointSmoothHardEdges;  // (49i)
 	j["point_steady_edges"] = settings.PointSteadyEdges;            // (49i)
+	j["point_dark_side_test"] = settings.PointDarkSideTest;         // (49m) 0 off, 1 original, 2 tolerant
+	j["point_grazing_offset"] = settings.PointGrazingOffset;
+	j["point_edge_rays"] = settings.PointEdgeRays;
+	j["point_soft_cut"] = settings.PointSoftCut;
 	j["first_person_player_rt"] = settings.FirstPersonPlayer;
 	j["denoiser"] = settings.Denoiser;
 	j["rt_contact_scale"] = settings.RtContactScale;

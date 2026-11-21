@@ -285,9 +285,26 @@ float HistoryDrop(uint a_id)
 	return float((word >> ((s & 3u) * 8u)) & 0xFFu) / 255.0;
 }
 
+// (49m) kPLFlagFractional: the trace's fractional encoding ("Smooth Shadow Edges (extra rays)" / "Soft Hand-Off for Weak Lights",
+// TracePointLightsCS kFlagEdgeRays / kFlagSoftCut): 255 = lit, 128..254 = partly lit ((b - 128) / 126 lit, no blocker distance),
+// 0..127 = blocked (b / 127 = sqrt(blocker / light distance)). Without it: 255 lit, 0..254 blocked (b / 254), exactly as before.
+static const uint kPLFlagFractional = 65536u;
+static const float kFracPartLo = 127.5 / 255.0;
+
 float Lit(float a_raw)
 {
-	return a_raw >= 0.999 ? 1.0 : 0.0;
+	// (49m) kPLFlagFractional: 128..254 partly lit (uniform: the same choice for every sample of the dispatch).
+	const bool partial = (asuint(PLParams.z) & kPLFlagFractional) != 0u && a_raw >= kFracPartLo;
+	return a_raw >= 0.999 ? 1.0 : (partial ? saturate((a_raw * 255.0 - 128.0) / 126.0) : 0.0);
+}
+
+// (49m) A fully blocked sample's sqrt(blocker / light distance) (o_t; false: lit or partly lit). Without kPLFlagFractional: raw < 0.999,
+// raw x 255 / 254 (what the three call sites computed before).
+bool BlockerT(float a_raw, out float o_t)
+{
+	const bool fractional = (asuint(PLParams.z) & kPLFlagFractional) != 0u;
+	o_t = a_raw * (fractional ? (255.0 / 127.0) : (255.0 / 254.0));
+	return a_raw < (fractional ? kFracPartLo : 0.999);
 }
 
 // (46x) Does this source (id = slot + 1) have its own emitter radius (a direct fill without a window spot)?
@@ -434,8 +451,8 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw)
 					weights2[s] += w * w;
 					lo[s] = min(lo[s], v);
 					hi[s] = max(hi[s], v);
-					if (v < 0.5) {
-						const float t = r * (255.0 / 254.0);
+					float t;
+					if (BlockerT(r, t)) {  // (49m) was: v < 0.5, t = r x 255 / 254
 						qSum[s] += t * t;
 						qCount[s] += 1.0;
 					}
@@ -577,8 +594,8 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw)
 							gW2[s5] += wG * wG;
 							lo5[s5] = min(lo5[s5], v);
 							hi5[s5] = max(hi5[s5], v);
-							if (v < 0.5) {
-								const float t = r * (255.0 / 254.0);
+							float t;
+							if (BlockerT(r, t)) {  // (49m) was: v < 0.5, t = r x 255 / 254
 								q5Sum[s5] += t * t;
 								q5Count[s5] += 1.0;
 							}
@@ -706,8 +723,8 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw)
 						const float wPlane = exp(-abs(dot(N, RTPosition(q, dq) - P)) / slotPlaneTolerance);
 						float rq;
 						if (wPlane >= 0.05 && MatchWide(Ids(PLIdx[q]), PLVis[q], WideAt(q, flags), ids[s], rq)) {
-							if (rq < 0.999) {
-								const float t = rq * (255.0 / 254.0);
+							float t;
+							if (BlockerT(rq, t)) {  // (49m) was: rq < 0.999, t = rq x 255 / 254
 								pqSum += t * t;
 								pqCount += 1.0;
 							}
@@ -1061,10 +1078,10 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw)
 				float v = 1.0;
 				[unroll] for (uint s = 0u; s < 4u; ++s)
 					if (ids[s] != 0u)
-						v *= raw[s] >= 0.999 ? 1.0 : 0.0;
+						v *= Lit(raw[s]);  // (49m) partly lit samples show grey (was raw >= 0.999, the same without kPLFlagFractional)
 				[unroll] for (uint s2 = 0u; s2 < 2u; ++s2)
 					if (wideIds[s2] != 0u)
-						v *= wideRaw[2u + s2] >= 0.999 ? 1.0 : 0.0;
+						v *= Lit(wideRaw[2u + s2]);
 				debug = float4(v.xxx, 1.0);
 			}
 		} else if (view == kViewPLDenoised) {
