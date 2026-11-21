@@ -19,7 +19,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	VariableRateShading::Settings,
 	Enabled,
 	Quality,
-	MotionPixels)
+	MotionPixels,
+	FullRateSoftEffects)
 // (48o) DebugOverlay is not saved or loaded: it always starts off (an old saved key is ignored).
 
 namespace
@@ -466,7 +467,8 @@ void VariableRateShading::EndOpaquePass()
 		ApplyTable(Table::Off);
 	// (47p, A) The blended pass's soft effects: the rate image stays bound (its values do not matter for kEffectsTable) until
 	// EndEffectsWindow (the engine's image space starts) or Present.
-	if (imageBound && hardwareSupported && PerfOptions::settings.VrsEffects && IsActive()) {
+	// (49k) Only with "Full Detail for Smoke and Mist" off (default on: no effects window, soft effects at full rate).
+	if (imageBound && hardwareSupported && PerfOptions::settings.VrsEffects && !settings.FullRateSoftEffects && IsActive()) {
 		effectsWindow = true;
 		return;
 	}
@@ -746,7 +748,19 @@ void VariableRateShading::DrawSettings()
 		ImGui::Text("Lets fast-moving parts of the screen drop more detail, since motion hides it. Lower values = stronger effect, more savings; 0 turns it off.");
 	}
 
-	ImGui::TextDisabled("Never affected: the ground, cut-out objects other than grass, blended decals, shadows, sky, water, transparent effects, UI, post-processing.");
+	// (49k) The 47p soft-effects window (every soft effect at 2x2) is now this switch, default on = full rate.
+	ImGui::Checkbox("Full Detail for Smoke and Mist", &settings.FullRateSoftEffects);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text(
+			"On: soft see-through effects (smoke, mist, the clouds around mountains, steam, glows) are shaded at full detail.\n"
+			"Off: they are shaded once per 2x2 block of pixels (about 0.1-0.2 ms faster), which turns their edges into blocks where\n"
+			"bright mist meets a dark object (mountain rock, a roof), and those blocks flicker.");
+	}
+
+	if (settings.FullRateSoftEffects)
+		ImGui::TextDisabled("Never affected: the ground, cut-out objects other than grass, blended decals, shadows, sky, water, transparent effects, UI, post-processing.");
+	else
+		ImGui::TextDisabled("Never affected: the ground, cut-out objects other than grass, blended decals, shadows, sky, water, UI, post-processing. Soft effects: 2x2.");
 
 	if (IsActive() && hasRateCounts) {
 		uint32_t total = 0;
