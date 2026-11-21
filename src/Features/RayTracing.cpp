@@ -1823,6 +1823,7 @@ void RayTracing::UpdateCharacters()
 	characters.SetStrictAlpha(settings.HairFaintStrands);  // (49h) a change re-captures the characters
 	characters.Configure(settings.PhysicsParts, settings.Hair, backend.SkinAlphaAvailable(), settings.FirstPersonPlayer, PerfOptions::settings.RtDropTinyParts);
 	characters.SetBonesTolerant(PerfOptions::settings.RtBonesTolerant);  // (47p)
+	characters.SetRefreshShapes(settings.CharRefreshShapes);              // (49m)
 	characters.SetBodyOnlyDistance(NpcFullDistance());                   // (47q) the NPC rule
 }
 
@@ -2090,6 +2091,7 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.PointGrazingOffset = read("PointGrazingOffset", defaults.PointGrazingOffset);
 		settings.PointEdgeRays = read("PointEdgeRays", defaults.PointEdgeRays);
 		settings.PointSoftCut = read("PointSoftCut", defaults.PointSoftCut);
+		settings.CharRefreshShapes = read("CharRefreshShapes", defaults.CharRefreshShapes);
 		settings.HairFaintStrands = read("HairFaintStrands", defaults.HairFaintStrands);    // (49h)
 		settings.AOContactOnce = read("AOContactOnce", defaults.AOContactOnce);  // (49h)
 		settings.ReflectionsMaterials = read("ReflectionsMaterials", defaults.ReflectionsMaterials);  // (48f)
@@ -2273,6 +2275,7 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["PointGrazingOffset"] = settings.PointGrazingOffset;
 	o_json["PointEdgeRays"] = settings.PointEdgeRays;
 	o_json["PointSoftCut"] = settings.PointSoftCut;
+	o_json["CharRefreshShapes"] = settings.CharRefreshShapes;
 	o_json["HairFaintStrands"] = settings.HairFaintStrands;    // (49h)
 	o_json["AOContactOnce"] = settings.AOContactOnce;  // (49h)
 	o_json["ReflectionsMaterials"] = settings.ReflectionsMaterials;  // (48f)
@@ -8980,6 +8983,14 @@ void RayTracing::DrawObjectRows()
 			ImGui::Text("Off (default): in first person the player keeps the shadow-map shadow (camera mods can hide the arms");
 			ImGui::Text("  from a traced shadow). On: the player is ray traced in first person too.");
 		}
+		// (49m)
+		ImGui::Checkbox("Refresh Changed Character Shapes", &settings.CharRefreshShapes);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): a character whose face expression or body shape changed after it was captured (talking, blinking, a body\n"
+			            "  morph) is captured again (at most about once a second per part), so the ray-traced shape keeps matching what you see:\n"
+			            "  no dark patches on cheeks, lips or the chest from an outdated shape.");
+			ImGui::Text("Off: as 49l (captured once; the face does not follow its expression).");
+		}
 		ImGui::EndDisabled();
 		ImGui::Unindent();
 	}
@@ -9846,6 +9857,7 @@ void RayTracing::DrawDiagnostics()
 				if (auto _tt = Util::HoverTooltipWrapper()) {
 					ImGui::Text("Each distinct shape is counted once. Placement: its skinned vertices did not fit the game's own bounds (details in the log).");
 					ImGui::Text("Shader: decals, effect shaders, alpha-blended only, does not cast shadows. Changes (equip, dismember) so far: %u.", ch.retiredShapes);
+				ImGui::Text("  Of those re-captured because their shape changed (Refresh Changed Character Shapes, 49m): %u.", ch.refreshedShapes);
 				}
 			}
 			ImGui::Text("BLAS: %u built (%.2f M triangles), %u queued, %u instances, %llu builds total", rt.blasCount,
@@ -10057,6 +10069,7 @@ nlohmann::json RayTracing::DescribeJson() const
 	j["point_grazing_offset"] = settings.PointGrazingOffset;
 	j["point_edge_rays"] = settings.PointEdgeRays;
 	j["point_soft_cut"] = settings.PointSoftCut;
+	j["char_refresh_shapes"] = settings.CharRefreshShapes;
 	j["first_person_player_rt"] = settings.FirstPersonPlayer;
 	j["denoiser"] = settings.Denoiser;
 	j["rt_contact_scale"] = settings.RtContactScale;
