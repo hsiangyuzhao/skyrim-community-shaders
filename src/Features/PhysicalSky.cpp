@@ -1619,6 +1619,10 @@ void PhysicalSky::Reset()
 		skyScaleSmoothed = -1.f;  // (47a) snap when the sky comes back
 		skyAnchorSnap = true;  // (50b) likewise
 		skyAnchorApplied = 1.f;
+		outdoorActive = false;  // (51a) interiors, other worldspaces, menus: the new model does nothing
+		outdoorWasActive = false;
+		realOzoneInEffect = false;
+		outdoorAmbient.valid = false;
 		HistogramAutoExposure::freezeAdaptation = false;
 		cbData.enabled = allGood;
 		horizonFixCbData = {};  // (47f)
@@ -1627,6 +1631,10 @@ void PhysicalSky::Reset()
 		linearLighting.isDirLightLinear = false;
 		return;
 	}
+
+	// (51a) Physical Outdoor Light: in effect here (outdoors, the physical sky drawn) with the master on.
+	outdoorActive = OutdoorOn(true);
+	realOzoneInEffect = OutdoorActive(settings.outdoorLight.realOzone);
 
 	// resolution
 	float2 res = globals::state->screenSize;
@@ -1729,7 +1737,13 @@ void PhysicalSky::Reset()
 	float3 ozoneAbsorption = settings.ozoneAbsorption;
 	float ozoneAltitude = settings.ozoneAltitude;
 	float ozoneThickness = settings.ozoneThickness;
-	if (skyFixes) {
+	if (realOzoneInEffect) {
+		// (51a) "Real Ozone": real ozone's absorption (peak of the 10-40 km tent, Hillaire 2020 / Bruneton 2017; mostly green, so the low sun
+		// reddens instead of yellowing), on the Sky Fixes layer, without the saved thickness' column scaling.
+		ozoneAbsorption = float3(kRealOzoneAbsorption[0], kRealOzoneAbsorption[1], kRealOzoneAbsorption[2]);
+		ozoneAltitude = kOzoneFixAltitude;
+		ozoneThickness = kOzoneFixThickness;
+	} else if (skyFixes) {
 		const float thickness = std::isfinite(settings.ozoneThickness) ? std::max(settings.ozoneThickness, 0.f) : 0.f;
 		ozoneAbsorption = settings.ozoneAbsorption * (thickness / kOzoneFixThickness);
 		ozoneAltitude = kOzoneFixAltitude;
@@ -2163,6 +2177,8 @@ bool PhysicalSky::UpdateCpuSkyModel()
 	atmosphere.ozoneAltitude = kOzoneFixAltitude;
 	atmosphere.ozoneThickness = kOzoneFixThickness;
 	atmosphere.ozoneAbsorption = { s.ozoneAbsorption.x * 1e-3 * ozoneScale, s.ozoneAbsorption.y * 1e-3 * ozoneScale, s.ozoneAbsorption.z * 1e-3 * ozoneScale };
+	if (realOzoneInEffect)  // (51a) as uploaded
+		atmosphere.ozoneAbsorption = { kRealOzoneAbsorption[0] * 1e-3, kRealOzoneAbsorption[1] * 1e-3, kRealOzoneAbsorption[2] * 1e-3 };
 	atmosphere.groundAlbedo = { s.groundAlbedo.x, s.groundAlbedo.y, s.groundAlbedo.z };
 	atmosphere.midpoint = true;
 	atmosphere.groundFix = true;
