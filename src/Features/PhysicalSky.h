@@ -203,6 +203,9 @@ struct PhysicalSky final : public Feature
 		/// (49h) "Sun Highlight on Water Follows the Atmosphere" (Celestials, under Transmittance Mix): Water.hlsl's sun highlight x the
 		/// transmittance toward the light (PhysSky::SampleTr), as every surface gets it (NightFlags kNightWaterSunTr). Off = 49g.
 		bool waterSunTransmittance = true;
+		/// (49j, design 9-4) "Rain Without Colour" (Scene Lighting > Related): Particle.hlsl's precipitation keeps only its texture's brightness
+		/// (PhysLightFlags kPLRainNoColour). Independent of the Lighting Fixes master. Off = 49i.
+		bool rainNoColour = true;
 		/// (49h stage 1; 50a redo base) "Lighting Fixes" (Scene Lighting tab): one master and one checkbox per rule (S3a-S8; the 49h
 		/// S1/S2 light-unit rules are retired). Master off = 49h groups 1-7. Saved outside the NLOHMANN macro (key "physicalLighting").
 		struct PhysicalLighting
@@ -445,6 +448,8 @@ struct PhysicalSky final : public Feature
 		kPLForwardCubemap = 1u << 8,
 		kPLSmallFixes = 1u << 9,
 		kPLLandPbr = 1u << 10,  // information: the loaded land uses True PBR texture sets
+		// bits 11-14: unused (49h stage 2 / 49j information bits, not in the base)
+		kPLRainNoColour = 1u << 15,  // (49j 9-4) Particle.hlsl: precipitation without the texture's colour (independent of the master)
 	};
 	struct NightCbData
 	{

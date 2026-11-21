@@ -413,6 +413,8 @@ namespace MoonSky
 	// Brightness of the planetshine grey, relative to the moon's lit colour: the mean luminance of the game's full
 	// moon picture (masser_full.dds after the sky gamma, 0.26).
 	static const float PlanetshineGrey = 0.25;
+	// (49j, design 9-3) Earthshine on the dark side relative to the lit side at a full Earth (order 1e-3 .. 1e-4; astronomy, not code).
+	static const float PlanetshineRatio = 1e-3;
 
 	bool StarFadeOn() { return (SharedData::physSkyNightData.Flags & StarFadeFlag) != 0; }
 	bool PlanetshineOn() { return (SharedData::physSkyNightData.Flags & PlanetshineFlag) != 0; }
@@ -620,7 +622,9 @@ PS_OUTPUT main(PS_INPUT input)
 			const float2 planetshine = MoonSky::PlanetshineAmounts();
 			const float amount = secunda ? planetshine.y : planetshine.x;
 			const float r = length(input.TexCoord0.xy * 2.0 - 1.0);
-			const float fillAlpha = amount * (1.0 - smoothstep(0.90, 0.99, r)) * (1.0 - smoothstep(0.02, 0.2, baseColor.w)) * saturate(input.Color.w);
+			// (49j, design 9-3) Earthshine: an opaque disc (a real moon hides what is behind it), sharp at its limb (the pictures' disc
+			// edge is at r ~0.97; 48b feathered 0.90-0.99); `amount` = brightness relative to the real ratio x the Earth's phase.
+			const float fillAlpha = saturate(4.0 * amount) * (1.0 - smoothstep(0.955, 0.975, r)) * (1.0 - smoothstep(0.02, 0.2, baseColor.w)) * saturate(input.Color.w);
 			[branch] if (fillAlpha > 0.0)
 			{
 				const float3 moonViewDir = normalize(input.WorldPosition.xyz);
@@ -631,8 +635,11 @@ PS_OUTPUT main(PS_INPUT input)
 					behind = PhysSky::SampleSky(moonViewDir, input.Position.xy, PhysSky::SampSv);
 				const float discLuminance = Color::RGBToLuminance(Color::Sky(input.Color.xyz)) *
 				                            (secunda ? SharedData::physSkyMoonData.SecundaDiskScale : SharedData::physSkyMoonData.MasserDiskScale);
-				// Slightly darker towards the limb, as the lit side.
-				const float grey = discLuminance * MoonSky::PlanetshineGrey * (0.6 + 0.4 * sqrt(saturate(1.0 - r * r)));
+				// (49j) The lit full disc's brightness x kPlanetshineRatio x amount, with the picture's own markings (its colour on the
+				// unlit side, relative to the full moon picture's mean 0.26; half-strength so a black unlit side still shows a disc), slightly
+				// darker towards the limb as the lit side.
+				const float markings = lerp(1.0, saturate(Color::RGBToLuminance(max(baseColor.xyz, 0.0)) / MoonSky::PlanetshineGrey), 0.5);
+				const float grey = discLuminance * MoonSky::PlanetshineGrey * MoonSky::PlanetshineRatio * amount * markings * (0.6 + 0.4 * sqrt(saturate(1.0 - r * r)));
 				const float3 fillColor = max(behind, 0.0) + grey;
 				const float litAlpha = psout.Color.w;
 				const float outAlpha = litAlpha + fillAlpha * (1.0 - litAlpha);

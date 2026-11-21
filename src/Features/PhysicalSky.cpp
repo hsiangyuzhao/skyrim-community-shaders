@@ -125,6 +125,7 @@ void PhysicalSky::LoadSettings(json& o_json)
 		settings.aerosolPreset = o_json.value("aerosolPreset", defaults.aerosolPreset);  // (47b)
 		settings.moonFadesStars = o_json.value("moonFadesStars", defaults.moonFadesStars);  // (48b)
 		settings.waterSunTransmittance = o_json.value("waterSunTransmittance", defaults.waterSunTransmittance);  // (49h)
+		settings.rainNoColour = o_json.value("rainNoColour", defaults.rainNoColour);  // (49j)
 		// (49h stage 1) Physical Lighting: missing keys keep their defaults.
 		if (const auto it = o_json.find("physicalLighting"); it != o_json.end() && it->is_object()) {
 			auto& pl = settings.physicalLighting;
@@ -286,6 +287,7 @@ void PhysicalSky::SaveSettings(json& o_json)
 	o_json["aerosolPreset"] = settings.aerosolPreset;  // (47b)
 	o_json["moonFadesStars"] = settings.moonFadesStars;  // (48b)
 	o_json["waterSunTransmittance"] = settings.waterSunTransmittance;  // (49h)
+	o_json["rainNoColour"] = settings.rainNoColour;  // (49j)
 	{
 		const auto& pl = settings.physicalLighting;  // (49h stage 1)
 		o_json["physicalLighting"] = { { "enabled", pl.enabled }, { "iblNoFeedback", pl.iblNoFeedback }, { "iblEnvOcclusion", pl.iblEnvOcclusion },
@@ -631,10 +633,10 @@ void PhysicalSky::SettingsCelestials()
 	ImGui::SliderFloat("Planetshine Strength", &settings.moonPlanetshineStrength, 0.f, 0.5f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text(
-			"A faint grey glow on the dark side of each moon, strongest at a thin crescent, none at full moon.\n"
-			"How visible the dark side is. Default 0.10: at a thin crescent the dark side gets a grey of\n"
-			"about 7%% of the lit side's brightness on top of the sky behind it.\n"
-			"Now: Masser %.3f, Secunda %.3f.",
+			"Earthshine: the dark side of each moon, lit by the Earth, strongest at a thin crescent, none at full moon.\n"
+			"(49j) The dark side is a solid disc (it hides the stars behind it) with a sharp edge and the moon's own markings; its\n"
+			"brightness is 1/1000 of the lit side x the Earth's phase at the default 0.10 (the real ratio); 0.20 = twice that.\n"
+			"Now (relative to the real ratio): Masser %.2f, Secunda %.2f.",
 			moonPlanetshineAmount[0], moonPlanetshineAmount[1]);
 
 	// (44h) removed the "New Moon" section ("Hide New Moon Disc"): fixed on (47m: in the code).
@@ -1145,8 +1147,10 @@ void PhysicalSky::UpdateMoonSky(float a_exposure, float a_sunElevation)
 	}
 
 	if (s.moonPlanetshine) {
-		// Opacity of the grey fill on the unlit side: strength x (1 - phase brightness) x night. Thin crescent (phase
-		// 0.25): 0.75 x strength; quarter 0.5x; gibbous 0.25x; full none. A new moon's disc is not drawn at all.
+		// (49j, design 9-3) Earthshine. The value is the dark side's brightness relative to kPlanetshineRatio x the lit disc: strength / 0.1
+		// (the default 0.1 = the real ratio) x the Earth's phase seen from the moon (1 - the moon's lit fraction, from the phase picture) x night.
+		// Sky.hlsl draws the dark side opaque (a real moon hides the stars behind it) with the sky behind plus this grey, sharp-edged and with
+		// the picture's brightness structure. 48b: an opacity of strength x (1 - phase), a grey of 0.25 x the lit disc (10-20x too bright).
 		const float strength = std::clamp(s.moonPlanetshineStrength, 0.f, 0.5f);
 		for (int i = 0; i < 2; ++i) {
 			if (!moons[i] || !(strength > 0.f) || !(dayFade > 0.f))
@@ -1154,8 +1158,8 @@ void PhysicalSky::UpdateMoonSky(float a_exposure, float a_sunElevation)
 			const float phase = SkySync::PhaseFactorFromTexture(moons[i]);
 			if (phase <= SkySync::NewMoonIntensityFactor)
 				continue;
-			const float amount = strength * (1.f - phase) * dayFade;
-			moonPlanetshineAmount[i] = std::isfinite(amount) ? std::clamp(amount, 0.f, 1.f) : 0.f;
+			const float amount = (strength / 0.1f) * (1.f - phase) * dayFade;
+			moonPlanetshineAmount[i] = std::isfinite(amount) ? std::clamp(amount, 0.f, 8.f) : 0.f;
 		}
 		moonCbData.planetshineHalves = toHalves(moonPlanetshineAmount[0], moonPlanetshineAmount[1]);
 		nightCbData.flags |= kNightPlanetshine;
@@ -2117,9 +2121,11 @@ uint32_t PhysicalSky::PhysLightingFlags() const
 {
 	// (49h stage 1) Physical Lighting rule bits for SharedData::horizonFixData.Flags (Common/PhysicalLighting.hlsli).
 	const auto& pl = settings.physicalLighting;
+	// (49j, design 9-4) Independent of the master.
+	const uint32_t independent = (loaded && settings.rainNoColour) ? kPLRainNoColour : 0u;
 	if (!pl.enabled)
-		return 0u;
-	uint32_t flags = 0u;
+		return independent;
+	uint32_t flags = independent;
 	flags |= pl.iblNoFeedback ? kPLIblNoFeedback : 0u;
 	flags |= pl.iblEnvOcclusion ? kPLEnvOcclusion : 0u;
 	flags |= pl.farSkylight ? kPLFarSkylight : 0u;
@@ -2198,6 +2204,12 @@ void PhysicalSky::SettingsSceneLighting()
 		ImGui::Text(
 			"On (default): the sun's bright highlight on water is reddened and dimmed by the atmosphere like the sunlight on the\n"
 			"ground (Celestials > Transmittance Mix), so at dusk and dawn it is no longer a white glare. Off: as in 49g.");
+	ImGui::Checkbox("Rain Without Colour", &settings.rainNoColour);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"On (default): rain and snow streaks keep only the brightness of their texture, tinted by the weather's precipitation colour.\n"
+			"Some weather mods paint the rain texture with refraction colours (cyan, brown, purple noise), which at night showed as\n"
+			"rainbow-coloured streaks. Off: as in 49i.");
 	ImGui::TextDisabled("Also: Lighting > Exponential Height Fog > Stable Fog Colour; Materials > Dynamic Cubemaps > Reflection Brightness Fix.");
 	if (pl.enabled && pl.lodScale)
 		ImGui::TextDisabled("PBR land seen: %s", (PhysLightingFlags() & kPLLandPbr) ? "yes (far land uses the PBR scale)" : "no");
