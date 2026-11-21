@@ -230,6 +230,24 @@ struct PhysicalSky final : public Feature
 			bool weatherHidesMoon = true;  // the ground's moonlight follows the moon visibility the sky and clouds use (weather x -2..3 deg)
 			bool starExtinction = true;    // Sky.hlsl: stars and the Milky Way x T(dir) / T(zenith) toward the horizon
 		} lightingStage2;
+		/// (51a) "Physical Outdoor Light" (Physical Sky > Scene Lighting, first section): the four-layer outdoor light model, package 1.
+		/// Acts only outdoors where the physical sky is drawn (OutdoorActive); interiors and other worldspaces stay 50d. While the master is
+		/// on, the 50b stage-2 "one brightness" factor k_sky and Sky Fixes' zenith factor are not used (the sun family is physical).
+		/// Master off = 50d exactly. Saved outside the NLOHMANN macro (key "physicalOutdoorLight").
+		struct OutdoorLight
+		{
+			bool enabled = true;            // the master
+			bool sunFamily = true;          // sun, sky, cloud sun, fog sky light, ambient sun part: physical x one constant x weather gloominess
+			float weatherGloominess = 1.f;  // exponent on the gloominess g (R1), 0..1: 0 = every weather as bright as the clear reference
+			bool moonFamily = true;         // moon visibility relative to the clear reference (R4), moon day fade -1..+3 deg, no k
+			bool nightGlow = true;          // the night sky's own glow: a CS constant (physical airglow) instead of the weather's night sky
+			float nightSkyGlow = 1.f;       // x the physical airglow, 0..100
+			bool ambient = true;            // the engine's directional ambient rewritten from the physical sky (R2 hue); the original kept for other readers
+			float ambientTint = 1.f;        // R2: how much of the weather's ambient hue (Planckian-bounded), 0..1
+			bool clouds = true;             // clouds lit only by CS light (sun x g, moons, the physical sky); no weather cloud colour
+			bool smoothSun = true;          // Sky Sync's sun path keeps descending below the horizon (SunWarp slope cap)
+			bool realOzone = true;          // ozone absorption 0.650 / 1.881 / 0.085 per Mm (Hillaire 2020 / Bruneton 2017), layer 10-40 km
+		} outdoorLight;
 		/// (48b) Its strength, 0-3. 1: Masser full and high on a clear night keeps about 40% of the Milky Way's light.
 		float moonStarFadeStrength = 1.f;
 		/// (48b) "Moon Planetshine": a faint grey fill on the unlit side of each moon disc (strongest at crescent, none at
@@ -532,6 +550,7 @@ struct PhysicalSky final : public Feature
 		kCloudMoonDaylightFade = 1u << 1,  // "Moons Fade in Daylight" (fixed on since 44h)
 		kCloudMoonDirect = 1u << 2,        // (44h) "Moonlight on Clouds": moons added after the weather cloud colour
 		kCloudLikeGround = 1u << 3,        // (50b) Sky.hlsl: the moons and the ground's ambient on clouds as on the ground (stage 2)
+		kCloudCsLightOnly = 1u << 4,       // (51a) Sky.hlsl: no weather cloud colour; the sky's ambient from the sky-view LUT (needs kCloudLikeGround)
 	};
 	struct CloudCbData
 	{
@@ -569,6 +588,110 @@ struct PhysicalSky final : public Feature
 	[[nodiscard]] bool PhysLightingOn(bool a_rule) const { return loaded && settings.physicalLighting.enabled && a_rule; }
 	/// (50b) A stage-2 item in effect (Physical Sky on, the stage-2 master and its checkbox).
 	[[nodiscard]] bool Stage2On(bool a_item) const { return loaded && settings.enabled && settings.lightingStage2.enabled && a_item; }
+
+	////////////////////////////////////////////////// (51a) Physical Outdoor Light
+	/// Physical Sky on, the master on and the item (also indoors: the sun path must not change at a door).
+	[[nodiscard]] bool OutdoorOn(bool a_item) const { return loaded && settings.enabled && settings.outdoorLight.enabled && a_item; }
+	/// The item in effect this frame: OutdoorOn and outdoors in a physical-sky worldspace (Reset's allGood).
+	[[nodiscard]] bool OutdoorActive(bool a_item) const { return outdoorActive && OutdoorOn(a_item); }
+	bool outdoorActive = false;
+	/// Real ozone (OutdoorLight::realOzone in effect): uploaded and in the CPU model. Set by Reset before anything uses the CPU model.
+	bool realOzoneInEffect = false;
+	static constexpr float kRealOzoneAbsorption[3] = { 0.650f, 1.881f, 0.085f };  // Mm^-1 at the layer's peak (Hillaire 2020; Bruneton 2017)
+
+	/// One weather's day / night keys as the rules read them. Colours linearised with Linear Lighting's gammas (1 without it).
+	struct WeatherKeys
+	{
+		float e = 0.f;           // R1: mean6 Lum(DALC_day^ga) + Lum(sunlight_day^gl) x directional multiplier x VDM x imagespace sunlight scale (day)
+		float a = 0.f;           // mean6 Lum(DALC_day^ga): the ambient calibration
+		float aCloud = 0.f;      // Lum((mean6 DALC_day)^ga): as 50b's cloud ambient read it (Stage2::Ambient)
+		float sigmaDay = 1.f;    // the day imagespace's HDR sunlight scale (1 without an imagespace)
+		float glareNight = 0.f;  // R4: Lum(moon glare_night^skyGamma)
+		float cloudDay = 0.f;    // alpha-weighted Lum(cloud colour_day^skyGamma) over the weather's cloud layers
+	};
+	static WeatherKeys ReadWeatherKeys(const RE::TESWeather* a_weather);
+	/// The "Pleasant" reference of the current worldspace: chance-weighted over the Pleasant weathers of every region weather list there
+	/// (the parent worldspace's when it has none), else the climate's Pleasant weathers; source 0 = none (the rules fall back to neutral).
+	struct WeatherReference
+	{
+		const RE::TESWorldSpace* worldspace = nullptr;
+		const RE::TESClimate* climate = nullptr;
+		float gammaKey = 0.f;  // the gammas it was built with (rebuilt when they change)
+		bool built = false;
+		int source = 0;  // 0 none, 1 regions, 2 parent worldspace's regions, 3 climate
+		int entries = 0;
+		float chance = 0.f;
+		WeatherKeys keys;
+	} weatherRef;
+	void UpdateWeatherReference();
+	/// Per-frame values of the outdoor model (Reset, when OutdoorActive).
+	struct OutdoorFrame
+	{
+		bool valid = false;
+		float gCurrent = 1.f, gLast = 1.f, g = 1.f;  // R1 before the strength: current / last weather, blended by the transition
+		float sunScale = 1.f;                        // g^strength: on the sun family
+		float sigmaNow = 1.f;                        // the imagespace's sunlight scale this frame (the engine multiplies the light by it)
+		float sigmaRef = 1.f;                        // the reference's day value (the clear-noon constant of the direct light)
+		float glareNight = 0.f;                      // R4: the weathers' night moon glare (linear luminance, blended)
+		bool timeJump = false;                       // this frame: time skip, stopped clock, new sun path, weather or worldspace
+	} outdoorFrame;
+	void UpdateOutdoorFrame();
+	float outdoorLastHours = -1.f;
+	uint32_t outdoorLastWarp = 0;
+	const RE::TESWeather* outdoorLastWeather = nullptr;
+	const RE::TESWorldSpace* outdoorLastWorldspace = nullptr;
+	bool outdoorWasActive = false;
+	/// R4 in effect (OutdoorActive(moonFamily)) or the 41b rule: every caller of the moon visibility goes through here.
+	static float MoonVisibility(const RE::Moon* a_moon, const RE::Sky* a_sky, float a_sinElevation);
+	/// R4: the weather's night moon glare relative to the reference's (0..1), the engine's exact-black hide kept, x the -2..3 deg rise.
+	float MoonVisibilityR4(const RE::Moon* a_moon, const RE::Sky* a_sky, float a_sinElevation) const;
+	/// (The moons' day fade with moonFamily in effect: SkySync::MoonDayFade, full below -1 deg, gone at +3.)
+	/// Night glow: the natural moonless sky's luminance per top-of-atmosphere solar illuminance (4.8e-4 cd/m2 / 128 klx; sr^-1), times the
+	/// sun colour's luminance gives the glow in the sky-view LUT's units.
+	static constexpr float kAirglowPerSolarIlluminance = 4.8e-4f / 128000.f;
+	static constexpr float kAirglowHorizonRatio = 1.6f;  // horizon / zenith (van Rhijn brightening less extinction)
+	static constexpr float kAirglowLowerRatio = 0.3f;    // below the horizon: a dark ground or sea
+	static constexpr float kAirglowTint[3] = { 0.92f, 1.0f, 1.12f };  // near neutral, a little cool (scattered starlight); normalised to luminance 1
+	/// R3: the weights of the weather's sunrise / day / sunset / night keys at the sun's true elevation (Sky Sync's path at the climate's key hours).
+	bool KeyWeightsByElevation(float a_sunElevationDeg, float a_weights[4]) const;
+	struct KeyElevations
+	{
+		bool valid = false;
+		float csb = 0.f, midR = 0.f, sre = 0.f, ssb = 0.f, midS = 0.f, cse = 0.f, noonHour = 12.f;
+	} keyElevations;
+	void UpdateKeyElevations();
+	/// Outdoor ambient (ambient): the engine's DALC rewritten from the CPU sky model each 4th frame (and on a time jump), written into
+	/// BSShaderManager::State before every SharedData upload (State::UpdateSharedData -> ApplyOutdoorDalc). The engine's own transform is
+	/// kept for the CPU readers (EngineDalcTranslate).
+	struct OutdoorAmbient
+	{
+		bool valid = false;
+		RE::NiTransform transform{};      // what is written (gamma space, as the engine stores it)
+		float3 linear[3][2] = {};         // intended linear values per axis (+, -), after the hue
+		float3 physical[3][2] = {};       // physical irradiance x calibration, before the hue
+		float calibration = 0.f;          // c_amb: reference DALC mean / physical clear-noon mean
+		uint32_t calibrationFrame = UINT32_MAX;
+		float cloudAmbientCal = 0.f;      // clouds: reference cloud ambient / physical sky-view average at clear noon
+		uint32_t frame = UINT32_MAX;
+	} outdoorAmbient;
+	void UpdateOutdoorAmbient(const RE::NiPoint3& a_lutSunDir);
+	void UpdateOutdoorCalibration();
+	/// Called at the top of State::UpdateSharedData: writes the outdoor DALC (keeps the engine's), or puts the engine's back once.
+	void ApplyOutdoorDalc();
+	RE::NiTransform engineDalc{};
+	RE::NiTransform writtenDalc{};
+	bool dalcWritten = false;      // the engine's transform currently holds writtenDalc
+	bool dalcEngineSaved = false;
+	bool dalcConventionChecked = false;
+	float dalcConventionError = -1.f;
+	/// The engine's own directional ambient (translation = its mean colour) for CPU readers (Linear Lighting's unlit effects scale).
+	RE::NiPoint3 EngineDalcTranslate() const;
+	/// R2: the colour a_weatherLinear's chromaticity, moved toward the Planckian locus (CIE 1960 uv, 1700 K..inf) to at most kHueMaxDuv;
+	/// false for black / unusable colours.
+	static bool PlanckianBoundedChroma(const float3& a_linear, float3& a_unitLuminanceOut);
+	static constexpr float kHueMaxDuv = 0.02f;
+	void SettingsOutdoorLight();
+	std::string DescribeOutdoorLight() const;
 	/// (50b) k_sky: E_v / E_phys of a white horizontal surface now, normalised by the same ratio for the current weather's day key with the sun at
 	/// kAnchorRefElevationDeg (so k = 1 at a clear noon of every weather), clamped to [1 / kAnchorCap, kAnchorCap], smoothed (log2, 1.5 s,
 	/// snaps as Sky Fixes). Inputs before k: a_sun = sunlightColor x exposure, the glows as UpdateMoonData gave them. Sets skyAnchorTarget.

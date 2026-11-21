@@ -260,15 +260,16 @@ float SkySync::GetDaytimeColorExtension()
 	return std::isfinite(value) ? std::clamp(value, 0.0f, 3.0f) : 0.5f;
 }
 
-void SkySync::SunWarp::Build(const RE::TESClimate::Timing& a_timing, const float a_colorExtension, const float a_sunAngleDeg)
+void SkySync::SunWarp::Build(const RE::TESClimate::Timing& a_timing, const float a_colorExtension, const float a_sunAngleDeg, const double a_maxAlpha)
 {
 	const uint8_t newKey[4] = { a_timing.sunrise.begin, a_timing.sunrise.end, a_timing.sunset.begin, a_timing.sunset.end };
-	if (built && std::equal(std::begin(newKey), std::end(newKey), std::begin(key)) && keyExtension == a_colorExtension && keySunAngle == a_sunAngleDeg)
+	if (built && std::equal(std::begin(newKey), std::end(newKey), std::begin(key)) && keyExtension == a_colorExtension && keySunAngle == a_sunAngleDeg && keyMaxAlpha == a_maxAlpha)
 		return;
 	built = true;
 	std::copy(std::begin(newKey), std::end(newKey), std::begin(key));
 	keyExtension = a_colorExtension;
 	keySunAngle = a_sunAngleDeg;
+	keyMaxAlpha = a_maxAlpha;
 	++generation;
 	valid = false;
 
@@ -318,6 +319,8 @@ void SkySync::SunWarp::Build(const RE::TESClimate::Timing& a_timing, const float
 	// horizon with that rate (beta x its own mean rate). Their shape: a cubic whose relative slope at -12 deg
 	// (alpha) is the largest monotone one up to 3 (Fritsch-Carlson), so the sun leaves -12 deg briskly and
 	// spends the twilight nearer the horizon; t^beta when beta > 4 (no monotone cubic exists).
+	// (51a) Up to a_maxAlpha: at 3 the cubic sits on the monotone limit and its slope nearly reaches 0 half way (NAT / vanilla
+	// timing: the sun hangs at -5.2..-6.2 deg from about 19:15 to 20:15 and 06:00 to 06:45); SmoothMaxAlpha keeps it moving.
 	const double rateUniform = std::numbers::pi / (keyMidS - keyMidR);
 	const double riseMean = -phaseNight / (keyMidR - keyCsb);
 	const double setMean = -phaseNight / (keyCse - keyMidS);
@@ -333,6 +336,8 @@ void SkySync::SunWarp::Build(const RE::TESClimate::Timing& a_timing, const float
 	auto pickAlpha = [&](double a_beta) {
 		for (int i = 60; i >= 1; --i) {
 			const double alpha = i * 0.05;  // 3.00, 2.95, ... 0.05
+			if (alpha > a_maxAlpha + 1e-9)
+				continue;  // (51a)
 			if (monotoneCubic(alpha, a_beta))
 				return alpha;
 		}
@@ -427,7 +432,10 @@ void SkySync::GetSunDirectionAtHour(const RE::Sky* sky, const float hour, RE::Ni
 {
 	double phase;
 	if (sky && sky->currentClimate) {
-		sunWarp.Build(sky->currentClimate->timing, GetDaytimeColorExtension(), sunAngle);
+		// (51a) "Smooth Sun Below Horizon" (Physical Sky > Scene Lighting > Physical Outdoor Light): the slope cap; off = the 47a2 curve.
+		const auto& physicalSky = globals::features::physicalSky;
+		sunWarp.Build(sky->currentClimate->timing, GetDaytimeColorExtension(), sunAngle,
+			physicalSky.OutdoorOn(physicalSky.settings.outdoorLight.smoothSun) ? SunWarp::SmoothMaxAlpha : 3.0);
 	}
 	if (sky && sky->currentClimate && sunWarp.valid) {
 		phase = sunWarp.Phase(hour);

@@ -153,6 +153,23 @@ void PhysicalSky::LoadSettings(json& o_json)
 			st.weatherHidesMoon = j.value("weatherHidesMoon", d.weatherHidesMoon);
 			st.starExtinction = j.value("starExtinction", d.starExtinction);
 		}
+		// (51a) Physical Outdoor Light: missing keys keep their defaults.
+		if (const auto it = o_json.find("physicalOutdoorLight"); it != o_json.end() && it->is_object()) {
+			auto& ol = settings.outdoorLight;
+			const Settings::OutdoorLight d{};
+			const auto& j = *it;
+			ol.enabled = j.value("enabled", d.enabled);
+			ol.sunFamily = j.value("sunFamily", d.sunFamily);
+			ol.weatherGloominess = j.value("weatherGloominess", d.weatherGloominess);
+			ol.moonFamily = j.value("moonFamily", d.moonFamily);
+			ol.nightGlow = j.value("nightGlow", d.nightGlow);
+			ol.nightSkyGlow = j.value("nightSkyGlow", d.nightSkyGlow);
+			ol.ambient = j.value("ambient", d.ambient);
+			ol.ambientTint = j.value("ambientTint", d.ambientTint);
+			ol.clouds = j.value("clouds", d.clouds);
+			ol.smoothSun = j.value("smoothSun", d.smoothSun);
+			ol.realOzone = j.value("realOzone", d.realOzone);
+		}
 		settings.moonStarFadeStrength = o_json.value("moonStarFadeStrength", defaults.moonStarFadeStrength);
 		settings.moonPlanetshineStrength = o_json.value("moonPlanetshineStrength", defaults.moonPlanetshineStrength);
 	}
@@ -167,6 +184,12 @@ void PhysicalSky::LoadSettings(json& o_json)
 	settings.moonCloudHalo = std::clamp(settings.moonCloudHalo, 0.f, 4.f);
 	settings.moonStarFadeStrength = std::isfinite(settings.moonStarFadeStrength) ? std::clamp(settings.moonStarFadeStrength, 0.f, 3.f) : 1.f;  // (48b)
 	settings.moonPlanetshineStrength = std::isfinite(settings.moonPlanetshineStrength) ? std::clamp(settings.moonPlanetshineStrength, 0.f, 0.5f) : 0.1f;
+	{
+		auto& ol = settings.outdoorLight;  // (51a)
+		ol.weatherGloominess = std::isfinite(ol.weatherGloominess) ? std::clamp(ol.weatherGloominess, 0.f, 1.f) : 1.f;
+		ol.nightSkyGlow = std::isfinite(ol.nightSkyGlow) ? std::clamp(ol.nightSkyGlow, 0.f, 100.f) : 1.f;
+		ol.ambientTint = std::isfinite(ol.ambientTint) ? std::clamp(ol.ambientTint, 0.f, 1.f) : 1.f;
+	}
 
 	// (batch 37b) A saved whitelist replaces the default one wholesale. Merge the defaults back
 	// in, except those the user removed, so defaults added later still reach older configs.
@@ -310,6 +333,12 @@ void PhysicalSky::SaveSettings(json& o_json)
 		const auto& st = settings.lightingStage2;  // (50b)
 		o_json["lightingStage2"] = { { "enabled", st.enabled }, { "skyAnchor", st.skyAnchor }, { "cloudsLikeGround", st.cloudsLikeGround },
 			{ "weatherHidesMoon", st.weatherHidesMoon }, { "starExtinction", st.starExtinction } };
+	}
+	{
+		const auto& ol = settings.outdoorLight;  // (51a)
+		o_json["physicalOutdoorLight"] = { { "enabled", ol.enabled }, { "sunFamily", ol.sunFamily }, { "weatherGloominess", ol.weatherGloominess },
+			{ "moonFamily", ol.moonFamily }, { "nightGlow", ol.nightGlow }, { "nightSkyGlow", ol.nightSkyGlow }, { "ambient", ol.ambient },
+			{ "ambientTint", ol.ambientTint }, { "clouds", ol.clouds }, { "smoothSun", ol.smoothSun }, { "realOzone", ol.realOzone } };
 	}
 	o_json["moonStarFadeStrength"] = settings.moonStarFadeStrength;
 	o_json["moonPlanetshineStrength"] = settings.moonPlanetshineStrength;
@@ -1219,7 +1248,8 @@ std::string PhysicalSky::DescribeForTrace() const
 			   settings.lightingStage2.enabled ? "on" : "off", Stage2On(settings.lightingStage2.skyAnchor) ? "on" : "off",
 			   Stage2On(settings.lightingStage2.skyAnchor) ? skyAnchorK : 1.f, Stage2On(settings.lightingStage2.cloudsLikeGround) ? "on" : "off",
 			   Stage2On(settings.lightingStage2.weatherHidesMoon) ? "on" : "off", Stage2On(settings.lightingStage2.starExtinction) ? "on" : "off",
-			   skyLightWobble ? ", sky light wobble on" : "");
+			   skyLightWobble ? ", sky light wobble on" : "") +
+	       "; " + DescribeOutdoorLight();  // (51a)
 }
 
 float PhysicalSky::MoonHorizonVisibility(const RE::Moon* a_moon, const RE::Sky* a_sky, float a_sinElevation)
@@ -2434,7 +2464,7 @@ void PhysicalSky::SettingsStage2()
 			"the dimmed band can be wide. Off: as 50a.");
 	ImGui::Unindent();
 	ImGui::EndDisabled();
-	if (Stage2On(st.skyAnchor) && cbData.enabled) {
+	if (Stage2On(st.skyAnchor) && cbData.enabled && !outdoorActive) {
 		const auto& d = skyAnchorDebug;
 		ImGui::TextDisabled("k now x%.3f (target x%.3f)%s", skyAnchorK, skyAnchorTarget, d.valid ? "" : " - no usable weather data, x1");
 		if (auto _tt = Util::HoverTooltipWrapper()) {
@@ -2447,7 +2477,14 @@ void PhysicalSky::SettingsStage2()
 
 void PhysicalSky::SettingsSceneLighting()
 {
-	SettingsStage2();  // (50b) first on the tab
+	SettingsOutdoorLight();  // (51a) first on the tab
+	ImGui::Spacing();
+	// (50b) Stage 2: replaced by Physical Outdoor Light while that is on (its anchor is not used then).
+	if (OutdoorOn(true))
+		ImGui::TextDisabled(
+			"Stage 2 below: its \"One Brightness\" is not used while Physical Outdoor Light is on; Clouds Lit Like the Ground and Weather\n"
+			"Hides the Moon apply only where the matching new item is off; Star Extinction always applies.");
+	SettingsStage2();
 	ImGui::Spacing();
 	// (49h stage 1; 50a redo base) "Lighting Fixes": fixes that do not change the light units (S3a-S8). The 49h S1/S2 unit rules are retired.
 	InfoBox("Lighting Fixes: consistency fixes for shadows, reflections, far land and fog. They do not change the light units.");
@@ -2519,4 +2556,808 @@ void PhysicalSky::SettingsSceneLighting()
 	ImGui::TextDisabled("Also: Lighting > Exponential Height Fog > Stable Fog Colour; Materials > Dynamic Cubemaps > Reflection Brightness Fix.");
 	if (pl.enabled && pl.lodScale)
 		ImGui::TextDisabled("PBR land seen: %s", (PhysLightingFlags() & kPLLandPbr) ? "yes (far land uses the PBR scale)" : "no");
+}
+
+void PhysicalSky::SettingsOutdoorLight()
+{
+	// (51a) "Physical Outdoor Light": first on the Scene Lighting tab, replacing stage 2's place.
+	auto& ol = settings.outdoorLight;
+	ImGui::SeparatorText("Physical Outdoor Light (new model, package 1)");
+	ImGui::Checkbox("Physical Outdoor Light", &ol.enabled);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"On (default): outdoors where the physical sky is drawn, the outdoor light follows the new model (the items below, each with\n"
+			"its own switch). The sun, the sky and the moonlight are no longer pulled to the weather's brightness moment by moment (stage 2's\n"
+			"\"one brightness\" factor and Sky Fixes' sky factor are not used); the weather decides how gloomy the day is and whether the moon\n"
+			"shows. Interiors and other worldspaces are unchanged. Off: exactly as 50d (stage 2's section below applies again).");
+	ImGui::BeginDisabled(!ol.enabled);
+	ImGui::Indent();
+	ImGui::Checkbox("Physical Sun and Sky", &ol.sunFamily);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"On (default): sunlight, the sky's glow, the sun on the clouds, the sky's light on the fog and the sun's share of the ambient come\n"
+			"from the physical sky with one fixed constant (a clear noon looks as before) times the weather's gloominess. Dawn, dusk and\n"
+			"twilight follow the atmosphere alone. The weather's per-time sunlight scale (imagespace) is replaced by its clear-day value.\n"
+			"Needs Celestials > Override Directional Light for the light on the ground.");
+	ImGui::BeginDisabled(!ol.sunFamily);
+	ImGui::SliderFloat("Weather Gloominess", &ol.weatherGloominess, 0.f, 1.f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"How much the weather's own day brightness dims the sun family: 1 (default) = as the weather mod wrote it (its daylight, ambient +\n"
+			"sunlight x its sunlight scale, against this world's clear weathers; limited to 3%%..100%%), 0 = every weather as bright as a clear day.");
+	ImGui::EndDisabled();
+	ImGui::Checkbox("Moon by Phase, Height and Weather", &ol.moonFamily);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"On (default): the moonlight is your moon colour (Celestials) x phase x height x how visible the weather leaves the moon (its night moon\n"
+			"glare against this world's clear weathers; overcast and rain dim it, a black glare still hides it). The same rule for the ground, the\n"
+			"sky's moon glow, the clouds and the stars. Full moonlight once the sun is 1 degree below the horizon, none by +3 degrees.\n"
+			"The weather's night sunlight scale no longer multiplies it.");
+	ImGui::Checkbox("Night Sky Glow from CS", &ol.nightGlow);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"On (default): the night sky's own faint glow is a fixed physical value (the natural moonless sky, about 0.0005 cd/m2, a little\n"
+			"brighter toward the horizon), not the weather's night sky colours. The stars are not changed.");
+	ImGui::BeginDisabled(!ol.nightGlow);
+	ImGui::SliderFloat("Night Sky Glow", &ol.nightSkyGlow, 0.f, 100.f, "x%.2f", ImGuiSliderFlags_Logarithmic);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("x the physical value: 1 (default) = physical, up to x100.");
+	ImGui::EndDisabled();
+	ImGui::Checkbox("Ambient from the Physical Sky", &ol.ambient);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"On (default): the game's directional ambient light (DALC) is worked out from the physical sky above (sun, moon, night glow) and the\n"
+			"ground's bounce, with one constant so a clear noon matches; no fixed weather ambient floor. Its colour takes the weather's ambient hue\n"
+			"(below). Image Based Lighting keeps reading the drawn sky. Other readers of the weather's own ambient still see the weather's.");
+	ImGui::BeginDisabled(!ol.ambient);
+	ImGui::SliderFloat("Weather Ambient Tint", &ol.ambientTint, 0.f, 1.f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"1 (default): the ambient's colour is the weather's ambient hue for the sun's height (brightness from physics; the saturation is limited\n"
+			"to natural daylight / sky colours). 0: the physical sky's own colour.");
+	ImGui::EndDisabled();
+	ImGui::Checkbox("Clouds Lit by CS Light Only", &ol.clouds);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"On (default): the clouds are lit only by CS's sun (with the weather's gloominess), the moons and the physical sky's light, at one\n"
+			"constant that keeps a clear noon; the weather's cloud colour no longer tints them (night clouds are no longer teal). The cloud\n"
+			"textures and their transparency are kept. Needs Clouds > Cloud Lighting \"Sun + Moons + Sky\".");
+	ImGui::Checkbox("Smooth Sun Below Horizon", &ol.smoothSun);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"On (default): below the horizon the sun keeps going down (Sky Sync's timing curve). Off: as 50d, where it hangs at about -6 degrees\n"
+			"for nearly an hour (about 19:15-20:15 and 06:00-06:45 with Skyrim's climate timing).");
+	ImGui::Checkbox("Real Ozone", &ol.realOzone);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"On (default): the ozone layer absorbs as real ozone does (mostly green: 0.650 / 1.881 / 0.085 per Mm, Hillaire 2020 / Bruneton),\n"
+			"so a low sun turns orange-red instead of lemon yellow. Off: your Atmosphere > Ozone values as before.");
+	ImGui::Unindent();
+	ImGui::EndDisabled();
+	if (OutdoorOn(true)) {
+		if (!outdoorActive) {
+			ImGui::TextDisabled("Not in effect here (interior, or a worldspace without the physical sky).");
+		} else {
+			const auto& f = outdoorFrame;
+			ImGui::TextDisabled("Gloominess %.2f (current %.2f, last %.2f) -> sun family x%.3f; sunlight scale now %.2f, clear-day %.2f", f.g, f.gCurrent, f.gLast, f.sunScale, f.sigmaNow, f.sigmaRef);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				static constexpr const char* kSources[] = { "none (neutral)", "this world's region weather lists", "the parent world's region weather lists", "the climate's list" };
+				ImGui::Text("Clear reference: %s, %d Pleasant entries; its day light %.4f, ambient %.4f, night moon glare %.4f, day cloud colour %.4f",
+					kSources[std::clamp(weatherRef.source, 0, 3)], weatherRef.entries, weatherRef.keys.e, weatherRef.keys.a, weatherRef.keys.glareNight, weatherRef.keys.cloudDay);
+				ImGui::Text("Moon visibility now: Masser %.2f, Secunda %.2f (weather night glare %.4f)", globals::game::sky ? MoonVisibility(globals::game::sky->masser, globals::game::sky, globals::features::skySync.rawDirections[static_cast<int>(SkySync::Caster::Masser)].z) : 0.f,
+					globals::game::sky ? MoonVisibility(globals::game::sky->secunda, globals::game::sky, globals::features::skySync.rawDirections[static_cast<int>(SkySync::Caster::Secunda)].z) : 0.f, f.glareNight);
+				if (outdoorAmbient.valid) {
+					float mean = 0.f;
+					for (int axis = 0; axis < 3; ++axis)
+						for (int side = 0; side < 2; ++side)
+							mean += 0.2126f * outdoorAmbient.linear[axis][side].x + 0.7152f * outdoorAmbient.linear[axis][side].y + 0.0722f * outdoorAmbient.linear[axis][side].z;
+					ImGui::Text("Ambient: mean %.4f (up %.4f, down %.4f), calibration %.3f; cloud sky ambient calibration %.3f", mean / 6.f,
+						0.2126f * outdoorAmbient.linear[2][0].x + 0.7152f * outdoorAmbient.linear[2][0].y + 0.0722f * outdoorAmbient.linear[2][0].z,
+						0.2126f * outdoorAmbient.linear[2][1].x + 0.7152f * outdoorAmbient.linear[2][1].y + 0.0722f * outdoorAmbient.linear[2][1].z, outdoorAmbient.calibration, outdoorAmbient.cloudAmbientCal);
+				}
+				ImGui::Text("Engine DALC layout check: %s", dalcConventionChecked ? (dalcConventionError < 0.01f ? "matches" : "DIFFERS (tell the developer)") : "not checked yet");
+				ImGui::Text("Weather keys by sun height: %s", keyElevations.valid ? "from the climate timing" : "fallback ramp");
+			}
+		}
+	}
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// (51a) Physical Outdoor Light (four-layer outdoor light model, package 1)
+
+namespace
+{
+	struct OutdoorGammas
+	{
+		float ambient = 1.f, light = 1.f, sky = 1.f, dirMult = 1.f, vdm = 1.f;
+	};
+	/// Linear Lighting's conversions as the shaders apply them (all 1 without Linear Lighting).
+	OutdoorGammas GetOutdoorGammas()
+	{
+		OutdoorGammas g;
+		const auto& ll = globals::features::linearLighting.settings;
+		if (!ll.enableLinearLighting)
+			return g;
+		auto gamma = [](float v) { return std::isfinite(v) ? std::clamp(v, 0.1f, 5.f) : 1.f; };
+		g.ambient = gamma(ll.ambientGamma);
+		g.light = gamma(ll.lightGamma);
+		g.sky = gamma(ll.skyGamma);
+		g.dirMult = std::isfinite(ll.directionalLightMult) ? std::max(ll.directionalLightMult, 0.f) : 1.f;
+		g.vdm = std::isfinite(ll.vanillaDiffuseMult) ? std::max(ll.vanillaDiffuseMult, 0.f) : 1.f;
+		return g;
+	}
+	float LumBytes(const RE::Color& a_c, float a_gamma)
+	{
+		auto lin = [a_gamma](std::uint8_t v) { return std::pow(v * (1.f / 255.f), a_gamma); };
+		return 0.2126f * lin(a_c.red) + 0.7152f * lin(a_c.green) + 0.0722f * lin(a_c.blue);
+	}
+	float Lum3(const float3& a_c) { return 0.2126f * a_c.x + 0.7152f * a_c.y + 0.0722f * a_c.z; }
+	float ImagespaceSunlightScale(const RE::TESImageSpace* a_imagespace)
+	{
+		if (!a_imagespace)
+			return 1.f;
+		const float v = a_imagespace->data.hdr.sunlightScale;
+		return std::isfinite(v) && v >= 0.f ? v : 1.f;
+	}
+	/// The imagespace sunlight scale the engine applies to the directional light this frame (State::UpdateSharedData, the Lighting constant).
+	float CurrentSunlightScale()
+	{
+		auto* imageSpaceManager = RE::ImageSpaceManager::GetSingleton();
+		if (!imageSpaceManager)
+			return 1.f;
+		const float v = !globals::game::isVR ? imageSpaceManager->GetRuntimeData().data.baseData.hdr.sunlightScale : imageSpaceManager->GetVRRuntimeData().data.baseData.hdr.sunlightScale;
+		return std::isfinite(v) && v >= 0.f ? v : 1.f;
+	}
+	bool IsPleasant(const RE::TESWeather* a_weather)
+	{
+		return a_weather && a_weather->data.flags.any(RE::TESWeather::WeatherDataFlag::kPleasant);
+	}
+	/// The six directional ambient colours of a weather key in the engine's order ([axis][0] = +axis (max), [axis][1] = -axis (min)), 0-1.
+	void DalcKey(const RE::TESWeather* a_weather, int a_time, float3 a_out[3][2])
+	{
+		const auto& d = a_weather->directionalAmbientLightingColors[a_time].directional;
+		const RE::Color* c[3][2] = { { &d.x.max, &d.x.min }, { &d.y.max, &d.y.min }, { &d.z.max, &d.z.min } };
+		for (int axis = 0; axis < 3; ++axis)
+			for (int side = 0; side < 2; ++side)
+				a_out[axis][side] = float3(c[axis][side]->red, c[axis][side]->green, c[axis][side]->blue) * (1.f / 255.f);
+	}
+	PhysicalSkyModel::Vec3 UnitVec(double x, double y, double z)
+	{
+		const double l = std::sqrt(x * x + y * y + z * z);
+		return l > 1e-9 ? PhysicalSkyModel::Vec3{ x / l, y / l, z / l } : PhysicalSkyModel::Vec3{ 0.0, 0.0, 1.0 };
+	}
+	/// Irradiance (rgb, in the lights' colour units) on the six axis-facing surfaces from the sky-view radiance of a_lights over the upper
+	/// hemisphere (3 bands x 8 azimuths) plus the night glow (radiance by elevation, upper / horizon, LutGen's gradient), with a Lambertian
+	/// ground of a_albedo under the sky and a_directHorizontal for the lower hemisphere. [axis][0] = +axis, [axis][1] = -axis.
+	struct SkyIrradiance
+	{
+		float3 e[3][2] = {};
+		float3 horizontal = {};  // the sky's alone, on a horizontal surface
+	};
+	SkyIrradiance IntegrateSky(const PhysicalSkyModel::Model& a_model, double a_cameraRadius, const PhysicalSkyModel::Light* a_lights, int a_lightCount,
+		const float3& a_glowUpper, const float3& a_glowHorizon, const float3& a_directHorizontal, const float3& a_albedo)
+	{
+		SkyIrradiance out;
+		constexpr double kPi = 3.14159265358979323846;
+		constexpr double kBandLow[3] = { 0.0, 30.0, 60.0 };
+		constexpr int kAzimuths = 8;
+		double e[3][2][3] = {};
+		double h[3] = {};
+		for (int band = 0; band < 3; ++band) {
+			const double lo = kBandLow[band] * (kPi / 180.0), hi = (kBandLow[band] + 30.0) * (kPi / 180.0);
+			const double el = 0.5 * (lo + hi);
+			const double solidAngle = (std::sin(hi) - std::sin(lo)) * (2.0 * kPi / kAzimuths);  // the band's solid angle per azimuth sample
+			const float glowMix = SkySync::SmoothStep(0.f, 0.5f, static_cast<float>(std::sin(el)));
+			const float3 glow = a_glowHorizon + (a_glowUpper - a_glowHorizon) * glowMix;
+			for (int j = 0; j < kAzimuths; ++j) {
+				const double az = (j + 0.5) * (2.0 * kPi / kAzimuths);
+				const PhysicalSkyModel::Vec3 dir = { std::cos(el) * std::cos(az), std::cos(el) * std::sin(az), std::sin(el) };
+				PhysicalSkyModel::Vec3 radiance = a_lightCount > 0 ? a_model.SkyRay(a_cameraRadius, dir, a_lights, a_lightCount) : PhysicalSkyModel::Vec3{ 0.0, 0.0, 0.0 };
+				radiance[0] += glow.x;
+				radiance[1] += glow.y;
+				radiance[2] += glow.z;
+				for (int axis = 0; axis < 3; ++axis) {
+					const double c = dir[axis];
+					const int side = c >= 0.0 ? 0 : 1;
+					const double w = std::abs(c) * solidAngle;
+					for (int ch = 0; ch < 3; ++ch)
+						e[axis][side][ch] += radiance[ch] * w;
+				}
+				for (int ch = 0; ch < 3; ++ch)
+					h[ch] += radiance[ch] * dir[2] * solidAngle;
+			}
+		}
+		out.horizontal = float3(static_cast<float>(h[0]), static_cast<float>(h[1]), static_cast<float>(h[2]));
+		// The ground: a Lambertian floor under the sky and the direct light, seen by the lower hemisphere (projected solid angle
+		// pi (1 - n_z) / 2 for a surface facing n: pi straight down, pi / 2 sideways, 0 up).
+		const float3 groundRadiance = a_albedo * (out.horizontal + a_directHorizontal) * static_cast<float>(1.0 / kPi);
+		for (int axis = 0; axis < 3; ++axis)
+			for (int side = 0; side < 2; ++side) {
+				const float nz = axis == 2 ? (side == 0 ? 1.f : -1.f) : 0.f;
+				const float3 bounce = groundRadiance * static_cast<float>(kPi * (1.0 - nz) * 0.5);
+				out.e[axis][side] = float3(static_cast<float>(e[axis][side][0]), static_cast<float>(e[axis][side][1]), static_cast<float>(e[axis][side][2])) + bounce;
+			}
+		return out;
+	}
+	bool AllFinite(const float3& c) { return std::isfinite(c.x) && std::isfinite(c.y) && std::isfinite(c.z); }
+	bool SameTransform(const RE::NiTransform& a, const RE::NiTransform& b)
+	{
+		return std::memcmp(a.rotate.entry, b.rotate.entry, sizeof(a.rotate.entry)) == 0 && a.translate.x == b.translate.x && a.translate.y == b.translate.y &&
+		       a.translate.z == b.translate.z;
+	}
+}
+
+PhysicalSky::WeatherKeys PhysicalSky::ReadWeatherKeys(const RE::TESWeather* a_weather)
+{
+	WeatherKeys k;
+	if (!a_weather)
+		return k;
+	const auto g = GetOutdoorGammas();
+	using ColorTypes = RE::TESWeather::ColorTypes;
+	using ColorTime = RE::TESWeather::ColorTime;
+	float3 dalc[3][2];
+	DalcKey(a_weather, ColorTime::kDay, dalc);
+	float a = 0.f;
+	float3 mean = {};
+	for (int axis = 0; axis < 3; ++axis)
+		for (int side = 0; side < 2; ++side) {
+			const float3& c = dalc[axis][side];
+			a += Lum3(float3(std::pow(c.x, g.ambient), std::pow(c.y, g.ambient), std::pow(c.z, g.ambient)));
+			mean += c;
+		}
+	k.a = a / 6.f;
+	mean = mean * (1.f / 6.f);
+	k.aCloud = Lum3(float3(std::pow(mean.x, g.ambient), std::pow(mean.y, g.ambient), std::pow(mean.z, g.ambient)));
+	k.sigmaDay = ImagespaceSunlightScale(a_weather->imageSpaces[ColorTime::kDay]);
+	k.e = k.a + LumBytes(a_weather->colorData[ColorTypes::kSunlight][ColorTime::kDay], g.light) * g.dirMult * g.vdm * k.sigmaDay;
+	k.glareNight = LumBytes(a_weather->colorData[ColorTypes::kMoonGlare][ColorTime::kNight], g.sky);
+	float weight = 0.f, sum = 0.f;
+	for (int i = 0; i < RE::TESWeather::kTotalLayers; ++i) {
+		if (a_weather->cloudLayerDisabledBits & (1u << i))
+			continue;
+		if (a_weather->cloudTextures[i].textureName.empty())
+			continue;
+		const float alpha = a_weather->cloudAlpha[i][ColorTime::kDay];
+		if (!(alpha > 0.01f) || !std::isfinite(alpha))
+			continue;
+		weight += alpha;
+		sum += alpha * LumBytes(a_weather->cloudColorData[i][ColorTime::kDay], g.sky);
+	}
+	k.cloudDay = weight > 0.f ? sum / weight : 0.f;
+	return k;
+}
+
+void PhysicalSky::UpdateWeatherReference()
+{
+	auto* worldspace = GetCurrentWorldspace();
+	auto* sky = globals::game::sky;
+	const RE::TESClimate* climate = sky ? sky->currentClimate : nullptr;
+	const auto g = GetOutdoorGammas();
+	const float gammaKey = g.ambient * 1000.f + g.light * 100.f + g.sky * 10.f + g.vdm + g.dirMult * 0.001f;
+	auto& ref = weatherRef;
+	if (ref.built && ref.worldspace == worldspace && ref.climate == climate && ref.gammaKey == gammaKey)
+		return;
+	ref = {};
+	ref.built = true;
+	ref.worldspace = worldspace;
+	ref.climate = climate;
+	ref.gammaKey = gammaKey;
+
+	WeatherKeys sum;
+	sum.sigmaDay = 0.f;
+	float total = 0.f;
+	int entries = 0;
+	auto add = [&](const RE::WeatherType* a_type) {
+		if (!a_type || !IsPleasant(a_type->weather) || a_type->chance == 0)
+			return;
+		const float w = static_cast<float>(a_type->chance);
+		const WeatherKeys k = ReadWeatherKeys(a_type->weather);
+		sum.e += w * k.e;
+		sum.a += w * k.a;
+		sum.aCloud += w * k.aCloud;
+		sum.sigmaDay += w * k.sigmaDay;
+		sum.glareNight += w * k.glareNight;
+		sum.cloudDay += w * k.cloudDay;
+		total += w;
+		++entries;
+	};
+	// Every region weather list in the worldspace (the lists the game draws the outdoor weather from; summed chances, as validated in
+	// reviews/validation-weather-rules-2026-11.md), else the parent worldspace's, else the climate's list.
+	auto gather = [&](const RE::TESWorldSpace* a_worldspace) {
+		auto* dataHandler = RE::TESDataHandler::GetSingleton();
+		if (!dataHandler || !a_worldspace)
+			return;
+		constexpr auto skipFlags = RE::TESRegion::RecordFlags::kBorderRegion | RE::TESRegion::RecordFlags::kDeleted | RE::TESRegion::RecordFlags::kIgnored;
+		for (auto* region : dataHandler->GetFormArray<RE::TESRegion>()) {
+			if (!region || region->worldSpace != a_worldspace || !region->dataList || (region->formFlags & skipFlags))
+				continue;
+			for (auto* data : region->dataList->regionDataList) {
+				if (!data || data->GetType() != RE::TESRegionData::Type::kWeather)
+					continue;
+				for (auto* type : static_cast<RE::TESRegionDataWeather*>(data)->weatherTypes)
+					add(type);
+			}
+		}
+	};
+	gather(worldspace);
+	ref.source = total > 0.f ? 1 : 0;
+	if (!(total > 0.f) && worldspace && worldspace->parentWorld) {
+		gather(worldspace->parentWorld);
+		ref.source = total > 0.f ? 2 : 0;
+	}
+	if (!(total > 0.f) && climate) {
+		for (auto* type : const_cast<RE::TESClimate*>(climate)->weatherList)
+			add(type);
+		ref.source = total > 0.f ? 3 : 0;
+	}
+	if (total > 0.f) {
+		const float inv = 1.f / total;
+		ref.keys = { sum.e * inv, sum.a * inv, sum.aCloud * inv, sum.sigmaDay * inv, sum.glareNight * inv, sum.cloudDay * inv };
+		ref.entries = entries;
+		ref.chance = total;
+	}
+	const char* name = worldspace ? worldspace->GetFormEditorID() : nullptr;
+	logger::info("[Physical Sky] (51a) weather reference for {}: source {}, {} Pleasant entries (chance {:.0f}), E {:.4f}, ambient {:.4f}, sunlight scale {:.3f}, night moon glare {:.4f}, day cloud {:.4f}",
+		name && *name ? name : "-", ref.source, ref.entries, ref.chance, ref.keys.e, ref.keys.a, ref.keys.sigmaDay, ref.keys.glareNight, ref.keys.cloudDay);
+}
+
+void PhysicalSky::UpdateOutdoorFrame()
+{
+	auto& f = outdoorFrame;
+	UpdateWeatherReference();
+	auto* sky = globals::game::sky;
+
+	// Time jumps (wait, sleep, fast travel, console), a stopped clock, a new sun path, weather or worldspace, or the model just switched on:
+	// the per-4th-frame CPU work runs this very frame (the 50b anchor decided its snap after a recompute that had been skipped, so it
+	// snapped to a target up to 3 frames old; nothing in this model is smoothed over time).
+	const auto calendar = RE::Calendar::GetSingleton();
+	const float hours = calendar ? calendar->GetHoursPassed() : 0.f;
+	const float timeScale = calendar ? calendar->GetTimescale() : 0.f;
+	const uint32_t warp = globals::features::skySync.GetSunWarpGeneration();
+	const RE::TESWeather* weather = sky ? sky->currentWeather : nullptr;
+	const RE::TESWorldSpace* worldspace = GetCurrentWorldspace();
+	f.timeJump = !outdoorWasActive || !(timeScale > 0.f) || !(std::abs(hours - outdoorLastHours) < 0.01f) || warp != outdoorLastWarp ||
+	             weather != outdoorLastWeather || worldspace != outdoorLastWorldspace;
+	outdoorLastHours = hours;
+	outdoorLastWarp = warp;
+	outdoorLastWeather = weather;
+	outdoorLastWorldspace = worldspace;
+	outdoorWasActive = true;
+
+	f.valid = sky && sky->currentWeather;
+	f.sigmaNow = CurrentSunlightScale();
+	if (!f.valid) {
+		f.gCurrent = f.gLast = f.g = f.sunScale = 1.f;
+		f.sigmaRef = f.sigmaNow;
+		f.glareNight = 0.f;
+		return;
+	}
+	const float pct = std::isfinite(sky->currentWeatherPct) ? std::clamp(sky->currentWeatherPct, 0.f, 1.f) : 1.f;
+	const RE::TESWeather* last = (sky->lastWeather && sky->lastWeather != sky->currentWeather && pct < 1.f) ? sky->lastWeather : nullptr;
+	const WeatherKeys keysCur = ReadWeatherKeys(sky->currentWeather);
+	const WeatherKeys keysLast = last ? ReadWeatherKeys(last) : keysCur;
+	const auto& ref = weatherRef;
+
+	// R1 gloominess: the weather's day light (ambient + sunlight x imagespace sunlight scale) / the reference's, [0.03, 1], day key only.
+	auto gloom = [&](const WeatherKeys& k) {
+		if (ref.source == 0 || !(ref.keys.e > 1e-6f) || !std::isfinite(k.e))
+			return 1.f;
+		return std::clamp(k.e / ref.keys.e, 0.03f, 1.f);
+	};
+	f.gCurrent = gloom(keysCur);
+	f.gLast = last ? gloom(keysLast) : f.gCurrent;
+	f.g = std::lerp(f.gLast, f.gCurrent, pct);
+	const float strength = std::clamp(settings.outdoorLight.weatherGloominess, 0.f, 1.f);
+	f.sunScale = std::pow(std::max(f.g, 0.03f), strength);
+	if (!std::isfinite(f.sunScale))
+		f.sunScale = 1.f;
+	// The direct light's clear-noon constant: the reference's day sunlight scale (no reference: the weathers' own day keys, never the clock).
+	f.sigmaRef = ref.source != 0 ? ref.keys.sigmaDay : std::lerp(keysLast.sigmaDay, keysCur.sigmaDay, pct);
+	if (!std::isfinite(f.sigmaRef) || f.sigmaRef < 0.f)
+		f.sigmaRef = 1.f;
+	// R4 input: the weathers' night moon glare.
+	f.glareNight = std::lerp(keysLast.glareNight, keysCur.glareNight, pct);
+}
+
+float PhysicalSky::MoonVisibility(const RE::Moon* a_moon, const RE::Sky* a_sky, float a_sinElevation)
+{
+	const auto& physicalSky = globals::features::physicalSky;
+	if (physicalSky.OutdoorActive(physicalSky.settings.outdoorLight.moonFamily))
+		return physicalSky.MoonVisibilityR4(a_moon, a_sky, a_sinElevation);
+	return MoonHorizonVisibility(a_moon, a_sky, a_sinElevation);
+}
+
+float PhysicalSky::MoonVisibilityR4(const RE::Moon* a_moon, const RE::Sky* a_sky, float a_sinElevation) const
+{
+	if (!a_moon || !a_moon->moonMesh || !a_sky)
+		return 0.f;
+	// The engine's own hide (as MoonHorizonVisibility): the blended Moon Glare colour equal to the fixed hide colour (1.5.97), or black.
+	const RE::NiColor& glare = a_sky->skyColor[RE::TESWeather::ColorTypes::kMoonGlare];
+	static const RE::NiColor* hideColor = (!REL::Module::IsVR() && REL::Module::get().version() == SKSE::RUNTIME_SSE_1_5_97) ?
+	                                          reinterpret_cast<const RE::NiColor*>(REL::Offset(0x30135F0).address()) :
+	                                          nullptr;
+	if (hideColor && glare.red == hideColor->red && glare.green == hideColor->green && glare.blue == hideColor->blue)
+		return 0.f;
+	if (!(std::max({ glare.red, glare.green, glare.blue }) > 0.f))
+		return 0.f;
+	// R4: the weathers' night moon glare relative to the reference's (vanilla uses it as a switch, NAT as a dimmer: both read right
+	// against their own clear weathers; the 41b fixed threshold 0.1 is not used). No reference: visible (the hide above still applies).
+	float weather = 1.f;
+	if (weatherRef.source != 0 && weatherRef.keys.glareNight > 1e-6f)
+		weather = std::clamp(outdoorFrame.glareNight / weatherRef.keys.glareNight, 0.f, 1.f);
+	if (!std::isfinite(weather))
+		weather = 1.f;
+	const float elevationDeg = DirectX::XMConvertToDegrees(std::asin(std::clamp(a_sinElevation, -1.f, 1.f)));
+	return weather * SkySync::SmoothStep(-2.f, 3.f, elevationDeg);
+}
+
+void PhysicalSky::UpdateKeyElevations()
+{
+	auto& k = keyElevations;
+	k.valid = false;
+	auto* sky = globals::game::sky;
+	if (!sky || !sky->currentClimate)
+		return;
+	const auto& t = sky->currentClimate->timing;
+	double srb = t.sunrise.begin / 6.0, sre = t.sunrise.end / 6.0, ssb = t.sunset.begin / 6.0, sse = t.sunset.end / 6.0;
+	if (srb == 0.0 && sre == 0.0 && ssb == 0.0 && sse == 0.0)
+		return;
+	auto widen = [](double& a_begin, double& a_end) {
+		if (a_end - a_begin < 0.5) {
+			const double centre = (a_begin + a_end) * 0.5;
+			a_begin = centre - 0.25;
+			a_end = centre + 0.25;
+		}
+	};
+	widen(srb, sre);
+	widen(ssb, sse);
+	// The engine's colour keys (as SkySync::SunWarp::Build): night until csb, sunrise peak at midR, day from sre to ssb, sunset peak at midS,
+	// night from cse.
+	const double ext = SkySync::GetDaytimeColorExtension();
+	const double csb = std::max(0.0, srb - ext), cse = std::min(23.99, sse + ext);
+	const double midR = csb + (sre - csb) * 0.5, midS = ssb + (cse - ssb) * 0.5;
+	auto& skySync = globals::features::skySync;
+	k.csb = skySync.SunElevationDegAtHour(sky, static_cast<float>(csb));
+	k.midR = skySync.SunElevationDegAtHour(sky, static_cast<float>(midR));
+	k.sre = skySync.SunElevationDegAtHour(sky, static_cast<float>(sre));
+	k.ssb = skySync.SunElevationDegAtHour(sky, static_cast<float>(ssb));
+	k.midS = skySync.SunElevationDegAtHour(sky, static_cast<float>(midS));
+	k.cse = skySync.SunElevationDegAtHour(sky, static_cast<float>(cse));
+	k.noonHour = static_cast<float>((sre + ssb) * 0.5);
+	// Rising through the morning keys and setting through the evening ones; anything else (other realms' odd timings): not valid.
+	k.valid = k.csb + 0.5f < k.midR && k.midR + 0.5f < k.sre && k.ssb > k.midS + 0.5f && k.midS > k.cse + 0.5f;
+}
+
+bool PhysicalSky::KeyWeightsByElevation(float a_sunElevationDeg, float a_weights[4]) const
+{
+	using ColorTime = RE::TESWeather::ColorTime;
+	a_weights[0] = a_weights[1] = a_weights[2] = a_weights[3] = 0.f;
+	const auto& k = keyElevations;
+	auto* sky = globals::game::sky;
+	const float hour = sky && std::isfinite(sky->currentGameHour) ? std::fmod(std::max(sky->currentGameHour, 0.f), 24.f) : 12.f;
+	const bool morning = hour < k.noonHour;  // which side of the day: the sunrise or the sunset key
+	const int edge = morning ? ColorTime::kSunrise : ColorTime::kSunset;
+	const float el = a_sunElevationDeg;
+	if (!k.valid || !std::isfinite(el)) {
+		// No usable timing: a plain elevation ramp (night below -12, the edge key at 0, day from +20).
+		if (!(el > -12.f))
+			a_weights[ColorTime::kNight] = 1.f;
+		else if (el < 0.f) {
+			const float t = (el + 12.f) / 12.f;
+			a_weights[ColorTime::kNight] = 1.f - t;
+			a_weights[edge] = t;
+		} else if (el < 20.f) {
+			const float t = el / 20.f;
+			a_weights[edge] = 1.f - t;
+			a_weights[ColorTime::kDay] = t;
+		} else
+			a_weights[ColorTime::kDay] = 1.f;
+		return false;
+	}
+	const float eNight = morning ? k.csb : k.cse;
+	const float ePeak = morning ? k.midR : k.midS;
+	const float eDay = morning ? k.sre : k.ssb;
+	if (el <= eNight)
+		a_weights[ColorTime::kNight] = 1.f;
+	else if (el < ePeak) {
+		const float t = (el - eNight) / (ePeak - eNight);
+		a_weights[ColorTime::kNight] = 1.f - t;
+		a_weights[edge] = t;
+	} else if (el < eDay) {
+		const float t = (el - ePeak) / (eDay - ePeak);
+		a_weights[edge] = 1.f - t;
+		a_weights[ColorTime::kDay] = t;
+	} else
+		a_weights[ColorTime::kDay] = 1.f;
+	return true;
+}
+
+bool PhysicalSky::PlanckianBoundedChroma(const float3& a_linear, float3& a_unitLuminanceOut)
+{
+	a_unitLuminanceOut = float3(1.f, 1.f, 1.f);
+	if (!AllFinite(a_linear))
+		return false;
+	const double r = std::max(a_linear.x, 0.f), g = std::max(a_linear.y, 0.f), b = std::max(a_linear.z, 0.f);
+	// Linear sRGB (D65) -> XYZ -> CIE 1960 uv.
+	const double X = 0.4124 * r + 0.3576 * g + 0.1805 * b;
+	const double Y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+	const double Z = 0.0193 * r + 0.1192 * g + 0.9505 * b;
+	const double denom = X + 15.0 * Y + 3.0 * Z;
+	if (!(Y > 1e-9) || !(denom > 1e-12))
+		return false;
+	double u = 4.0 * X / denom, v = 6.0 * Y / denom;
+	// The Planckian locus (Krystek 1985), 1700 K .. 1e7 K, as a polyline in equal mired steps.
+	static const std::vector<std::array<double, 2>> locus = [] {
+		std::vector<std::array<double, 2>> points;
+		constexpr int kSteps = 240;
+		const double miredHot = 1e6 / 1e7, miredCold = 1e6 / 1700.0;
+		for (int i = 0; i <= kSteps; ++i) {
+			const double mired = miredCold + (miredHot - miredCold) * i / kSteps;
+			const double T = 1e6 / mired;
+			const double pu = (0.860117757 + 1.54118254e-4 * T + 1.28641212e-7 * T * T) / (1.0 + 8.42420235e-4 * T + 7.08145163e-7 * T * T);
+			const double pv = (0.317398726 + 4.22806245e-5 * T + 4.20481691e-8 * T * T) / (1.0 - 2.89741816e-5 * T + 1.61456053e-7 * T * T);
+			points.push_back({ pu, pv });
+		}
+		return points;
+	}();
+	double bestD2 = 1e30, bestU = u, bestV = v;
+	for (size_t i = 0; i + 1 < locus.size(); ++i) {
+		const double ax = locus[i][0], ay = locus[i][1], bx = locus[i + 1][0], by = locus[i + 1][1];
+		const double dx = bx - ax, dy = by - ay;
+		const double len2 = dx * dx + dy * dy;
+		const double t = len2 > 0.0 ? std::clamp(((u - ax) * dx + (v - ay) * dy) / len2, 0.0, 1.0) : 0.0;
+		const double px = ax + dx * t, py = ay + dy * t;
+		const double d2 = (u - px) * (u - px) + (v - py) * (v - py);
+		if (d2 < bestD2) {
+			bestD2 = d2;
+			bestU = px;
+			bestV = py;
+		}
+	}
+	const double d = std::sqrt(bestD2);
+	if (d > kHueMaxDuv) {
+		// Only the saturation goes: along the line to the nearest locus point, the hue direction kept.
+		const double s = kHueMaxDuv / d;
+		u = bestU + (u - bestU) * s;
+		v = bestV + (v - bestV) * s;
+	}
+	const double den2 = 2.0 * u - 8.0 * v + 4.0;
+	if (!(std::abs(den2) > 1e-12))
+		return false;
+	const double x = 3.0 * u / den2, y = 2.0 * v / den2;
+	if (!(y > 1e-9))
+		return false;
+	const double X2 = x / y, Y2 = 1.0, Z2 = (1.0 - x - y) / y;
+	float3 rgb(static_cast<float>(3.2406 * X2 - 1.5372 * Y2 - 0.4986 * Z2), static_cast<float>(-0.9689 * X2 + 1.8758 * Y2 + 0.0415 * Z2),
+		static_cast<float>(0.0557 * X2 - 0.2040 * Y2 + 1.0570 * Z2));
+	rgb = float3(std::max(rgb.x, 0.f), std::max(rgb.y, 0.f), std::max(rgb.z, 0.f));
+	const float l = Lum3(rgb);
+	if (!(l > 1e-6f) || !AllFinite(rgb))
+		return false;
+	a_unitLuminanceOut = rgb * (1.f / l);
+	return true;
+}
+
+void PhysicalSky::UpdateOutdoorCalibration()
+{
+	// The ambient's one global constant: the reference's clear-noon directional ambient (mean of the six, linear) over the physical model's
+	// clear noon (the sun at the path's peak, colour as set, gloominess 1, no moons, no glow, the same ground bounce). Likewise the clouds'
+	// sky ambient: 50b read the DALC's mean colour (Stage2::Ambient), the new one reads the sky-view LUT at Sky.hlsl's 5 taps.
+	auto& amb = outdoorAmbient;
+	const uint32_t frame = globals::state->frameCount;
+	if (amb.calibrationFrame != UINT32_MAX && frame - amb.calibrationFrame < 64u && !outdoorFrame.timeJump)
+		return;
+	amb.calibrationFrame = frame;
+	amb.calibration = 0.f;
+	amb.cloudAmbientCal = 0.f;
+	if (!UpdateCpuSkyModel())
+		return;
+	const float sinTilt = std::abs(std::sin(DirectX::XMConvertToRadians(globals::features::skySync.GetSunAngle())));
+	const double peak = std::asin(std::clamp(static_cast<double>(sinTilt), 0.17, 1.0));  // a flat path's peak counted no lower than 10 deg
+	const PhysicalSkyModel::Light sun = { { std::cos(peak), 0.0, std::sin(peak) }, { settings.sunlightColor.x, settings.sunlightColor.y, settings.sunlightColor.z } };
+	const double cameraRadius = static_cast<double>(cbData.zCameraPlanet) * Util::Units::GAME_UNIT_TO_KM;
+	const auto tr = skyModelCpu.Transmittance(cameraRadius, sun.dir);
+	const float3 direct = float3(static_cast<float>(sun.color[0] * tr[0]), static_cast<float>(sun.color[1] * tr[1]), static_cast<float>(sun.color[2] * tr[2])) *
+	                      static_cast<float>(std::sin(peak));
+	const SkyIrradiance noon = IntegrateSky(skyModelCpu, cameraRadius, &sun, 1, {}, {}, direct, settings.groundAlbedo);
+	float mean = 0.f;
+	for (int axis = 0; axis < 3; ++axis)
+		for (int side = 0; side < 2; ++side)
+			mean += Lum3(noon.e[axis][side]);
+	mean /= 6.f;
+	const auto& ref = weatherRef;
+	const RE::TESWeather* current = globals::game::sky ? globals::game::sky->currentWeather : nullptr;
+	const WeatherKeys fallback = ref.source == 0 ? ReadWeatherKeys(current) : WeatherKeys{};
+	const float targetA = ref.source != 0 ? ref.keys.a : fallback.a;
+	const float targetCloud = ref.source != 0 ? ref.keys.aCloud : fallback.aCloud;
+	if (mean > 1e-9f && std::isfinite(mean) && targetA > 0.f)
+		amb.calibration = targetA / mean;
+	// Sky.hlsl's cloud sky ambient taps: 0.3 x the zenith + 4 x 0.175 at 15 degrees (the ring mean stands for the four).
+	const auto zenith = skyModelCpu.SkyRay(cameraRadius, { 0.0, 0.0, 1.0 }, &sun, 1);
+	const double lut = 0.3 * (0.2126 * zenith[0] + 0.7152 * zenith[1] + 0.0722 * zenith[2]) + 0.7 * skyModelCpu.RingLuminance(cameraRadius, 15.0, &sun, 1);
+	if (lut > 1e-9 && std::isfinite(lut) && targetCloud > 0.f)
+		amb.cloudAmbientCal = static_cast<float>(targetCloud / lut);
+}
+
+void PhysicalSky::UpdateOutdoorAmbient(const RE::NiPoint3& a_lutSunDir)
+{
+	auto& amb = outdoorAmbient;
+	const uint32_t frame = globals::state->frameCount;
+	if (amb.valid && amb.frame != UINT32_MAX && frame - amb.frame < 4u && !outdoorFrame.timeJump)
+		return;
+	amb.frame = frame;
+	amb.valid = false;
+	auto* sky = globals::game::sky;
+	if (!sky || !sky->currentWeather || !UpdateCpuSkyModel())
+		return;
+	UpdateOutdoorCalibration();
+	UpdateKeyElevations();
+	if (!(amb.calibration > 0.f))
+		return;
+
+	// Luminance from physics: the sky as drawn (the sun family's scattering through cbData.sunlightColor, the moons' glows, the night glow) +
+	// the ground's bounce of it and of the direct sun and moons, x the one calibration constant.
+	const double cameraRadius = static_cast<double>(cbData.zCameraPlanet) * Util::Units::GAME_UNIT_TO_KM;
+	const PhysicalSkyModel::Light lights[3] = {
+		{ UnitVec(a_lutSunDir.x, a_lutSunDir.y, a_lutSunDir.z), { cbData.sunlightColor.x, cbData.sunlightColor.y, cbData.sunlightColor.z } },
+		{ UnitVec(cbData.masserDir.x, cbData.masserDir.y, cbData.masserDir.z), { cbData.masserColor.x, cbData.masserColor.y, cbData.masserColor.z } },
+		{ UnitVec(cbData.secundaDir.x, cbData.secundaDir.y, cbData.secundaDir.z), { cbData.secundaColor.x, cbData.secundaColor.y, cbData.secundaColor.z } },
+	};
+	const bool glowOn = (nightCbData.flags & kNightBaseLight) != 0;
+	const float3 glowUpper = glowOn ? nightCbData.baseUpper : float3{};
+	const float3 glowHorizon = glowOn ? nightCbData.baseHorizon : float3{};
+	// Direct light on the ground (for the bounce): the sun through the air (none below the horizon), each moon as it lights the ground.
+	float3 direct = {};
+	{
+		const auto trSun = skyModelCpu.Transmittance(cameraRadius, lights[0].dir);
+		const float up = static_cast<float>(std::max(lights[0].dir[2], 0.0));
+		direct += float3(static_cast<float>(lights[0].color[0] * trSun[0]), static_cast<float>(lights[0].color[1] * trSun[1]), static_cast<float>(lights[0].color[2] * trSun[2])) * up;
+		const auto& skySync = globals::features::skySync;
+		const float dayFade = SkySync::MoonDayFade(DirectX::XMConvertToDegrees(std::asin(std::clamp(skySync.rawDirections[static_cast<int>(SkySync::Caster::Sun)].z, -1.f, 1.f))));
+		const RE::Moon* moons[2] = { sky->masser, sky->secunda };
+		const float3* colors[2] = { &settings.masserColor, &settings.secundaColor };
+		const SkySync::Caster casters[2] = { SkySync::Caster::Masser, SkySync::Caster::Secunda };
+		for (int i = 0; i < 2; ++i) {
+			if (!moons[i])
+				continue;
+			const float sinEl = skySync.rawDirections[static_cast<int>(casters[i])].z;
+			const float strength = SkySync::PhaseFactorFromTexture(moons[i]) * MoonVisibility(moons[i], sky, sinEl) * dayFade * (i == 1 ? SkySync::SecundaIntensityFactor : 1.f);
+			const auto trMoon = skyModelCpu.Transmittance(cameraRadius, lights[1 + i].dir);
+			const float3 c = *colors[i] * (strength * std::max(sinEl, 0.f));
+			direct += float3(c.x * static_cast<float>(trMoon[0]), c.y * static_cast<float>(trMoon[1]), c.z * static_cast<float>(trMoon[2]));
+		}
+	}
+	const SkyIrradiance now = IntegrateSky(skyModelCpu, cameraRadius, lights, 3, glowUpper, glowHorizon, direct, settings.groundAlbedo);
+
+	// Hue (R2): the weather's directional ambient sampled by the sun's elevation (R3), each direction's chromaticity bounded to 0.02 Duv from
+	// the Planckian locus; the luminance stays the physical one. Weather Ambient Tint blends the physical colour toward it.
+	float weights[4];
+	KeyWeightsByElevation(DirectX::XMConvertToDegrees(std::asin(std::clamp(a_lutSunDir.z, -1.f, 1.f))), weights);
+	const float pct = std::isfinite(sky->currentWeatherPct) ? std::clamp(sky->currentWeatherPct, 0.f, 1.f) : 1.f;
+	const RE::TESWeather* last = (sky->lastWeather && sky->lastWeather != sky->currentWeather && pct < 1.f) ? sky->lastWeather : nullptr;
+	float3 weatherGamma[3][2] = {};
+	auto addWeather = [&](const RE::TESWeather* a_weather, float a_share) {
+		for (int key = 0; key < 4; ++key) {
+			if (!(weights[key] > 0.f))
+				continue;
+			float3 c[3][2];
+			DalcKey(a_weather, key, c);
+			for (int axis = 0; axis < 3; ++axis)
+				for (int side = 0; side < 2; ++side)
+					weatherGamma[axis][side] += c[axis][side] * (weights[key] * a_share);
+		}
+	};
+	addWeather(sky->currentWeather, last ? pct : 1.f);
+	if (last)
+		addWeather(last, 1.f - pct);
+	const auto g = GetOutdoorGammas();
+	const float tint = std::clamp(settings.outdoorLight.ambientTint, 0.f, 1.f);
+	const float invGamma = 1.f / g.ambient;
+	float3 gammaSpace[3][2];
+	for (int axis = 0; axis < 3; ++axis)
+		for (int side = 0; side < 2; ++side) {
+			const float3 phys = now.e[axis][side] * amb.calibration;
+			amb.physical[axis][side] = phys;
+			const float l = Lum3(phys);
+			float3 result = {};
+			if (l > 0.f && AllFinite(phys)) {
+				const float3 physChroma = phys * (1.f / l);
+				const float3& wg = weatherGamma[axis][side];
+				float3 weatherChroma;
+				if (!PlanckianBoundedChroma(float3(std::pow(wg.x, g.ambient), std::pow(wg.y, g.ambient), std::pow(wg.z, g.ambient)), weatherChroma))
+					weatherChroma = float3(1.f, 1.f, 1.f);  // black or unusable: neutral
+				float3 chroma = physChroma + (weatherChroma - physChroma) * tint;
+				chroma = float3(std::max(chroma.x, 0.f), std::max(chroma.y, 0.f), std::max(chroma.z, 0.f));
+				const float cl = Lum3(chroma);
+				result = cl > 1e-6f ? chroma * (l / cl) : float3(l, l, l);
+			}
+			amb.linear[axis][side] = result;
+			// The engine stores what Lighting raises to the ambient gamma (Color::Ambient): the inverse here.
+			gammaSpace[axis][side] = float3(std::pow(std::max(result.x, 0.f), invGamma), std::pow(std::max(result.y, 0.f), invGamma), std::pow(std::max(result.z, 0.f), invGamma));
+			if (!AllFinite(gammaSpace[axis][side]))
+				return;
+		}
+	// The engine's transform layout (checked against its own colours at run time, dalcConventionError): translation = the mean of the six,
+	// rotate[channel][axis] = (+axis - -axis) / 2, so DALC x (n, 1) gives the mean plus the half difference along each axis.
+	RE::NiTransform t{};
+	float3 mean = {};
+	for (int axis = 0; axis < 3; ++axis)
+		mean += gammaSpace[axis][0] + gammaSpace[axis][1];
+	mean = mean * (1.f / 6.f);
+	t.translate = { mean.x, mean.y, mean.z };
+	for (int axis = 0; axis < 3; ++axis) {
+		const float3 half = (gammaSpace[axis][0] - gammaSpace[axis][1]) * 0.5f;
+		t.rotate.entry[0][axis] = half.x;
+		t.rotate.entry[1][axis] = half.y;
+		t.rotate.entry[2][axis] = half.z;
+	}
+	t.scale = 1.f;
+	amb.transform = t;
+	amb.valid = true;
+}
+
+void PhysicalSky::ApplyOutdoorDalc()
+{
+	auto* sm = globals::game::smState;
+	if (!sm)
+		return;
+	RE::NiTransform& current = sm->directionalAmbientTransform;
+	const bool holdsOurs = dalcWritten && SameTransform(current, writtenDalc);
+	if (!holdsOurs) {
+		// The engine (re)wrote its own: keep it for the CPU readers and for putting back.
+		engineDalc = current;
+		dalcEngineSaved = true;
+		dalcWritten = false;
+		if (!dalcConventionChecked && globals::game::sky && outdoorActive) {
+			// Self-check of the layout UpdateOutdoorAmbient writes: the engine's translation against the mean of its six colours.
+			float3 mean = {};
+			for (int axis = 0; axis < 3; ++axis)
+				for (int side = 0; side < 2; ++side) {
+					const auto& c = globals::game::sky->directionalAmbientColors[axis][side];
+					mean += float3(c.red, c.green, c.blue);
+				}
+			mean = mean * (1.f / 6.f);
+			if (Lum3(mean) > 1e-4f) {
+				dalcConventionError = std::max({ std::abs(mean.x - current.translate.x), std::abs(mean.y - current.translate.y), std::abs(mean.z - current.translate.z) });
+				dalcConventionChecked = true;
+				logger::info("[Physical Sky] (51a) engine DALC layout check: |translation - mean of the six colours| = {:.5f}", dalcConventionError);
+			}
+		}
+	}
+	const bool want = OutdoorActive(settings.outdoorLight.ambient) && outdoorAmbient.valid;
+	if (want) {
+		std::memcpy(current.rotate.entry, outdoorAmbient.transform.rotate.entry, sizeof(current.rotate.entry));
+		current.translate = outdoorAmbient.transform.translate;
+		writtenDalc = current;
+		dalcWritten = true;
+	} else if (holdsOurs) {
+		std::memcpy(current.rotate.entry, engineDalc.rotate.entry, sizeof(current.rotate.entry));
+		current.translate = engineDalc.translate;
+		dalcWritten = false;
+	}
+}
+
+RE::NiPoint3 PhysicalSky::EngineDalcTranslate() const
+{
+	const auto* sm = globals::game::smState;
+	if (!sm)
+		return {};
+	const RE::NiTransform& current = sm->directionalAmbientTransform;
+	if (dalcWritten && dalcEngineSaved && SameTransform(current, writtenDalc))
+		return engineDalc.translate;
+	return current.translate;
+}
+
+std::string PhysicalSky::DescribeOutdoorLight() const
+{
+	const auto& ol = settings.outdoorLight;
+	if (!OutdoorOn(true))
+		return "physical outdoor light off";
+	const auto& f = outdoorFrame;
+	return std::format(
+		"physical outdoor light on ({}; sun family {} g {:.3f} -> x{:.3f} [strength {:.2f}], sunlight scale now {:.2f} ref {:.2f}; moon family {}; night glow {} x{:.1f}; "
+		"ambient {} tint {:.2f} cal {:.4f}; clouds {}; smooth sun {}; real ozone {}; reference source {} ({} entries))",
+		outdoorActive ? "active" : "not here", ol.sunFamily ? "on" : "off", f.g, f.sunScale, ol.weatherGloominess, f.sigmaNow, f.sigmaRef,
+		ol.moonFamily ? "on" : "off", ol.nightGlow ? "on" : "off", ol.nightSkyGlow, ol.ambient ? "on" : "off", ol.ambientTint, outdoorAmbient.calibration,
+		ol.clouds ? "on" : "off", ol.smoothSun ? "on" : "off", ol.realOzone ? "on" : "off", weatherRef.source, weatherRef.entries);
 }

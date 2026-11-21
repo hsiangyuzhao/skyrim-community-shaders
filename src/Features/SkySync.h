@@ -306,7 +306,7 @@ public:
 		double pn = 0.0;    // path phase at NightElevation (negative), radians
 		double rate = 0.0;  // uniform phase rate between midR and midS, radians per hour
 		double riseBeta = 0.0, setBeta = 0.0;      // horizon rate / mean rate of the piece below the horizon
-		double riseAlpha = 1.0, setAlpha = 1.0;     // relative slope at -12 deg (largest monotone value up to 3)
+		double riseAlpha = 1.0, setAlpha = 1.0;     // relative slope at -12 deg (largest monotone value up to the cap: 3, or SmoothMaxAlpha)
 		bool risePower = false, setPower = false;  // ratio above 4: t^beta (a pause at -12 deg), else a cubic
 		double nightM0 = 0.0, nightM1 = 0.0;       // night piece slopes at cse and at csb + 24, radians per hour
 		// What the knots were built from; Build() is a no-op while these match.
@@ -314,14 +314,21 @@ public:
 		uint8_t key[4] = {};
 		float keyExtension = 0.f;
 		float keySunAngle = 0.f;
+		double keyMaxAlpha = 0.0;  // (51a)
 		uint32_t generation = 0;  // bumped whenever the knots change (climate, sun path)
 
-		void Build(const RE::TESClimate::Timing& a_timing, float a_colorExtension, float a_sunAngleDeg);
+		/// (51a) a_maxAlpha: the cap on the relative slope at -12 deg. 3 = the 47a2 curve (monotone limit: with NAT / vanilla timing the
+		/// sun stalls at -5.2..-6.2 deg for about an hour, 0.26 deg per game hour at its slowest); SmoothMaxAlpha ("Smooth Sun Below
+		/// Horizon") keeps it descending (slowest 1.9 deg per game hour, at about -9 deg).
+		void Build(const RE::TESClimate::Timing& a_timing, float a_colorExtension, float a_sunAngleDeg, double a_maxAlpha = 3.0);
+		static constexpr double SmoothMaxAlpha = 1.25;
 		double Phase(double a_hour) const;
 	};
 	SunWarp sunWarp;
 	/// (47a) Bumped when the warp's knots change, so Physical Sky can snap its smoothing.
 	uint32_t GetSunWarpGeneration() const { return sunWarp.generation; }
+	/// (51a) The sun path's tilt (degrees from the horizon plane's normal side, as Sky Sync uses it): the path's peak elevation is asin(|sin|).
+	float GetSunAngle() const { return sunAngle; }
 	/// (47a) GMST fDaytimeColorExtension (0.5 if missing).
 	static float GetDaytimeColorExtension();
 
