@@ -94,6 +94,8 @@ struct HistogramAutoExposure : public PostProcessFeature
 	/// (50a) Scene Scale Wobble self-test (Developer; not saved): the frame x 2^sin(2 pi t / 4 s) before the histogram, adaptation instant.
 	bool eyeWobble = false;
 	double eyeWobbleStart = 0.0;
+	/// (50b) Physical Sky's "Sky Light Wobble" self-test: the adaptation holds its level (classic: no lerp; eye: no change, no snap) while set.
+	static inline bool freezeAdaptation = false;
 	/// (50a) Snap bookkeeping: a loading screen seen since the last Draw, the game hour of the last Draw, the eye mode of the last Draw.
 	int eyeSnapFrames = 3;
 	float eyeLastGameHours = -1.0f;

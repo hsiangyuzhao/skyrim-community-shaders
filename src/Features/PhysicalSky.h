@@ -220,6 +220,16 @@ struct PhysicalSky final : public Feature
 			bool forwardCubemap = true;    // S7: forward cubemap reflections at the cubemap's own brightness, ambient converted
 			bool smallFixes = true;        // S8: small consistency fixes
 		} physicalLighting;
+		/// (50b) Physical lighting redo, stage 2 ("one sun, one moon, one sky", Physical Sky > Scene Lighting, first section). Master off =
+		/// 50a exactly (every value below uploads as before). Saved outside the NLOHMANN macro (key "lightingStage2").
+		struct LightingStage2
+		{
+			bool enabled = true;           // the master
+			bool skyAnchor = true;         // one factor k_sky for the physical sky family (replaces Sky Fixes' zenith-only factor)
+			bool cloudsLikeGround = true;  // clouds: the ground's moonlight (no strength / greying, alpha once) and the ground's ambient
+			bool weatherHidesMoon = true;  // the ground's moonlight follows the moon visibility the sky and clouds use (weather x -2..3 deg)
+			bool starExtinction = true;    // Sky.hlsl: stars and the Milky Way x T(dir) / T(zenith) toward the horizon
+		} lightingStage2;
 		/// (48b) Its strength, 0-3. 1: Masser full and high on a clear night keeps about 40% of the Milky Way's light.
 		float moonStarFadeStrength = 1.f;
 		/// (48b) "Moon Planetshine": a faint grey fill on the unlit side of each moon disc (strongest at crescent, none at
@@ -434,6 +444,8 @@ struct PhysicalSky final : public Feature
 		kNightPlanetshine = 1u << 7,     // "Moon Planetshine": MoonCbData::planetshineHalves
 		// (49h) Water.hlsl only: its sun highlight x the transmittance toward the light ("Sun Highlight on Water Follows the Atmosphere").
 		kNightWaterSunTr = 1u << 8,
+		// (50b) Sky.hlsl only (HORIZFADE): stars and the Milky Way x the transmittance toward them / toward the zenith ("Star Extinction").
+		kNightStarExtinction = 1u << 9,
 	};
 	/// (49h stage 1) Physical Lighting rule bits in SharedData::horizonFixData.Flags (HorizonFixCbData::flags, unused since 47m).
 	/// Mirrored by Common/PhysicalLighting.hlsli.
@@ -519,6 +531,7 @@ struct PhysicalSky final : public Feature
 		kCloudMultiLight = 1u << 0,        // "Cloud Lighting: Sun + Moons + Sky"
 		kCloudMoonDaylightFade = 1u << 1,  // "Moons Fade in Daylight" (fixed on since 44h)
 		kCloudMoonDirect = 1u << 2,        // (44h) "Moonlight on Clouds": moons added after the weather cloud colour
+		kCloudLikeGround = 1u << 3,        // (50b) Sky.hlsl: the moons and the ground's ambient on clouds as on the ground (stage 2)
 	};
 	struct CloudCbData
 	{
@@ -554,6 +567,30 @@ struct PhysicalSky final : public Feature
 	[[nodiscard]] uint32_t PhysLightingFlags() const;
 	/// (49h stage 1) A Physical Lighting rule in effect (master and its checkbox) -- for the C++ side of S1 / S4a.
 	[[nodiscard]] bool PhysLightingOn(bool a_rule) const { return loaded && settings.physicalLighting.enabled && a_rule; }
+	/// (50b) A stage-2 item in effect (Physical Sky on, the stage-2 master and its checkbox).
+	[[nodiscard]] bool Stage2On(bool a_item) const { return loaded && settings.enabled && settings.lightingStage2.enabled && a_item; }
+	/// (50b) k_sky: E_v / E_phys of a white horizontal surface now, normalised by the same ratio for the current weather's day key with the sun at
+	/// kAnchorRefElevationDeg (so k = 1 at a clear noon of every weather), clamped to [1 / kAnchorCap, kAnchorCap], smoothed (log2, 1.5 s,
+	/// snaps as Sky Fixes). Inputs before k: a_sun = sunlightColor x exposure, the glows as UpdateMoonData gave them. Sets skyAnchorTarget.
+	void UpdateSkyAnchor(const RE::NiPoint3& a_lutSunDir, const float3& a_sun, const float3& a_masserGlow, const float3& a_secundaGlow, float a_exposure);
+	static constexpr float kAnchorCap = 32.f;
+	static constexpr float kAnchorRefElevationDeg = 50.f;
+	float skyAnchorK = 1.f;        // smoothed k_sky (1 while off)
+	float skyAnchorTarget = 1.f;
+	float skyAnchorApplied = 1.f;  // what this frame's uploads carry (k x the wobble)
+	bool skyAnchorSnap = true;
+	float skyAnchorLastHours = -1.f;
+	uint32_t skyAnchorLastWarp = 0;
+	uint32_t skyAnchorFrame = UINT32_MAX;
+	struct SkyAnchorDebug
+	{
+		bool valid = false;
+		float eVanilla = 0.f, ePhys = 0.f, eVanillaRef = 0.f, ePhysRef = 0.f, dalc = 0.f, skyPhys = 0.f;
+	} skyAnchorDebug;
+	/// (50b) "Sky Light Wobble" self-test (not saved): k x 2^sin(2 pi t / 4 s), eye adaptation frozen.
+	bool skyLightWobble = false;
+	double skyLightWobbleStart = 0.0;
+	void SettingsStage2();
 	void SettingsSceneLighting();
 	/// (49h) EHF "Stable Fog Colour": Physical Sky's transmittance from the camera toward a_dir (towards the light) as
 	/// PhysSky::SampleTr gives the shaders (Transmittance Mix applied), from the CPU model; 1 while Physical Sky is off or the

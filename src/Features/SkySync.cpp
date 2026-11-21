@@ -503,6 +503,11 @@ void SkySync::UpdateCombined(const RE::Sky* sky)
 		if (!moons[i] || !moons[i]->moonMesh)
 			continue;
 		float s = SmoothStep(MoonStartElevation, MoonFullElevation, elevationDeg(rawDirections[i]));
+		// (50b) Physical lighting stage 2 "Weather Hides the Moon": one rule for the ground, the sky and the clouds -- the ground's moonlight
+		// follows the moon visibility the sky glow and the clouds use (PhysicalSky::MoonHorizonVisibility: the weather's moon glare x the
+		// -2..3 degree rise). Off: the clock ramp above (overcast nights keep their moonlight), as 50a.
+		if (const auto& physicalSky = globals::features::physicalSky; physicalSky.Stage2On(physicalSky.settings.lightingStage2.weatherHidesMoon))
+			s = PhysicalSky::MoonHorizonVisibility(moons[i], sky, rawDirections[i].z);
 		s *= PhaseFactorFromTexture(moons[i]) * dayFade;
 		if (i == secundaIdx)
 			s *= SecundaIntensityFactor;

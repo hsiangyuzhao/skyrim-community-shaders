@@ -10,6 +10,7 @@
 #include "LinearLighting.h"
 #include "SkySync.h"
 #include "TerrainShadows.h"
+#include "PostProcessing/HistogramAutoExposure.h"  // (50b) Sky Light Wobble freezes the eye
 
 #include "Menu.h"
 #include "State.h"
@@ -140,6 +141,17 @@ void PhysicalSky::LoadSettings(json& o_json)
 			pl.farFog = j.value("farFog", d.farFog);
 			pl.forwardCubemap = j.value("forwardCubemap", d.forwardCubemap);
 			pl.smallFixes = j.value("smallFixes", d.smallFixes);
+		}
+		// (50b) Stage 2: missing keys keep their defaults (on).
+		if (const auto it = o_json.find("lightingStage2"); it != o_json.end() && it->is_object()) {
+			auto& st = settings.lightingStage2;
+			const Settings::LightingStage2 d{};
+			const auto& j = *it;
+			st.enabled = j.value("enabled", d.enabled);
+			st.skyAnchor = j.value("skyAnchor", d.skyAnchor);
+			st.cloudsLikeGround = j.value("cloudsLikeGround", d.cloudsLikeGround);
+			st.weatherHidesMoon = j.value("weatherHidesMoon", d.weatherHidesMoon);
+			st.starExtinction = j.value("starExtinction", d.starExtinction);
 		}
 		settings.moonStarFadeStrength = o_json.value("moonStarFadeStrength", defaults.moonStarFadeStrength);
 		settings.moonPlanetshineStrength = o_json.value("moonPlanetshineStrength", defaults.moonPlanetshineStrength);
@@ -293,6 +305,11 @@ void PhysicalSky::SaveSettings(json& o_json)
 		o_json["physicalLighting"] = { { "enabled", pl.enabled }, { "iblNoFeedback", pl.iblNoFeedback }, { "iblEnvOcclusion", pl.iblEnvOcclusion },
 			{ "farShadows", pl.farShadows }, { "farSkylight", pl.farSkylight }, { "lodScale", pl.lodScale }, { "farFog", pl.farFog },
 			{ "forwardCubemap", pl.forwardCubemap }, { "smallFixes", pl.smallFixes } };
+	}
+	{
+		const auto& st = settings.lightingStage2;  // (50b)
+		o_json["lightingStage2"] = { { "enabled", st.enabled }, { "skyAnchor", st.skyAnchor }, { "cloudsLikeGround", st.cloudsLikeGround },
+			{ "weatherHidesMoon", st.weatherHidesMoon }, { "starExtinction", st.starExtinction } };
 	}
 	o_json["moonStarFadeStrength"] = settings.moonStarFadeStrength;
 	o_json["moonPlanetshineStrength"] = settings.moonPlanetshineStrength;
@@ -758,6 +775,8 @@ void PhysicalSky::SettingsClouds()
 			ImGui::SliderFloat("Moonlight Strength", &settings.moonCloudStrength, 0.f, 3.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 			if (auto _tt = Util::HoverTooltipWrapper())
 				ImGui::Text("How bright the moonlight on clouds is. Default 0.5.");
+			if (Stage2On(settings.lightingStage2.cloudsLikeGround))  // (50b)
+				ImGui::TextDisabled("Not used now: Scene Lighting > Clouds Lit Like the Ground gives the clouds the ground's moonlight.");
 			ImGui::SliderFloat("Moon Halo", &settings.moonCloudHalo, 0.f, 4.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 			if (auto _tt = Util::HoverTooltipWrapper())
 				ImGui::Text("Extra glow on thin clouds right around the moon. 0 = none. Default 1.");
@@ -782,6 +801,23 @@ void PhysicalSky::SettingsDebug()
 
 	if (ImGui::Button("Recompile Shaders"))
 		ClearShaderCache();
+
+	// (50b) Stage 2 self-test (not saved).
+	ImGui::SeparatorText("Self-Test");
+	ImGui::BeginDisabled(!Stage2On(true));
+	if (ImGui::Checkbox("Sky Light Wobble", &skyLightWobble))
+		skyLightWobbleStart = static_cast<double>(GetTickCount64()) * 1e-3;
+	ImGui::EndDisabled();
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("Not saved. The sky family's factor k swings up and down every 4 seconds (x2 .. x1/2) while the eye adaptation holds still.");
+		ImGui::Text("  Must pulse together: sunlit / moonlit ground, the sky, clouds, the moon discs, god rays, the sun's glint on water.");
+		ImGui::Text("  Must stay still: torches, windows, rain, the fog colour, the water body, a moonless starry sky, the sun disc (the game's own picture).");
+		ImGui::Text("  With a moon up: faint stars and the Milky Way's edge come and go with the sky behind them; bright stars stay.");
+		ImGui::Text("Anything sun- or moon-coloured that stays still is a path the factor misses. Needs Scene Lighting > Sky Family on One Scale.");
+	}
+	if (skyLightWobble && Stage2On(true))
+		ImGui::TextDisabled("Wobbling: x%.2f now (k x%.3f), eye adaptation frozen", skyAnchorApplied / std::max(Stage2On(settings.lightingStage2.skyAnchor) ? skyAnchorK : 1.f, 1e-6f),
+			Stage2On(settings.lightingStage2.skyAnchor) ? skyAnchorK : 1.f);
 
 	ImGui::SeparatorText("Values");
 	{
@@ -1086,7 +1122,8 @@ void PhysicalSky::UpdateMoonData(float a_exposure, float a_sunElevation, float3&
 			const float sinR = radius / dist;
 			const float solidAngle = 2.f * DirectX::XM_PI * (1.f - std::sqrt(1.f - sinR * sinR));
 			const float irradiance = (0.2126f * a_color.x + 0.7152f * a_color.y + 0.0722f * a_color.z) * a_exposure;
-			return std::clamp(irradiance / std::max(solidAngle, 1e-6f), 1.f, cap);
+			// (50b) x k_sky (with its cap: the disc follows the family; x 1.0f off).
+			return std::clamp(irradiance / std::max(solidAngle, 1e-6f), 1.f, cap) * skyAnchorApplied;
 		};
 		moonCbData.masserDiskScale = discScale(sky->masser, settings.masserColor);
 		moonCbData.secundaDiskScale = discScale(sky->secunda, settings.secundaColor);
@@ -1138,7 +1175,7 @@ void PhysicalSky::UpdateMoonSky(float a_exposure, float a_sunElevation)
 			const float luminance = std::max(0.2126f * light.x + 0.7152f * light.y + 0.0722f * light.z, 0.f);
 			const float amount = strength * kMoonStarFadeScale * SkySync::PhaseFactorFromTexture(moons[i]) *
 			                     MoonHorizonVisibility(moons[i], sky, sinElevation[i]) * dayFade * height * luminance *
-			                     (i == 1 ? SkySync::SecundaIntensityFactor : 1.f);
+			                     (i == 1 ? SkySync::SecundaIntensityFactor : 1.f) * skyAnchorApplied;  // (50b) the moonlight in the scene's scale (x 1.0f off)
 			// D >= 1 drowns every texel (c0 <= 1); the half keeps it exactly.
 			moonStarFadeAmount[i] = std::isfinite(amount) ? std::clamp(amount, 0.f, 1.f) : 0.f;
 		}
@@ -1177,7 +1214,12 @@ std::string PhysicalSky::DescribeForTrace() const
 		"moon planetshine {} (strength {:.2f}, now Masser {:.3f} / Secunda {:.3f})",
 		s.enabled && cbData.enabled ? "on" : (s.enabled ? "on (not drawn here)" : "off"), SkyFixesActive() ? "on" : "off", s.moonGlowStrength,
 		s.moonFadesStars ? "on" : "off", s.moonStarFadeStrength, moonStarFadeAmount[0], moonStarFadeAmount[1],
-		s.moonPlanetshine ? "on" : "off", s.moonPlanetshineStrength, moonPlanetshineAmount[0], moonPlanetshineAmount[1]);
+		s.moonPlanetshine ? "on" : "off", s.moonPlanetshineStrength, moonPlanetshineAmount[0], moonPlanetshineAmount[1]) +
+	       std::format("; stage 2 {} (one scale {}, k {:.3f}, clouds like ground {}, weather hides moon {}, star extinction {}{})",  // (50b)
+			   settings.lightingStage2.enabled ? "on" : "off", Stage2On(settings.lightingStage2.skyAnchor) ? "on" : "off",
+			   Stage2On(settings.lightingStage2.skyAnchor) ? skyAnchorK : 1.f, Stage2On(settings.lightingStage2.cloudsLikeGround) ? "on" : "off",
+			   Stage2On(settings.lightingStage2.weatherHidesMoon) ? "on" : "off", Stage2On(settings.lightingStage2.starExtinction) ? "on" : "off",
+			   skyLightWobble ? ", sky light wobble on" : "");
 }
 
 float PhysicalSky::MoonHorizonVisibility(const RE::Moon* a_moon, const RE::Sky* a_sky, float a_sinElevation)
@@ -1494,6 +1536,16 @@ void PhysicalSky::UpdateCloudData(float a_exposure, float a_sunElevation)
 	}
 
 	cloudCbData.skyAmbient = std::clamp(s.cloudSkyAmbient, 0.f, 4.f);
+	// (50b) Stage 2 "Clouds Lit Like the Ground" (needs Moonlight on Clouds): Sky.hlsl takes the moons' light as the ground gets it (the
+	// moonlight colour x VDM-equivalent, its own colour, the cloud's alpha once) and adds the ground's ambient (the weather DALC, as Lighting
+	// converts it) x the cloud texture x the weather cloud colour's hue after the (near-black at night) weather cloud colour. The sky-view LUT
+	// term of RelightCloudMulti is switched off by its strength 0; the user's Cloud Sky Ambient goes to Sky.hlsl in the moonCloudSaturation
+	// field (that field's greying is not used on this path).
+	if (s.moonCloudLight && Stage2On(settings.lightingStage2.cloudsLikeGround)) {
+		cloudCbData.flags |= kCloudLikeGround;
+		cloudCbData.moonCloudSaturation = cloudCbData.skyAmbient;
+		cloudCbData.skyAmbient = 0.f;
+	}
 	// Cloud Shadows' layer is 0.5 km above the camera's ground; only the extra goes in.
 	cloudCbData.heightOffset = (std::clamp(s.cloudLightHeightKm, 0.5f, 12.f) - 0.5f) / Util::Units::GAME_UNIT_TO_KM;
 }
@@ -1535,6 +1587,9 @@ void PhysicalSky::Reset()
 		if (skySync.loaded && skySync.settings.Enabled)
 			skySync.lightColors = std::nullopt;
 		skyScaleSmoothed = -1.f;  // (47a) snap when the sky comes back
+		skyAnchorSnap = true;  // (50b) likewise
+		skyAnchorApplied = 1.f;
+		HistogramAutoExposure::freezeAdaptation = false;
 		cbData.enabled = allGood;
 		horizonFixCbData = {};  // (47f)
 		horizonFixCbData.flags = PhysLightingFlags();  // (49h stage 1) the rules that do not need the physical sky still apply (interiors)
@@ -1611,10 +1666,33 @@ void PhysicalSky::Reset()
 	if (skyFixes)
 		exposure = 1.f;
 
+	// (50b) Stage 2: the factor this frame's sky-family uploads carry: k_sky (smoothed, from the frames before) x the Sky Light Wobble; exactly 1
+	// with the master or the anchor off (then every upload below is the 50a value: x 1.0f is exact).
+	const bool stage2 = Stage2On(true);
+	const bool anchor = Stage2On(settings.lightingStage2.skyAnchor);
+	{
+		float applied = anchor ? skyAnchorK : 1.f;
+		if (stage2 && skyLightWobble) {
+			const double t = static_cast<double>(GetTickCount64()) * 1e-3 - skyLightWobbleStart;
+			applied *= static_cast<float>(std::exp2(std::sin(2.0 * 3.14159265358979 * t / 4.0)));
+		}
+		skyAnchorApplied = applied;
+		HistogramAutoExposure::freezeAdaptation = stage2 && skyLightWobble;  // the eye holds still while the sky family pulses
+	}
+	if (!anchor)
+		skyAnchorSnap = true;  // snap when it comes back
+
 	float3 masserGlow, secundaGlow;
 	// (48b) The sun's true elevation, as for the clouds just below.
 	UpdateMoonData(exposure, std::asin(std::clamp(skySync.rawDirections[static_cast<int>(SkySync::Caster::Sun)].z, -1.f, 1.f)), masserGlow, secundaGlow);
 	UpdateCloudData(exposure, std::asin(std::clamp(skySync.rawDirections[static_cast<int>(SkySync::Caster::Sun)].z, -1.f, 1.f)));
+	if (skyAnchorApplied != 1.f) {
+		// (50b) The clouds' sun and moons (DirLightColor units) with the family.
+		cloudCbData.sunColor = cloudCbData.sunColor * skyAnchorApplied;
+		cloudCbData.masserColor = cloudCbData.masserColor * skyAnchorApplied;
+		cloudCbData.secundaColor = cloudCbData.secundaColor * skyAnchorApplied;
+		extCbData.sunRadianceCap = extCbData.sunRadianceCap * skyAnchorApplied;  // (no shader reads it since 49h; kept consistent)
+	}
 
 	// (47a) Sky Fixes: the ozone layer moved to 10-40 km, keeping the user's absorption colour and the
 	// column (peak x thickness / 2). Only the upload changes; the saved settings keep their values.
@@ -1639,15 +1717,15 @@ void PhysicalSky::Reset()
 		.frameDim = dynres,
 		.rcpFrameDim = float2(1.0f) / dynres,
 		.sunDir = { sunDir.x, sunDir.y, sunDir.z },
-		.sunlightColor = settings.sunlightColor * exposure,
+		.sunlightColor = settings.sunlightColor * exposure * skyAnchorApplied,  // (50b) x k_sky (x 1.0f off)
 		.trMix = settings.trMix,
 		.masserDir = { masserDir.x, masserDir.y, masserDir.z },
 		.apLumMix = settings.apLumMix,
-		.masserColor = masserGlow,
+		.masserColor = masserGlow * skyAnchorApplied,
 		.apTrMix = settings.apTrMix,
 		.secundaDir = { secundaDir.x, secundaDir.y, secundaDir.z },
 		.sunDiskCos = 0.f,  // (49h) the procedural sun is retired (field kept, SharedData unchanged)
-		.secundaColor = secundaGlow,
+		.secundaColor = secundaGlow * skyAnchorApplied,
 		.enabled = allGood,
 		.tonemapper = linearLighting.settings.enableLinearLighting ? 0 : settings.tonemapper,
 		.vanillaMix = settings.vanillaMix,
@@ -1679,7 +1757,9 @@ void PhysicalSky::Reset()
 			return RE::NiColor(color.x, color.y, color.z);
 		};
 		// (40d) The moonlight keeps the full colour: the glow strength only scales the sky LUTs.
-		skySync.lightColors = { LightConvFn(cbData.sunlightColor), LightConvFn(settings.masserColor * exposure), LightConvFn(settings.secundaColor * exposure) };
+		// (50b) The moons' light x k_sky too (the sun's through cbData.sunlightColor).
+		skySync.lightColors = { LightConvFn(cbData.sunlightColor), LightConvFn(settings.masserColor * exposure * skyAnchorApplied),
+			LightConvFn(settings.secundaColor * exposure * skyAnchorApplied) };
 	} else {
 		linearLighting.isDirLightLinear = false;
 	}
@@ -1692,6 +1772,14 @@ void PhysicalSky::Reset()
 
 	// (47a) Sky brightness factor, LUT flags and star values (all neutral when off).
 	UpdateSkyFixes(skyFixes, lutSunDir);
+	if (anchor) {
+		// (50b) k_sky replaces Sky Fixes' zenith-only factor (the sun's in-scatter now carries k through cbData.sunlightColor), and is
+		// updated for the next frames from this frame's values before k.
+		nightCbData.skyScale = 1.f;
+		UpdateSkyAnchor(lutSunDir, settings.sunlightColor * exposure, masserGlow, secundaGlow, exposure);
+	}
+	if (Stage2On(settings.lightingStage2.starExtinction))
+		nightCbData.flags |= kNightStarExtinction;  // (50b)
 	if (settings.waterSunTransmittance)
 		nightCbData.flags |= kNightWaterSunTr;  // (49h)
 
@@ -2117,6 +2205,168 @@ float3 PhysicalSky::ComputeLightTransmittance(const float3& a_dir)
 	return result;
 }
 
+void PhysicalSky::UpdateSkyAnchor(const RE::NiPoint3& a_lutSunDir, const float3& a_sun, const float3& a_masserGlow, const float3& a_secundaGlow, float a_exposure)
+{
+	// (50b) Stage 2: one factor k_sky that puts the physical sky family on the scene's (vanilla / weather) brightness scale.
+	//   The brightness a white horizontal surface sends back (DALC and Lighting's units: ambient as is, a directional light x N.L x the
+	//   vanilla diffuse multiplier):
+	//     E_v    = the weather's DALC mean (as Lighting linearises it) + its sunlight colour (light gamma, directional multiplier) x VDM x sin(elevation)
+	//              of the body that lights the scene (the sun while it is up, else the higher moon);
+	//     E_phys = the CPU sky model's cosine-weighted sky radiance (the sun's and the moons' scattering, WITHOUT the night base light, which is
+	//              the weather's own layer) + the sun x the transmittance x VDM x sin + each moon's light x phase x the weather / horizon
+	//              visibility x the daylight fade x VDM x sin.
+	//   k = (E_v / E_phys) / (E_v,ref / E_phys,ref): the reference is the same weather's day key with the sun at kAnchorRefElevationDeg (same
+	//   azimuth, no moons), so k = 1 at a clear noon of every weather (the user's noon tuning is kept) and follows the weather's own data at
+	//   every other moment (no time keying). Clamp: [1 / kAnchorCap, kAnchorCap] (32, as Sky Fixes' factor). Moonless nights: E_phys -> 0,
+	//   k reaches the cap; it then multiplies only light that is ~0 (the night base light and the stars are not multiplied).
+	//   Recomputed every 4th frame (the CPU model, as Physical Fog Brightness); smoothed in log2 over 1.5 s, snapping as Sky Fixes.
+	const uint32_t frame = globals::state->frameCount;
+	if (skyAnchorFrame == UINT32_MAX || frame - skyAnchorFrame >= 4u || skyAnchorSnap) {
+		skyAnchorFrame = frame;
+		auto& dbg = skyAnchorDebug;
+		dbg = {};
+		float target = 1.f;
+		auto* sky = globals::game::sky;
+		if (sky && sky->currentWeather && UpdateCpuSkyModel()) {
+			const auto& ll = globals::features::linearLighting.settings;
+			const bool linear = ll.enableLinearLighting;
+			const float ambientGamma = linear && std::isfinite(ll.ambientGamma) ? std::clamp(ll.ambientGamma, 0.1f, 5.f) : 1.f;
+			const float lightGamma = linear && std::isfinite(ll.lightGamma) ? std::clamp(ll.lightGamma, 0.1f, 5.f) : 1.f;
+			const float dirMult = linear && std::isfinite(ll.directionalLightMult) ? std::max(ll.directionalLightMult, 0.f) : 1.f;
+			const float vdm = linear && std::isfinite(ll.vanillaDiffuseMult) ? std::max(ll.vanillaDiffuseMult, 0.f) : 1.f;
+			auto lumPow = [](float r, float g, float b, float a_gamma) {
+				auto lin = [&](float v) { return std::pow(std::isfinite(v) ? std::max(v, 0.f) : 0.f, a_gamma); };
+				return 0.2126f * lin(r) + 0.7152f * lin(g) + 0.0722f * lin(b);
+			};
+			auto lum = [](const float3& c) { return 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z; };
+			// The weather blend (current / last, as the game blends the keys).
+			const float pct = std::isfinite(sky->currentWeatherPct) ? std::clamp(sky->currentWeatherPct, 0.f, 1.f) : 1.f;
+			const RE::TESWeather* last = (sky->lastWeather && sky->lastWeather != sky->currentWeather && pct < 1.f) ? sky->lastWeather : nullptr;
+			// E_v now: DALC (the engine's blend) and the sunlight colour (the engine's blend).
+			float dalc = 0.f;
+			for (int axis = 0; axis < 3; ++axis)
+				for (int side = 0; side < 2; ++side) {
+					const auto& c = sky->directionalAmbientColors[axis][side];
+					dalc += lumPow(c.red, c.green, c.blue, ambientGamma);
+				}
+			dalc /= 6.f;
+			const auto& sl = sky->skyColor[RE::TESWeather::ColorTypes::kSunlight];
+			const float sunV = lumPow(sl.red, sl.green, sl.blue, lightGamma) * dirMult;
+			const auto& skySync = globals::features::skySync;
+			const float masserZ = skySync.rawDirections[static_cast<int>(SkySync::Caster::Masser)].z;
+			const float secundaZ = skySync.rawDirections[static_cast<int>(SkySync::Caster::Secunda)].z;
+			const float sunZ = std::clamp(a_lutSunDir.z, -1.f, 1.f);
+			const float sinV = sunZ > 0.f ? sunZ : std::max({ masserZ, secundaZ, 0.f });
+			const float eV = dalc + sunV * vdm * sinV;
+			// E_v at the reference: the day keys of the same weathers.
+			auto keyDalc = [&]() {
+				auto channel = [](const RE::Color& c, int i) { return (i == 0 ? c.red : i == 1 ? c.green : c.blue) * (1.f / 255.f); };
+				float sum = 0.f;
+				for (int axis = 0; axis < 3; ++axis)
+					for (int side = 0; side < 2; ++side) {
+						auto colorOf = [&](const RE::TESWeather* w) -> const RE::Color& {
+							const auto& d = w->directionalAmbientLightingColors[RE::TESWeather::ColorTime::kDay].directional;
+							const auto& mm = axis == 0 ? d.x : axis == 1 ? d.y : d.z;
+							return side == 0 ? mm.max : mm.min;
+						};
+						float rgb[3];
+						for (int i = 0; i < 3; ++i)
+							rgb[i] = last ? std::lerp(channel(colorOf(last), i), channel(colorOf(sky->currentWeather), i), pct) : channel(colorOf(sky->currentWeather), i);
+						sum += lumPow(rgb[0], rgb[1], rgb[2], ambientGamma);
+					}
+				return sum / 6.f;
+			};
+			auto keySun = [&]() {
+				auto colorOf = [](const RE::TESWeather* w) { return w->colorData[RE::TESWeather::ColorTypes::kSunlight][RE::TESWeather::ColorTime::kDay]; };
+				const auto cur = colorOf(sky->currentWeather);
+				float rgb[3] = { cur.red / 255.f, cur.green / 255.f, cur.blue / 255.f };
+				if (last) {
+					const auto old = colorOf(last);
+					rgb[0] = std::lerp(old.red / 255.f, rgb[0], pct);
+					rgb[1] = std::lerp(old.green / 255.f, rgb[1], pct);
+					rgb[2] = std::lerp(old.blue / 255.f, rgb[2], pct);
+				}
+				return lumPow(rgb[0], rgb[1], rgb[2], lightGamma) * dirMult;
+			};
+			const double refEl = DirectX::XMConvertToRadians(kAnchorRefElevationDeg);
+			const float sinRef = static_cast<float>(std::sin(refEl));
+			const float eVRef = keyDalc() + keySun() * vdm * sinRef;
+			// E_phys now and at the reference (CPU model; the cosine-weighted mean as ComputeFogSkyLight, without the night base).
+			auto unit = [](double x, double y, double z) {
+				const double l = std::sqrt(x * x + y * y + z * z);
+				return l > 1e-9 ? PhysicalSkyModel::Vec3{ x / l, y / l, z / l } : PhysicalSkyModel::Vec3{ 0.0, 0.0, 1.0 };
+			};
+			auto vec = [](const float3& c) { return PhysicalSkyModel::Vec3{ c.x, c.y, c.z }; };
+			const double cameraRadius = static_cast<double>(cbData.zCameraPlanet) * Util::Units::GAME_UNIT_TO_KM;
+			const PhysicalSkyModel::Light lights[3] = {
+				{ unit(a_lutSunDir.x, a_lutSunDir.y, a_lutSunDir.z), vec(a_sun) },
+				{ unit(cbData.masserDir.x, cbData.masserDir.y, cbData.masserDir.z), vec(a_masserGlow) },
+				{ unit(cbData.secundaDir.x, cbData.secundaDir.y, cbData.secundaDir.z), vec(a_secundaGlow) },
+			};
+			const double horizontal = std::sqrt(double(a_lutSunDir.x) * a_lutSunDir.x + double(a_lutSunDir.y) * a_lutSunDir.y);
+			PhysicalSkyModel::Light refLight = lights[0];
+			refLight.dir = horizontal > 1e-6 ? PhysicalSkyModel::Vec3{ a_lutSunDir.x / horizontal * std::cos(refEl), a_lutSunDir.y / horizontal * std::cos(refEl), std::sin(refEl) } :
+			                                   PhysicalSkyModel::Vec3{ std::cos(refEl), 0.0, std::sin(refEl) };
+			constexpr double kElevations[3] = { 15.0, 45.0, 75.0 };
+			constexpr double kWeights[3] = { 0.25, 0.5, 0.25 };
+			double skyNow = 0.0, skyRef = 0.0;
+			for (int i = 0; i < 3; ++i) {
+				skyNow += kWeights[i] * (skyModelCpu.RingLuminance(cameraRadius, kElevations[i], lights, 1) + skyModelCpu.RingLuminance(cameraRadius, kElevations[i], lights + 1, 2));
+				skyRef += kWeights[i] * skyModelCpu.RingLuminance(cameraRadius, kElevations[i], &refLight, 1);
+			}
+			const float3 trSun = ComputeLightTransmittance(float3(a_lutSunDir.x, a_lutSunDir.y, a_lutSunDir.z));
+			const float3 trRef = ComputeLightTransmittance(float3(static_cast<float>(refLight.dir[0]), static_cast<float>(refLight.dir[1]), static_cast<float>(refLight.dir[2])));
+			const float sunDirect = lum(a_sun * trSun) * vdm * std::max(sunZ, 0.f);
+			float moonDirect = 0.f;
+			const float dayFade = SkySync::MoonDayFade(DirectX::XMConvertToDegrees(std::asin(std::clamp(skySync.rawDirections[static_cast<int>(SkySync::Caster::Sun)].z, -1.f, 1.f))));
+			const RE::Moon* moons[2] = { sky->masser, sky->secunda };
+			const float3* colors[2] = { &settings.masserColor, &settings.secundaColor };
+			const float moonZ[2] = { masserZ, secundaZ };
+			for (int i = 0; i < 2; ++i) {
+				if (!moons[i])
+					continue;
+				const float strength = SkySync::PhaseFactorFromTexture(moons[i]) * MoonHorizonVisibility(moons[i], sky, moonZ[i]) * dayFade *
+				                       (i == 1 ? SkySync::SecundaIntensityFactor : 1.f);
+				moonDirect += lum(*colors[i] * a_exposure) * strength * vdm * std::max(moonZ[i], 0.f);
+			}
+			const double ePhys = skyNow + sunDirect + moonDirect;
+			const double ePhysRef = skyRef + lum(a_sun * trRef) * vdm * sinRef;
+			dbg.eVanilla = eV;
+			dbg.ePhys = static_cast<float>(ePhys);
+			dbg.eVanillaRef = eVRef;
+			dbg.ePhysRef = static_cast<float>(ePhysRef);
+			dbg.dalc = dalc;
+			dbg.skyPhys = static_cast<float>(skyNow);
+			if (std::isfinite(eV) && std::isfinite(ePhys) && std::isfinite(eVRef) && std::isfinite(ePhysRef) && eVRef > 1e-6f && ePhysRef > 1e-9) {
+				const double k = (static_cast<double>(eV) / std::max(ePhys, 1e-9)) * (ePhysRef / static_cast<double>(eVRef));
+				target = static_cast<float>(std::clamp(k, 1.0 / kAnchorCap, static_cast<double>(kAnchorCap)));
+				dbg.valid = true;
+			}
+		}
+		skyAnchorTarget = std::isfinite(target) ? target : 1.f;
+	}
+	// Smoothing (log2), snapping on time skips, loads, a stopped clock, a new sun path and when the sky (re)appears.
+	const auto calendar = RE::Calendar::GetSingleton();
+	const float hours = calendar ? calendar->GetHoursPassed() : 0.f;
+	const float timeScale = calendar ? calendar->GetTimescale() : 0.f;
+	const uint32_t warp = globals::features::skySync.GetSunWarpGeneration();
+	const bool snap = skyAnchorSnap || !(timeScale > 0.f) || !(std::abs(hours - skyAnchorLastHours) < 0.01f) || warp != skyAnchorLastWarp;
+	skyAnchorLastHours = hours;
+	skyAnchorLastWarp = warp;
+	skyAnchorSnap = false;
+	if (snap) {
+		skyAnchorK = skyAnchorTarget;
+	} else {
+		const float dt = globals::game::deltaTime ? std::clamp(*globals::game::deltaTime, 0.f, 1.f) : 0.f;
+		const float logK = std::log2(std::max(skyAnchorK, 1e-6f));
+		const float logT = std::log2(std::max(skyAnchorTarget, 1e-6f));
+		skyAnchorK = std::exp2(logK + (logT - logK) * (1.f - std::exp(-dt / kSkyFixesSmoothingSeconds)));
+	}
+	if (!std::isfinite(skyAnchorK))
+		skyAnchorK = 1.f;
+	skyAnchorK = std::clamp(skyAnchorK, 1.f / kAnchorCap, kAnchorCap);
+}
+
 uint32_t PhysicalSky::PhysLightingFlags() const
 {
 	// (49h stage 1) Physical Lighting rule bits for SharedData::horizonFixData.Flags (Common/PhysicalLighting.hlsli).
@@ -2141,8 +2391,66 @@ uint32_t PhysicalSky::PhysLightingFlags() const
 	return flags;
 }
 
+void PhysicalSky::SettingsStage2()
+{
+	// (50b) Physical lighting redo, stage 2: "One Sun, One Moon, One Sky".
+	auto& st = settings.lightingStage2;
+	ImGui::SeparatorText("One Sun, One Moon, One Sky (stage 2)");
+	ImGui::Checkbox("Sky Family on One Scale", &st.enabled);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"On (default): the switches below. Off: exactly as 50a (nothing below acts).\n"
+			"The physical sky family (sunlight and moonlight on the ground, the sky's own glow, the clouds' sun and moon light, the moon\n"
+			"discs, the sky's light on the fog) is brought to the game's own brightness by one factor per frame, worked out from the\n"
+			"weather's ambient and sunlight colours against the physical sky model. Lamps, fire, windows, glowing things, the weather's\n"
+			"ambient, rain, the stars and the night sky's own glow are never changed by it.");
+	ImGui::BeginDisabled(!st.enabled);
+	ImGui::Indent();
+	ImGui::Checkbox("One Brightness for Sun, Moon, Sky and Clouds", &st.skyAnchor);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"On (default): one factor k for the whole sky family = how bright the weather wants this moment (its ambient and sunlight\n"
+			"colours on a white surface) / how bright the physical sky makes it, normalised so a clear noon of each weather keeps k = 1\n"
+			"(your noon stays as it is). Dawn, dusk and moonlit nights: sky, clouds, discs and the ground's sun / moonlight rise and fall\n"
+			"together. Replaces Sky Fixes' zenith-only sky factor. k is limited to 1/32 .. 32 and changes smoothly (1.5 s).\n"
+			"Off: as 50a (only the sky's sun scattering follows the ground, through Sky Fixes).");
+	ImGui::Checkbox("Clouds Lit Like the Ground", &st.cloudsLikeGround);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"On (default): the moons light the clouds exactly as they light the ground (no separate half-strength, no greying, the\n"
+			"cloud's transparency counted once instead of twice), and the clouds get the ground's ambient light, no longer dimmed\n"
+			"by the weather's near-black night cloud colour (whose hue is kept). Night clouds are no longer dark and dirty.\n"
+			"Daytime clouds can look a little different (their ambient is the ground's now). Needs Clouds > Moonlight on Clouds.\n"
+			"Off: as 50a (Moonlight Strength and the sky's glow on clouds as set on the Clouds tab).");
+	ImGui::Checkbox("Weather Hides the Moon on the Ground Too", &st.weatherHidesMoon);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"On (default): when the weather hides the moon (thick overcast, storms), the moonlight on the ground fades with it, the same\n"
+			"way the moon's glow in the sky and its light on the clouds fade. Also the same rise above the horizon (-2 to +3 degrees).\n"
+			"Off: as 50a (overcast nights keep their moonlight on the ground).");
+	ImGui::Checkbox("Stars Dim Toward the Horizon", &st.starExtinction);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"On (default): stars and the Milky Way get dimmer and warmer toward the horizon, where their light crosses more air\n"
+			"(atmospheric extinction, from the physical sky's transmittance); straight up nothing changes. With dense haze settings\n"
+			"the dimmed band can be wide. Off: as 50a.");
+	ImGui::Unindent();
+	ImGui::EndDisabled();
+	if (Stage2On(st.skyAnchor) && cbData.enabled) {
+		const auto& d = skyAnchorDebug;
+		ImGui::TextDisabled("k now x%.3f (target x%.3f)%s", skyAnchorK, skyAnchorTarget, d.valid ? "" : " - no usable weather data, x1");
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("Game brightness now %.4f (ambient %.4f), physical %.4f (sky %.4f); at the clear-noon reference: game %.4f, physical %.4f",
+				d.eVanilla, d.dalc, d.ePhys, d.skyPhys, d.eVanillaRef, d.ePhysRef);
+			ImGui::Text("Self-test: Debug tab > Sky Light Wobble.");
+		}
+	}
+}
+
 void PhysicalSky::SettingsSceneLighting()
 {
+	SettingsStage2();  // (50b) first on the tab
+	ImGui::Spacing();
 	// (49h stage 1; 50a redo base) "Lighting Fixes": fixes that do not change the light units (S3a-S8). The 49h S1/S2 unit rules are retired.
 	InfoBox("Lighting Fixes: consistency fixes for shadows, reflections, far land and fog. They do not change the light units.");
 	auto& pl = settings.physicalLighting;

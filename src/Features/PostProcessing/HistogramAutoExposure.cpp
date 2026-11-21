@@ -387,6 +387,8 @@ void HistogramAutoExposure::Draw(TextureInfo& inout_tex)
 		.PurkinjeMaxEV = settings.PurkinjeMaxEV,
 		.PurkinjeStrength = settings.PurkinjeStrength,
 	};
+	if (freezeAdaptation)
+		cbData.AdaptLerp = 0.f;  // (50b) Sky Light Wobble: the classic adaptation holds its level
 
 	// (50a) Eye Model. Snap after a loading screen, a time skip (wait, sleep, fast travel: the game clock jumped over 15 min in one frame) or
 	// when the mode was switched on, unless Keep Adapting After Load. The classic path and its constants are unchanged.
@@ -429,8 +431,13 @@ void HistogramAutoExposure::Draw(TextureInfo& inout_tex)
 		cbData.EyeWobble = wobble;
 		cbData.EyeMesopic = std::clamp(settings.EyeMesopic, 0.0f, 1.0f);
 		cbData.EyeDt = dt;
-		const bool snap = eyeSwitchedOn || (eyeSnapFrames > 0 && !settings.EyeKeepAdaptingAfterLoad);
-		cbData.EyeFlags = (snap ? kEyeSnap : 0u) | (localExposure ? 0u : kEyeGlobalFloor) | (eyeWobble ? kEyeInstant : 0u);
+		const bool snap = eyeSwitchedOn || (eyeSnapFrames > 0 && !settings.EyeKeepAdaptingAfterLoad && !freezeAdaptation);
+		cbData.EyeFlags = (snap ? kEyeSnap : 0u) | (localExposure ? 0u : kEyeGlobalFloor) | (eyeWobble && !freezeAdaptation ? kEyeInstant : 0u);
+		if (freezeAdaptation && !eyeSwitchedOn) {
+			// (50b) Sky Light Wobble: the eye holds its level (no time passes for it).
+			cbData.EyeDt = 0.f;
+			cbData.EyeTauBright = cbData.EyeTauDark = 1e9f;
+		}
 		eyeLocalMinVisibility = localExposure ? cbData.EyeMinVisibility : 0.0f;
 	} else {
 		eyeLocalMinVisibility = 0.0f;

@@ -462,6 +462,59 @@ namespace MoonSky
 		return drown;
 	}
 }
+
+// (50b) Physical lighting stage 2, Sky.hlsl's part (PhysicalSky::NightFlags bit 9 / CloudFlags bit 3, named here so SharedData.hlsli stays
+// byte-identical). Both off: the 50a code paths exactly (the branches below are not taken).
+namespace Stage2
+{
+	// "Star Extinction": stars and the Milky Way x the transmittance toward them / toward the zenith (per channel: dimmer and warmer toward the
+	// horizon, the zenith unchanged). The weather-authored star brightness itself is not touched.
+	static const uint StarExtinctionFlag = (1 << 9);
+	bool StarExtinctionOn() { return (SharedData::physSkyNightData.Flags & StarExtinctionFlag) != 0; }
+	float3 StarExtinction(float3 a_dir)
+	{
+		const float3 zenith = PhysSky::SampleTr(float3(0.0, 0.0, 1.0), PhysSky::SampTr);
+		const float3 toward = PhysSky::SampleTr(normalize(float3(a_dir.xy, max(a_dir.z, 0.0))), PhysSky::SampTr);
+		return saturate(toward / max(zenith, 1e-4));
+	}
+
+#		if defined(PS_CLOUDS) && defined(CLOUD_SHADOWS)
+	// "Clouds Lit Like the Ground": the moons on clouds as on the ground (the moonlight colour, which carries k_sky; x 2 x the vanilla diffuse
+	// multiplier, which turns CloudPhase's E / 2 into the E x VDM a white ground surface sends back; their own colour, no extra strength; the
+	// cloud's alpha only once: the blend applies it), with the same capped forward-scatter halo as PhysSky::CloudMoonLight.
+	static const uint LikeGroundFlag = (1 << 3);
+	bool LikeGroundOn() { return (SharedData::physSkyCloudData.Flags & LikeGroundFlag) != 0; }
+	float3 MoonLight(float4 baseColor, float3 viewDir, float3 cloudPosWS, SamplerState sampTr, SamplerState sampCube)
+	{
+		const SharedData::PhysSkyCloudData cloud = SharedData::physSkyCloudData;
+		float3 result = 0.0;
+		[branch] if (baseColor.w > 0)
+		{
+			const SharedData::PhysSkyData data = SharedData::physSkyData;
+			const float3 posPlanet = cloudPosWS + float3(0, 0, data.zCameraPlanet + cloud.HeightOffset);
+			const float haloFade = 1.0 - 0.6 * saturate(baseColor.w);
+			const float3 masserDir = normalize(data.masserDir);
+			const float3 secundaDir = normalize(data.secundaDir);
+			const float masserHalo = 1.0 + min(cloud.MoonCloudHalo * PhysSky::Phase::HG(dot(viewDir, masserDir), 0.75), 8.0) * haloFade;
+			const float secundaHalo = 1.0 + min(cloud.MoonCloudHalo * PhysSky::Phase::HG(dot(viewDir, secundaDir), 0.75), 8.0) * haloFade;
+			float3 light = PhysSky::CloudBodyLight(baseColor, viewDir, posPlanet, masserDir, cloud.MasserColor, sampTr, sampCube) * masserHalo;
+			light += PhysSky::CloudBodyLight(baseColor, viewDir, posPlanet, secundaDir, cloud.SecundaColor, sampTr, sampCube) * secundaHalo;
+			result = min(baseColor.rgb * light * (2.0 * Color::VanillaDiffuseMult()), 16.0);
+		}
+		return result;
+	}
+	// The ground's ambient (the weather DALC's mean, as Lighting converts it) x the cloud texture's colour (a_albedo) x the weather cloud colour's
+	// hue, at the user's Cloud Sky Ambient (carried in MoonCloudSaturation on this path). Added after the weather cloud colour.
+	float3 Ambient(float3 a_albedo, float3 a_weatherCloud)
+	{
+		const float3 weatherCloud = max(a_weatherCloud, 0.0);
+		const float weatherLuma = Color::RGBToLuminance(weatherCloud);
+		const float3 hue = weatherLuma > 1e-4 ? weatherCloud / weatherLuma : float3(1.0, 1.0, 1.0);
+		const float3 ambient = Color::Ambient(max(0, mul(SharedData::DirectionalAmbient, float4(0, 0, 0, 1))));
+		return a_albedo * Color::RGBToLuminance(ambient) * hue * SharedData::physSkyCloudData.MoonCloudSaturation;
+	}
+#		endif
+}
 #	endif
 
 PS_OUTPUT main(PS_INPUT input)
@@ -510,10 +563,14 @@ PS_OUTPUT main(PS_INPUT input)
 #		if defined(PS_CLOUDS) && defined(CLOUD_SHADOWS)
 	// (44h) "Moonlight on Clouds": the moons' light, added after the weather's cloud colour below.
 	float3 cloudMoonLight = 0.0;
+	const float3 cloudAlbedo = baseColor.rgb;  // (50b) the texture's colour, before the relight (Stage2::Ambient)
 	if (SharedData::physSkyData.enabled) {
 		// (42b) "Cloud Lighting": Sun + Moons + Sky, or the single directional light as before.
 		[branch] if (SharedData::physSkyCloudData.Flags & SharedData::PhysSkyCloudFlags::MultiLight) {
-			cloudMoonLight = PhysSky::CloudMoonLight(baseColor, viewDir, float3(0, 0, 0) + viewDir * psCloudDist, PhysSky::SampTr, SampBaseSampler);
+			[branch] if (Stage2::LikeGroundOn())
+				cloudMoonLight = Stage2::MoonLight(baseColor, viewDir, float3(0, 0, 0) + viewDir * psCloudDist, PhysSky::SampTr, SampBaseSampler);  // (50b)
+			else
+				cloudMoonLight = PhysSky::CloudMoonLight(baseColor, viewDir, float3(0, 0, 0) + viewDir * psCloudDist, PhysSky::SampTr, SampBaseSampler);
 			baseColor.rgb = PhysSky::RelightCloudMulti(baseColor, viewDir, float3(0, 0, 0) + viewDir * psCloudDist, PhysSky::SampTr, PhysSky::SampSv, SampBaseSampler);
 		} else
 			baseColor.rgb = PhysSky::RelightCloud(baseColor, viewDir, float3(0, 0, 0) + viewDir * psCloudDist, PhysSky::SampTr, SampBaseSampler);
@@ -550,6 +607,9 @@ PS_OUTPUT main(PS_INPUT input)
 	psout.Color.xyz = Color::Sky(input.Color.xyz) * baseColor.xyz + yyy;
 #			if defined(PS_CLOUDS) && defined(CLOUD_SHADOWS)
 	psout.Color.xyz += cloudMoonLight;  // (44h) not dimmed by the (near-black night) weather cloud colour
+	// (50b) Stage 2 "Clouds Lit Like the Ground": the ground's ambient, also not dimmed by it (the sky-view LUT term is off on this path).
+	[branch] if (SharedData::physSkyData.enabled && Stage2::LikeGroundOn())
+		psout.Color.xyz += Stage2::Ambient(cloudAlbedo, Color::Sky(input.Color.xyz));
 #			endif
 #		endif
 
@@ -603,6 +663,15 @@ PS_OUTPUT main(PS_INPUT input)
 		[branch] if ((SkyFixes::On() && SkyFixes::StarFadeStrength() > 0.0) || moonStarFade)
 			psout.Color.w *= SkyFixes::StarVisibility(normalize(input.WorldPosition.xyz), Color::RGBToLuminance(baseColor.xyz) * baseColor.w,
 				moonStarFade ? MoonSky::StarDrown(SampBaseSampler) : 0.0);
+		// (50b) Stage 2 "Star Extinction": the air toward the star relative to the zenith (alpha x its luminance, the colour x its tint, so the
+		// layer dims and warms toward the horizon in either blend mode).
+		[branch] if (Stage2::StarExtinctionOn())
+		{
+			const float3 extinction = Stage2::StarExtinction(normalize(input.WorldPosition.xyz));
+			const float extinctionLuma = Color::RGBToLuminance(extinction);
+			psout.Color.w *= extinctionLuma;
+			psout.Color.xyz *= extinction / max(extinctionLuma, 1e-4);
+		}
 #		elif defined(DEFERRED) && defined(TEX) && !defined(MOONMASK)
 		// (batch 37c) Not the moon/star mask: it is TEX too. (49h) The procedural sun disc that was drawn here is retired.
 		// (40d) Moon Physical Brightness: the vanilla disc (phase picture and fade alpha kept) is
