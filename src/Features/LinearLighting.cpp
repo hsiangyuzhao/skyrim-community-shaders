@@ -3,6 +3,8 @@
 #include "JiayeStatement.h"
 #include "WindowLight.h"
 
+#include "PhysicalSky.h"  // (51a) the engine's own DALC while Physical Outdoor Light writes its own
+
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	LinearLighting::Settings,
 	enableLinearLighting,
@@ -284,7 +286,8 @@ float LinearLighting::ComputeUnlitSceneScale()
 	const auto* smState = globals::game::smState;
 	if (smState == nullptr)
 		return 1.0f;
-	const auto& t = smState->directionalAmbientTransform.translate;
+	// (51a) The engine's own (weather) DALC, also while Physical Sky's outdoor ambient has replaced it for the shaders.
+	const RE::NiPoint3 t = globals::features::physicalSky.loaded ? globals::features::physicalSky.EngineDalcTranslate() : smState->directionalAmbientTransform.translate;
 	unlitAmbientNow = luminance(t.x, t.y, t.z);
 
 	if (const auto* sky = globals::game::sky; sky != nullptr && sky->currentWeather != nullptr) {

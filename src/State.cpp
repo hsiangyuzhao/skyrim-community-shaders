@@ -10,6 +10,7 @@
 #include "EngineFixes/WndProcPseudoHandleFix.h"
 #include "FeatureIssues.h"
 #include "Features/CloudShadows.h"
+#include "Features/PhysicalSky.h"
 #include "Features/PerformanceOverlay.h"
 #include "Features/RayTracing.h"
 #include "Features/Skin.h"
@@ -845,6 +846,9 @@ void State::UpdateSharedData([[maybe_unused]] bool a_inWorld, [[maybe_unused]] b
 	{
 		SharedDataCB data{};
 
+		// (51a) Physical Outdoor Light's ambient into the engine's DALC (or the engine's put back), before anything reads it this pass.
+		if (globals::features::physicalSky.loaded)
+			globals::features::physicalSky.ApplyOutdoorDalc();
 		const auto shaderManager = globals::game::smState;
 		const RE::NiTransform& dalcTransform = shaderManager->directionalAmbientTransform;
 		Util::StoreTransform3x4NoScale(data.DirectionalAmbient, dalcTransform);

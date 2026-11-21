@@ -237,6 +237,9 @@ void SkySync::Update(const RE::Sky* sky)
 
 float SkySync::MoonDayFade(const float sunElevationDeg)
 {
+	// (51a) Physical Outdoor Light's moon: full once the sun is 1 degree below the horizon, gone at +3 (no dip before the moon takes over).
+	if (const auto& physicalSky = globals::features::physicalSky; physicalSky.OutdoorActive(physicalSky.settings.outdoorLight.moonFamily))
+		return 1.0f - SmoothStep(-1.0f, 3.0f, sunElevationDeg);
 	// (47a) Sky Fixes: upstream's moonlight retreat. Its moonlight cap before sunrise is
 	// (effective horizon - sun height) / 7 degrees with the effective horizon at -1 degree: full
 	// at -8, gone at -1 (by then the real sky is already far brighter than any full moon).
@@ -562,7 +565,10 @@ void SkySync::UpdateCombined(const RE::Sky* sky)
 		// (50b) Physical lighting stage 2 "Weather Hides the Moon": one rule for the ground, the sky and the clouds -- the ground's moonlight
 		// follows the moon visibility the sky glow and the clouds use (PhysicalSky::MoonHorizonVisibility: the weather's moon glare x the
 		// -2..3 degree rise). Off: the clock ramp above (overcast nights keep their moonlight), as 50a.
-		if (const auto& physicalSky = globals::features::physicalSky; physicalSky.Stage2On(physicalSky.settings.lightingStage2.weatherHidesMoon))
+		// (51a) Physical Outdoor Light's moon (R4: the weather's night moon glare against the clear reference, x the same rise) replaces both.
+		if (const auto& physicalSky = globals::features::physicalSky; physicalSky.OutdoorActive(physicalSky.settings.outdoorLight.moonFamily))
+			s = PhysicalSky::MoonVisibility(moons[i], sky, rawDirections[i].z);
+		else if (physicalSky.Stage2On(physicalSky.settings.lightingStage2.weatherHidesMoon))
 			s = PhysicalSky::MoonHorizonVisibility(moons[i], sky, rawDirections[i].z);
 		s *= PhaseFactorFromTexture(moons[i]) * dayFade;
 		if (i == secundaIdx)
