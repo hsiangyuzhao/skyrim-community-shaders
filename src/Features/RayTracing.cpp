@@ -332,6 +332,7 @@ namespace
 	// (49m) TracePointLightsCS: Dark Side Test Tolerant, Grazing-Angle Offset, Soft Hand-Off for Weak Lights
 	// ((50b) 4194304u was Smooth Shadow Edges (extra rays), deleted with its trace loop).
 	constexpr std::uint32_t kPointFlagDarkTolerant = 1048576u, kPointFlagGrazeOffset = 2097152u, kPointFlagSoftCut = 8388608u;
+	constexpr std::uint32_t kPointFlagBlueNoise = 16777216u;  // (50b) TracePointLightsCS: Blue-Noise Sampling (t10)
 	// (49m) PointDenoiseCS: the trace wrote the fractional encoding (kFlagEdgeRays / kFlagSoftCut).
 	constexpr std::uint32_t kPointDenoiseFractional = 65536u;
 	constexpr std::uint32_t kPointDenoiseNoiseDecorrelate = 256u, kPointDenoiseNoiseStable = 512u, kPointDenoiseNoiseCloseBlur = 1024u;
@@ -1988,6 +1989,49 @@ RayTracing::DenoiserMode RayTracing::EffectiveDenoiser() const
 	return CurrentDenoiser();
 }
 
+int RayTracing::EffectivePointDenoiser() const
+{
+	// (50b) As the sun's: while Upscaling's Ray Reconstruction runs, the point lights take the DLSS RR route too. A failed v2 shader /
+	// texture set falls back to Penumbra for the session.
+	if (UpscalingRRActive())
+		return pointV2Failed ? kPointPenumbra : kPointRR;
+	const int mode = std::clamp(settings.PointDenoiser, 0, kPointModeCount - 1);
+	return pointV2Failed && mode != kPointPenumbra ? kPointPenumbra : mode;
+}
+
+void RayTracing::OnDenoiserPicked(bool a_point)
+{
+	// (50b) DLSS RR is global for the sun and the point lights. The page that was picked on already holds its new value.
+	const bool sunRR = CurrentDenoiser() == DenoiserMode::DLSSRR;
+	const bool pointRR = settings.PointDenoiser == kPointRR;
+	if (a_point ? pointRR : sunRR) {
+		// RR on this page: the other page follows (its last other choice remembered).
+		if (a_point && !sunRR) {
+			settings.SunDenoiserNonRR = ValidDenoiser(settings.Denoiser);
+			settings.Denoiser = static_cast<int>(DenoiserMode::DLSSRR);
+		} else if (!a_point && !pointRR) {
+			settings.PointDenoiserNonRR = std::clamp(settings.PointDenoiser, 0, kPointModeCount - 1);
+			settings.PointDenoiser = kPointRR;
+		}
+	} else {
+		// Something else on this page: remember it; the other page leaves RR for its last other choice.
+		if (a_point) {
+			settings.PointDenoiserNonRR = settings.PointDenoiser;
+			if (sunRR) {
+				const int back = ValidDenoiser(settings.SunDenoiserNonRR);
+				settings.Denoiser = back == static_cast<int>(DenoiserMode::DLSSRR) ? static_cast<int>(DenoiserMode::Penumbra) : back;
+			}
+		} else {
+			settings.SunDenoiserNonRR = ValidDenoiser(settings.Denoiser);
+			if (pointRR) {
+				const int back = std::clamp(settings.PointDenoiserNonRR, 0, kPointModeCount - 1);
+				settings.PointDenoiser = back == kPointRR ? kPointV2 : back;
+			}
+		}
+	}
+	OnDenoiserPicked();
+}
+
 void RayTracing::OnDenoiserPicked()
 {
 	// The same setting as Upscaling's "Ray Reconstruction" checkbox (Upscaling rebuilds its resources on its next frame).
@@ -2059,6 +2103,13 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.AOSpecOccStrength = std::clamp(read("AOSpecOccStrength", defaults.AOSpecOccStrength), 0.0f, 1.0f);
 		settings.ParticlesRTShadows = read("ParticlesRTShadows", defaults.ParticlesRTShadows);  // (49b)
 		settings.ParticlesSmoothSheets = read("ParticlesSmoothSheets", defaults.ParticlesSmoothSheets);  // (50a)
+		// (50b) Point Light Shadows > Denoiser (no key: Penumbra v2), the pages' last choices other than DLSS RR, Blue-Noise Sampling.
+		settings.PointDenoiser = std::clamp(read("PointDenoiser", defaults.PointDenoiser), 0, static_cast<int>(kPointModeCount) - 1);
+		settings.PointDenoiserNonRR = std::clamp(read("PointDenoiserNonRR", defaults.PointDenoiserNonRR), 0, static_cast<int>(kPointRR) - 1);
+		settings.SunDenoiserNonRR = ValidDenoiser(read("SunDenoiserNonRR", defaults.SunDenoiserNonRR));
+		if (settings.SunDenoiserNonRR == static_cast<int>(DenoiserMode::DLSSRR))
+			settings.SunDenoiserNonRR = static_cast<int>(DenoiserMode::Penumbra);
+		settings.PointBlueNoise = read("PointBlueNoise", defaults.PointBlueNoise);
 		settings.LoadFinish = read("LoadFinish", defaults.LoadFinish);  // (49c) (49b Hitch* keys: no longer read)
 		settings.PointQuality = read("PointQuality", -1);
 		settings.AOQuality = read("AOQuality", -1);
@@ -2156,6 +2207,16 @@ void RayTracing::LoadSettings(json& o_json)
 	if (settings.Denoiser == 1)
 		logger::info("[RayTracing] Denoiser Temporal was removed: Penumbra");
 	settings.Denoiser = ValidDenoiser(settings.Denoiser);
+	// (50b) DLSS RR is one choice for the sun and the point lights: a saved RR on either page means both (the other page's own value is
+	// kept as its last other choice).
+	if (settings.Denoiser == static_cast<int>(DenoiserMode::DLSSRR) && settings.PointDenoiser != kPointRR) {
+		settings.PointDenoiserNonRR = settings.PointDenoiser;
+		settings.PointDenoiser = kPointRR;
+		logger::info("[RayTracing] Point Light Shadows denoiser: DLSS RR (the sun's denoiser is DLSS RR; 50b: one choice for both)");
+	} else if (settings.PointDenoiser == kPointRR && settings.Denoiser != static_cast<int>(DenoiserMode::DLSSRR)) {
+		settings.SunDenoiserNonRR = settings.Denoiser;
+		settings.Denoiser = static_cast<int>(DenoiserMode::DLSSRR);
+	}
 	settings.SettingsVersion = Settings{}.SettingsVersion;
 	settings.QualityLevel = std::clamp(settings.QualityLevel, 0, static_cast<int>(Quality::Count) - 1);
 	settings.CustomBaseRays = std::clamp(settings.CustomBaseRays, 1, 4);
@@ -2293,6 +2354,10 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["AOSpecOccStrength"] = settings.AOSpecOccStrength;
 	o_json["ParticlesRTShadows"] = settings.ParticlesRTShadows;  // (49b)
 	o_json["ParticlesSmoothSheets"] = settings.ParticlesSmoothSheets;  // (50a)
+	o_json["PointDenoiser"] = settings.PointDenoiser;  // (50b)
+	o_json["PointDenoiserNonRR"] = settings.PointDenoiserNonRR;
+	o_json["SunDenoiserNonRR"] = settings.SunDenoiserNonRR;
+	o_json["PointBlueNoise"] = settings.PointBlueNoise;
 	o_json["LoadFinish"] = settings.LoadFinish;  // (49c)
 }
 
@@ -2441,6 +2506,8 @@ void RayTracing::ClearShaderCache()
 		fixShader = nullptr;
 	for (auto& cleanShader : pointDenoiseCleanCS)  // (48m)
 		cleanShader = nullptr;
+	for (auto& v2Shader : pointDenoiseV2CS)  // (50b)
+		v2Shader = nullptr;
 	aoNormalReflectCS = nullptr;
 	reflectDebugCS = nullptr;
 	aoNormalReflectAsync.Reset();  // (48e) compiled again in the background on the next request
@@ -2477,7 +2544,13 @@ void RayTracing::PrecompileShaders()
 		GetShaderDefined(denoiseHalfVCS, L"Data\\Shaders\\RayTracing\\DenoiseSpatialCS.hlsl", "DenoiseSpatialCS (half, vertical)", "DENOISE_HALF,DENOISE_VERTICAL");
 		GetShaderDefined(denoiseVCS, L"Data\\Shaders\\RayTracing\\DenoiseSpatialCS.hlsl", "DenoiseSpatialCS (vertical)", "DENOISE_VERTICAL");
 	}
-	if (settings.PointLights) {
+	if (settings.PointLights && (settings.PointDenoiser != kPointPenumbra || UpscalingRRActive())) {
+		// (50b) Off / Penumbra v2 / DLSS RR: PointDenoiseV2CS (both variants: Extra Lights Where Crowded can ask for slots 4 - 5 anywhere).
+		PointDenoiseV2Shader(false);
+		PointDenoiseV2Shader(true);
+		GetShader(pointMaskCS, L"Data\\Shaders\\RayTracing\\PointMaskCS.hlsl", "PointMaskCS");
+	}
+	if (settings.PointLights && settings.PointDenoiser == kPointPenumbra) {
 		GetShader(pointDenoiseCS, L"Data\\Shaders\\RayTracing\\PointDenoiseCS.hlsl", "PointDenoiseCS");
 		GetShader(pointMaskCS, L"Data\\Shaders\\RayTracing\\PointMaskCS.hlsl", "PointMaskCS");
 		// (48a) The variants the current settings can use (window beams are indoor-only; K > 4 per the tier).
@@ -2578,6 +2651,15 @@ ID3D11ComputeShader* RayTracing::PointDenoiseShader(bool a_wide, bool a_beam, bo
 	if (a_beam)
 		return GetShaderDefined(pointDenoiseBeamCS, kPath, "PointDenoiseCS (beam edges)", "PL_BEAM");
 	return GetShader(pointDenoiseCS, kPath, "PointDenoiseCS");
+}
+
+ID3D11ComputeShader* RayTracing::PointDenoiseV2Shader(bool a_wide)
+{
+	// (50b) Penumbra v2 / Off / DLSS RR: one shader, PL_WIDE for slots 4 - 5.
+	const wchar_t* kPath = L"Data\\Shaders\\RayTracing\\PointDenoiseV2CS.hlsl";
+	if (a_wide)
+		return GetShaderDefined(pointDenoiseV2CS[1], kPath, "PointDenoiseV2CS (slots 4-5)", "PL_WIDE");
+	return GetShader(pointDenoiseV2CS[0], kPath, "PointDenoiseV2CS");
 }
 
 ID3D11ComputeShader* RayTracing::GetShader(winrt::com_ptr<ID3D11ComputeShader>& a_shader, const wchar_t* a_path, const char* a_name)
@@ -5488,6 +5570,86 @@ void RayTracing::ReleasePointDenoiser()
 	d3d11Bytes -= std::min(d3d11Bytes, pointD3D11Bytes);
 	pointD3D11Bytes = 0;
 	ReleasePointWide();  // (48a)
+	ReleasePointV2();    // (50b)
+}
+
+void RayTracing::ReleasePointV2()
+{
+	// (50b) The history lengths and the DLSS RR raw-ray textures (unbound first: t40 / t46 may hold the raw ones).
+	if (pointBound && pointRRBound)
+		UnbindPointLights();
+	pointLen[0] = {};
+	pointLen[1] = {};
+	pointRaw = {};
+	pointRawWide = {};
+	pointLenValid = false;
+	pointRRBound = false;
+	pointEffectSwapped = false;
+	d3d11Bytes -= std::min(d3d11Bytes, pointV2D3D11Bytes);
+	pointV2D3D11Bytes = 0;
+}
+
+bool RayTracing::EnsurePointV2(std::uint32_t a_width, std::uint32_t a_height, bool a_rr, bool a_wide)
+{
+	// (50b) pointLen (both, R32_UINT) for every mode of PointDenoiseV2CS; pointRaw only for DLSS RR, pointRawWide for DLSS RR with slots 4 - 5.
+	// Created on first use, at the point textures' size; a size change drops them all (no history length).
+	auto sizeOf = [](const DenoiseTexture& a_t, std::uint32_t& o_w, std::uint32_t& o_h) {
+		D3D11_TEXTURE2D_DESC d{};
+		a_t.texture->GetDesc(&d);
+		o_w = d.Width;
+		o_h = d.Height;
+	};
+	if (pointLen[0].texture) {
+		std::uint32_t w = 0, h = 0;
+		sizeOf(pointLen[0], w, h);
+		if (w != a_width || h != a_height)
+			ReleasePointV2();
+	}
+	bool ok = true;
+	if (!pointLen[0].texture || !pointLen[1].texture) {
+		pointLenValid = false;
+		for (int i = 0; i < 2 && ok; ++i)
+			ok = CreateDenoiseTexture(this, pointLen[i].texture, pointLen[i].srv, pointLen[i].uav, a_width, a_height, DXGI_FORMAT_R32_UINT, "RayTracing PointLen");
+	}
+	if (ok && a_rr && !pointRaw.texture)
+		ok = CreateDenoiseTexture(this, pointRaw.texture, pointRaw.srv, pointRaw.uav, a_width, a_height, DXGI_FORMAT_R8G8B8A8_UNORM, "RayTracing PointRaw");
+	if (ok && a_rr && a_wide && !pointRawWide.texture)
+		ok = CreateDenoiseTexture(this, pointRawWide.texture, pointRawWide.srv, pointRawWide.uav, a_width, a_height, DXGI_FORMAT_R8G8B8A8_UNORM, "RayTracing PointRawWide");
+	if (!ok) {
+		ReleasePointV2();
+		return false;
+	}
+	d3d11Bytes -= std::min(d3d11Bytes, pointV2D3D11Bytes);
+	pointV2D3D11Bytes = static_cast<std::uint64_t>(a_width) * a_height * 4 * (2 + (pointRaw.texture ? 1 : 0) + (pointRawWide.texture ? 1 : 0));
+	d3d11Bytes += pointV2D3D11Bytes;
+	return true;
+}
+
+void RayTracing::BindEffectPointVisibility()
+{
+	// (50b) DLSS RR mode: the effect draw reads the filtered copy (pointVis / pointWide of this frame) at t40 / t46 instead of the raw rays.
+	if (!pointBound || !pointRRBound || !pointDenoised)
+		return;
+	const std::uint32_t latest = pointWrite ^ 1u;  // FinishPointLights flipped it after writing
+	ID3D11ShaderResourceView* vis = pointVis[latest].srv.get();
+	ID3D11ShaderResourceView* wide = pointWideThisFrame ? pointWide[latest].srv.get() : nullptr;
+	globals::d3d::context->PSSetShaderResources(40, 1, &vis);
+	globals::d3d::context->PSSetShaderResources(46, 1, &wide);
+	pointEffectSwapped = true;
+}
+
+void RayTracing::RestoreEffectPointVisibility()
+{
+	// (50b) Back to the raw rays for the Lighting draws that follow.
+	if (!pointEffectSwapped)
+		return;
+	pointEffectSwapped = false;
+	if (!pointBound || !pointRRBound)
+		return;
+	ID3D11ShaderResourceView* vis = pointRaw.srv.get();
+	ID3D11ShaderResourceView* wide = pointWideThisFrame ? pointRawWide.srv.get() : nullptr;
+	globals::d3d::context->PSSetShaderResources(40, 1, &vis);
+	globals::d3d::context->PSSetShaderResources(46, 1, &wide);
 }
 
 void RayTracing::ReleasePointWide()
@@ -5741,6 +5903,9 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	if constexpr (Settings::PointSoftCut)
 		flags |= kPointFlagSoftCut;
 	pointFractionalThisFrame = settings.PointSoftCut;  // (50b) Smooth Shadow Edges (extra rays) deleted
+	// (50b) Blue-Noise Sampling (loaded on first use; its copy goes out in this frame's point list before the trace).
+	if (settings.PointBlueNoise && backend.EnsurePointBlueNoise())
+		flags |= kPointFlagBlueNoise;
 	if (wide)  // (48a)
 		flags |= kPointFlagWide | (widePrev ? kPointFlagWidePrev : 0u);
 	if (extra)  // (48c)
@@ -5847,6 +6012,17 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 
 void RayTracing::FinishPointLights()
 {
+	// (50b) Point Light Shadows > Denoiser: Off / Penumbra v2 / DLSS RR (also while Upscaling's Ray Reconstruction runs) take PointDenoiseV2CS;
+	// Penumbra this 50a code, unchanged.
+	const int mode = EffectivePointDenoiser();
+	if (mode != kPointPenumbra) {
+		FinishPointLightsV2(mode);
+		if (!pointV2Failed)
+			return;
+	}
+	if (pointLen[0].texture || pointRaw.texture)
+		ReleasePointV2();  // (50b) not needed by Penumbra
+	pointModeThisFrame = kPointPenumbra;
 	// (48a) The shader variant this frame needs: slots 4 - 5 (K > 4) and / or Window Beams: Smooth Edges (only with soft beam slots; outdoors
 	// and without beams the plain 47z shader runs). A variant that fails to compile falls back to the plain one (its extras off).
 	bool wide = pointWideThisFrame && backend.PointWideSRV() && pointWide[0].texture && pointWide[1].texture;
@@ -6000,6 +6176,114 @@ void RayTracing::FinishPointLights()
 	// (48a) t46: slots 4 - 5 (null with K <= 4; the light tags carry kTagWide only on wide frames).
 	ID3D11ShaderResourceView* wideView = wide ? pointWide[write].srv.get() : nullptr;
 	context->PSSetShaderResources(46, 1, &wideView);
+	pointWideHistoryValid = wide;
+	pointBound = true;
+	pointWrite ^= 1u;
+	pointHistoryValid = true;
+	pointDenoised = true;
+}
+
+void RayTracing::FinishPointLightsV2(int a_mode)
+{
+	// (50b) PointDenoiseV2CS: Penumbra v2 (history-length aware), Off (3x3 only, no history) or DLSS RR (Lighting reads the decoded rays;
+	// the filtered copy for the lit effects). A shader or texture failure: Penumbra from then on this session (pointV2Failed).
+	constexpr std::uint32_t kV2Off = 131072u, kV2RR = 262144u, kV2LenHistory = 524288u;  // PointDenoiseV2CS
+	bool wide = pointWideThisFrame && backend.PointWideSRV() && pointWide[0].texture && pointWide[1].texture;
+	ID3D11ComputeShader* shader = PointDenoiseV2Shader(wide);
+	if (!shader && wide) {
+		if (!pointWideDenoiseFailed) {
+			pointWideDenoiseFailed = true;
+			logger::warn("[RayTracing] PointDenoiseV2CS (slots 4-5) did not compile: 4 lights per pixel are traced from now on");
+		}
+		wide = false;
+		shader = PointDenoiseV2Shader(false);
+	}
+	if (!wide && pointWideThisFrame) {
+		pointWideThisFrame = false;
+		pointWideHistoryValid = false;
+	}
+	const bool rr = a_mode == kPointRR;
+	if (!shader || !EnsurePointV2(pending.width, pending.height, rr, wide)) {
+		pointV2Failed = true;
+		ReleasePointV2();
+		logger::warn("[RayTracing] Point Light Shadows denoiser {}: {}; Penumbra is used this session", a_mode == kPointRR ? "DLSS RR" : (a_mode == kPointOff ? "Off" : "Penumbra v2"),
+			shader ? "its textures could not be created" : "PointDenoiseV2CS did not compile");
+		return;
+	}
+	if (!pointVis[0].texture || !backend.PointVisibilitySRV() || !backend.PointSourcesSRV())
+		return;
+	auto* context = globals::d3d::context;
+	auto* timers = Util::GpuPassTimers::GetSingleton();
+	const std::uint32_t write = pointWrite, read = pointWrite ^ 1u;
+	const bool plDebug = PointDenoiserDebugView() && debugColorUAV;
+	ID3D11ShaderResourceView* motionSRV = globals::game::renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGET::kMOTION_VECTOR].SRV;
+	PointDenoiseCB cb{};
+	cb.Params[0] = settings.PointLightsSize;
+	cb.Params[1] = kPointHistoryWeight;  // (not read by PointDenoiseV2CS)
+	const bool history = pointHistoryValid && prevCameraValid;
+	std::uint32_t flags = (history ? kPointDenoiseHistory : 0u) | (plDebug ? kPointDenoiseDebug : 0u) | (motionSRV ? kPointDenoiseMotion : 0u);
+	if (pointFractionalThisFrame)
+		flags |= kPointDenoiseFractional;
+	const bool wideHistory = wide && pointWideHistoryValid && history;
+	flags |= (wide ? kPointDenoiseWide : 0u) | (wideHistory ? kPointDenoiseWideHistory : 0u);
+	flags |= a_mode == kPointOff ? kV2Off : (rr ? kV2RR : 0u);
+	const bool lenHistory = history && pointLenValid;
+	flags |= lenHistory ? kV2LenHistory : 0u;
+	std::memcpy(&cb.Params[2], &flags, sizeof(float));
+	cb.Params[3] = kPointMaxFilterRadius;  // a converged slot's largest radius (young slots up to the shader's kYoungMaxRadius)
+	cb.Extra[0] = static_cast<float>(pointK);
+	{
+		const std::uint32_t lo = static_cast<std::uint32_t>(pointBeamMask), hi = static_cast<std::uint32_t>(pointBeamMask >> 32);
+		std::memcpy(&cb.Extra[1], &lo, sizeof(float));
+		std::memcpy(&cb.Extra[2], &hi, sizeof(float));
+		cb.Extra[3] = pointBeamMask ? pointBeamTan : 0.0f;
+	}
+	cb.Emitter[0] = static_cast<std::uint32_t>(pointEmitterMask);
+	cb.Emitter[1] = static_cast<std::uint32_t>(pointEmitterMask >> 32);
+	std::memcpy(&cb.Emitter[2], &pointEmitterRadius, sizeof(float));
+	cb.Emitter[3] = frameIndex;  // the taps' rotation per frame
+	{
+		const auto& motion = pointSelector.SlotMotion();
+		for (std::uint32_t s = 0; s < RayTracingPointLights::kMaxSources; ++s)
+			cb.Motion[s / 4] |= static_cast<std::uint32_t>(motion[s]) << ((s % 4) * 8);
+		const auto& fill = pointSelector.FillEmitterBytes();
+		for (std::uint32_t s = 0; s < RayTracingPointLights::kMaxSources; ++s)
+			cb.FillEmitter[s / 4] |= static_cast<std::uint32_t>(fill[s]) << ((s % 4) * 8);
+	}
+	pointDenoiseCB->Update(cb);
+
+	timers->Begin(Util::GpuBucket::RayTracingPointDenoise);
+	ID3D11Buffer* cbs[2] = { combineCB->CB(), pointDenoiseCB->CB() };
+	ID3D11ShaderResourceView* srvs[10] = { backend.PointVisibilitySRV(), backend.PointSourcesSRV(), backend.DepthMaskSRV(), pointVis[read].srv.get(),
+		pointIdx[read].srv.get(), pointDist[read].srv.get(), motionSRV, wide ? backend.PointWideSRV() : nullptr, wideHistory ? pointWide[read].srv.get() : nullptr,
+		lenHistory ? pointLen[read].srv.get() : nullptr };
+	ID3D11UnorderedAccessView* uavs[8] = { pointVis[write].uav.get(), pointIdx[write].uav.get(), pointDist[write].uav.get(), plDebug ? debugColorUAV.get() : nullptr,
+		wide ? pointWide[write].uav.get() : nullptr, pointLen[write].uav.get(), rr ? pointRaw.uav.get() : nullptr, rr && wide ? pointRawWide.uav.get() : nullptr };
+	context->CSSetConstantBuffers(0, 2, cbs);
+	context->CSSetShaderResources(0, 10, srvs);
+	context->CSSetUnorderedAccessViews(0, 8, uavs, nullptr);
+	context->CSSetShader(shader, nullptr, 0);
+	context->Dispatch((pending.width + 7) / 8, (pending.height + 7) / 8, 1);
+	ID3D11ShaderResourceView* nullSrvs[10]{};
+	ID3D11UnorderedAccessView* nullUavs[8]{};
+	ID3D11Buffer* nullCbs[2]{};
+	context->CSSetShaderResources(0, 10, nullSrvs);
+	context->CSSetUnorderedAccessViews(0, 8, nullUavs, nullptr);
+	context->CSSetConstantBuffers(0, 2, nullCbs);
+	context->CSSetShader(nullptr, nullptr, 0);
+	timers->End(Util::GpuBucket::RayTracingPointDenoise);
+
+	// For the pixel shaders of this frame: the denoised slots, or (DLSS RR) the decoded rays (the effect draws swap in the filtered copy).
+	const bool water = waterTraced && backend.PointWaterReady();
+	ID3D11ShaderResourceView* views[4] = { rr ? pointRaw.srv.get() : pointVis[write].srv.get(), pointIdx[write].srv.get(),
+		water ? backend.PointWaterVisSRV() : nullptr, water ? backend.PointWaterDistSRV() : nullptr };
+	context->PSSetShaderResources(40, 4, views);
+	ID3D11ShaderResourceView* wideView = wide ? (rr ? pointRawWide.srv.get() : pointWide[write].srv.get()) : nullptr;
+	context->PSSetShaderResources(46, 1, &wideView);
+	pointRRBound = rr;
+	pointEffectSwapped = false;
+	pointLenValid = true;
+	pointModeThisFrame = a_mode;
 	pointWideHistoryValid = wide;
 	pointBound = true;
 	pointWrite ^= 1u;
@@ -8080,8 +8364,10 @@ void RayTracing::WritePointMask(bool a_traced)
 	}
 	auto* context = globals::d3d::context;
 	ID3D11Buffer* cbs[2] = { combineCB->CB(), pointMaskCB->CB() };
-	ID3D11ShaderResourceView* srvs[5] = { mask.SRV, depth.depthSRV, rt ? pointVis[latest].srv.get() : nullptr, rt ? pointIdx[latest].srv.get() : nullptr,
-		wideMask ? pointWide[latest].srv.get() : nullptr };
+	// (50b) DLSS RR mode: the decoded rays, as Lighting reads them (Ray Reconstruction cleans the shadow-mask lights too).
+	const bool rawMask = pointRRBound && pointRaw.srv;
+	ID3D11ShaderResourceView* srvs[5] = { mask.SRV, depth.depthSRV, rt ? (rawMask ? pointRaw.srv.get() : pointVis[latest].srv.get()) : nullptr,
+		rt ? pointIdx[latest].srv.get() : nullptr, wideMask ? ((rawMask && pointRawWide.srv) ? pointRawWide.srv.get() : pointWide[latest].srv.get()) : nullptr };
 	ID3D11UnorderedAccessView* uavs[1] = { maskTempUAV.get() };
 	context->CSSetConstantBuffers(0, 2, cbs);
 	context->CSSetShaderResources(0, 5, srvs);
@@ -8733,7 +9019,7 @@ void RayTracing::DrawSunPage()
 			const bool rrActive = UpscalingRRActive();
 			if (ImGui::Combo("Denoiser", &denoiserIndex, denoisers, IM_ARRAYSIZE(denoisers))) {
 				settings.Denoiser = static_cast<int>(kOrder[std::clamp(denoiserIndex, 0, IM_ARRAYSIZE(kOrder) - 1)]);
-				OnDenoiserPicked();
+				OnDenoiserPicked(false);  // (50b) DLSS RR: one choice for the sun and the point lights
 			}
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::Text("How the grainy soft edges of the traced shadows are cleaned up.");
@@ -8742,6 +9028,8 @@ void RayTracing::DrawSunPage()
 				ImGui::Text("    contact shadows), then blends the last ~12 frames; extra rays only at shadow edges.");
 				ImGui::Text("  DLSS RR: no cleanup of ours; DLSS Ray Reconstruction cleans up the raw noise.");
 				ImGui::Text("    Picking it switches Ray Reconstruction on in Upscaling; picking any other one switches it off there.");
+				ImGui::Text("    (50b) One choice for the sun and the point lights: picking it here sets Point Light Shadows > Denoiser to DLSS RR too;");
+				ImGui::Text("    picking another one here returns the point lights to their last choice. RT ambient occlusion keeps its own denoiser.");
 				ImGui::Text("    While Ray Reconstruction is on in Upscaling, the shadows always take this route.");
 				ImGui::Text("  NRD SIGMA: NVIDIA's shadow denoiser (one ray per pixel, its own blur and history).");
 			}
@@ -9002,6 +9290,48 @@ void RayTracing::DrawPointLightPage()
 			}
 		}
 		ImGui::BeginDisabled(!settings.PointLights);
+		{
+			// (50b) Denoiser: Off / Penumbra / Penumbra v2 / DLSS RR (stored as PointDenoiserMode 0 - 3). DLSS RR is one choice with the sun's.
+			const char* kPointDenoisers[kPointModeCount] = { "Off", "Penumbra", "Penumbra v2", "DLSS RR" };
+			int pick = std::clamp(settings.PointDenoiser, 0, kPointModeCount - 1);
+			if (ImGui::Combo("Denoiser##Point", &pick, kPointDenoisers, kPointModeCount)) {
+				settings.PointDenoiser = std::clamp(pick, 0, kPointModeCount - 1);
+				OnDenoiserPicked(true);
+			}
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("How the grainy point-light shadows (one ray per light and pixel) are cleaned up.");
+				ImGui::Text("  Off: only a 3x3 blur, no history (grainy; a reference).");
+				ImGui::Text("  Penumbra: the denoiser of 50a (blurs each soft edge as wide as it is, blends the last frames).");
+				ImGui::Text("  Penumbra v2 (default): knows how many frames each pixel has gathered. Where a shadow just appeared or changed it blurs");
+				ImGui::Text("    wider (never wider than the real soft edge: contact shadows stay sharp) and catches up within a few frames, so no");
+				ImGui::Text("    black / white specks; a still picture looks as with Penumbra.");
+				ImGui::Text("  DLSS RR: nothing of ours; DLSS Ray Reconstruction cleans the raw rays. One choice for the sun and the point lights:");
+				ImGui::Text("    picking it here sets the sun's denoiser to DLSS RR too and switches Ray Reconstruction on in Upscaling; picking");
+				ImGui::Text("    anything else on either page returns the other page to its last choice. While Ray Reconstruction is on in");
+				ImGui::Text("    Upscaling, both always take this route. Smoke and other lit effects keep a cheap filtered copy (not the raw rays).");
+				ImGui::Text("RT ambient occlusion always keeps its own denoiser (it darkens the ambient light: it must be filtered in the same frame).");
+			}
+			const int effective = EffectivePointDenoiser();
+			if (effective == kPointRR && settings.PointDenoiser != kPointRR) {
+				ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{ 0.5f, 0.85f, 1.0f, 1.0f });
+				ImGui::TextWrapped("Following Upscaling: Ray Reconstruction is on, so the point-light shadows use the DLSS RR route.");
+				ImGui::PopStyleColor();
+			} else if (settings.PointDenoiser == kPointRR && !UpscalingRRActive()) {
+				ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{ 1.0f, 0.85f, 0.3f, 1.0f });
+				ImGui::TextWrapped("Ray Reconstruction is not running (Upscaling must be DLSS with Ray Reconstruction available): the point-light shadows stay grainy.");
+				ImGui::PopStyleColor();
+			}
+			if (pointV2Failed)
+				ImGui::TextColored({ 1.0f, 0.4f, 0.3f, 1.0f }, "Penumbra v2 / Off / DLSS RR could not start this session (see the log): Penumbra is used.");
+			ImGui::Checkbox("Blue-Noise Sampling", &settings.PointBlueNoise);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): the point on the flame each ray aims at comes from a spatiotemporal blue-noise pattern (spread evenly at every");
+				ImGui::Text("  scale and from frame to frame), so the same one ray per pixel leaves noise the denoiser (or DLSS RR) removes more easily.");
+				ImGui::Text("  Practically free. Off: the 50a pattern. Needs the blue-noise texture of Skylighting (installed with it).");
+				if (backend.PointBlueNoiseFailed())
+					ImGui::Text("Not available this session (the texture could not be loaded): the 50a pattern is used.");
+			}
+		}
 		ImGui::SliderFloat("Light Size", &settings.PointLightsSize, 0.0f, 32.0f, "%.1f units");
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("Radius of the flame the rays aim at: larger = softer shadow edges (a little grainier before the clean-up). 0 = hard edges.");
@@ -9529,7 +9859,7 @@ void RayTracing::DrawDiagnostics()
 	const std::uint64_t vram = rt.blasBytes + rt.scratchBytes + rt.tlasBytes + rt.uploadBytes + rt.sharedTextureBytes + d3d11Bytes +
 	                           alphaBytes.uvBytes + alphaBytes.layerBytes + alphaBytes.infoBytes +
 	                           backend.GetSkinStats().bytes + backend.GetSkinStats().scratchBytes + backend.GetSkinStats().boneBytes +
-	                           backend.PointWideBytes() + backend.ReflectBytes();  // (48a)
+	                           backend.PointWideBytes() + backend.ReflectBytes() + backend.PointBlueNoiseBytes();  // (48a) (50b)
 
 	// Summary for players: where the settings are, what is on, what it costs.
 	ImGui::TextWrapped("The settings are on the Sun Shadows, Point Light Shadows and Ambient Occlusion pages (below this one in the list).");
@@ -9888,6 +10218,10 @@ std::string RayTracing::DescribeForProfile() const
 		pt.effects ? "on" : "off", pt.alphaOutdoors ? "on" : "off");
 	// (46o)
 	text += std::format(", window beam softness {:.2f} deg", settings.PointLightsBeamSoftness);
+	// (50b)
+	static constexpr const char* kPointDenoisers[5] = { "off", "penumbra", "penumbra v2", "DLSS RR", "-" };
+	text += std::format(", point denoiser {} (in effect {}), point blue noise {}", kPointDenoisers[std::clamp(settings.PointDenoiser, 0, 3)],
+		kPointDenoisers[pointModeThisFrame < 0 ? 4 : std::clamp(pointModeThisFrame, 0, 3)], settings.PointBlueNoise ? (backend.PointBlueNoiseFailed() ? "failed" : "on") : "off");
 	// (48o) The fixed switches (47x - 48m) are no longer listed; the measurements stay.
 	text += std::format(", buildings kept in the sun shadow map: {} draws", RayTracingCasterFilter::KeptLastFrame());
 	text += std::format(", lights per pixel this frame {}{}",
@@ -9987,6 +10321,10 @@ nlohmann::json RayTracing::DescribeJson() const
 	j["lights_without_flame"] = settings.PointLightsMeshless;     // (50a) 0 own, 1 snap (old), 2 skip, 3 soft
 	j["first_person_player_rt"] = settings.FirstPersonPlayer;
 	j["denoiser"] = settings.Denoiser;
+	j["point_denoiser"] = settings.PointDenoiser;  // (50b) 0 off, 1 penumbra, 2 penumbra v2, 3 DLSS RR
+	j["point_denoiser_effective"] = pointModeThisFrame;
+	j["point_blue_noise"] = settings.PointBlueNoise ? (backend.PointBlueNoiseFailed() ? "failed" : "on") : "off";
+	j["point_v2_mb"] = static_cast<double>(pointV2D3D11Bytes + backend.PointBlueNoiseBytes()) / (1024.0 * 1024.0);
 	j["rt_contact_scale"] = settings.RtContactScale;
 	// (48o) The fixed switches (47n - 48m) are no longer written; their measurements stay.
 	j["kept_sun_caster_draws"] = RayTracingCasterFilter::KeptLastFrame();

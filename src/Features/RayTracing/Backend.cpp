@@ -7,6 +7,7 @@
 #include <cstring>
 
 #include <dxgi1_4.h>
+#include <fstream>  // (50b) the point trace's blue noise
 #include <iterator>
 
 // Generated at build time from Shaders/TraceShadowsCS.hlsl by the Windows SDK's dxc (CMakeLists.txt).
@@ -567,7 +568,7 @@ namespace RayTracingRT
 		alphaRanges[1].BaseShaderRegister = 0;
 		alphaRanges[1].RegisterSpace = 1;
 		alphaRanges[1].OffsetInDescriptorsFromTableStart = 1;
-		D3D12_ROOT_PARAMETER params[8]{};
+		D3D12_ROOT_PARAMETER params[9]{};  // (50b) + 8: the blue noise (t10)
 		params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 		params[0].Constants.ShaderRegister = 0;
 		params[0].Constants.Num32BitValues = sizeof(PointTraceConstants) / 4;
@@ -595,6 +596,9 @@ namespace RayTracingRT
 		params[7].DescriptorTable.NumDescriptorRanges = 2;
 		params[7].DescriptorTable.pDescriptorRanges = alphaRanges;
 		params[7].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		params[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;  // (50b) ByteAddressBuffer BlueNoise : register(t10)
+		params[8].Descriptor.ShaderRegister = 10;
+		params[8].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		D3D12_STATIC_SAMPLER_DESC sampler{};
 		sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
 		sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
@@ -602,7 +606,7 @@ namespace RayTracingRT
 		sampler.ShaderRegister = 0;
 		sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		D3D12_ROOT_SIGNATURE_DESC rootDesc{};
-		rootDesc.NumParameters = 8;
+		rootDesc.NumParameters = 9;
 		rootDesc.pParameters = params;
 		rootDesc.NumStaticSamplers = 1;
 		rootDesc.pStaticSamplers = &sampler;
@@ -912,6 +916,53 @@ namespace RayTracingRT
 		device_->CreateShaderResourceView(pointIdxPrev_.Get(), &srvDesc, StagingCpu(kDynPointPrev));
 	}
 
+
+	// (50b) Point Light Shadows > Blue-Noise Sampling.
+	bool Backend::EnsurePointBlueNoise()
+	{
+		if (pointBlueNoise_)
+			return true;
+		if (pointBlueNoiseFailed_ || !device_ || !pointPipeline_)
+			return false;
+		// Skylighting's asset (DirectX 10 DDS header: RGBA8, 2D, 64 slices of 128 x 128, one mip), as one raw buffer in the file's own layout.
+		static constexpr const wchar_t* kPath = L"Data\\Shaders\\Skylighting\\SpatiotemporalBlueNoise\\stbn_vec3_2Dx1D_128x128x64.dds";
+		static constexpr std::uint32_t kSize = 128, kSlices = 64, kHeaderBytes = 4 + 124 + 20;
+		auto fail = [&](const std::string& a_why) {
+			pointBlueNoiseFailed_ = true;
+			logger::warn("[RayTracing] Point lights: Blue-Noise Sampling unavailable ({}); the 50a sampling pattern is used", a_why);
+			return false;
+		};
+		std::vector<std::uint8_t> file;
+		{
+			std::ifstream in(kPath, std::ios::binary);
+			if (!in)
+				return fail("Data\\Shaders\\Skylighting\\SpatiotemporalBlueNoise\\stbn_vec3_2Dx1D_128x128x64.dds not found");
+			file.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+		}
+		auto u32 = [&](std::size_t a_offset) {
+			std::uint32_t v = 0;
+			std::memcpy(&v, file.data() + a_offset, sizeof(v));
+			return v;
+		};
+		if (file.size() < kHeaderBytes + kPointBlueNoiseBytes || std::memcmp(file.data(), "DDS ", 4) != 0 || std::memcmp(file.data() + 84, "DX10", 4) != 0 ||
+			u32(12) != kSize || u32(16) != kSize || u32(28) > 1u || u32(128) != static_cast<std::uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM) || u32(132) != 3u ||
+			u32(140) != kSlices)
+			return fail("unexpected file layout");
+		auto buffer = CreateBuffer(kPointBlueNoiseBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, false);
+		auto upload = CreateBuffer(kPointBlueNoiseBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false);
+		void* mapped = nullptr;
+		if (!buffer || !upload || FAILED(upload->Map(0, nullptr, &mapped)) || !mapped)
+			return fail("its buffers could not be created");
+		std::memcpy(mapped, file.data() + kHeaderBytes, kPointBlueNoiseBytes);
+		upload->Unmap(0, nullptr);
+		buffer->SetName(L"CS RayTracing point blue noise");
+		pointBlueNoise_ = std::move(buffer);
+		pointBlueNoiseUpload_ = std::move(upload);
+		pointBlueNoiseCopyPending_ = true;
+		pointBlueNoiseRetirePending_ = false;
+		logger::info("[RayTracing] Point lights: blue noise {}x{}x{} loaded", kSize, kSize, kSlices);
+		return true;
+	}
 	bool Backend::EnsurePointBuffer(CommandContext& a_context, std::uint32_t a_bytes)
 	{
 		if (a_context.pointBuffer && a_context.pointMapped && a_context.pointCapacity >= a_bytes)
@@ -954,6 +1005,23 @@ namespace RayTracingRT
 		a_list->SetComputeRootDescriptorTable(2, a_table);  // (46f) this context's copy of the point table
 		a_list->SetComputeRootShaderResourceView(3, a_context.pointBuffer->GetGPUVirtualAddress());
 		a_list->SetComputeRootUnorderedAccessView(4, pointCounter_->GetGPUVirtualAddress());
+		// (50b) Blue-Noise Sampling: the upload buffer of a copy recorded in an earlier list goes now (this list orders after it on our
+		// queue); a pending copy goes out first in this list (the buffer is promoted from COMMON to COPY_DEST, then made a shader resource).
+		// t10 is always bound (the sources' buffer when there is no blue noise: the shader reads t10 only with kFlagBlueNoise).
+		if (pointBlueNoiseRetirePending_) {
+			if (pointBlueNoiseUpload_)
+				Retire(pointBlueNoiseUpload_, 0, nullptr);
+			pointBlueNoiseUpload_.Reset();
+			pointBlueNoiseRetirePending_ = false;
+		}
+		if (pointBlueNoiseCopyPending_ && pointBlueNoise_ && pointBlueNoiseUpload_) {
+			a_list->CopyBufferRegion(pointBlueNoise_.Get(), 0, pointBlueNoiseUpload_.Get(), 0, kPointBlueNoiseBytes);
+			D3D12_RESOURCE_BARRIER toSrv = Transition(pointBlueNoise_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+			a_list->ResourceBarrier(1, &toSrv);
+			pointBlueNoiseCopyPending_ = false;
+			pointBlueNoiseRetirePending_ = true;
+		}
+		a_list->SetComputeRootShaderResourceView(8, (pointBlueNoise_ && !pointBlueNoiseCopyPending_ ? pointBlueNoise_ : a_context.pointBuffer)->GetGPUVirtualAddress());
 		if (alpha) {
 			a_list->SetComputeRootShaderResourceView(5, a_context.alphaInfoBuffer->GetGPUVirtualAddress());
 			a_list->SetComputeRootShaderResourceView(6, alphaUv_->GetGPUVirtualAddress());
@@ -2195,6 +2263,9 @@ namespace RayTracingRT
 		pointIdx_ = {};
 		pointWide_ = {};  // (48a)
 		pointWidePrev_.Reset();
+		pointBlueNoise_.Reset();  // (50b)
+		pointBlueNoiseUpload_.Reset();
+		pointBlueNoiseCopyPending_ = pointBlueNoiseRetirePending_ = false;
 		pointWideBytes_ = 0;
 		pointWidth_ = pointHeight_ = 0;
 		pointBytes_ = 0;

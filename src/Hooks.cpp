@@ -251,6 +251,8 @@ namespace EffectExtensions
 
 			// (49g) Linear Lighting's effect constants (Effect.hlsl EffectSceneCB, PS b7) for this draw.
 			globals::features::linearLighting.BindEffectScene();
+			// (50b) Point Light Shadows in DLSS RR mode: the effect reads the filtered point-light visibility (t40 / t46), not the raw rays.
+			globals::features::rayTracing.BindEffectPointVisibility();
 		}
 		static inline REL::Relocation<decltype(thunk)> func;
 	};
@@ -263,6 +265,7 @@ namespace EffectExtensions
 		{
 			func(shader, pass, renderFlags);
 			globals::features::linearLighting.UnbindEffectScene();
+			globals::features::rayTracing.RestoreEffectPointVisibility();  // (50b)
 		}
 		static inline REL::Relocation<decltype(thunk)> func;
 	};

@@ -1015,6 +1015,13 @@ namespace RayTracingRT
 		[[nodiscard]] bool PointWideReady() const { return pointWide_.resource12 != nullptr; }
 		[[nodiscard]] ID3D11ShaderResourceView* PointWideSRV() const { return pointWide_.srv11.Get(); }
 		[[nodiscard]] std::uint64_t PointWideBytes() const { return pointWideBytes_; }
+		/// (50b) Point Light Shadows > Blue-Noise Sampling: Skylighting's spatiotemporal blue noise (RGBA8, 64 slices of 128 x 128) as a raw
+		/// buffer for the point trace (t10; TracePointLightsCS kFlagBlueNoise), loaded on first use and copied in the next point list. False =
+		/// not available (the trace keeps the 50a pattern).
+		bool EnsurePointBlueNoise();
+		[[nodiscard]] bool PointBlueNoiseFailed() const { return pointBlueNoiseFailed_; }
+		[[nodiscard]] std::uint64_t PointBlueNoiseBytes() const { return pointBlueNoise_ ? kPointBlueNoiseBytes : 0u; }
+		static constexpr std::uint64_t kPointBlueNoiseBytes = 128ull * 128ull * 4ull * 64ull;
 
 		// (46f) RTAO. Its pipeline is created with the others; its texture, ray counter and second fence on first use only.
 		[[nodiscard]] bool AOAvailable() const { return ready_ && !failed_ && aoPipeline_ && aoFault_.empty(); }
@@ -1964,6 +1971,9 @@ namespace RayTracingRT
 		SharedTexture pointWide_;
 		ComPtr<ID3D12Resource> pointWidePrev_;
 		std::uint64_t pointWideBytes_ = 0;
+		// (50b) Blue-Noise Sampling: default-heap buffer (COMMON between frames), its upload buffer until the copy has run.
+		ComPtr<ID3D12Resource> pointBlueNoise_, pointBlueNoiseUpload_;
+		bool pointBlueNoiseCopyPending_ = false, pointBlueNoiseRetirePending_ = false, pointBlueNoiseFailed_ = false;
 		static constexpr DXGI_FORMAT kPointWaterDistFormat = DXGI_FORMAT_R32_FLOAT;
 		std::uint32_t pointWidth_ = 0, pointHeight_ = 0;
 		ComPtr<ID3D12Resource> pointCounter_;          // default heap, UAV: rays traced (monotonic, wraps)

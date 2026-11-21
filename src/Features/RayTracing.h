@@ -100,6 +100,15 @@ public:
 		Sigma = 4,     // NVIDIA NRD SIGMA shadow denoiser
 		Count
 	};
+	/// (50b) The point-light denoiser (Point Light Shadows > Denoiser), stored as an int.
+	enum PointDenoiserMode : int
+	{
+		kPointOff = 0,       // the 3x3 mean only, no history (a reference)
+		kPointPenumbra = 1,  // the 50a denoiser (PointDenoiseCS), exactly
+		kPointV2 = 2,        // (default) Penumbra v2 (PointDenoiseV2CS)
+		kPointRR = 3,        // nothing of ours for Lighting: the decoded rays for DLSS Ray Reconstruction
+		kPointModeCount
+	};
 
 	/// (48i) The RT reflection values a Quality preset sets (Reflections page > Advanced). The defaults are the High preset (= the 48h
 	/// defaults). Not part of a preset: the mode (Off / Trace Only / Gap Fill), Off-screen Hit Brightness and the Diagnostics fixes.
@@ -272,6 +281,13 @@ public:
 		float AOSpecOccStrength = 1.0f;  // 0 = the scalar specular AO, 1 = the cone result where it is trusted
 		// (49b) "Particles Use RT Shadows": lit effects (smoke, dust, mist sheets) take the volumetric fog's ray-traced visibility (sun and the four
 		// strongest traced point-light sources per froxel; shadow-casting engine lights then light them too). Needs the volumetric fog's near grid.
+		// (50b) Point Light Shadows > Denoiser (PointDenoiserMode) and each page's last choice other than DLSS RR (DLSS RR is one choice for both
+		// pages: OnDenoiserPicked). PointBlueNoise "Blue-Noise Sampling": the point rays' disc samples from the spatiotemporal blue noise
+		// (TracePointLightsCS kFlagBlueNoise). Outside the settings macro (read / written in Load / SaveSettings).
+		int PointDenoiser = kPointV2;
+		int PointDenoiserNonRR = kPointV2;
+		int SunDenoiserNonRR = static_cast<int>(DenoiserMode::Penumbra);
+		bool PointBlueNoise = true;
 		bool ParticlesRTShadows = true;
 		// (50a) "Smooth Shadows on Smoke and Water Sheets": lit effects interpolate the point-light visibility between the fog grid's cells
 		// and the opaque surface behind them (Effect.hlsl RTFogVis::SmoothVisibility) instead of the nearest cell (49b: 16-px blocks).
@@ -697,6 +713,10 @@ public:
 	bool EnsureFogResources(std::uint32_t a_gridX, std::uint32_t a_gridY, std::uint32_t a_gridZ);
 	[[nodiscard]] bool ParticlesUseRT() const { return loaded && settings.Enabled && settings.ParticlesRTShadows; }
 	[[nodiscard]] bool ParticlesSmoothSheets() const { return ParticlesUseRT() && settings.ParticlesSmoothSheets; }  // (50a)
+	/// (50b) DLSS RR mode of the point lights: Lighting reads the raw rays at t40 / t46; Hooks.cpp calls these around every effect draw so the
+	/// lit effects (Effect.hlsl, Smooth Shadows on Smoke and Water Sheets) read the filtered copy instead. No-ops in the other modes.
+	void BindEffectPointVisibility();
+	void RestoreEffectPointVisibility();
 	/// (49b) The RT fog / particle source id of a light (slot + 1; 0 = none): its point-light shadow tag's slot, or for a window beam (spot
 	/// shadow lights carry no tag) the slot of its beam source. Light Limit Fix writes it per light (t53). Render thread, this frame's selection.
 	[[nodiscard]] std::uint32_t FogLightId(const RE::BSLight* a_light) const;
@@ -830,6 +850,8 @@ private:
 	static bool UpscalingRRActive();
 	/// (45l) The denoiser in effect: DLSS RR whenever Upscaling's Ray Reconstruction runs, else the chosen one.
 	[[nodiscard]] DenoiserMode EffectiveDenoiser() const;
+	/// (50b) The point-light denoiser in effect (PointDenoiserMode): DLSS RR whenever Upscaling's Ray Reconstruction runs, else the chosen one.
+	[[nodiscard]] int EffectivePointDenoiser() const;
 
 	bool EnsureBackend();
 	bool EnsureD3D11Resources(const D3D11_TEXTURE2D_DESC& a_maskDesc, bool a_maskTemp = true);
@@ -1080,6 +1102,10 @@ private:
 	/// (45o) Picking a denoiser in the dropdown: DLSS RR switches Upscaling's Ray Reconstruction on, any other
 	/// one switches it off while it is on (the same setting as Upscaling's checkbox).
 	void OnDenoiserPicked();
+	/// (50b) DLSS RR is one choice for the sun and the point lights: picking it on either page sets both (remembering each page's last other
+	/// choice) and switches Upscaling's Ray Reconstruction on; picking anything else on either page while it was RR returns the other page to
+	/// its last other choice and switches it off. a_point: the pick was on the point-light page.
+	void OnDenoiserPicked(bool a_point);
 	// (45j) CPU split of the last frame (also in the F7 trace), smoothed and worst for the page.
 	struct CpuSplit
 	{
@@ -1196,6 +1222,22 @@ private:
 	// (48m) Moving Characters: Clean Shadow History (PL_CLEAN): the eight above with it compiled in, index wide 1 | beam 2 | fix 4.
 	winrt::com_ptr<ID3D11ComputeShader> pointDenoiseCleanCS[8];
 	ID3D11ComputeShader* PointDenoiseShader(bool a_wide, bool a_beam, bool a_fix = false, bool a_clean = false);
+	// (50b) Point Light Shadows > Denoiser: Off / Penumbra v2 / DLSS RR run PointDenoiseV2CS (plain / PL_WIDE); Penumbra the shaders above.
+	// pointLen: per pixel and slot the history length (4 bits x 6 slots, R32_UINT, ping-pong with pointWrite); pointRaw / pointRawWide: the
+	// decoded rays Lighting reads in the DLSS RR mode (slots 0 - 3 / 4 - 5), while the lit effects get the filtered copy in pointVis /
+	// pointWide (BindEffectPointVisibility / RestoreEffectPointVisibility around every effect draw).
+	winrt::com_ptr<ID3D11ComputeShader> pointDenoiseV2CS[2];
+	DenoiseTexture pointLen[2], pointRaw, pointRawWide;
+	std::uint64_t pointV2D3D11Bytes = 0;
+	bool pointLenValid = false;   // pointLen[read] holds last frame's lengths (written by PointDenoiseV2CS)
+	bool pointRRBound = false;    // this frame's t40 / t46 hold the raw rays (DLSS RR mode): the effect draws swap in the filtered copy
+	bool pointEffectSwapped = false;
+	bool pointV2Failed = false;   // PointDenoiseV2CS did not compile / its textures failed: Penumbra this session
+	int pointModeThisFrame = -1;  // the point denoiser that ran this frame (PointDenoiserMode), -1 none
+	ID3D11ComputeShader* PointDenoiseV2Shader(bool a_wide);
+	bool EnsurePointV2(std::uint32_t a_width, std::uint32_t a_height, bool a_rr, bool a_wide);
+	void ReleasePointV2();
+	void FinishPointLightsV2(int a_mode);
 	/// (48l) The noise fix's denoiser variant is wanted (master on and a denoiser part on).
 	bool PointNoiseFixDenoiserWanted() const;
 	/// (48m) The point denoiser's debug views (PointDenoiseCS writes them).

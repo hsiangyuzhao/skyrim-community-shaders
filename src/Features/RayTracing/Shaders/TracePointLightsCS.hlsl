@@ -79,6 +79,8 @@ Texture2D<unorm float4> PLIdxPrev : register(t8);  // (47z) last frame's PLIdx (
 // bytes, no count or caster bits), z / w = their PLVis values. Not touched (and not allocated: null views) while K <= 4.
 RWTexture2D<unorm float4> PLWide : register(u4);
 Texture2D<unorm float4> PLWidePrev : register(t9);  // (48a) last frame's PLWide (kFlagStickyReproject with kFlagWidePrev)
+// (50b) Blue-Noise Sampling (kFlagBlueNoise): Skylighting's spatiotemporal blue noise, RGBA8, 64 slices of 128 x 128 (the DDS data as it is).
+ByteAddressBuffer BlueNoise : register(t10);
 
 static const uint kFlagCharacters = 1u;   // characters are in the TLAS: the character ray
 static const uint kFlagFirstPerson = 2u;  // no character ray for pixels near the camera
@@ -159,6 +161,10 @@ static const float kGrazeStart = 0.5;
 // (49m) "Soft Hand-Off for Weak Lights": a light traced only just above its cut (the share cut / absolute minimum / sun gate, or the 7 % of an
 // extra rank) has its shadow faded in: full only from kSoftCutRange x that cut up; at the cut it is lit, as on the untraced side next to it.
 static const uint kFlagSoftCut = 8388608u;
+// (50b) "Blue-Noise Sampling": every point slot's disc sample (u.x radius, u.y angle) from the spatiotemporal blue noise (the vec3 STBN's first two
+// numbers: blue noise as a pair, in space and over its 64 frames), the texel at the pixel shifted per slot (decorrelated slots), the slice
+// = the frame. Replaces the R2 / beam patterns for the point rays (the water rays keep theirs). Off: exactly as before.
+static const uint kFlagBlueNoise = 16777216u;
 static const float kSoftCutRange = 1.5;
 // (49m) Encoding with kFlagSoftCut (PointDenoiseCS kPLFlagFractional): 255 = lit; 128..254 = partly lit, (b - 128) / 126 the
 // lit fraction (no blocker distance); 0..127 = blocked, b / 127 = sqrt(blocker distance / light distance). Without them: as before.
@@ -294,6 +300,14 @@ float2 BeamSample(float2 p, uint frame, uint k)
 	const float b = frac(52.9829189 * frac(dot(p + float2(83.0, 29.0), float2(0.06711056, 0.00583715))));
 	const float f = float(frame);
 	return frac(float2(a, b) + f * float2(0.7548776662, 0.5698402910) + float(k) * float2(0.4142135624, 0.7320508076));
+}
+
+// (50b) kFlagBlueNoise: the disc sample from the blue noise (t10).
+float2 BlueNoiseSample(uint2 p, uint frame, uint k)
+{
+	const uint2 t = (p + uint2(37u, 71u) * k) & 127u;
+	const uint word = BlueNoise.Load(((((frame & 63u) << 7u) + t.y) << 7u | t.x) << 2u);
+	return (float2(word & 0xFFu, (word >> 8u) & 0xFFu) + 0.5) * (1.0 / 256.0);
 }
 
 // Lighting.hlsl's attenuation (InverseSquareLighting::GetAttenuation, or 1 - (d / r)^2).
@@ -969,6 +983,10 @@ groupshared uint gsMask[2];
 		[branch] if ((beamSmooth && g.softBeam) || noiseDecorrelate)
 		{
 			u = BeamSample(float2(p), uint(C.Params.y), k);
+		}
+		[branch] if (flags & kFlagBlueNoise)
+		{
+			u = BlueNoiseSample(uint2(p), uint(C.Params.y), k);  // (50b)
 		}
 		idxA[k] = bestIdx[k];
 		// (49m) Soft Hand-Off for Weak Lights: no shadow at the cut, the full shadow from kSoftCutRange x the cut.
