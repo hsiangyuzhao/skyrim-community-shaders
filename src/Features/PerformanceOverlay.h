@@ -574,6 +574,7 @@ struct PerformanceOverlay : OverlayFeature
 		bool ScreenshotOnSave = true;        // F12 / Save frame also takes a screenshot with the same time stamp
 		bool ReflectionCensus = true;        // (49h) F12 / Save frame also runs the reflection census (one pass, its block added to the JSON)
 		bool ScreenshotSaveHDR = true;       // HDR frames: also save the untouched PQ image (16-bit PNG)
+		bool ScreenshotNotify = true;        // (49l) Skyrim HUD notification when a screenshot is saved / fails
 		uint32_t TraceKey = VK_F7;           // start / stop a frame-time trace
 		float TraceSeconds = 20.0f;
 	};
