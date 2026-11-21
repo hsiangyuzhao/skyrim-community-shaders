@@ -19,17 +19,55 @@ namespace Util::Screenshot
 			bool pq = false;
 			uint64_t frame = 0;
 			std::string stem;
+			std::string companion;  // (49l) F12: the frame JSON saved with this screenshot ("" = plain screenshot)
 			float paperWhite = 203.0f;
 			float peak = 1000.0f;
 		};
 
 		bool g_requested = false;
 		std::string g_requestedStem;
+		std::string g_requestedCompanion;
 		uint64_t g_frame = 0;
 		bool g_capturedThisFrame = false;
 		std::vector<Pending> g_inFlight;
 		std::mutex g_fileMutex;
 		std::string g_lastFile;
+
+		/// (49l) Short on-screen confirmation once a screenshot has been written (or has failed): Skyrim's
+		/// own HUD notification, so it shows with the CS menu and the overlay closed, plus the overlay's
+		/// message line. Callable from any thread: everything runs later as an SKSE task on the game's
+		/// main thread, never on the caller's (the PNG encoder is a detached worker). It is only queued
+		/// after the frame was copied (OnFinalImage) and the file written, so it is never in the picture.
+		void Notify(std::string a_text, bool a_error)
+		{
+			const auto* tasks = SKSE::GetTaskInterface();
+			if (!tasks) {
+				logger::info("[Screenshot] No SKSE task interface; notification skipped: {}", a_text);
+				return;
+			}
+			tasks->AddTask([text = std::move(a_text), a_error]() {
+				auto& overlay = globals::features::performanceOverlay;
+				overlay.FlashMessage(text, a_error);
+				if (!overlay.settings.ScreenshotNotify)
+					return;
+				auto* ui = RE::UI::GetSingleton();
+				if (!ui || !ui->IsMenuOpen(RE::HUDMenu::MENU_NAME) || ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME) ||
+					ui->IsMenuOpen(RE::MainMenu::MENU_NAME)) {
+					logger::info("[Screenshot] HUD not shown; notification skipped: {}", text);
+					return;
+				}
+				RE::DebugNotification(text.c_str(), nullptr, false);
+			});
+		}
+
+		/// (49l) Keeps a failure reason short enough for one HUD line.
+		std::string ShortReason(std::string a_reason)
+		{
+			constexpr size_t kMax = 80;
+			if (a_reason.size() > kMax)
+				a_reason = a_reason.substr(0, kMax - 3) + "...";
+			return a_reason;
+		}
 
 		std::filesystem::path Folder()
 		{
@@ -148,6 +186,7 @@ namespace Util::Screenshot
 				const auto pngPath = folder / (a_p.stem + ".png");
 				DX::ThrowIfFailed(DirectX::SaveToWICFile(*out, DirectX::WIC_FLAGS_NONE, DirectX::GetWICCodec(DirectX::WIC_CODEC_PNG), pngPath.c_str()));
 				std::string saved = pngPath.filename().string();
+				bool savedHdr = false;
 
 				// The untouched HDR10 image as a 16-bit PNG (PQ code values, BT.2020).
 				auto& overlay = globals::features::performanceOverlay;
@@ -167,8 +206,10 @@ namespace Util::Screenshot
 						}
 					}
 					const auto hdrPath = folder / (a_p.stem + "-hdr10-pq.png");
-					if (SUCCEEDED(DirectX::SaveToWICFile(*img, DirectX::WIC_FLAGS_NONE, DirectX::GetWICCodec(DirectX::WIC_CODEC_PNG), hdrPath.c_str())))
+					if (SUCCEEDED(DirectX::SaveToWICFile(*img, DirectX::WIC_FLAGS_NONE, DirectX::GetWICCodec(DirectX::WIC_CODEC_PNG), hdrPath.c_str()))) {
 						saved += " + " + hdrPath.filename().string();
+						savedHdr = true;
+					}
 				}
 
 				{
@@ -176,10 +217,19 @@ namespace Util::Screenshot
 					g_lastFile = saved;
 				}
 				logger::info("[Screenshot] Saved {} ({}x{}, {})", (folder / (a_p.stem + ".png")).string(), w, h, a_p.pq ? "HDR10 tone-mapped to SDR" : "SDR");
+				// (49l) F12 with a screenshot: one line for the whole frame save (JSON + PNG).
+				const char* hdrNote = savedHdr ? " (+ HDR10 copy)" : "";
+				if (!a_p.companion.empty())
+					Notify(std::format("Frame saved: {} + {}{}", a_p.companion, pngPath.filename().string(), hdrNote), false);
+				else
+					Notify(std::format("Screenshot saved: {}{}", pngPath.filename().string(), hdrNote), false);
 			} catch (const std::exception& e) {
 				logger::error("[Screenshot] Saving failed: {}", e.what());
-				std::scoped_lock lk(g_fileMutex);
-				g_lastFile = std::string("failed: ") + e.what();
+				{
+					std::scoped_lock lk(g_fileMutex);
+					g_lastFile = std::string("failed: ") + e.what();
+				}
+				Notify("Screenshot failed: " + ShortReason(e.what()), true);
 			}
 			if (SUCCEEDED(co))
 				CoUninitialize();
@@ -198,10 +248,11 @@ namespace Util::Screenshot
 		return std::format("{}-{:03}", stamp, ms);
 	}
 
-	void Request(const std::string& a_stem)
+	void Request(const std::string& a_stem, const std::string& a_companion)
 	{
 		g_requested = true;
 		g_requestedStem = a_stem.empty() ? "cs-" + MakeStamp() : a_stem;
+		g_requestedCompanion = a_companion;
 	}
 
 	void Poll()
@@ -221,6 +272,7 @@ namespace Util::Screenshot
 				// Not finished yet; give up after a few seconds' worth of frames.
 				if (g_frame > it->frame + 600) {
 					logger::warn("[Screenshot] Readback never completed; dropped {}", it->stem);
+					Notify("Screenshot failed: the frame copy never finished", true);
 					it = g_inFlight.erase(it);
 				} else {
 					++it;
@@ -250,8 +302,11 @@ namespace Util::Screenshot
 		float dummy[3];
 		if (desc.SampleDesc.Count != 1 || !ReadTexel(desc.Format, reinterpret_cast<const uint8_t*>(&dummy), 0, dummy)) {
 			logger::warn("[Screenshot] Unsupported back-buffer format {} (or multisampled)", static_cast<uint32_t>(desc.Format));
-			std::scoped_lock lk(g_fileMutex);
-			g_lastFile = "failed: unsupported image format";
+			{
+				std::scoped_lock lk(g_fileMutex);
+				g_lastFile = "failed: unsupported image format";
+			}
+			Notify("Screenshot failed: unsupported image format", true);
 			return;
 		}
 
@@ -266,12 +321,14 @@ namespace Util::Screenshot
 		sdesc.MiscFlags = 0;
 		if (FAILED(globals::d3d::device->CreateTexture2D(&sdesc, nullptr, p.staging.put()))) {
 			logger::warn("[Screenshot] Could not create the readback texture");
+			Notify("Screenshot failed: could not create the readback texture", true);
 			return;
 		}
 		globals::d3d::context->CopySubresourceRegion(p.staging.get(), 0, 0, 0, 0, a_image, 0, nullptr);
 		p.pq = a_pq;
 		p.frame = g_frame;
 		p.stem = g_requestedStem;
+		p.companion = g_requestedCompanion;
 		if (a_pq) {
 			const auto levels = HDROutput::GetDisplayLevels();
 			if (levels.paperWhiteNits > 0.0f)

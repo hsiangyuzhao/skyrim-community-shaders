@@ -18,7 +18,9 @@
 namespace Util::Screenshot
 {
 	/// Queues a capture of the next presented frame. a_stamp: file-name stamp ("" = now).
-	void Request(const std::string& a_stamp = {});
+	/// a_companion: (49l) a file saved together with it (the F12 frame JSON), named in the
+	/// "saved" notification instead of a plain "Screenshot saved".
+	void Request(const std::string& a_stamp = {}, const std::string& a_companion = {});
 
 	/// Present hooks: the final image of this frame. a_pq = it is HDR10 (PQ, BT.2020).
 	/// Called once per frame; does nothing unless a capture is queued.

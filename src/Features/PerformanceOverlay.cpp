@@ -211,6 +211,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	ScreenshotOnSave,
 	ReflectionCensus,
 	ScreenshotSaveHDR,
+	ScreenshotNotify,
 	TraceKey,
 	TraceSeconds)
 
@@ -4574,6 +4575,12 @@ void PerformanceOverlay::DrawViewOptions()
 		ImGui::SameLine();
 		if (ImGui::SmallButton("Take one"))
 			Util::Screenshot::Request();
+		// (49l)
+		ImGui::Checkbox("Notify When a Screenshot Is Saved", &settings.ScreenshotNotify);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted("Shows a short Skyrim notification (top left) once the PNG is written, or if saving failed;\n"
+								   "also for F12 with \"Screenshot with every saved frame\". It appears after the picture was taken,\n"
+								   "so it is never in that screenshot. Not shown in the main menu or on loading screens (logged only).");
 		ImGui::Checkbox("Screenshot with every saved frame (F12)", &settings.ScreenshotOnSave);
 		// (49h)
 		ImGui::Checkbox("Reflection census with every saved frame (F12)", &settings.ReflectionCensus);
@@ -5387,9 +5394,6 @@ void PerformanceOverlay::SaveFrameJson(const PerfView::ViewConfig& a_cfg)
 		std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &local);
 		const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000;
 		const std::string name = std::format("perf-{}-{:03}.json", stamp, ms);
-		// (44e) The same moment as a screenshot (menu and overlay included), same time stamp.
-		if (settings.ScreenshotOnSave)
-			Util::Screenshot::Request(std::format("perf-{}-{:03}", stamp, ms));
 		path /= name;
 
 		const nlohmann::json j = BuildFrameJson(a_cfg);
@@ -5400,6 +5404,11 @@ void PerformanceOverlay::SaveFrameJson(const PerfView::ViewConfig& a_cfg)
 		}
 		out << j.dump(2, ' ', false, nlohmann::json::error_handler_t::replace);
 		out.close();
+		// (44e) The same moment as a screenshot (menu and overlay included), same time stamp.
+		// (49l) Queued once the JSON is written, so the "Frame saved: <json> + <png>" notification
+		// it ends with is true; still the same presented frame (Request only flags the next Present).
+		if (settings.ScreenshotOnSave)
+			Util::Screenshot::Request(std::format("perf-{}-{:03}", stamp, ms), name);
 		view.lastSavedFile = name;
 		if (settings.ReflectionCensus)  // (49h) the census is added to this file a few frames later
 			::ReflectionCensus::Request(path);
