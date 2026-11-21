@@ -765,7 +765,8 @@ uint32_t ExponentialHeightFog::PrepareRTFogVisibility(ID3D11DeviceContext* a_con
 
     RTFogDataGPU data{};
     data.flags = (volumetric.RTSunShafts && rtHistorySun ? 1u : 0u) | (volumetric.RTLightShadows && rawLights ? 2u : 0u) |
-                 (particles && rtHistorySun ? 4u : 0u) | (particles && rawLights ? 8u : 0u);
+                 (particles && rtHistorySun ? 4u : 0u) | (particles && rawLights ? 8u : 0u) |
+                 (particles && rawLights && rayTracing.ParticlesSmoothSheets() ? 16u : 0u);  // (50a) Effect.hlsl RTFogVis::kParticleSmooth
     rtFogData->Update(&data, sizeof(data));
 
     // The light scattering pass reads them from the same slots as lit effects.

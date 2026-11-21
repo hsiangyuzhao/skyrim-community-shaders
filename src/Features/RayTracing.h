@@ -271,6 +271,10 @@ public:
 		// (49b) "Particles Use RT Shadows": lit effects (smoke, dust, mist sheets) take the volumetric fog's ray-traced visibility (sun and the four
 		// strongest traced point-light sources per froxel; shadow-casting engine lights then light them too). Needs the volumetric fog's near grid.
 		bool ParticlesRTShadows = true;
+		// (50a) "Smooth Shadows on Smoke and Water Sheets": lit effects interpolate the point-light visibility between the fog grid's cells
+		// and the opaque surface behind them (Effect.hlsl RTFogVis::SmoothVisibility) instead of the nearest cell (49b: 16-px blocks).
+		// Outside the settings macro (read / written in Load / SaveSettings).
+		bool ParticlesSmoothSheets = true;
 		// (49c) "Loading Screens" (replaces 49b's Hitch Fixes): the master "Finish Loading Work Behind the Loading Screen" and its three parts.
 		// LoadPrepareArrival "Prepare When Arriving": at the teleport's end (PositionPlayer finish, main thread, the game's loading screen still up)
 		// the destination is captured and built before the loading screen closes (at most 3 s). LoadThreadCopies "Use the Loading Screen's Thread
@@ -688,6 +692,7 @@ public:
 	/// Creates the shared fog textures for a grid (called when the fog creates its volumes; false = no RT fog).
 	bool EnsureFogResources(std::uint32_t a_gridX, std::uint32_t a_gridY, std::uint32_t a_gridZ);
 	[[nodiscard]] bool ParticlesUseRT() const { return loaded && settings.Enabled && settings.ParticlesRTShadows; }
+	[[nodiscard]] bool ParticlesSmoothSheets() const { return ParticlesUseRT() && settings.ParticlesSmoothSheets; }  // (50a)
 	/// (49b) The RT fog / particle source id of a light (slot + 1; 0 = none): its point-light shadow tag's slot, or for a window beam (spot
 	/// shadow lights carry no tag) the slot of its beam source. Light Limit Fix writes it per light (t53). Render thread, this frame's selection.
 	[[nodiscard]] std::uint32_t FogLightId(const RE::BSLight* a_light) const;

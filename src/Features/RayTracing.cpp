@@ -2062,6 +2062,7 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.AOSpecOcc = read("AOSpecOcc", defaults.AOSpecOcc);  // (49a)
 		settings.AOSpecOccStrength = std::clamp(read("AOSpecOccStrength", defaults.AOSpecOccStrength), 0.0f, 1.0f);
 		settings.ParticlesRTShadows = read("ParticlesRTShadows", defaults.ParticlesRTShadows);  // (49b)
+		settings.ParticlesSmoothSheets = read("ParticlesSmoothSheets", defaults.ParticlesSmoothSheets);  // (50a)
 		settings.LoadFinish = read("LoadFinish", defaults.LoadFinish);  // (49c) (49b Hitch* keys: no longer read)
 		settings.LoadPrepareArrival = read("LoadPrepareArrival", defaults.LoadPrepareArrival);
 		settings.LoadThreadCopies = read("LoadThreadCopies", defaults.LoadThreadCopies);
@@ -2316,6 +2317,7 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["AOSpecOcc"] = settings.AOSpecOcc;  // (49a)
 	o_json["AOSpecOccStrength"] = settings.AOSpecOccStrength;
 	o_json["ParticlesRTShadows"] = settings.ParticlesRTShadows;  // (49b)
+	o_json["ParticlesSmoothSheets"] = settings.ParticlesSmoothSheets;  // (50a)
 	o_json["LoadFinish"] = settings.LoadFinish;  // (49c)
 	o_json["LoadPrepareArrival"] = settings.LoadPrepareArrival;
 	o_json["LoadThreadCopies"] = settings.LoadThreadCopies;
@@ -8183,6 +8185,16 @@ void RayTracing::DrawParticlesSection()
 		ImGui::Text("Needs Exponential Height Fog's Volumetric Fog (its near grid holds the data; indoors also Skip Volumetric Fog Indoors off).");
 		ImGui::Text("Flames, magic and glowing effects are not lit and do not change. Off: as before.");
 	}
+	// (50a) Directly below, greyed while Particles Use RT Shadows is off.
+	ImGui::BeginDisabled(!settings.ParticlesRTShadows);
+	ImGui::Checkbox("Smooth Shadows on Smoke and Water Sheets", &settings.ParticlesSmoothSheets);
+	ImGui::EndDisabled();
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("On (default): the lamp and torch shadows on smoke, mist and waterfall sheets are blended smoothly between the fog's");
+		ImGui::Text("  shadow samples and the shadow on the wall or ground right behind the sheet, by their real distances. No more lit / dark");
+		ImGui::Text("  squares (16 pixels at the default fog grid) on sheets that lie on a wall; the edges line up with the shadows on the wall.");
+		ImGui::Text("Off: as 49m (the nearest fog sample: the squares). Costs a little more on screens full of lit smoke.");
+	}
 	if (settings.ParticlesRTShadows && settings.Enabled) {
 		auto& fog = globals::features::exponentialHeightFog;
 		if (!fog.loaded || !fog.VolumetricFogActive())
@@ -10101,6 +10113,8 @@ nlohmann::json RayTracing::DescribeJson() const
 	j["point_dark_side_test"] = settings.PointDarkSideTest;         // (49m) 0 off, 1 original, 2 tolerant
 	j["point_grazing_offset"] = settings.PointGrazingOffset;
 	j["point_edge_rays"] = settings.PointEdgeRays;
+	j["particles_smooth_sheets"] = settings.ParticlesSmoothSheets;  // (50a)
+	j["lights_without_flame"] = settings.PointLightsMeshless;     // (50a) 0 own, 1 snap (old), 2 skip, 3 soft
 	j["point_soft_cut"] = settings.PointSoftCut;
 	j["char_refresh_shapes"] = settings.CharRefreshShapes;
 	j["first_person_player_rt"] = settings.FirstPersonPlayer;

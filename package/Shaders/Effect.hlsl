@@ -541,6 +541,8 @@ cbuffer PerGeometry : register(b2)
 // (ExponentialHeightFog/RTFogVisibility.hlsli; only while the near fog grid is built). Off / unbound: every factor is 1 and no light is added.
 // (49g) In every effect permutation: lit smoke without the LIGHTING flag uses it too when it follows the scene light.
 #		include "ExponentialHeightFog/RTFogVisibility.hlsli"
+// (50a) The per-pixel point-light visibility (t40 / t41 / t46) for Smooth Shadows on Smoke and Water Sheets (unbound: no match).
+#		include "RayTracing/PointLightShadows.hlsli"
 namespace RTFogVis
 {
 	/// Near-grid volume uvw (texel centres) of a camera-relative position; false outside the near grid or without the textures.
@@ -576,6 +578,122 @@ namespace RTFogVis
 		[branch] if ((Flags() & kParticleSun) && ParticleCoords(a_positionWS, a_eyeIndex, uvw))
 			result = SunFactor(RTFogSun.SampleLevel(SampColorSampler, uvw, 0));
 		return result;
+	}
+
+	// (50a) "Smooth Shadows on Smoke and Water Sheets" (Ray Tracing > Fog & Particles, kParticleSmooth): instead of the nearest light cell
+	// (one visibility per 2x2 near-grid froxels, i.e. GridPixelSize x 2 render pixels x a depth slice: hard blocks on sheets lying on walls),
+	// the visibility is interpolated between the known samples by their real positions:
+	//   - the 8 light cells around the fragment, trilinear, each only where it lists the light (weights renormalised); a cell whose slice
+	//     centre lies behind the opaque surface at this pixel (inside solid geometry) is left out;
+	//   - the opaque surface behind the fragment: its denoised per-pixel ray-traced visibility of the light (RTPointShadows t40 / t41 / t46,
+	//     without Get()'s depth match), at the scene depth z_s;
+	//   - along the view ray: lerp(grid estimate, surface sample, saturate((z_f - z_g) / (z_s - z_g))), z_g = the deepest slice centre that
+	//     contributed (in front of the surface). Grid only without a surface sample; surface only (no grid entry) when the fragment lies
+	//     within one slice of the surface; neither: not found (as before).
+	static const uint kParticleSmooth = 16u;
+
+	struct SmoothSamples
+	{
+		uint2 cell[8];      // packed slots (PackSlots) of the 8 corners; zero = left out
+		float weight[8];    // trilinear weights (0 = left out)
+		float layerDepth[2];  // view depth of the two slice centres (corners 0-3: lower slice, 4-7: upper)
+		uint2 surface;      // packed slots of the pixel's traced point lights (slots 0-3)
+		float4 wide;        // (48a) slots 4 - 5: xy source + 1 (unorm), zw visibility (zero when unbound)
+		float surfaceDepth; // z_s (0 = no opaque surface: sky)
+		float sliceDepth;   // one slice in front of the surface (the "near the surface" tolerance)
+		float fragmentDepth;
+	};
+
+	/// Gathers the samples once per fragment (a_uvw from ParticleCoords; a_viewDepth = the fragment's view depth; a_svPosition = SV_Position.xy).
+	SmoothSamples GatherSmooth(float3 a_uvw, float a_viewDepth, float2 a_svPosition)
+	{
+		SmoothSamples s = (SmoothSamples)0;
+		s.fragmentDepth = a_viewDepth;
+		const int2 pixel = int2(a_svPosition);
+		const float rawDepth = SharedData::DepthTexture.Load(int3(pixel, 0)).x;
+		s.surfaceDepth = rawDepth < 1.0 ? SharedData::GetScreenDepth(rawDepth) : 0.0;
+		const float3 zParams = SharedData::volumetricFogSettings.NearGridZParams.xyz;
+		uint w, h, d;
+		RTFogLightId.GetDimensions(w, h, d);
+		const float3 size = float3(w, h, d);
+		const float3 c = a_uvw * size - 0.5;
+		const int3 base = int3(floor(c));
+		const float3 f = c - float3(base);
+		const int3 maxCoord = int3(size) - 1;
+		[unroll] for (uint layer = 0u; layer < 2u; ++layer)
+		{
+			const int z = clamp(base.z + int(layer), 0, maxCoord.z);
+			s.layerDepth[layer] = ExponentialHeightFog::VolumetricSliceToDepth(float(z) + 0.5, zParams);
+		}
+		[unroll] for (uint k = 0u; k < 8u; ++k)
+		{
+			const int3 o = int3(k & 1u, (k >> 1u) & 1u, k >> 2u);
+			const float3 wt = lerp(1.0 - f, f, float3(o));
+			const float layerDepth = s.layerDepth[k >> 2u];
+			const bool inside = s.surfaceDepth > 0.0 && layerDepth > s.surfaceDepth;  // the slice centre is behind the opaque surface
+			[branch] if (!inside)
+			{
+				const int4 coord = int4(clamp(base + o, int3(0, 0, 0), maxCoord), 0);
+				s.cell[k] = PackSlots(RTFogLightId.Load(coord), RTFogLightVis.Load(coord));
+				s.weight[k] = wt.x * wt.y * wt.z;
+			}
+		}
+		[branch] if (s.surfaceDepth > 0.0)
+		{
+			s.surface = PackSlots(uint4(RTPointShadows::Sources.Load(int3(pixel, 0)) * 255.0 + 0.5) & RTPointShadows::kSourceMask,
+				RTPointShadows::Visibility.Load(int3(pixel, 0)));
+			s.wide = RTPointShadows::WideSlots.Load(int3(pixel, 0));
+			const float sliceAtSurface = ExponentialHeightFog::VolumetricDepthToNormalizedSlice(s.surfaceDepth, zParams, 1.0);
+			s.sliceDepth = s.surfaceDepth - ExponentialHeightFog::VolumetricSliceToDepth(max(floor(sliceAtSurface - 0.5), 0.0) + 0.5, zParams);
+			s.sliceDepth = s.sliceDepth > 0.0 ? s.sliceDepth : s.surfaceDepth;
+		}
+		return s;
+	}
+
+	/// The visibility of source a_id (slot + 1) from the gathered samples; a_found = some sample knows it.
+	float SmoothVisibility(SmoothSamples s, uint a_id, out bool a_found)
+	{
+		float sum = 0.0, weightSum = 0.0, gridDepth = 0.0;
+		[unroll] for (uint k = 0u; k < 8u; ++k)
+		{
+			bool cellFound;
+			const float v = LightVisibility(s.cell[k], a_id, cellFound);
+			[flatten] if (cellFound && s.weight[k] > 0.0)
+			{
+				sum += s.weight[k] * v;
+				weightSum += s.weight[k];
+				gridDepth = max(gridDepth, s.layerDepth[k >> 2u]);
+			}
+		}
+		const bool gridFound = weightSum > 1e-6;
+		const float grid = gridFound ? sum / weightSum : 1.0;
+		bool surfaceFound;
+		float surface = LightVisibility(s.surface, a_id, surfaceFound);
+		[flatten] if (!surfaceFound && s.surfaceDepth > 0.0 && a_id != 0u)
+		{
+			const uint2 wideIds = uint2(s.wide.xy * 255.0 + 0.5) & RTPointShadows::kSourceMask;
+			surfaceFound = wideIds.x == a_id || wideIds.y == a_id;
+			surface = wideIds.x == a_id ? s.wide.z : s.wide.w;
+		}
+		float visibility = 1.0;
+		a_found = false;
+		[branch] if (gridFound && surfaceFound)
+		{
+			const float toSurface = saturate((s.fragmentDepth - gridDepth) / max(s.surfaceDepth - gridDepth, 1e-3));
+			visibility = lerp(grid, surface, toSurface);
+			a_found = true;
+		}
+		else if (gridFound)
+		{
+			visibility = grid;
+			a_found = true;
+		}
+		else if (surfaceFound && s.surfaceDepth - s.fragmentDepth <= s.sliceDepth)
+		{
+			visibility = surface;
+			a_found = true;
+		}
+		return visibility;
 	}
 }
 #	endif
@@ -746,7 +864,8 @@ namespace EffectScene
 	/// Light Limit Fix's clustered point lights on an effect (49b: x the ray-traced visibility of "Particles Use RT Shadows"). Each light
 	/// adds PointLight x attenuation x a_scaleA x fade x a_scaleB: the old lit-effect loop with a_scaleA = 0.5, a_scaleB = Effect Lighting
 	/// Multiplier; following the scene light a_scaleA = Vanilla Diffuse Multiplier.
-	void AddPointLights(inout float3 a_color, float3 a_positionWS, uint a_eyeIndex, float a_scaleA, float a_scaleB, inout uint a_lightCount)
+	/// (50a) a_svPosition: SV_Position.xy (Smooth Shadows on Smoke and Water Sheets reads the per-pixel trace there).
+	void AddPointLights(inout float3 a_color, float3 a_positionWS, float2 a_svPosition, uint a_eyeIndex, float a_scaleA, float a_scaleB, inout uint a_lightCount)
 	{
 		float3 viewPosition = mul(FrameBuffer::CameraView[a_eyeIndex], float4(a_positionWS, 1)).xyz;
 		float2 screenUV = FrameBuffer::ViewToUV(viewPosition, true, a_eyeIndex);
@@ -760,16 +879,28 @@ namespace EffectScene
 			// (49b) Particles Use RT Shadows: the four point-light sources traced at this spot of the fog grid. A light among them is shadowed by
 			// its ray-traced visibility; a shadow-casting light (skipped before) lights the effect only when it is among them.
 			bool rtLights = (RTFogVis::Flags() & RTFogVis::kParticleLights) != 0u;
+			// (50a) Smooth Shadows on Smoke and Water Sheets: the interpolated visibility (RTFogVis::GatherSmooth / SmoothVisibility);
+			// off: the nearest light cell, exactly as 49b.
+			const bool rtSmooth = rtLights && (RTFogVis::Flags() & RTFogVis::kParticleSmooth) != 0u;
 			uint2 rtSlots = 0u.xx;
+			RTFogVis::SmoothSamples rtSamples = (RTFogVis::SmoothSamples)0;
 			[branch] if (rtLights)
 			{
 				float3 rtUvw;
 				rtLights = RTFogVis::ParticleCoords(a_positionWS, a_eyeIndex, rtUvw);
-				uint rtW, rtH, rtD;
-				RTFogVis::RTFogLightId.GetDimensions(rtW, rtH, rtD);
-				const int4 rtCoord = int4(min(uint3(rtUvw * float3(rtW, rtH, rtD)), uint3(rtW, rtH, rtD) - 1u), 0);
-				if (rtLights)
-					rtSlots = RTFogVis::PackSlots(RTFogVis::RTFogLightId.Load(rtCoord), RTFogVis::RTFogLightVis.Load(rtCoord));
+				[branch] if (rtSmooth)
+				{
+					if (rtLights)
+						rtSamples = RTFogVis::GatherSmooth(rtUvw, viewPosition.z, a_svPosition);
+				}
+				else
+				{
+					uint rtW, rtH, rtD;
+					RTFogVis::RTFogLightId.GetDimensions(rtW, rtH, rtD);
+					const int4 rtCoord = int4(min(uint3(rtUvw * float3(rtW, rtH, rtD)), uint3(rtW, rtH, rtD) - 1u), 0);
+					if (rtLights)
+						rtSlots = RTFogVis::PackSlots(RTFogVis::RTFogLightId.Load(rtCoord), RTFogVis::RTFogLightVis.Load(rtCoord));
+				}
 			}
 #		endif
 			[loop] for (uint i = 0; i < a_lightCount; i++)
@@ -785,7 +916,10 @@ namespace EffectScene
 				{
 					const uint rtId = RTFogVis::LightId(clusteredLightIndex);
 					bool rtFound;
-					rtLightVis = RTFogVis::LightVisibility(rtSlots, rtId, rtFound);
+					[branch] if (rtSmooth)
+						rtLightVis = RTFogVis::SmoothVisibility(rtSamples, rtId, rtFound);  // (50a)
+					else
+						rtLightVis = RTFogVis::LightVisibility(rtSlots, rtId, rtFound);
 					if (rtFound)
 						skipLight = false;
 				}
@@ -1173,7 +1307,7 @@ PS_OUTPUT main(PS_INPUT input)
 #		if defined(LIGHT_LIMIT_FIX)
 	uint lightCount = 0;
 	if (LightingInfluence.x > 0.0)
-		EffectScene::AddPointLights(propertyColor, input.WorldPosition.xyz, eyeIndex, followLit ? Color::VanillaDiffuseMult() : 0.5, Color::EffectLightingMult(), lightCount);
+		EffectScene::AddPointLights(propertyColor, input.WorldPosition.xyz, input.Position.xy, eyeIndex, followLit ? Color::VanillaDiffuseMult() : 0.5, Color::EffectLightingMult(), lightCount);
 #		endif
 #	elif defined(MEMBRANE)
 	propertyColor *= 0;
@@ -1185,7 +1319,7 @@ PS_OUTPUT main(PS_INPUT input)
 		propertyColor = EffectScene::MatteLight(input.WorldPosition.xyz, input.Position.xyzw, eyeIndex, shadowVariance);
 #		if defined(LIGHT_LIMIT_FIX)
 		uint followLightCount = 0;
-		EffectScene::AddPointLights(propertyColor, input.WorldPosition.xyz, eyeIndex, Color::VanillaDiffuseMult(), Color::EffectLightingMult(), followLightCount);
+		EffectScene::AddPointLights(propertyColor, input.WorldPosition.xyz, input.Position.xy, eyeIndex, Color::VanillaDiffuseMult(), Color::EffectLightingMult(), followLightCount);
 #		endif
 	}
 #	endif
