@@ -27,6 +27,7 @@ cbuffer PointDenoiseCB : register(b1)
 	float4 PLExtra;   // x K, (46o) y / z window-beam source slots 0-31 / 32-63 (uint bits), w tan of the beams' angular size (0 = 46n)
 	uint4 PLMotion[4];  // (46d) per source slot one byte (slot s: byte s % 4 of uint s / 4): history dropped this frame, 0 keep .. 255 none
 	uint4 PLEmitter;  // (46x) x / y source slots 0-31 / 32-63 with their own emitter radius (uint bits), z that radius (float bits)
+	uint4 PLFillEmitter[4];  // (50a) Soft fill lights: per source slot one byte (slot s: byte s % 4 of uint s / 4) = emitter radius / 2 units, 0 = none
 };
 
 Texture2D<unorm float4> PLVis : register(t0);
@@ -317,6 +318,21 @@ bool BigEmitter(uint a_id)
 	return ((word >> (s & 31u)) & 1u) != 0u;
 }
 
+// (50a) The emitter radius that sets a source's penumbra width: a Soft fill light's own (PLFillEmitter, the radius before the trace's
+// per-pixel disc clamp: an upper bound, the filter radius is capped at PLParams.w anyway), else as 46x (a direct fill's, else the light size).
+float SlotEmitter(uint a_id)
+{
+	float emitter = BigEmitter(a_id) ? asfloat(PLEmitter.z) : PLParams.x;
+	[branch] if (a_id != 0u)
+	{
+		const uint s = a_id - 1u;
+		const uint fill = (PLFillEmitter[s >> 4u][(s >> 2u) & 3u] >> ((s & 3u) * 8u)) & 0xFFu;
+		if (fill != 0u)
+			emitter = float(fill) * 2.0;
+	}
+	return emitter;
+}
+
 // (46o) Is this source (id = slot + 1) a soft window beam this frame?
 bool SoftBeam(uint a_id)
 {
@@ -331,7 +347,7 @@ bool SoftBeam(uint a_id)
 float FixPointRadius(uint a_id, float a_q, float a_footprint)
 {
 	const float q = clamp(a_q, 0.0, 0.95);
-	const float emitter = BigEmitter(a_id) ? asfloat(PLEmitter.z) : PLParams.x;
+	const float emitter = SlotEmitter(a_id);  // (50a) + Soft fill lights
 	const float width = 2.0 * emitter * q / (1.0 - q);
 	return clamp(0.5 * width / a_footprint, 1.0, PLParams.w);
 }
@@ -531,7 +547,7 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw)
 			else
 			{
 				const float q = qCount[s] > 0.0 ? clamp(qSum[s] / qCount[s], 0.0, 0.95) : 0.25;
-				const float emitter = BigEmitter(ids[s]) ? asfloat(PLEmitter.z) : PLParams.x;  // (46x)
+				const float emitter = SlotEmitter(ids[s]);  // (46x) (50a) + Soft fill lights
 				const float width = 2.0 * emitter * q / (1.0 - q);
 				radiusPx[s] = clamp(0.5 * width / footprint, 1.0, PLParams.w);
 				// (48k) Close Blockers: Minimum Blur (Stable Penumbra off: this path).

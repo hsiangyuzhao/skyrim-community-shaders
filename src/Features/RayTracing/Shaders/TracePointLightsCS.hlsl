@@ -188,6 +188,21 @@ static const uint kSourceNoPlayer = 32u;  // (46d) RayTracingPointLights::kSourc
 static const uint kSourceAim = 64u;        // (46x) RayTracingPointLights::kSourceAim: Spot.xyz = the ray target (a window spot), beam-like rays
 static const uint kSourceEmitter = 128u;   // (46x) Spot.w = this source's emitter radius
 static const uint kSourceRoomBox = 256u;   // (46x) Spot.xyz (uint bits) = its rooms' box, half floats: pixels outside do not rank it
+// (50a) RayTracingPointLights::kSourceFill: a Soft fill light (Lights Without a Visible Flame), with kSourceEmitter (Spot.w = its emitter
+// radius, up to ~320 units). Its disc is clamped per pixel to kFillDiscFraction x the receiver-light distance: every disc point is then
+// within atan(0.5) = 26.6 degrees of the light's centre seen from the receiver, so a receiver facing the light at N.L >= 0.45 never aims a
+// sample behind its own plane (and a receiver closer than the radius does not sample the far side of the disc around itself).
+static const uint kSourceFill = 512u;
+static const float kFillDiscFraction = 0.5;
+
+/// The emitter disc radius of a source seen from a receiver at distance a_len0 (49j and earlier: the same expression without the fill clamp).
+float SourceEmitter(PLSource src, bool isAim, bool softBeam, float len0)
+{
+	float emitter = softBeam ? len0 * C.Bounds.w : (((src.Info.x & kSourceEmitter) && !isAim) ? src.Spot.w : C.Bias.w);
+	[branch] if ((src.Info.x & kSourceFill) && !isAim && !softBeam)
+		emitter = min(emitter, kFillDiscFraction * len0);
+	return emitter;
+}
 static const uint kSceneMask = 0x01u;
 static const uint kCharacterMasks = 0x06u;
 static const uint kNpcMask = 0x04u;  // (46d) the other actors only (Backend::kNpcMask): rays of the player's own lights
@@ -525,7 +540,7 @@ SlotGeom MakeSlotGeom(PLSource src, float3 P, float3 N, float3 NRank, float bias
 	g.T = normalize(cross(helper, Ln));
 	g.B = cross(Ln, g.T);
 	// (46x) A direct fill without a window spot: its own (larger) emitter.
-	g.emitter = g.softBeam ? len0 * C.Bounds.w : (((src.Info.x & kSourceEmitter) && !isAim) ? src.Spot.w : C.Bias.w);
+	g.emitter = SourceEmitter(src, isAim, g.softBeam, len0);  // (50a) + the Soft fill's per-pixel disc clamp
 	// (47x) Close-Contact Shadows on Characters: TMin 2 units, back to Bias.z (6) where the light grazes the surface. (49m) Grazing-Angle
 	// Offset: 2 / N.L, within [2, Bias.z].
 	g.charTMin = C.Bias.z;
@@ -646,7 +661,7 @@ float4 TraceFromWater(int2 p, uint4 idx, float waterDist, uint flags, float n0, 
 		const float u2 = frac(n1 + float(k) * 0.5698402910);
 		float sn, cs;
 		sincos(6.2831853 * u2, sn, cs);
-		const float emitter = softBeam ? len0 * C.Bounds.w : (((src.Info.x & kSourceEmitter) && !isAim) ? src.Spot.w : C.Bias.w);
+		const float emitter = SourceEmitter(src, isAim, softBeam, len0);  // (50a)
 		const float3 target = rayTarget + (T * cs + B * sn) * (sqrt(u1) * emitter);
 		const float3 L = target - origin;
 		const float len = length(L);

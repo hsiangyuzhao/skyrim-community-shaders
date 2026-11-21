@@ -2031,7 +2031,16 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.CellEventMs = read("CellEventMs", defaults.CellEventMs);
 		settings.PointLightsBeamSoftness = read("PointLightsBeamSoftness", defaults.PointLightsBeamSoftness);  // (46o)
 		settings.CarrierClearance = std::clamp(read("CarrierClearance", defaults.CarrierClearance), 0.0f, 64.0f);
-		settings.PointLightsMeshless = std::clamp(read("PointLightsMeshless", defaults.PointLightsMeshless), 0, 2);
+		// (50a) "Lights Without a Visible Flame": the new key; without it the 46s key, whose Snap (the old default, known to shatter the
+		// shadows on characters) migrates once to Soft.
+		if (o_json.contains("PointLightsFlameless")) {
+			settings.PointLightsMeshless = std::clamp(read("PointLightsFlameless", defaults.PointLightsMeshless), 0, 3);
+		} else if (o_json.contains("PointLightsMeshless")) {
+			const int old = std::clamp(read("PointLightsMeshless", 1), 0, 2);
+			settings.PointLightsMeshless = old == static_cast<int>(RayTracingPointLights::kMeshlessSnap) ? static_cast<int>(RayTracingPointLights::kMeshlessSoft) : old;
+			if (old == static_cast<int>(RayTracingPointLights::kMeshlessSnap))
+				logger::info("[RayTracing] Lights Without a Visible Flame: saved Snap migrated to Soft (50a)");
+		}
 		// (46t) RTAO ((47n) Fine Detail, Normal-Guided Filter, Single Long Ray, Character Self-Occlusion Fix and Smooth Normals v2
 		// are always on: their keys are ignored and dropped on the next save)
 		settings.AODetailStrength = read("AODetailStrength", defaults.AODetailStrength);
@@ -2245,7 +2254,11 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["CellEventMs"] = settings.CellEventMs;
 	o_json["PointLightsBeamSoftness"] = settings.PointLightsBeamSoftness;  // (46o)
 	o_json["CarrierClearance"] = settings.CarrierClearance;
-	o_json["PointLightsMeshless"] = settings.PointLightsMeshless;
+	o_json["PointLightsFlameless"] = settings.PointLightsMeshless;  // (50a)
+	// (50a) The 46s key for a package before 50a (Soft has no value there: Snap, its old default).
+	o_json["PointLightsMeshless"] = settings.PointLightsMeshless == static_cast<int>(RayTracingPointLights::kMeshlessSoft) ?
+	                                    static_cast<int>(RayTracingPointLights::kMeshlessSnap) :
+	                                    std::clamp(settings.PointLightsMeshless, 0, 2);
 	o_json["AODetailStrength"] = settings.AODetailStrength;  // (46t)
 	o_json["AODetailLength"] = settings.AODetailLength;
 	o_json["AODetailRays"] = settings.AODetailRays;
@@ -5620,7 +5633,7 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	config.player = tier.player;
 	config.effects = tier.effects;
 	// (46s)
-	config.meshless = static_cast<std::uint32_t>(std::clamp(settings.PointLightsMeshless, 0, 2));
+	config.meshless = static_cast<std::uint32_t>(std::clamp(settings.PointLightsMeshless, 0, 3));  // (50a) + Soft
 	// (46x) Direct fills' emitter. (47m) Native shadow lights, stable selection, steady flickering lights, merge hysteresis, direct
 	// fills, plugin-only fill fixtures, wider window beams, portals and room boxes are always on.
 	config.directEmitter = std::min(std::max(settings.PointLightsSize, 0.0f) * 4.0f, 64.0f);
@@ -5978,6 +5991,10 @@ void RayTracing::FinishPointLights()
 		const auto& motion = pointSelector.SlotMotion();
 		for (std::uint32_t s = 0; s < RayTracingPointLights::kMaxSources; ++s)
 			cb.Motion[s / 4] |= static_cast<std::uint32_t>(motion[s]) << ((s % 4) * 8);
+		// (50a) Soft fill lights: their emitter radius per slot (all 0 without fills: every slot as before).
+		const auto& fill = pointSelector.FillEmitterBytes();
+		for (std::uint32_t s = 0; s < RayTracingPointLights::kMaxSources; ++s)
+			cb.FillEmitter[s / 4] |= static_cast<std::uint32_t>(fill[s]) << ((s % 4) * 8);
 	}
 	pointDenoiseCB->Update(cb);
 
@@ -9084,15 +9101,25 @@ void RayTracing::DrawPointLightPage()
 			}
 		}
 		{
-			const char* kMeshless[3] = { "Own", "Snap", "Skip" };
-			settings.PointLightsMeshless = std::clamp(settings.PointLightsMeshless, 0, 2);
-			ImGui::Combo("Meshless Lights Near Fires", &settings.PointLightsMeshless, kMeshless, 3);
+			// (50a) "Lights Without a Visible Flame" (was "Meshless Lights Near Fires"): shown Soft, Own, Skip, Snap (old); stored as the
+			// selector's mode (RayTracingPointLights::kMeshless*: 0 Own, 1 Snap, 2 Skip, 3 Soft).
+			const char* kFlameless[4] = { "Soft", "Own", "Skip", "Snap (old)" };
+			constexpr int kModeOfItem[4] = { 3, 0, 2, 1 };
+			constexpr int kItemOfMode[4] = { 1, 3, 2, 0 };
+			int item = kItemOfMode[std::clamp(settings.PointLightsMeshless, 0, 3)];
+			if (ImGui::Combo("Lights Without a Visible Flame", &item, kFlameless, 4))
+				settings.PointLightsMeshless = kModeOfItem[std::clamp(item, 0, 3)];
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Some of the game's \"torch\" lights have no torch: an invisible light placed near braziers and fires.");
-				ImGui::Text("  Own (46r): it casts its own shadow, from a point where nothing burns (an extra shadow between two braziers).");
-				ImGui::Text("  Snap (default): its shadow comes from the nearest visible fire or lamp within about 4.5 m; none in range, or a torch");
-				ImGui::Text("    holder / candle right next to it (then it is that fixture's light): its own.");
-				ImGui::Text("  Skip: it casts no ray-traced shadow (the old screen-space shadow, if any).");
+				ImGui::Text("Some placed lights have nothing visible that burns: an invisible light near braziers and fires that stands for");
+				ImGui::Text("  the fire's light bouncing off the surroundings.");
+				ImGui::Text("  Soft (default): its shadow comes from where its light comes from (its own spot), but from a big, soft light:");
+				ImGui::Text("    as big as the distance to the nearest visible fire or lamp (up to about 4.5 m). A broad, soft darkening");
+				ImGui::Text("    instead of a sharp extra shadow.");
+				ImGui::Text("  Own: a sharp shadow from its own spot (an extra shadow between two braziers).");
+				ImGui::Text("  Skip: no ray-traced shadow for these lights (the old screen-space shadow, if any).");
+				ImGui::Text("  Snap (old): the shadow comes from the nearest visible fire instead. Known to break the shadows on characters");
+				ImGui::Text("    into dark patches; kept for comparison only.");
+				ImGui::Text("A light right next to a candle / torch holder / brazier model is that model's own light and keeps a normal shadow.");
 			}
 		}
 		ImGui::EndDisabled();
@@ -9292,6 +9319,10 @@ void RayTracing::DrawPointLightPage()
 				// (46s)
 				ImGui::Text("Steady positions: %u at the rest point, %u averaged; merge kept %u; meshless lights: %u snapped, %u own, %u skipped",
 					ps.steadyParent, ps.steadyAverage, ps.mergeKept, ps.snapped, ps.meshlessOwn, ps.meshlessSkipped);
+				// (50a)
+				ImGui::Text("Lights without a visible flame (data test): %u; not picked by the old name rule %u, picked only by it %u; "
+							"Soft: %u with a fire / lamp in range, %u without, largest emitter %.0f units",
+					ps.fillLights, ps.fillNewVsName, ps.fillNameOnly, ps.fillSoftNear, ps.fillSoftFar, ps.fillEmitterMax);
 				// (46x)
 				ImGui::Text("Fill lights: %u direct traced (%u aimed at a window spot, %u soft point), %u taken as fixtures, %u left untraced; "
 							"negative lights %u; beams by the wider rule %u",
@@ -10009,8 +10040,8 @@ std::string RayTracing::DescribeForProfile() const
 	text += std::format(", residency priority {}, submit worker in effect {}, carrier clearance {:.0f}", backend.ResidencyHigh() ? "high" : "normal",
 		backend.SubmitWorkerInEffect() ? "yes" : "no", settings.CarrierClearance);
 	// (46s)
-	static constexpr const char* kMeshless[3] = { "own", "snap", "skip" };
-	text += std::format(", meshless lights near fires {}", kMeshless[std::clamp(settings.PointLightsMeshless, 0, 2)]);
+	static constexpr const char* kMeshless[4] = { "own", "snap (old)", "skip", "soft" };  // (50a) by mode
+	text += std::format(", lights without a visible flame {}", kMeshless[std::clamp(settings.PointLightsMeshless, 0, 3)]);
 	// (47l)
 	text += std::format(", sway in RT shadows {}{}", settings.FoliageSway ? "on" : "off",
 		settings.FoliageSway && !scene.SwayActive() ? " (not in effect: Foliage is shadow map or the wind shader is unavailable)" : "");
@@ -10024,7 +10055,9 @@ nlohmann::json RayTracing::PointSelectionJson() const
 	return { { "traced", pointThisFrame }, { "sources", ps.sources }, { "candidates", ps.candidates }, { "fillDirectAimed", ps.fillDirectAimed },
 		{ "fillDirectPoint", ps.fillDirectPoint }, { "fillFixture", ps.fillFixture }, { "fillAmbient", ps.fillAmbient }, { "negative", ps.negative },
 		{ "beamsWider", ps.beamsWider }, { "portalCameraInRoom", ps.cameraInRoom }, { "portalStrict", ps.portalStrict }, { "portalAway", ps.portalAway },
-		{ "portalDropped", ps.portalDropped }, { "portalBoxed", ps.portalBoxed }, { "portalBadRooms", ps.portalBadRooms } };
+		{ "portalDropped", ps.portalDropped }, { "portalBoxed", ps.portalBoxed }, { "portalBadRooms", ps.portalBadRooms },
+		{ "flamelessLights", ps.fillLights }, { "flamelessNotByName", ps.fillNewVsName }, { "flamelessByNameOnly", ps.fillNameOnly },
+		{ "flamelessSoftNear", ps.fillSoftNear }, { "flamelessSoftFar", ps.fillSoftFar }, { "flamelessEmitterMax", ps.fillEmitterMax } };  // (50a)
 }
 
 nlohmann::json RayTracing::PointSourcesReachingPlayerJson() const

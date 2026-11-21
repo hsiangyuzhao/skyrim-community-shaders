@@ -1597,7 +1597,8 @@ namespace Util::LightCensus
 			t.lightPlacer = r.lightPlacer;
 			const bool lighNoMesh = r.lighModel.empty() || Lower(r.lighModel).find("marker") != std::string::npos;
 			t.meshlessNamedFixture = !r.readError && r.baseIsLight && lighNoMesh && !r.shadow && e.category == Category::Fixture;
-			if (t.meshlessNamedFixture) {
+			t.meshlessPlaced = !r.readError && r.baseIsLight && lighNoMesh && !r.shadow;  // (50a) the same without the name / category gate
+			if (t.meshlessPlaced) {
 				float d = -1.0f;
 				if (NearestFixtureMeshSafe(owner, kMeshScanRadius, &d))
 					t.nearMeshDistance = d;

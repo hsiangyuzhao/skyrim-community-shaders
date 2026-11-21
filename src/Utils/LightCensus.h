@@ -120,6 +120,9 @@ namespace Util::LightCensus
 		/// For a meshlessNamedFixture: distance from its reference to the nearest fixture mesh (candle, torch, brazier, fire ...)
 		/// within kMeshScanRadius; -1 = none (or not scanned).
 		float nearMeshDistance = -1.0f;
+		/// (50a) A placed LIGH reference without a mesh (model "" or a marker), not shadow-casting, whatever its name / category (the data-only
+		/// part of the "Lights Without a Visible Flame" test; nearMeshDistance is scanned for these too).
+		bool meshlessPlaced = false;
 		/// A light of a visible fixture: Light Placer, a light inside a fixture's model, or a LIGH with a mesh of its own.
 		bool visibleFixture = false;
 		bool lightPlacer = false;

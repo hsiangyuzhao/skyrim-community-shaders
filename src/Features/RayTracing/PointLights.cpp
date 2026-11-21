@@ -355,6 +355,10 @@ namespace RayTracingPointLights
 			bool steady;           // pos is the steady position
 			bool meshless;         // a meshless placed light named like a fixture (Config::meshless applies)
 			std::uint32_t anchor;  // Snap: index (sorted order) of the visible fixture it is tagged to (UINT32_MAX = none)
+			// (50a) The data-only "Lights Without a Visible Flame" test (any mode); Soft: a fill source of its own, emitter radius below.
+			bool fillTest;
+			bool fill;
+			float fillEmitter;
 			// (46x)
 			bool forced;           // its shadow map was not drawn (always a source)
 			bool direct;           // a direct fill light (a source of its own)
@@ -391,6 +395,8 @@ namespace RayTracingPointLights
 			const Candidate* strongest = nullptr;
 			bool native = false;
 			bool spot = false;  // (46c) never merged with anything
+			bool fill = false;  // (50a) a Soft fill group: merged only with fills, the largest member's emitter radius
+			float fillEmitter = 0.0f;
 			std::uint8_t kind = 0;  // (46d) merged only with lights of the same kind
 			std::uint32_t owner = 0;  // (46e) merged only with lights of the same carrier (or none)
 			std::uint32_t first = 0;  // first member in the member list
@@ -536,6 +542,7 @@ namespace RayTracingPointLights
 		reach_.clear();      // (46s)
 		decisions_.clear();  // (46x)
 		emitterSlots_ = 0;
+		fillEmitter_.fill(0);  // (50a)
 		published_ = false;
 	}
 
@@ -565,6 +572,10 @@ namespace RayTracingPointLights
 		reach_.clear();  // (46s)
 		decisions_.clear();  // (46x)
 		emitterSlots_ = 0;
+		fillEmitter_.fill(0);  // (50a)
+		// (50a) Real time since the last selection, for the fill radius smoothing (0.25 s at most: a pause / loading screen).
+		const double selectDt = lastSelectQpc_ != 0 ? std::clamp(QpcToMs(start - lastSelectQpc_) * 1e-3, 0.0, 0.25) : 0.0;
+		lastSelectQpc_ = start;
 		stats_ = {};
 		std::fill_n(o_sources, kMaxSources, GpuSource{});
 
@@ -688,6 +699,9 @@ namespace RayTracingPointLights
 			c.steady = false;
 			c.meshless = false;
 			c.anchor = UINT32_MAX;
+			c.fillTest = false;
+			c.fill = false;
+			c.fillEmitter = 0.0f;
 			c.forced = forced;  // (46x)
 			c.direct = false;
 			c.aimed = false;
@@ -715,11 +729,22 @@ namespace RayTracingPointLights
 			}
 			// (46s) Meshless placed lights named like a fixture (a vanilla "torch" light that is at no visible fire).
 			c.meshless = traits.meshlessNamedFixture && !native && !forced && !spot && category == C::Fixture && c.kind == 0 && c.owner == 0;
-			if (c.meshless && a_config.meshless == kMeshlessSkip) {
+			// (50a) Lights Without a Visible Flame, data only (no name): a placed static world light without a mesh (traits.meshlessPlaced:
+			// a LIGH reference whose model is "" or a marker, not shadow-casting), of a fixture-like category (not a window, fill, spell or
+			// the player's), not native / forced / spot / beam / carried, and no fixture mesh within kOwnMeshTolerance (then it is that
+			// mesh's own light). The 46x direct fills are added with category Fill: never. Counted against the 46s name gate.
+			c.fillTest = traits.meshlessPlaced && !native && !forced && !spot && !beam && c.kind == 0 && c.owner == 0 && SteadyCategory(category) &&
+			             !(traits.nearMeshDistance >= 0.0f && traits.nearMeshDistance <= kOwnMeshTolerance);
+			stats_.fillLights += c.fillTest ? 1 : 0;
+			stats_.fillNewVsName += (c.fillTest && !c.meshless) ? 1 : 0;
+			stats_.fillNameOnly += (!c.fillTest && c.meshless) ? 1 : 0;
+			// Skip: 46s gated it by the name (c.meshless); (50a) by the data-only test. Snap (old) keeps the name gate below.
+			if (a_config.meshless == kMeshlessSkip && c.fillTest) {
 				++stats_.meshlessSkipped;
 				++stats_.byReason[kRejectCategory];
 				return nullptr;
 			}
+			c.fill = c.fillTest && a_config.meshless == kMeshlessSoft;
 			// (46s) Steady Flickering Lights: static world lights take their steady position.
 			if (hist && !spot && !beam && c.kind == 0 && c.owner == 0 && SteadyCategory(category)) {
 				updateSteady(*hist, r, traits);
@@ -1181,6 +1206,62 @@ namespace RayTracingPointLights
 			}
 		}
 
+		// (50a) Soft: a fill light's emitter radius = the distance to the nearest visible emitter (the snap's anchorable lights, within the
+		// snap distance; last frame's choice kept while within 1.25 x), the snap distance when none; nothing moves. Smoothed toward that
+		// target with time constant kFillEmitterSeconds (real time), so the softness never jumps when the nearest emitter changes.
+		if (a_config.meshless == kMeshlessSoft) {
+			const double searchSq = static_cast<double>(a_config.snapDistance) * a_config.snapDistance;
+			const double keepSq = searchSq * 1.5625;
+			const auto emitterLike = [](const Candidate& a) {
+				return a.traits.visibleFixture && !a.meshless && !a.fill && a.kind == 0 && a.owner == 0 && !a.spot && !a.beam && !a.direct;
+			};
+			const float alpha = static_cast<float>(1.0 - std::exp(-selectDt / static_cast<double>(kFillEmitterSeconds)));
+			for (std::uint32_t i = 0; i < candidates.size(); ++i) {
+				auto& c = candidates[i];
+				if (!c.fill)
+					continue;
+				auto* h = static_cast<History*>(c.hist);
+				std::uint32_t best = UINT32_MAX;
+				double bestSq = searchSq;
+				if (h && h->fillAnchor && a_frame - h->fillAnchorFrame <= 30u) {
+					for (std::uint32_t j = 0; j < candidates.size(); ++j) {
+						if (candidates[j].light != h->fillAnchor)
+							continue;
+						const double d = DistSq(candidates[j].pos, c.pos);
+						if (emitterLike(candidates[j]) && d <= keepSq) {
+							best = j;
+							bestSq = d;
+						}
+						break;
+					}
+				}
+				if (best == UINT32_MAX) {
+					for (std::uint32_t j = 0; j < candidates.size(); ++j) {
+						if (j == i || !emitterLike(candidates[j]))
+							continue;
+						const double d = DistSq(candidates[j].pos, c.pos);
+						if (d < bestSq || (d == bestSq && best != UINT32_MAX && candidates[j].light < candidates[best].light)) {
+							bestSq = d;
+							best = j;
+						}
+					}
+				}
+				const float target = best != UINT32_MAX ? static_cast<float>(std::sqrt(bestSq)) : a_config.snapDistance;
+				float radius = target;
+				if (h) {
+					h->fillAnchor = best != UINT32_MAX ? candidates[best].light : nullptr;
+					h->fillAnchorFrame = a_frame;
+					if (h->fillEmitterFrame != 0 && a_frame - h->fillEmitterFrame <= 30u && std::isfinite(h->fillEmitter))
+						radius = h->fillEmitter + (target - h->fillEmitter) * alpha;
+					h->fillEmitter = radius;
+					h->fillEmitterFrame = a_frame;
+				}
+				c.fillEmitter = std::isfinite(radius) ? std::clamp(radius, 1.0f, a_config.snapDistance) : a_config.snapDistance;
+				stats_.fillSoftNear += best != UINT32_MAX ? 1 : 0;
+				stats_.fillSoftFar += best != UINT32_MAX ? 0 : 1;
+			}
+		}
+
 		// (47w) Merge by membership. 47v keyed the hysteresis on the seed (the brightest member): flickering candles of about the same
 		// brightness swapped order, the seed changed, the hysteresis no longer applied and the groups (and their count, slots and the
 		// per-pixel selection) flipped from frame to frame. Now: pass 1 keeps every light in last frame's group (by identity) while it
@@ -1199,6 +1280,8 @@ namespace RayTracingPointLights
 			group.strongest = &c;
 			group.native = c.native;
 			group.spot = c.spot;
+			group.fill = c.fill;  // (50a)
+			group.fillEmitter = c.fillEmitter;
 			group.kind = c.kind;
 			group.owner = c.owner;
 			group.direct = c.direct;  // (46x)
@@ -1227,6 +1310,7 @@ namespace RayTracingPointLights
 			group.intensity += c.intensity;
 			group.score += c.score;
 			group.native = group.native || c.native;
+			group.fillEmitter = std::max(group.fillEmitter, c.fillEmitter);  // (50a) fills only join fills
 			JoinBox(group, c);  // (46x)
 			memberGroup[a_index] = a_group;
 			++stats_.merged;
@@ -1240,7 +1324,8 @@ namespace RayTracingPointLights
 			if (!h || h->groupId == 0 || a_frame - h->groupFrame > 2u)
 				continue;
 			const auto mem = groupMemory_.find(h->groupId);
-			if (mem == groupMemory_.end() || a_frame - mem->second.frame > 2u || mem->second.kind != c.kind || mem->second.owner != c.owner)
+			if (mem == groupMemory_.end() || a_frame - mem->second.frame > 2u || mem->second.kind != c.kind || mem->second.owner != c.owner ||
+				mem->second.fill != c.fill)  // (50a)
 				continue;
 			const double d = DistSq(mem->second.centre, c.pos);
 			if (d > keepMergeSq)
@@ -1257,7 +1342,7 @@ namespace RayTracingPointLights
 			} else {
 				// (46c) Spot lights keep a source of their own (their cone and direction are theirs). (46x) Direct fills too (their aim).
 				// (A spot or direct fill was alone in its group: a second light under the same identity cannot happen; defensive.)
-				if (c.spot || c.direct || groups[found].spot || groups[found].direct)
+				if (c.spot || c.direct || groups[found].spot || groups[found].direct || groups[found].fill != c.fill)
 					continue;
 				joinGroup(i, found);
 			}
@@ -1271,7 +1356,7 @@ namespace RayTracingPointLights
 			std::uint32_t found = UINT32_MAX;
 			for (std::uint32_t g = 0; g < groups.size() && !c.spot && !c.direct; ++g) {
 				const auto& group = groups[g];
-				if (group.spot || group.direct || group.kind != c.kind || group.owner != c.owner)
+				if (group.spot || group.direct || group.kind != c.kind || group.owner != c.owner || group.fill != c.fill)  // (50a) fills with fills
 					continue;
 				if (DistSq(group.anchor, c.pos) <= mergeSq) {
 					found = g;
@@ -1343,7 +1428,7 @@ namespace RayTracingPointLights
 		}
 		for (std::uint32_t i = 0; i < candidates.size(); ++i) {
 			const auto& c = candidates[i];
-			if (c.meshless && c.anchor == UINT32_MAX)
+			if (c.meshless && c.anchor == UINT32_MAX && !c.fill)  // (50a) not a Soft fill
 				++stats_.meshlessOwn;
 			// (46s) Merge hysteresis; (47w) the identity of the group each light is in (seeds too; none for snapped lights).
 			if (auto* h = static_cast<History*>(c.hist)) {
@@ -1450,6 +1535,7 @@ namespace RayTracingPointLights
 			mem.frame = a_frame;
 			mem.owner = group.owner;
 			mem.kind = group.kind;
+			mem.fill = group.fill;  // (50a)
 		}
 		std::erase_if(groupMemory_, [&](const auto& a_entry) { return a_frame - a_entry.second.frame > 2u; });
 
@@ -1528,6 +1614,14 @@ namespace RayTracingPointLights
 					h[4] | (static_cast<std::uint32_t>(h[5]) << 16) };
 				std::memcpy(out.spot, packed, sizeof(packed));
 				out.info[0] |= kSourceRoomBox;
+			}
+			// (50a) A Soft fill: its own emitter (spot[3]; a room box keeps spot[0..2]); the denoiser gets the radius per slot.
+			if (group.fill && !group.spot && !group.direct) {
+				const float radius = std::clamp(std::isfinite(group.fillEmitter) ? group.fillEmitter : a_config.snapDistance, 1.0f, 255.0f * kFillEmitterByteUnits);
+				out.info[0] |= kSourceEmitter | kSourceFill;
+				out.spot[3] = radius;
+				fillEmitter_[group.slot] = static_cast<std::uint8_t>(std::clamp(std::lround(radius / kFillEmitterByteUnits), 1l, 255l));
+				stats_.fillEmitterMax = std::max(stats_.fillEmitterMax, radius);
 			}
 			std::memcpy(&clearanceBits, &clearance, sizeof(clearanceBits));
 			out.info[1] = clearanceBits;

@@ -212,7 +212,9 @@ public:
 		float CarrierClearance = 28.0f;
 		// (46s) Outside the settings macro too. Meshless Lights Near Fires: placed lights without a mesh named like a fixture
 		// (vanilla "torch" lights at no visible fire) -- 0 Own (46r), 1 Snap to the nearest visible fixture's source, 2 Skip.
-		int PointLightsMeshless = 1;
+		// (50a) "Lights Without a Visible Flame" (RayTracingPointLights::kMeshless*): 3 Soft (default: a fill light, own position, large
+		// emitter), 0 Own, 2 Skip, 1 Snap (old). Saved as "PointLightsFlameless"; a saved 49m "PointLightsMeshless" Snap migrates once to Soft.
+		int PointLightsMeshless = 3;
 		// (46t) RTAO, outside the settings macro too. Two scales (AODetail): the long ray split at AODetailLength (its far part
 		// counted only where the near part is open) plus near-only rays (AODetailRays near rays per pixel in all, the long ray's near part included), the near visibility filtered at full
 		// resolution and multiplied in with AODetailStrength (AOStrength is then the far / large-scale term's). AONormalGuided: the
@@ -354,7 +356,7 @@ public:
 		bool PointGrazingOffset = true;
 		// PointEdgeRays "Smooth Shadow Edges (extra rays)": slots 0 - 3 whose ray disagrees with a neighbour's trace 3 more rays from sub-pixel
 		// positions and store the lit fraction (kFlagEdgeRays; the denoiser reads the fractional encoding).
-		bool PointEdgeRays = true;
+		bool PointEdgeRays = false;  // (50a) default off: the stair-steps it targeted were the particle grid (Smooth Shadows on Smoke and Water Sheets)
 		// PointSoftCut "Soft Hand-Off for Weak Lights": a light traced just above its cut has its shadow faded in up to 1.5x the cut, so the
 		// edge between traced and untraced pixels of that light is not a hard line (kFlagSoftCut; fractional encoding).
 		bool PointSoftCut = true;
@@ -1133,8 +1135,12 @@ private:
 		// (46x) Source slots with their own emitter radius (bits 0-31, 32-63; direct fills without a window spot), that radius,
 		// (47x) the frame index (Smoother Shadow Edges' tap rotation).
 		std::uint32_t Emitter[4];
+		// (50a) Soft fill lights: per source slot one byte (4 per uint, as Motion) = the fill's emitter radius / kFillEmitterByteUnits
+		// (0 = not a fill: the radius above / Params[0] as before).
+		std::uint32_t FillEmitter[16];
 	};
 	STATIC_ASSERT_ALIGNAS_16(PointDenoiseCB);
+	static_assert(offsetof(PointDenoiseCB, FillEmitter) == 112 && sizeof(PointDenoiseCB) == 176, "PointDenoiseCB must match PointDenoiseCS.hlsl");
 	RayTracingPointLights::Selector pointSelector;
 	std::array<RayTracingPointLights::GpuSource, RayTracingPointLights::kMaxSources> pointSources{};
 	RayTracingRT::PointLightInput pointInput{};

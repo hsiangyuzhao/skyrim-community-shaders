@@ -72,6 +72,9 @@ namespace RayTracingPointLights
 	// (46x) Portal-strict light with rooms: spot[0..2] (uint bits) = its rooms' box, camera-relative, as half floats (lo.x | lo.y << 16,
 	// lo.z | hi.x << 16, hi.y | hi.z << 16): pixels outside it do not rank it (Light Limit Fix does not light them with it).
 	inline constexpr std::uint32_t kSourceRoomBox = 256u;
+	// (50a) A Soft fill light (Lights Without a Visible Flame: Soft), with kSourceEmitter: spot[3] = its emitter radius; the trace
+	// clamps the disc per pixel to kFillDiscFraction x the receiver-light distance (TracePointLightsCS).
+	inline constexpr std::uint32_t kSourceFill = 512u;
 
 	/// (46x) What the selection decided for a light of the 46x classes this frame (Light Census "rtClass" / "rtWhy").
 	enum class Decision : std::uint8_t
@@ -158,7 +161,12 @@ namespace RayTracingPointLights
 		// (46s) Meshless lights near fires (placed LIGH without a mesh, classified a fixture by its name only, not shadow-casting):
 		// MeshlessOwn = a source of its own (46r), MeshlessSnap = its tag goes to the nearest visible fixture's source within
 		// snapDistance (its intensity added, no weight in the centre; none in range: own), MeshlessSkip = no RT source.
-		std::uint32_t meshless = 1;
+		// (50a) MeshlessSoft "Lights Without a Visible Flame: Soft": a FILL light (placed LIGH without a mesh / with a marker, not
+		// shadow-casting, a static world light of a fixture-like category, no fixture mesh within kOwnMeshTolerance; no name test) keeps
+		// its own position as the shadow origin (= its shading position) but casts from a large emitter: radius = the distance to the
+		// nearest visible emitter (the snap search: snapDistance, sticky), snapDistance when none, smoothed over ~0.5 s. Fills merge only
+		// with fills (the group takes the largest radius). Skip uses the same data-only test; Snap (old) keeps the 46s name gate.
+		std::uint32_t meshless = 3;
 		float snapDistance = 320.0f;
 		// (46s) Diagnostics: the sources whose range covers this point (world; the player's chest). Not used when null.
 		const double* reachPoint = nullptr;
@@ -174,7 +182,13 @@ namespace RayTracingPointLights
 		// rooms (or portals) holds the camera takes no source when its rooms' box is off screen; every portal-strict light with
 		// readable rooms is ranked only at pixels inside its rooms' box (kSourceRoomBox). The camera in no known room: nothing changes.
 	};
-	inline constexpr std::uint32_t kMeshlessOwn = 0, kMeshlessSnap = 1, kMeshlessSkip = 2;
+	inline constexpr std::uint32_t kMeshlessOwn = 0, kMeshlessSnap = 1, kMeshlessSkip = 2, kMeshlessSoft = 3;
+	/// (50a) A fixture mesh this close to a meshless light (its reference) makes the light that mesh's own (not a fill): the 46s
+	/// "flame sits above the mesh's origin" allowance.
+	inline constexpr float kOwnMeshTolerance = 64.0f;
+	/// (50a) Fill emitter radius smoothing time constant (seconds) and its encoding for the denoiser (one byte per slot, x this many units).
+	inline constexpr float kFillEmitterSeconds = 0.5f;
+	inline constexpr float kFillEmitterByteUnits = 2.0f;
 
 	/// (46s) A source whose range covers the player this frame (diagnostics).
 	struct Reach
@@ -219,6 +233,14 @@ namespace RayTracingPointLights
 		std::uint32_t snapped = 0;       // (46s) meshless lights tagged to a visible fixture's source
 		std::uint32_t meshlessOwn = 0;   // (46s) meshless lights with a source of their own (Own, or Snap with no fixture in range)
 		std::uint32_t meshlessSkipped = 0;  // (46s) meshless lights left without a source (Skip)
+		// (50a) Lights Without a Visible Flame: candidates the data-only fill test picks (whatever the mode), of which the 46s name gate
+		// did not pick (new) / picked lights the fill test does not (old only); Soft: fill sources with an emitter in range / without.
+		std::uint32_t fillLights = 0;
+		std::uint32_t fillNewVsName = 0;
+		std::uint32_t fillNameOnly = 0;
+		std::uint32_t fillSoftNear = 0;
+		std::uint32_t fillSoftFar = 0;
+		float fillEmitterMax = 0.0f;  // the largest fill emitter radius in use (units)
 		// (46x) Fill lights and negative lights (at the category rule: past the radius / intensity / distance / area rules).
 		std::uint32_t negative = 0;         // negative lights (never traced)
 		std::uint32_t fillAmbient = 0;      // fill lights left untraced
@@ -278,6 +300,8 @@ namespace RayTracingPointLights
 		[[nodiscard]] std::uint16_t DecisionFor(const RE::BSLight* a_light) const;
 		/// (46x) Slots of this frame's sources with their own emitter radius (kSourceEmitter), for the denoiser.
 		[[nodiscard]] std::uint64_t EmitterSlots() const { return emitterSlots_; }
+		/// (50a) Per slot the fill emitter radius / kFillEmitterByteUnits (0 = not a fill source), for the denoiser's penumbra width.
+		[[nodiscard]] const std::array<std::uint8_t, kMaxSources>& FillEmitterBytes() const { return fillEmitter_; }
 
 	private:
 		std::vector<MaskEntry> maskEntries_;
@@ -315,6 +339,11 @@ namespace RayTracingPointLights
 			// (46x) A direct fill's window spot (world position; kept 120 frames while the spot is not in this frame's lights).
 			double aim[3]{};
 			std::uint32_t aimFrame = 0;
+			// (50a) Soft fill: the nearest visible emitter (sticky, as the snap's anchor) and the smoothed emitter radius.
+			const RE::BSLight* fillAnchor = nullptr;
+			std::uint32_t fillAnchorFrame = 0;
+			float fillEmitter = 0.0f;
+			std::uint32_t fillEmitterFrame = 0;  // 0 = none yet
 		};
 		std::unordered_map<const RE::BSLight*, History> history_;
 		// (47w) Merge groups by identity: last frame's centre (the members' unweighted mean, world), representative light (the GPU
@@ -327,8 +356,11 @@ namespace RayTracingPointLights
 			std::uint32_t frame = 0;
 			std::uint32_t owner = 0;
 			std::uint8_t kind = 0;
+			bool fill = false;  // (50a) a Soft fill group (fills merge only with fills)
 		};
 		std::unordered_map<std::uint32_t, GroupMemory> groupMemory_;
+		std::array<std::uint8_t, kMaxSources> fillEmitter_{};  // (50a)
+		std::int64_t lastSelectQpc_ = 0;                        // (50a) the fill radius smoothing's clock
 		std::uint32_t nextGroupId_ = 1;
 		std::vector<Reach> reach_;  // (46s)
 		std::vector<std::pair<const RE::BSLight*, std::uint16_t>> decisions_;  // (46x) sorted by pointer
