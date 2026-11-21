@@ -57,10 +57,14 @@ namespace RayTracingRT
 
 	bool Backend::CreateSkinPipelines()
 	{
+		// (50d) 64-DWORD budget: constants, t0 / t1 / u0.
+		static constexpr RootSignatureBudget kBudget{ 4, 3, 0 };
+		static_assert(kBudget.Dwords() <= kMaxRootSignatureDwords, "the skinning root signature is over 64 DWORDs");
 		D3D12_ROOT_PARAMETER params[4]{};
+		static_assert(std::extent_v<decltype(params)> == kBudget.Parameters());
 		params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 		params[0].Constants.ShaderRegister = 0;
-		params[0].Constants.Num32BitValues = 4;
+		params[0].Constants.Num32BitValues = kBudget.constants;
 		params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
 		params[1].Descriptor.ShaderRegister = 0;
@@ -72,7 +76,7 @@ namespace RayTracingRT
 		params[3].Descriptor.ShaderRegister = 0;
 		params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		D3D12_ROOT_SIGNATURE_DESC rootDesc{};
-		rootDesc.NumParameters = 4;
+		rootDesc.NumParameters = kBudget.Parameters();
 		rootDesc.pParameters = params;
 		ComPtr<ID3DBlob> blob, error;
 		HRESULT hr = D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error);

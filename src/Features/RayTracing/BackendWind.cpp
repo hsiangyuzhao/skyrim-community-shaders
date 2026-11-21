@@ -81,7 +81,11 @@ namespace RayTracingRT
 
 	bool Backend::CreateWindPipeline()
 	{
+		// (50d) 64-DWORD budget: constants, t0 / u0.
+		static constexpr RootSignatureBudget kBudget{ kWindConstants, 2, 0 };
+		static_assert(kBudget.Dwords() <= kMaxRootSignatureDwords, "the wind root signature is over 64 DWORDs");
 		D3D12_ROOT_PARAMETER params[3]{};
+		static_assert(std::extent_v<decltype(params)> == kBudget.Parameters());
 		params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 		params[0].Constants.ShaderRegister = 0;
 		params[0].Constants.Num32BitValues = kWindConstants;
@@ -93,7 +97,7 @@ namespace RayTracingRT
 		params[2].Descriptor.ShaderRegister = 0;
 		params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		D3D12_ROOT_SIGNATURE_DESC rootDesc{};
-		rootDesc.NumParameters = 3;
+		rootDesc.NumParameters = kBudget.Parameters();
 		rootDesc.pParameters = params;
 		ComPtr<ID3DBlob> blob, error;
 		HRESULT hr = D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error);

@@ -319,7 +319,11 @@ namespace RayTracingRT
 		alphaRanges[1].RegisterSpace = 1;
 		alphaRanges[1].OffsetInDescriptorsFromTableStart = 1;
 
+		// (50d) 64-DWORD budget: constants, TLAS t0 / t2 / t3, two tables.
+		static constexpr RootSignatureBudget kBudget{ kRootConstants, 3, 2 };
+		static_assert(kBudget.Dwords() <= kMaxRootSignatureDwords, "the sun trace root signature is over 64 DWORDs");
 		D3D12_ROOT_PARAMETER params[6]{};
+		static_assert(std::extent_v<decltype(params)> == kBudget.Parameters());
 		params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 		params[0].Constants.ShaderRegister = 0;
 		params[0].Constants.Num32BitValues = kRootConstants;
@@ -350,7 +354,7 @@ namespace RayTracingRT
 		sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
 		D3D12_ROOT_SIGNATURE_DESC rootDesc{};
-		rootDesc.NumParameters = 6;
+		rootDesc.NumParameters = kBudget.Parameters();
 		rootDesc.pParameters = params;
 		rootDesc.NumStaticSamplers = 1;
 		rootDesc.pStaticSamplers = &sampler;
@@ -453,6 +457,14 @@ namespace RayTracingRT
 				for (std::uint32_t k = 1; k < 4; ++k)
 					device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynFog + set * 4 + k));
 			}
+			// (50d) The point trace's blue noise (t10, raw buffer; filled once it is loaded, EnsurePointBlueNoise).
+			D3D12_SHADER_RESOURCE_VIEW_DESC nullRaw{};
+			nullRaw.Format = DXGI_FORMAT_R32_TYPELESS;
+			nullRaw.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+			nullRaw.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			nullRaw.Buffer.NumElements = 1;
+			nullRaw.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+			device_->CreateShaderResourceView(nullptr, &nullRaw, StagingCpu(kDynPointBlueNoise));
 		}
 
 		// (45h) Null views in every alpha slot (the copy layers and the bindless table are filled on use).
@@ -529,7 +541,15 @@ namespace RayTracingRT
 		// (47i) + the water views in the same table (water distance t7, water visibility u3; past the RTAO table in the block).
 		// (47z) + last frame's PLIdx (t8) in the same table (past the RTAO normals SRV in the block).
 		// (48a) + the wide slots (u4) and last frame's copy (t9) in the same table (after the 47z SRV in the block).
-		D3D12_DESCRIPTOR_RANGE ranges[7]{};
+		// (50d) + the blue noise (t10, raw buffer) in the same table (the last slot of the block). 50b had it as a root SRV, which made the
+		// signature 66 DWORDs: the driver refused it and point-light shadows switched themselves off.
+		static constexpr RootSignatureBudget kBudget{ sizeof(PointTraceConstants) / 4, 5, 2 };
+		static_assert(kBudget.Dwords() <= kMaxRootSignatureDwords, "the point-light trace root signature is over 64 DWORDs");
+		D3D12_DESCRIPTOR_RANGE ranges[8]{};
+		ranges[7].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+		ranges[7].NumDescriptors = 1;
+		ranges[7].BaseShaderRegister = 10;
+		ranges[7].OffsetInDescriptorsFromTableStart = kDynPointBlueNoise - kDynPoint;
 		ranges[5].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
 		ranges[5].NumDescriptors = 1;
 		ranges[5].BaseShaderRegister = 4;
@@ -568,7 +588,8 @@ namespace RayTracingRT
 		alphaRanges[1].BaseShaderRegister = 0;
 		alphaRanges[1].RegisterSpace = 1;
 		alphaRanges[1].OffsetInDescriptorsFromTableStart = 1;
-		D3D12_ROOT_PARAMETER params[9]{};  // (50b) + 8: the blue noise (t10)
+		D3D12_ROOT_PARAMETER params[8]{};
+		static_assert(std::extent_v<decltype(params)> == kBudget.Parameters());
 		params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 		params[0].Constants.ShaderRegister = 0;
 		params[0].Constants.Num32BitValues = sizeof(PointTraceConstants) / 4;
@@ -577,7 +598,7 @@ namespace RayTracingRT
 		params[1].Descriptor.ShaderRegister = 0;
 		params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-		params[2].DescriptorTable.NumDescriptorRanges = 7;
+		params[2].DescriptorTable.NumDescriptorRanges = static_cast<UINT>(std::extent_v<decltype(ranges)>);
 		params[2].DescriptorTable.pDescriptorRanges = ranges;
 		params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
@@ -596,9 +617,6 @@ namespace RayTracingRT
 		params[7].DescriptorTable.NumDescriptorRanges = 2;
 		params[7].DescriptorTable.pDescriptorRanges = alphaRanges;
 		params[7].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-		params[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;  // (50b) ByteAddressBuffer BlueNoise : register(t10)
-		params[8].Descriptor.ShaderRegister = 10;
-		params[8].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		D3D12_STATIC_SAMPLER_DESC sampler{};
 		sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
 		sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
@@ -606,7 +624,7 @@ namespace RayTracingRT
 		sampler.ShaderRegister = 0;
 		sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		D3D12_ROOT_SIGNATURE_DESC rootDesc{};
-		rootDesc.NumParameters = 9;
+		rootDesc.NumParameters = kBudget.Parameters();
 		rootDesc.pParameters = params;
 		rootDesc.NumStaticSamplers = 1;
 		rootDesc.pStaticSamplers = &sampler;
@@ -960,6 +978,15 @@ namespace RayTracingRT
 		pointBlueNoiseUpload_ = std::move(upload);
 		pointBlueNoiseCopyPending_ = true;
 		pointBlueNoiseRetirePending_ = false;
+		// (50d) Its raw view in the point table (t10). Blocks published from now on reference it; the copy goes out in the next point
+		// list before its trace (RecordPointTrace), and every later list on our queue orders after that one.
+		D3D12_SHADER_RESOURCE_VIEW_DESC rawSrv{};
+		rawSrv.Format = DXGI_FORMAT_R32_TYPELESS;
+		rawSrv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+		rawSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		rawSrv.Buffer.NumElements = static_cast<UINT>(kPointBlueNoiseBytes / 4);
+		rawSrv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+		device_->CreateShaderResourceView(pointBlueNoise_.Get(), &rawSrv, StagingCpu(kDynPointBlueNoise));
 		logger::info("[RayTracing] Point lights: blue noise {}x{}x{} loaded", kSize, kSize, kSlices);
 		return true;
 	}
@@ -1007,7 +1034,7 @@ namespace RayTracingRT
 		a_list->SetComputeRootUnorderedAccessView(4, pointCounter_->GetGPUVirtualAddress());
 		// (50b) Blue-Noise Sampling: the upload buffer of a copy recorded in an earlier list goes now (this list orders after it on our
 		// queue); a pending copy goes out first in this list (the buffer is promoted from COMMON to COPY_DEST, then made a shader resource).
-		// t10 is always bound (the sources' buffer when there is no blue noise: the shader reads t10 only with kFlagBlueNoise).
+		// (50d) t10 is in the point table (a null raw view until the buffer exists; the shader reads t10 only with kFlagBlueNoise).
 		if (pointBlueNoiseRetirePending_) {
 			if (pointBlueNoiseUpload_)
 				Retire(pointBlueNoiseUpload_, 0, nullptr);
@@ -1021,7 +1048,6 @@ namespace RayTracingRT
 			pointBlueNoiseCopyPending_ = false;
 			pointBlueNoiseRetirePending_ = true;
 		}
-		a_list->SetComputeRootShaderResourceView(8, (pointBlueNoise_ && !pointBlueNoiseCopyPending_ ? pointBlueNoise_ : a_context.pointBuffer)->GetGPUVirtualAddress());
 		if (alpha) {
 			a_list->SetComputeRootShaderResourceView(5, a_context.alphaInfoBuffer->GetGPUVirtualAddress());
 			a_list->SetComputeRootShaderResourceView(6, alphaUv_->GetGPUVirtualAddress());
@@ -1151,7 +1177,11 @@ namespace RayTracingRT
 		alphaRanges[1].BaseShaderRegister = 0;
 		alphaRanges[1].RegisterSpace = 1;
 		alphaRanges[1].OffsetInDescriptorsFromTableStart = 1;
+		// (50d) 64-DWORD budget: constants, TLAS t0 / u1 / t2 / t3, two tables.
+		static constexpr RootSignatureBudget kBudget{ sizeof(AOTraceConstants) / 4, 4, 2 };
+		static_assert(kBudget.Dwords() <= kMaxRootSignatureDwords, "the RTAO trace root signature is over 64 DWORDs");
 		D3D12_ROOT_PARAMETER params[7]{};
+		static_assert(std::extent_v<decltype(params)> == kBudget.Parameters());
 		params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 		params[0].Constants.ShaderRegister = 0;
 		params[0].Constants.Num32BitValues = sizeof(AOTraceConstants) / 4;
@@ -1183,7 +1213,7 @@ namespace RayTracingRT
 		sampler.ShaderRegister = 0;
 		sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		D3D12_ROOT_SIGNATURE_DESC rootDesc{};
-		rootDesc.NumParameters = 7;
+		rootDesc.NumParameters = kBudget.Parameters();
 		rootDesc.pParameters = params;
 		rootDesc.NumStaticSamplers = 1;
 		rootDesc.pStaticSamplers = &sampler;
@@ -1548,7 +1578,11 @@ namespace RayTracingRT
 		alphaRanges[1].BaseShaderRegister = 0;
 		alphaRanges[1].RegisterSpace = 1;
 		alphaRanges[1].OffsetInDescriptorsFromTableStart = 1;
+		// (50d) 64-DWORD budget: constants, TLAS t0 / u1 / t2 / t3 / t6 / t7, two tables.
+		static constexpr RootSignatureBudget kBudget{ sizeof(ReflectTraceConstants) / 4, 6, 2 };
+		static_assert(kBudget.Dwords() <= kMaxRootSignatureDwords, "the reflection trace root signature is over 64 DWORDs");
 		D3D12_ROOT_PARAMETER params[9]{};
+		static_assert(std::extent_v<decltype(params)> == kBudget.Parameters());
 		params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 		params[0].Constants.ShaderRegister = 0;
 		params[0].Constants.Num32BitValues = sizeof(ReflectTraceConstants) / 4;
@@ -1586,7 +1620,7 @@ namespace RayTracingRT
 		sampler.ShaderRegister = 0;
 		sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		D3D12_ROOT_SIGNATURE_DESC rootDesc{};
-		rootDesc.NumParameters = 9;
+		rootDesc.NumParameters = kBudget.Parameters();
 		rootDesc.pParameters = params;
 		rootDesc.NumStaticSamplers = 1;
 		rootDesc.pStaticSamplers = &sampler;
@@ -1918,7 +1952,11 @@ namespace RayTracingRT
 		alphaRanges[1].BaseShaderRegister = 0;
 		alphaRanges[1].RegisterSpace = 1;
 		alphaRanges[1].OffsetInDescriptorsFromTableStart = 1;
+		// (50d) 64-DWORD budget: constants, TLAS t0 / t1 / t2 / t3, two tables.
+		static constexpr RootSignatureBudget kBudget{ sizeof(FogTraceConstants) / 4, 4, 2 };
+		static_assert(kBudget.Dwords() <= kMaxRootSignatureDwords, "the RT fog root signature is over 64 DWORDs");
 		D3D12_ROOT_PARAMETER params[7]{};
+		static_assert(std::extent_v<decltype(params)> == kBudget.Parameters());
 		params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 		params[0].Constants.ShaderRegister = 0;
 		params[0].Constants.Num32BitValues = sizeof(FogTraceConstants) / 4;
@@ -1950,7 +1988,7 @@ namespace RayTracingRT
 		sampler.ShaderRegister = 0;
 		sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		D3D12_ROOT_SIGNATURE_DESC rootDesc{};
-		rootDesc.NumParameters = 7;
+		rootDesc.NumParameters = kBudget.Parameters();
 		rootDesc.pParameters = params;
 		rootDesc.NumStaticSamplers = 1;
 		rootDesc.pStaticSamplers = &sampler;

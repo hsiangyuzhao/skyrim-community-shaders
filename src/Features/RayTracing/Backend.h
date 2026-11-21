@@ -42,6 +42,19 @@ namespace RayTracingRT
 {
 	using Microsoft::WRL::ComPtr;
 
+	/// (50d) The D3D12 root signature budget (64 DWORDs: root constants = their count, root descriptor = 2, descriptor table = 1).
+	/// Every root signature of the backend states its layout here and static_asserts it fits, and that its parameter array has
+	/// exactly that many entries (50b broke the point trace by adding a root SRV to a signature already at 64).
+	struct RootSignatureBudget
+	{
+		std::uint32_t constants;    // 32-bit root constants (one parameter when non-zero)
+		std::uint32_t descriptors;  // root SRV / UAV / CBV
+		std::uint32_t tables;       // descriptor tables
+		[[nodiscard]] constexpr std::uint32_t Dwords() const { return constants + 2u * descriptors + tables; }
+		[[nodiscard]] constexpr std::uint32_t Parameters() const { return (constants ? 1u : 0u) + descriptors + tables; }
+	};
+	inline constexpr std::uint32_t kMaxRootSignatureDwords = 64;
+
 	/// Triangles of one BLAS, positions relative to the owner's origin (a cell corner).
 	struct ChunkGeometry
 	{
@@ -2007,7 +2020,7 @@ namespace RayTracingRT
 		// (47n) The 47l RTAO blue noise SRV (slot 11) is gone.
 		// (47z) + last frame's PLIdx SRV (point table offset 9, t8).
 		static constexpr std::uint32_t kDynSun = 0, kDynPoint = 2, kDynAO = 6, kDynWater = 8, kDynAONormal = 10, kDynPointPrev = 11, kDynPointWide = 12, kDynPointWidePrev = 13,
-		                               kDynReflect = 14, kDynAOBent = 20, kDynFog = 21, kDynamicDescriptors = 29;  // (49b) + the fog tables (2 sets x depth SRV t5, sun UAV u0, light vis UAV u1, light id UAV u2). (49a) + the RTAO bent normal UAV (RTAO table offset 14, u2). (48f) + the surface record UAVs u3 / u4 (reflection table offsets 4, 5). (47j) + the RTAO smooth normals SRV (RTAO table offset 4); (48a) + the wide slots UAV / prev SRV (point table offsets 10, 11) and the reflection table (depth SRV t1, output UAV u0, prep SRV t5; (48d) + direction UAV u2)
+		                               kDynReflect = 14, kDynAOBent = 20, kDynFog = 21, kDynPointBlueNoise = 29, kDynamicDescriptors = 30;  // (50d) + the point trace's blue noise raw SRV (point table offset 27, t10; was a root SRV in 50b, over the 64-DWORD limit). (49b) + the fog tables (2 sets x depth SRV t5, sun UAV u0, light vis UAV u1, light id UAV u2). (49a) + the RTAO bent normal UAV (RTAO table offset 14, u2). (48f) + the surface record UAVs u3 / u4 (reflection table offsets 4, 5). (47j) + the RTAO smooth normals SRV (RTAO table offset 4); (48a) + the wide slots UAV / prev SRV (point table offsets 10, 11) and the reflection table (depth SRV t1, output UAV u0, prep SRV t5; (48d) + direction UAV u2)
 		static constexpr std::uint32_t kDynamicBase = kPointDescriptorBase + kPointDescriptors;  // after the (unused) 46b point slots
 		ComPtr<ID3D12DescriptorHeap> stagingHeap_;
 		[[nodiscard]] D3D12_CPU_DESCRIPTOR_HANDLE StagingCpu(std::uint32_t a_slot) const;
