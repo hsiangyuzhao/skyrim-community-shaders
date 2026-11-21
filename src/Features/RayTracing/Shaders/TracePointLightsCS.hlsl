@@ -14,7 +14,7 @@
 // Outputs (R8G8B8A8_UNORM, shared with D3D11), per slot s = 0..3 (slots past K are empty; (48c) unless Extra Lights Where Crowded
 // traced a rank there, kFlagExtra):
 //   PLVis[s]: 1 = lit; < 1 = blocked, the value is sqrt(blocker distance / light distance) * 254/255
-//             (the denoiser's penumbra width); (49m) with kFlagEdgeRays / kFlagSoftCut the fractional encoding (see kFlagSoftCut);
+//             (the denoiser's penumbra width); (49m) with kFlagSoftCut the fractional encoding (see kFlagSoftCut);
 //   PLIdx[s]: byte = source slot + 1 (0 = empty slot), bit 7 of byte s = bit s of the pixel's candidate
 //             count (0..15, the debug view). (46y) The count has 3 bits (bytes 0-2, 0..7); bit 7 of byte 3 = the visible
 //             surface is a ray-traced caster (kFlagRtSurface; Screen-Space Shadows for Non-RT Casters, SSPLS.hlsli).
@@ -155,20 +155,12 @@ static const float kDarkMarginMax = 0.35;
 // N.L 0.3 - 0.5). Off: exactly 49j.
 static const uint kFlagGrazeOffset = 2097152u;
 static const float kGrazeStart = 0.5;
-// (49m) "Smooth Shadow Edges (extra rays)": slots 0 - 3 whose main ray disagrees with a neighbour's ray to the same light (8 neighbours in the
-// same wave: no group barrier, WaveReadLaneAt with the neighbour's lane checked) trace kEdgeExtraRays more rays from sub-pixel positions on
-// the pixel's plane (kEdgeOffsets, in pixels) with their own disc samples; the slot stores the lit fraction (kFlagFractional encoding).
-static const uint kFlagEdgeRays = 4194304u;
-static const uint kEdgeExtraRays = 3u;
-// Only on sharp edges: the penumbra width (2 emitter q / (1 - q), q = the nearest blocker's distance ratio seen at the edge, self or
-// neighbours) at most kEdgeHardWidth x the trace's footprint (dist x 2 / height, about 1.7 pixels at the game's field of view); wider
-// penumbras are the denoiser's (its Stable Penumbra filter), and 1-ray noise there would make nearly every pixel an "edge".
-static const float kEdgeHardWidth = 3.0;
+// (50b) 4194304u was (49m) "Smooth Shadow Edges (extra rays)" (3 more rays from sub-pixel positions at sharp edges): deleted.
 // (49m) "Soft Hand-Off for Weak Lights": a light traced only just above its cut (the share cut / absolute minimum / sun gate, or the 7 % of an
 // extra rank) has its shadow faded in: full only from kSoftCutRange x that cut up; at the cut it is lit, as on the untraced side next to it.
 static const uint kFlagSoftCut = 8388608u;
 static const float kSoftCutRange = 1.5;
-// (49m) Encoding with kFlagEdgeRays or kFlagSoftCut (PointDenoiseCS kPLFlagFractional): 255 = lit; 128..254 = partly lit, (b - 128) / 126 the
+// (49m) Encoding with kFlagSoftCut (PointDenoiseCS kPLFlagFractional): 255 = lit; 128..254 = partly lit, (b - 128) / 126 the
 // lit fraction (no blocker distance); 0..127 = blocked, b / 127 = sqrt(blocker distance / light distance). Without them: as before.
 static const uint kTracedPixelWord = 3u;     // (48c) RayCounter words (kFlagExtra only): [3] pixels with a traced light,
 static const uint kExtraPixelWord = 4u;      //   [4] of which with at least one extra rank traced,
@@ -942,7 +934,7 @@ groupshared uint gsMask[2];
 	// (48a) Six slots (4 - 5 only with K > 4: otherwise bestIdx is 0 there and the slot is skipped at once).
 	float visA[6] = { 1.0, 1.0, 1.0, 1.0, 1.0, 1.0 };
 	uint idxA[6] = { 0u, 0u, 0u, 0u, 0u, 0u };
-	// (49m) Kept small (registers): per slot 3 bits of blocked rays (bits 3s..3s+2), bit 24 + s = slot s took the edge rays; the Soft Hand-Off
+	// (49m) Kept small (registers): per slot 3 bits of blocked rays (bits 3s..3s+2), the Soft Hand-Off
 	// fade-in per slot in 8 bits (255 = full shadow; slots 0 - 3 / 4 - 5). The first blocked ray's distance ratio is in visA (49j encoding).
 	uint hitBits = 0u;
 	uint fadeLo = 0xFFFFFFFFu, fadeHi = 0xFFFFu;
@@ -1006,121 +998,17 @@ groupshared uint gsMask[2];
 				RayCounter.InterlockedAdd((word + 1u) * 4u, 1u, previousBeam);
 		}
 	}
-	// (49m) Smooth Shadow Edges (extra rays): slots 0 - 3 whose ray disagrees with a neighbour's ray to the same light. The neighbours come from
-	// the same wave (rows of this 8x8 group; no group barrier: lanes left above are not active), each lane's index checked against the
-	// neighbour's own group index, so a different lane layout only means fewer neighbours, never wrong ones.
-	[branch] if (flags & kFlagEdgeRays)
-	{
-		uint packed = 0u;   // per slot: source + 1 (7 bits), bit 7 = the main ray was lit
-		uint packedQ = 0u;  // per slot: the blocked main ray's sqrt(blocker / light distance) x 254 (255 = lit)
-		[unroll] for (uint ps = 0u; ps < 4u; ++ps)
-		{
-			const bool hit = ((hitBits >> (3u * ps)) & 7u) != 0u;
-			packed |= ((idxA[ps] & 0x7Fu) | (hit ? 0u : 0x80u)) << (8u * ps);
-			packedQ |= (hit ? uint(round(saturate(visA[ps] * (255.0 / 254.0)) * 254.0)) : 255u) << (8u * ps);
-		}
-		const uint lane = WaveGetLaneIndex();
-		const int laneCount = int(WaveGetLaneCount());
-		const uint4 activeLanes = WaveActiveBallot(true);
-		const int2 gt = int2(dtid.xy & 7u);
-		uint edgeSlots = 0u;
-		uint edgeQ = packedQ;  // per slot: the nearest blocker seen at the edge (self or the disagreeing neighbours), x 254
-		[unroll] for (int nb = 0; nb < 9; ++nb)
-		{
-			const int2 o = int2(nb % 3 - 1, nb / 3 - 1);
-			const int delta = o.x + o.y * 8;
-			const int want = int(lane) + delta;
-			const uint L = uint(clamp(want, 0, laneCount - 1));
-			const uint theirPacked = WaveReadLaneAt(packed, L);
-			const uint theirQ = WaveReadLaneAt(packedQ, L);
-			const uint theirIndex = WaveReadLaneAt(gi, L);
-			const int2 gn = gt + o;
-			const bool ok = nb != 4 && all(gn >= 0) && all(gn < 8) && want == int(L) && ((activeLanes[L >> 5u] >> (L & 31u)) & 1u) != 0u &&
-			                theirIndex == uint(int(gi) + delta);
-			[unroll] for (uint es = 0u; es < 4u; ++es)
-			{
-				const uint mine = (packed >> (8u * es)) & 0xFFu;
-				[unroll] for (uint et = 0u; et < 4u; ++et)
-				{
-					const uint theirs = (theirPacked >> (8u * et)) & 0xFFu;
-					if (ok && (mine & 0x7Fu) != 0u && (theirs & 0x7Fu) == (mine & 0x7Fu) && theirs != mine) {
-						edgeSlots |= 1u << es;
-						const uint tq = (theirQ >> (8u * et)) & 0xFFu;
-						const uint cq = (edgeQ >> (8u * es)) & 0xFFu;
-						if (tq < cq)
-							edgeQ = (edgeQ & ~(0xFFu << (8u * es))) | (tq << (8u * es));
-					}
-				}
-			}
-		}
-		[branch] if (edgeSlots != 0u)
-		{
-			// Sub-pixel positions on the pixel's plane (the 1-pixel steps of the depth normal; none across a depth jump).
-			const float stepLimit = 8.0 * dist * 2.0 * C.RenderSize.w;
-			const float3 sx = length(dx) <= stepLimit ? dx : float3(0.0, 0.0, 0.0);
-			const float3 sy = length(dy) <= stepLimit ? dy : float3(0.0, 0.0, 0.0);
-			const float hardWidth = kEdgeHardWidth * dist * 2.0 * C.RenderSize.w;
-			// One copy of the ray code for all four slots (a loop, the slot's values picked by index).
-			[loop] for (uint rs = 0u; rs < 4u; ++rs)
-			{
-				[branch] if (edgeSlots & (1u << rs))
-				{
-					const uint id = rs == 0u ? idxA[0] : (rs == 1u ? idxA[1] : (rs == 2u ? idxA[2] : idxA[3]));
-					const PLSource src = Sources[id - 1u];
-					const SlotGeom g = MakeSlotGeom(src, P, N, NRank, bias, flags);
-					// Only sharp edges: a penumbra (the denoiser's width formula, from the nearest blocker seen here) wider than
-					// kEdgeHardWidth x the footprint is left to the denoiser's wide filter.
-					const float ratio = float((edgeQ >> (8u * rs)) & 0xFFu) / 254.0;
-					const float q = saturate(ratio * ratio);
-					const float width = g.softBeam ? q * kBeamBlockerRange * 2.0 * C.Bounds.w : 2.0 * g.emitter * q / max(1.0 - q, 0.05);
-					[branch] if (width <= hardWidth)
-					{
-						// The main ray's disc sample, as above.
-						float2 u0 = float2(frac(n0 + float(rs) * 0.7548776662), frac(n1 + float(rs) * 0.5698402910));
-						[branch] if ((beamSmooth && g.softBeam) || noiseDecorrelate)
-						{
-							u0 = BeamSample(float2(p), uint(C.Params.y), rs);
-						}
-						uint hits = (hitBits >> (3u * rs)) & 7u;
-						float firstRatio = -1.0;  // a blocked edge ray's distance ratio, for a slot whose main ray was lit
-						[loop] for (uint e = 0u; e < kEdgeExtraRays; ++e)
-						{
-							const float2 o = e == 0u ? float2(-0.375, -0.125) : (e == 1u ? float2(0.375, 0.125) : float2(-0.125, 0.375));
-							const float3 Ps = P + sx * o.x + sy * o.y;
-							const float2 u = frac(u0 + float(e + 1u) * float2(0.6180339887, 0.3819660113));
-							float tHit, len;
-							bool skip;
-							const bool blocked = SlotRay(src, g, Ps + N * g.offset, u, P, V, N, dist, flags, characters, beamSmooth, darkSide, darkN,
-								darkLimit, rtSurface, darkProbed, darkTraced, rays, tHit, len, skip);
-							if (blocked) {
-								hits += 1u;
-								if (firstRatio < 0.0)
-									firstRatio = min(sqrt(saturate(tHit / (g.softBeam ? kBeamBlockerRange : max(len, 1.0)))), 1.0);
-							}
-						}
-						hitBits = (hitBits & ~(7u << (3u * rs))) | (hits << (3u * rs)) | (1u << (24u + rs));
-						[unroll] for (uint ws = 0u; ws < 4u; ++ws)
-						{
-							if (ws == rs && visA[ws] >= 1.0 && firstRatio >= 0.0)
-								visA[ws] = firstRatio * (254.0 / 255.0);
-						}
-					}
-				}
-			}
-		}
-	}
-	// (49m) The fractional encoding (kFlagEdgeRays / kFlagSoftCut; PointDenoiseCS kPLFlagFractional): lit 255, partly lit 128..254, blocked
+	// (49m) The fractional encoding (kFlagSoftCut; PointDenoiseCS kPLFlagFractional): lit 255, partly lit 128..254, blocked
 	// 0..127 (sqrt of the distance ratio x 127).
-	[branch] if (flags & (kFlagEdgeRays | kFlagSoftCut))
+	[branch] if (softCut)
 	{
 		[unroll] for (uint fs = 0u; fs < 6u; ++fs)
 		{
 			if (idxA[fs] == 0u)
 				continue;
 			const uint hits = (hitBits >> (3u * fs)) & 7u;
-			const float traced = (fs < 4u && ((hitBits >> (24u + fs)) & 1u) != 0u) ? float(1u + kEdgeExtraRays) : 1.0;
 			const float fade = float(fs < 4u ? (fadeLo >> (8u * fs)) & 0xFFu : (fadeHi >> (8u * (fs - 4u))) & 0xFFu) / 255.0;
-			const float shadow = float(hits) / traced * fade;
+			const float shadow = float(hits) * fade;  // hits is 0 or 1 (one ray per slot)
 			if (shadow <= 0.0)
 				visA[fs] = 1.0;
 			else if (shadow >= 1.0)

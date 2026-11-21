@@ -55,7 +55,6 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	PointLightsMaxSources,
 	PointLightsDistance,
 	PointLightsSize,
-	PointLightsClearance,
 	PointLightsInteriors,
 	PointLightsPerPixelInterior,
 	PointLightsWindowBeams,
@@ -66,7 +65,6 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	AOMode,
 	AORayLength,
 	AOStrength,
-	AOTemporal,
 	AODistance,
 	AOInteriors,
 	AOModeInterior,
@@ -331,9 +329,9 @@ namespace
 	// Dark Side (a ray from a traced surface whose smoothed normal faces away from the light is blocked). PointDenoiseCS (PL_FIX variant):
 	// Decorrelated Sampling (taps rotated by a hash), Stable Penumbra (the beam path for every point slot), Close Blockers: Minimum Blur.
 	constexpr std::uint32_t kPointFlagNoiseDecorrelate = 262144u, kPointFlagNoiseDarkSide = 524288u;
-	// (49m) TracePointLightsCS: Dark Side Test Tolerant, Grazing-Angle Offset, Smooth Shadow Edges (extra rays), Soft Hand-Off for Weak Lights.
-	constexpr std::uint32_t kPointFlagDarkTolerant = 1048576u, kPointFlagGrazeOffset = 2097152u, kPointFlagEdgeRays = 4194304u,
-							kPointFlagSoftCut = 8388608u;
+	// (49m) TracePointLightsCS: Dark Side Test Tolerant, Grazing-Angle Offset, Soft Hand-Off for Weak Lights
+	// ((50b) 4194304u was Smooth Shadow Edges (extra rays), deleted with its trace loop).
+	constexpr std::uint32_t kPointFlagDarkTolerant = 1048576u, kPointFlagGrazeOffset = 2097152u, kPointFlagSoftCut = 8388608u;
 	// (49m) PointDenoiseCS: the trace wrote the fractional encoding (kFlagEdgeRays / kFlagSoftCut).
 	constexpr std::uint32_t kPointDenoiseFractional = 65536u;
 	constexpr std::uint32_t kPointDenoiseNoiseDecorrelate = 256u, kPointDenoiseNoiseStable = 512u, kPointDenoiseNoiseCloseBlur = 1024u;
@@ -2030,7 +2028,6 @@ void RayTracing::LoadSettings(json& o_json)
 		};
 		settings.CellEventMs = read("CellEventMs", defaults.CellEventMs);
 		settings.PointLightsBeamSoftness = read("PointLightsBeamSoftness", defaults.PointLightsBeamSoftness);  // (46o)
-		settings.CarrierClearance = std::clamp(read("CarrierClearance", defaults.CarrierClearance), 0.0f, 64.0f);
 		// (50a) "Lights Without a Visible Flame": the new key; without it the 46s key, whose Snap (the old default, known to shatter the
 		// shadows on characters) migrates once to Soft.
 		if (o_json.contains("PointLightsFlameless")) {
@@ -2049,7 +2046,6 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.AOFullResFilter = read("AOFullResFilter", defaults.AOFullResFilter);
 		settings.AOAlphaBudget = read("AOAlphaBudget", defaults.AOAlphaBudget);
 		// (46y)
-		settings.PointLightsSSPLSContact = read("PointLightsSSPLSContact", defaults.PointLightsSSPLSContact);
 		// (47q) AOBroadRate; saved before 47q: from AOHalfResFar (half or every pixel).
 		settings.AOBroadRate = read("AOBroadRate", read("AOHalfResFar", false) ? 1 : 0);
 		// (47h) (47o) Sun Shadow: Depth Check for Translucent Surfaces, Point Light Shadows on Water and (46y) Screen-Space Shadows for
@@ -2064,9 +2060,6 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.ParticlesRTShadows = read("ParticlesRTShadows", defaults.ParticlesRTShadows);  // (49b)
 		settings.ParticlesSmoothSheets = read("ParticlesSmoothSheets", defaults.ParticlesSmoothSheets);  // (50a)
 		settings.LoadFinish = read("LoadFinish", defaults.LoadFinish);  // (49c) (49b Hitch* keys: no longer read)
-		settings.LoadPrepareArrival = read("LoadPrepareArrival", defaults.LoadPrepareArrival);
-		settings.LoadThreadCopies = read("LoadThreadCopies", defaults.LoadThreadCopies);
-		settings.ReserveUpFront = read("ReserveUpFront", defaults.ReserveUpFront);
 		settings.PointQuality = read("PointQuality", -1);
 		settings.AOQuality = read("AOQuality", -1);
 		// (47q) The sun's size left the tiers. Saved before 47q (no key): the cone the tier in effect had -- High / Ultra 0.5, Very Low -
@@ -2094,16 +2087,6 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.ReflectionsHitDistance = read("ReflectionsHitDistance", defaults.ReflectionsHitDistance);
 		settings.ReflectionsLoadingPrep = read("ReflectionsLoadingPrep", defaults.ReflectionsLoadingPrep);  // (48e)
 		settings.ReflectionsCubemapWarmUp = read("ReflectionsCubemapWarmUp", defaults.ReflectionsCubemapWarmUp);
-		settings.PointCloseContact = read("PointCloseContact", defaults.PointCloseContact);  // (49h)
-		settings.PointSmoothHardEdges = read("PointSmoothHardEdges", defaults.PointSmoothHardEdges);  // (49i)
-		settings.PointSteadyEdges = read("PointSteadyEdges", defaults.PointSteadyEdges);              // (49i)
-		settings.PointDarkSideTest = std::clamp(read("PointDarkSideTest", defaults.PointDarkSideTest), 0, 2);  // (49m)
-		settings.PointGrazingOffset = read("PointGrazingOffset", defaults.PointGrazingOffset);
-		settings.PointEdgeRays = read("PointEdgeRays", defaults.PointEdgeRays);
-		settings.PointSoftCut = read("PointSoftCut", defaults.PointSoftCut);
-		settings.CharRefreshShapes = read("CharRefreshShapes", defaults.CharRefreshShapes);
-		settings.HairFaintStrands = read("HairFaintStrands", defaults.HairFaintStrands);    // (49h)
-		settings.AOContactOnce = read("AOContactOnce", defaults.AOContactOnce);  // (49h)
 		settings.ReflectionsMaterials = read("ReflectionsMaterials", defaults.ReflectionsMaterials);  // (48f)
 		settings.ReflectionsOffscreenColor = std::clamp(read("ReflectionsOffscreenColor", defaults.ReflectionsOffscreenColor), 0, 1);  // (48g)
 		settings.ReflectionsOffscreenBrightness = std::clamp(read("ReflectionsOffscreenBrightness", defaults.ReflectionsOffscreenBrightness), 0.25f, 4.0f);
@@ -2192,13 +2175,18 @@ void RayTracing::LoadSettings(json& o_json)
 	settings.CustomFarDenoiseScale = std::isfinite(settings.CustomFarDenoiseScale) ? std::clamp(settings.CustomFarDenoiseScale, 0.0f, 1.0f) : 0.75f;
 	settings.SigmaStabilizedFrames = std::clamp(settings.SigmaStabilizedFrames, 0, 5);
 	settings.Foliage = std::clamp(settings.Foliage, 0, 2);
+	// (50b) Trees and Foliage are one "Trees and Plants" choice: leaves traced without their trunks is no longer offered. Such a saved pair
+	// (not the defaults, Trees false with Foliage 0) loads with the trunks traced as well (one log line); every other pair is a choice.
+	if (!settings.Trees && settings.Foliage != 0) {
+		settings.Trees = true;
+		logger::info("[RayTracing] Trees and Plants (50b): leaves were traced without their trunks; the trunks are traced too now");
+	}
 	settings.RtContactScale = std::isfinite(settings.RtContactScale) ? std::clamp(settings.RtContactScale, 0.0f, 32.0f) : 8.0f;
 	// (46b)
 	settings.PointLightsPerPixel = ValidPointK(settings.PointLightsPerPixel);
 	settings.PointLightsMaxSources = std::clamp(settings.PointLightsMaxSources, 8, static_cast<int>(RayTracingPointLights::kMaxSources));
 	settings.PointLightsDistance = std::isfinite(settings.PointLightsDistance) ? std::clamp(settings.PointLightsDistance, 512.0f, 8192.0f) : 4000.0f;
 	settings.PointLightsSize = std::isfinite(settings.PointLightsSize) ? std::clamp(settings.PointLightsSize, 0.0f, 32.0f) : 6.0f;
-	settings.PointLightsClearance = std::isfinite(settings.PointLightsClearance) ? std::clamp(settings.PointLightsClearance, 0.0f, 128.0f) : 32.0f;
 	// (46f)
 	settings.AOMode = std::clamp(settings.AOMode, 0, static_cast<int>(AOModeKind::Count) - 1);
 	settings.AORayLength = std::isfinite(settings.AORayLength) ? std::clamp(settings.AORayLength, kAORayLengthMin, kAORayLengthMax) : 100.0f;
@@ -2210,7 +2198,6 @@ void RayTracing::LoadSettings(json& o_json)
 	settings.AODetailLength = std::isfinite(settings.AODetailLength) ? std::clamp(settings.AODetailLength, kAODetailLengthMin, kAODetailLengthMax) : 20.0f;
 	settings.AODetailRays = std::clamp(settings.AODetailRays, 1, kAODetailRaysMax);
 	settings.AOAlphaBudget = std::clamp(settings.AOAlphaBudget, 0, 2);
-	settings.PointLightsSSPLSContact = std::isfinite(settings.PointLightsSSPLSContact) ? std::clamp(settings.PointLightsSSPLSContact, 0.0f, 31.875f) : 8.0f;  // (46y)
 	// (46k)
 	settings.LoadingPumpMs = std::isfinite(settings.LoadingPumpMs) ? std::clamp(settings.LoadingPumpMs, 2.0f, 32.0f) : 8.0f;
 	settings.BlackWindowMs = std::isfinite(settings.BlackWindowMs) ? std::clamp(settings.BlackWindowMs, 0.0f, 2000.0f) : 200.0f;
@@ -2254,7 +2241,6 @@ void RayTracing::SaveSettings(json& o_json)
 	// (46n) Outside the macro (it takes at most 64 members).
 	o_json["CellEventMs"] = settings.CellEventMs;
 	o_json["PointLightsBeamSoftness"] = settings.PointLightsBeamSoftness;  // (46o)
-	o_json["CarrierClearance"] = settings.CarrierClearance;
 	o_json["PointLightsFlameless"] = settings.PointLightsMeshless;  // (50a)
 	// (50a) The 46s key for a package before 50a (Soft has no value there: Snap, its old default).
 	o_json["PointLightsMeshless"] = settings.PointLightsMeshless == static_cast<int>(RayTracingPointLights::kMeshlessSoft) ?
@@ -2265,7 +2251,6 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["AODetailRays"] = settings.AODetailRays;
 	o_json["AOFullResFilter"] = settings.AOFullResFilter;
 	o_json["AOAlphaBudget"] = settings.AOAlphaBudget;
-	o_json["PointLightsSSPLSContact"] = settings.PointLightsSSPLSContact;
 	o_json["AOBroadRate"] = settings.AOBroadRate;  // (47q) replaces AOHalfResFar
 	o_json["SunSize"] = settings.SunSize;          // (47q)
 	o_json["CustomNpcFullDistance"] = settings.CustomNpcFullDistance;
@@ -2282,16 +2267,6 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["ReflectionsHitDistance"] = settings.ReflectionsHitDistance;
 	o_json["ReflectionsLoadingPrep"] = settings.ReflectionsLoadingPrep;  // (48e)
 	o_json["ReflectionsCubemapWarmUp"] = settings.ReflectionsCubemapWarmUp;
-	o_json["PointCloseContact"] = settings.PointCloseContact;  // (49h)
-	o_json["PointSmoothHardEdges"] = settings.PointSmoothHardEdges;  // (49i)
-	o_json["PointSteadyEdges"] = settings.PointSteadyEdges;          // (49i)
-	o_json["PointDarkSideTest"] = settings.PointDarkSideTest;        // (49m)
-	o_json["PointGrazingOffset"] = settings.PointGrazingOffset;
-	o_json["PointEdgeRays"] = settings.PointEdgeRays;
-	o_json["PointSoftCut"] = settings.PointSoftCut;
-	o_json["CharRefreshShapes"] = settings.CharRefreshShapes;
-	o_json["HairFaintStrands"] = settings.HairFaintStrands;    // (49h)
-	o_json["AOContactOnce"] = settings.AOContactOnce;  // (49h)
 	o_json["ReflectionsMaterials"] = settings.ReflectionsMaterials;  // (48f)
 	o_json["ReflectionsOffscreenColor"] = settings.ReflectionsOffscreenColor;  // (48g)
 	o_json["ReflectionsOffscreenBrightness"] = settings.ReflectionsOffscreenBrightness;
@@ -2319,9 +2294,6 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["ParticlesRTShadows"] = settings.ParticlesRTShadows;  // (49b)
 	o_json["ParticlesSmoothSheets"] = settings.ParticlesSmoothSheets;  // (50a)
 	o_json["LoadFinish"] = settings.LoadFinish;  // (49c)
-	o_json["LoadPrepareArrival"] = settings.LoadPrepareArrival;
-	o_json["LoadThreadCopies"] = settings.LoadThreadCopies;
-	o_json["ReserveUpFront"] = settings.ReserveUpFront;
 }
 
 void RayTracing::RestoreDefaultSettings()
@@ -5755,22 +5727,20 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	pointInput.coverageCount = 0;
 	// (48o) Always on: (47x) Trace Lights on Curved Surfaces Reliably; (47z) Window Beams: Respect Their Range; (48a) Window Beams: Smooth
 	// Edges; (48k) Noise Fix: Decorrelated Sampling, Consistent Dark Side. (49h) Close-Contact Shadows on Characters: a switch again (default on).
-	if (settings.PointCloseContact)
+	if constexpr (Settings::PointCloseContact)
 		flags |= kPointFlagCloseContact;
 	flags |= kPointFlagCurvedRanking | kPointFlagBeamRange | kPointFlagBeamSmooth | kPointFlagNoiseDecorrelate;
 	// (49m) Dark Side Test (0 Off / 1 Original = 48k-49j / 2 Tolerant), Grazing-Angle Offset, Smooth Shadow Edges (extra rays), Soft Hand-Off
 	// for Weak Lights. The last two switch the trace to the fractional encoding, which the denoiser of this frame must read too.
-	if (settings.PointDarkSideTest >= 1)
+	if constexpr (Settings::PointDarkSideTest >= 1)
 		flags |= kPointFlagNoiseDarkSide;
-	if (settings.PointDarkSideTest >= 2)
+	if constexpr (Settings::PointDarkSideTest >= 2)
 		flags |= kPointFlagDarkTolerant;
-	if (settings.PointGrazingOffset)
+	if constexpr (Settings::PointGrazingOffset)
 		flags |= kPointFlagGrazeOffset;
-	if (settings.PointEdgeRays)
-		flags |= kPointFlagEdgeRays;
-	if (settings.PointSoftCut)
+	if constexpr (Settings::PointSoftCut)
 		flags |= kPointFlagSoftCut;
-	pointFractionalThisFrame = settings.PointEdgeRays || settings.PointSoftCut;
+	pointFractionalThisFrame = settings.PointSoftCut;  // (50b) Smooth Shadow Edges (extra rays) deleted
 	if (wide)  // (48a)
 		flags |= kPointFlagWide | (widePrev ? kPointFlagWidePrev : 0u);
 	if (extra)  // (48c)
@@ -7375,7 +7345,7 @@ void RayTracing::DrawAmbientOcclusionImpl()
 		aoV2Index = v2Write;
 		aoV2Valid = true;
 		aoV2Frame = frameNow;
-	} else if (settings.AOTemporal) {
+	} else if constexpr (Settings::AOTemporal) {
 		aoV2Valid = false;  // (47l)
 		dispatch(temporal, { aoFiltered.srv.get(), aoHistory[read].srv.get(), motion.SRV, backend.AORawSRV() }, { aoHistory[write].uav.get() }, groupsX, groupsY);
 		blended = &aoHistory[write];
@@ -7391,7 +7361,7 @@ void RayTracing::DrawAmbientOcclusionImpl()
 	} else if (detail) {
 		// (46t) The detail term: this frame's near rays, 5x5 edge-aware at full resolution, then its own clamped history.
 		dispatch(detailCS, { backend.AORawSRV(), depth.depthSRV, normal.SRV }, { aoDetailFiltered.uav.get() }, groupsX, groupsY);
-		if (settings.AOTemporal) {
+		if constexpr (Settings::AOTemporal) {
 			dispatch(detailTemporal, { aoDetailFiltered.srv.get(), aoDetailHistory[detailRead].srv.get(), motion.SRV, backend.AORawSRV() },
 				{ aoDetailHistory[detailWrite].uav.get() }, groupsX, groupsY);
 			detailBlended = &aoDetailHistory[detailWrite];
@@ -8151,11 +8121,10 @@ void RayTracing::DrawSettings()
 	// diagnostics (both collapsed). Sun Shadows, Point Light Shadows, Ambient Occlusion and (48i) Reflections have their own entries in the
 	// Ray Tracing category (each shows the switch and the status on top).
 	ImGui::PushID("rtMainPage");  // tree-node open states of its own (other pages also have Advanced / Diagnostics)
-	DrawMasterHeader();
+	DrawMasterHeader(true);
 	// (47y) Moving Characters: Keep Shadow History / Smooth When No History: (48o) fixed on (no switches).
 	DrawObjectRows();  // (47n) one per-kind choice for the sun, the point lights and RTAO
-	// (49f) Particles Use RT Shadows moved to the Fog & Particles entry.
-	DrawLoadingScreens();  // (49c)
+	// (49f) Particles Use RT Shadows moved to the Fog & Particles entry. (50b) The loading-screen master is in Diagnostics (DrawDiagnostics).
 	DrawDiagnostics();
 	ImGui::PopID();
 }
@@ -8170,6 +8139,19 @@ void RayTracing::DrawFogParticlesPage()
 	globals::features::exponentialHeightFog.DrawRayTracedFogSettings();
 	ImGui::SeparatorText("Particles");
 	DrawParticlesSection();
+	// (50b) Smooth Shadows on Smoke and Water Sheets moved here (Diagnostics, collapsed), to be retired after a long quiet period.
+	if (ImGui::TreeNodeEx("Diagnostics")) {
+		ImGui::BeginDisabled(!settings.ParticlesRTShadows);
+		ImGui::Checkbox("Smooth Shadows on Smoke and Water Sheets", &settings.ParticlesSmoothSheets);
+		ImGui::EndDisabled();
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): the lamp and torch shadows on smoke, mist and waterfall sheets are blended smoothly between the fog's");
+			ImGui::Text("  shadow samples and the shadow on the wall or ground right behind the sheet, by their real distances. No more lit / dark");
+			ImGui::Text("  squares (16 pixels at the default fog grid) on sheets that lie on a wall; the edges line up with the shadows on the wall.");
+			ImGui::Text("Off: as 49m (the nearest fog sample: the squares). Only with Particles Use RT Shadows on.");
+		}
+		ImGui::TreePop();
+	}
 	ImGui::PopID();
 }
 
@@ -8185,16 +8167,7 @@ void RayTracing::DrawParticlesSection()
 		ImGui::Text("Needs Exponential Height Fog's Volumetric Fog (its near grid holds the data; indoors also Skip Volumetric Fog Indoors off).");
 		ImGui::Text("Flames, magic and glowing effects are not lit and do not change. Off: as before.");
 	}
-	// (50a) Directly below, greyed while Particles Use RT Shadows is off.
-	ImGui::BeginDisabled(!settings.ParticlesRTShadows);
-	ImGui::Checkbox("Smooth Shadows on Smoke and Water Sheets", &settings.ParticlesSmoothSheets);
-	ImGui::EndDisabled();
-	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("On (default): the lamp and torch shadows on smoke, mist and waterfall sheets are blended smoothly between the fog's");
-		ImGui::Text("  shadow samples and the shadow on the wall or ground right behind the sheet, by their real distances. No more lit / dark");
-		ImGui::Text("  squares (16 pixels at the default fog grid) on sheets that lie on a wall; the edges line up with the shadows on the wall.");
-		ImGui::Text("Off: as 49m (the nearest fog sample: the squares). Costs a little more on screens full of lit smoke.");
-	}
+	// (50a) Smooth Shadows on Smoke and Water Sheets: (50b) in this page's Diagnostics.
 	if (settings.ParticlesRTShadows && settings.Enabled) {
 		auto& fog = globals::features::exponentialHeightFog;
 		if (!fog.loaded || !fog.VolumetricFogActive())
@@ -8204,40 +8177,19 @@ void RayTracing::DrawParticlesSection()
 
 void RayTracing::DrawLoadingScreens()
 {
-	// (49c) "Loading Screens" (replaces 49b's Hitch Fixes): the master and three parts; master off = 48o / 49a.
-	ImGui::SeparatorText("Loading Screens");
+	// (49c) "Loading Screens" (replaces 49b's Hitch Fixes). (50b) Only the master is left, in the main page's Diagnostics as a kill switch;
+	// its three parts (Prepare When Arriving, Use the Loading Screen's Thread for GPU Copies, Reserve Shaders and Memory Up Front) are
+	// retired and always on with it. Master off = 48o / 49a.
 	ImGui::Checkbox("Finish Loading Work Behind the Loading Screen", &settings.LoadFinish);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("On (default): after fast travel or a door, Ray Tracing's preparation of the new place is done while the game's own loading");
 		ImGui::Text("  screen is still showing, instead of in the first seconds you can see. The loading screen may stay up about 0.5 - 1.5 s longer;");
 		ImGui::Text("  at most 3 s. Ray Tracing takes over from the shadow map once the place is complete (objects, trees and cut-outs included).");
-		ImGui::Text("Not only Ray Tracing: grass buffers are reused from the place left (Grass Optimizations) and, with the second part, grass is");
-		ImGui::Text("  uploaded behind the loading screen too.");
+		ImGui::Text("  Includes: preparing when you arrive, GPU copies on the loading screen's thread (grass uploads too), shaders and memory");
+		ImGui::Text("  reserved up front (+16 MB point-light textures, the cut-out record buffers at full size).");
 		ImGui::Text("Save loads have no point to prepare at behind the loading screen: they work as before (the log says so).");
-		ImGui::Text("Off: everything below off (48o / 49a).");
+		ImGui::Text("Off (emergency switch only, e.g. a loading screen that hangs): all of it off (48o / 49a).");
 	}
-	ImGui::BeginDisabled(!settings.LoadFinish);
-	ImGui::Indent();
-	ImGui::Checkbox("Prepare When Arriving", &settings.LoadPrepareArrival);
-	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("When the teleport ends (the loading screen is still up), the new place's buildings, objects, trees and characters are");
-		ImGui::Text("  captured and their ray-tracing structures built before the game closes the loading screen (at most 3 s, then the rest");
-		ImGui::Text("  follows as before). Logged: \"Prepare When Arriving ...\". F7 column rt_arrival_ms.");
-	}
-	ImGui::Checkbox("Use the Loading Screen's Thread for GPU Copies", &settings.LoadThreadCopies);
-	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Meanwhile the thread that draws the loading screen also makes the leaf / fence cut-out copies and the grass uploads between");
-		ImGui::Text("  its frames (about 8 ms each), so they are not made in the first visible frames. Needs Prepare When Arriving.");
-		ImGui::Text("  F7 column rt_loadthread_copies.");
-	}
-	ImGui::Checkbox("Reserve Shaders and Memory Up Front", &settings.ReserveUpFront);
-	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Point-light shadows: every filter variant that can be needed is compiled at the main menu and the extra-light textures stay");
-		ImGui::Text("  once made (+16 MB). The cut-out record buffers are made at full size once (about 3 MB each, 8 of them). Same picture.");
-		ImGui::Text("  (49h: Advanced Skin always remembers missing optional _wet / _rfaos textures now, whatever this switch.)");
-	}
-	ImGui::Unindent();
-	ImGui::EndDisabled();
 }
 
 namespace
@@ -8678,15 +8630,20 @@ void RayTracing::DrawReflectionsPage()
 	ImGui::PopID();
 }
 
-void RayTracing::DrawMasterHeader()
+void RayTracing::DrawMasterHeader(bool a_switch)
 {
-	ImGui::Checkbox("Ray Tracing", &settings.Enabled);
-	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("On: sun shadows of buildings, rocks, furniture, doors, items and characters inside the loaded area are ray traced.");
-		ImGui::Text("Trees, leaves, hair (unless changed under Objects in Ray Tracing), grass and the terrain itself (hills) keep their normal shadows;");
-		ImGui::Text("  the ground still receives traced shadows.");
-		ImGui::Text("Screen Space Shadows are switched off where ray tracing is in charge.");
-		ImGui::Text("Off: the game's shadows exactly as before (nothing of this feature runs).");
+	// (50b) The master checkbox only on the main "Ray Tracing" entry; the other entries show whether it is on (and the status).
+	if (a_switch) {
+		ImGui::Checkbox("Ray Tracing", &settings.Enabled);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On: sun shadows of buildings, rocks, furniture, doors, items and characters inside the loaded area are ray traced.");
+			ImGui::Text("Trees, leaves, hair (unless changed under Objects in Ray Tracing), grass and the terrain itself (hills) keep their normal shadows;");
+			ImGui::Text("  the ground still receives traced shadows.");
+			ImGui::Text("Screen Space Shadows are switched off where ray tracing is in charge.");
+			ImGui::Text("Off: the game's shadows exactly as before (nothing of this feature runs).");
+		}
+	} else {
+		ImGui::TextDisabled("Ray Tracing: %s (the switch is on the Ray Tracing entry)", settings.Enabled ? "on" : "off");
 	}
 	const char* statusText = "Off";
 	ImVec4 color{ 0.7f, 0.7f, 0.7f, 1.0f };
@@ -8959,16 +8916,23 @@ void RayTracing::DrawObjectRows()
 	row("Buildings", settings.Buildings, "Statics, furniture, containers, rocks, walls (default: Ray traced).",
 		"Also big one-sided shapes whose cut-out only trims their edges (roof tiles, plank ends), taken as solid.");
 	row("Objects", settings.Objects, "Doors, activators, movable objects, lights and loose items (default: Ray traced).", nullptr);
-	row("Trees", settings.Trees, "Trunks and branches of trees and plants (default: Shadow map).", "Their leaves are Foliage.");
 	{
-		const char* foliageModes[] = { "Shadow map", "Ray traced", "Both" };
+		// (50b) Trees + Foliage merged: Shadow map (Trees off, Foliage 0) / Trunks only (on, 0) / Trunks and leaves (on, 1) / Both (on, 2).
+		const char* plantModes[] = { "Shadow map", "Trunks only", "Trunks and leaves", "Both" };
 		settings.Foliage = std::clamp(settings.Foliage, 0, 2);
-		ImGui::Combo("Foliage", &settings.Foliage, foliageModes, 3);
+		int plants = settings.Trees ? settings.Foliage + 1 : 0;  // a saved Trees-off / Foliage-on pair loads with Trees on (LoadSettings)
+		if (ImGui::Combo("Trees and Plants", &plants, plantModes, 4)) {
+			plants = std::clamp(plants, 0, 3);
+			settings.Trees = plants != 0;
+			settings.Foliage = plants == 0 ? 0 : plants - 1;
+		}
 		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Leaves, bushes and plants with a cut-out (default: Shadow map).");
-			ImGui::Text("  Shadow map: the leaves keep the game's shadows and their screen-space contact shadows (they sway with the wind).");
-			ImGui::Text("  Ray traced: traced with their cut-out instead (sharper; they sway with Sway in RT Shadows on).");
-			ImGui::Text("  Both: traced AND kept in the shadow map; the darker of both wins (fullest shadow).");
+			ImGui::Text("Trees and plants (default: Shadow map).");
+			ImGui::Text("  Shadow map: trunks, branches and leaves keep the game's shadows and their screen-space contact shadows.");
+			ImGui::Text("  Trunks only: trunks and branches ray traced; leaves, bushes and plants with a cut-out keep the game's shadows.");
+			ImGui::Text("  Trunks and leaves: the leaves are traced with their cut-out too (sharper; they sway with Sway in RT Shadows on).");
+			ImGui::Text("  Both: trunks and leaves traced AND the leaves kept in the shadow map; the darker of both wins (fullest shadow).");
+			ImGui::Text("(50b: was two rows, Trees and Foliage.)");
 		}
 		// (47l) Foliage sway; (47n) per plant, with each plant's own wind.
 		ImGui::Indent();
@@ -8978,7 +8942,7 @@ void RayTracing::DrawObjectRows()
 			ImGui::Text("On (default): ray-traced leaves, bushes, swaying branches and banners move with the wind in their shadow, each plant");
 			ImGui::Text("  exactly as the game moves it (its own wind timer and strength, every frame), for the sun, point lights and RT AO.");
 			ImGui::Text("  Costs GPU time (F7: rt_wind_* columns, rt_prep_gpu_ms). Off: they are traced at rest.");
-			ImGui::Text("  No effect while Foliage is Shadow map.");
+			ImGui::Text("  No effect while the leaves are not ray traced (Trees and Plants: Shadow map or Trunks only).");
 		}
 		ImGui::EndDisabled();
 		// (47q) Keep Leaves Moving on Long Frames, (47r) Learn on Any Frame: (48o) fixed on (no switches). The sway stats line is in
@@ -8996,30 +8960,13 @@ void RayTracing::DrawObjectRows()
 		ImGui::BeginDisabled(!settings.Characters);
 		row("Physics parts", settings.PhysicsParts, "Capes, skirts and other HDT-SMP / HDT-PE parts, not hair (default: Ray traced).", nullptr);
 		row("Hair", settings.Hair, "Hair and wigs (default: Shadow map: the hair shader's own shadowing looks better than solid cards).", nullptr);
-		// (49h)
-		ImGui::Indent();
-		ImGui::Checkbox("Hair: Ignore Faint Strands in RT", &settings.HairFaintStrands);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): ray-traced hair only blocks light where the strands are at least half opaque, so the faint fringe of a\n"
-			            "  hair card no longer acts as a solid board (wide dark stripes across the forehead and nose from a nearby lamp).\n"
-			            "  Also: cut-outs whose test is \"greater than\" leave out their fully transparent texels exactly (no visible change\n"
-			            "  expected on fences, leaves and nets).");
-			ImGui::Text("Off: as in 49g. Switching re-captures characters and the ray-traced scene (a second or two).");
-		}
-		ImGui::Unindent();
+		// (49h) Hair: Ignore Faint Strands in RT: (50b) retired, always on.
 		ImGui::Checkbox("Player in first person", &settings.FirstPersonPlayer);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("Off (default): in first person the player keeps the shadow-map shadow (camera mods can hide the arms");
 			ImGui::Text("  from a traced shadow). On: the player is ray traced in first person too.");
 		}
-		// (49m)
-		ImGui::Checkbox("Refresh Changed Character Shapes", &settings.CharRefreshShapes);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): a character whose face expression or body shape changed after it was captured (talking, blinking, a body\n"
-			            "  morph) is captured again (at most about once a second per part), so the ray-traced shape keeps matching what you see:\n"
-			            "  no dark patches on cheeks, lips or the chest from an outdated shape.");
-			ImGui::Text("Off: as 49l (captured once; the face does not follow its expression).");
-		}
+		// (49m) Refresh Changed Character Shapes: (50b) retired, always on.
 		ImGui::EndDisabled();
 		ImGui::Unindent();
 	}
@@ -9066,12 +9013,7 @@ void RayTracing::DrawPointLightPage()
 			ImGui::Text("  when you come in (behind the loading screen) and the lights cast ray-traced shadows there too.");
 			ImGui::Text("Off: indoors the lights' shadows are exactly as before (RT Ambient Occlusion has its own Indoors Too).");
 		}
-		ImGui::BeginDisabled(!settings.PointLightsInteriors);
-		ImGui::Checkbox("Window Light Beams", &settings.PointLightsWindowBeams);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Window Shadows Ultimate's beams of sunlight through the windows (and the game's other spot lights indoors):");
-			ImGui::Text("  their shadow is ray traced, the window frames give the pattern on the floor. Off: they keep the game's shadow maps.");
-		}
+		ImGui::BeginDisabled(!settings.PointLightsInteriors || !settings.PointLightsWindowBeams);  // (50b) Window Light Beams: in Diagnostics
 		ImGui::SliderFloat("Window Beam Softness", &settings.PointLightsBeamSoftness, 0.0f, 3.0f, "%.2f deg", ImGuiSliderFlags_AlwaysClamp);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("How wide the sun looks through the window (degrees, like the sun's own size): soft edges on the beam's window pattern,");
@@ -9110,28 +9052,6 @@ void RayTracing::DrawPointLightPage()
 				}
 				settings.PointLightsPlayer = player;
 				settings.PointLightsEffects = effects;
-			}
-		}
-		{
-			// (50a) "Lights Without a Visible Flame" (was "Meshless Lights Near Fires"): shown Soft, Own, Skip, Snap (old); stored as the
-			// selector's mode (RayTracingPointLights::kMeshless*: 0 Own, 1 Snap, 2 Skip, 3 Soft).
-			const char* kFlameless[4] = { "Soft", "Own", "Skip", "Snap (old)" };
-			constexpr int kModeOfItem[4] = { 3, 0, 2, 1 };
-			constexpr int kItemOfMode[4] = { 1, 3, 2, 0 };
-			int item = kItemOfMode[std::clamp(settings.PointLightsMeshless, 0, 3)];
-			if (ImGui::Combo("Lights Without a Visible Flame", &item, kFlameless, 4))
-				settings.PointLightsMeshless = kModeOfItem[std::clamp(item, 0, 3)];
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Some placed lights have nothing visible that burns: an invisible light near braziers and fires that stands for");
-				ImGui::Text("  the fire's light bouncing off the surroundings.");
-				ImGui::Text("  Soft (default): its shadow comes from where its light comes from (its own spot), but from a big, soft light:");
-				ImGui::Text("    as big as the distance to the nearest visible fire or lamp (up to about 4.5 m). A broad, soft darkening");
-				ImGui::Text("    instead of a sharp extra shadow.");
-				ImGui::Text("  Own: a sharp shadow from its own spot (an extra shadow between two braziers).");
-				ImGui::Text("  Skip: no ray-traced shadow for these lights (the old screen-space shadow, if any).");
-				ImGui::Text("  Snap (old): the shadow comes from the nearest visible fire instead. Known to break the shadows on characters");
-				ImGui::Text("    into dark patches; kept for comparison only.");
-				ImGui::Text("A light right next to a candle / torch holder / brazier model is that model's own light and keeps a normal shadow.");
 			}
 		}
 		ImGui::EndDisabled();
@@ -9201,78 +9121,9 @@ void RayTracing::DrawPointLightPage()
 						settings.PointLightsAlphaOutdoors = v.alphaOutdoors;
 				}
 			}
-			ImGui::Separator();
-			ImGui::SliderFloat("Fixture Clearance", &settings.PointLightsClearance, 0.0f, 128.0f, "%.0f units");
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Rays stop this far before the light, so the lamp, brazier bowl or torch holding it does not shadow its own light.");
-				ImGui::Text("  Too small: a dark ring or a black patch around a lamp. Too large: objects right next to a light cast nothing.");
-			}
-			ImGui::SliderFloat("Carrier Clearance (units)", &settings.CarrierClearance, 0.0f, 64.0f, "%.0f");
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Someone holding a torch (an NPC, or you in third person) casts a body shadow from it; body parts closer than this to");
-				ImGui::Text("  the flame (the hand and forearm) do not block it (70 units = 1 m). NPC lights also stop %.0f units before the flame.",
-					settings.PointLightsClearance);
-				ImGui::Text("  In first person your body never blocks your own light.");
-			}
-			// (46y) Screen-Space Shadows for Non-RT Casters ((47o) permanent): for ray-traced lights Screen Space Point Light Shadows run as
-			// well, but only for what the ray tracer cannot see; a traced occluder shadows only within this contact length.
-			ImGui::SliderFloat("Non-RT Casters: RT Caster Contact Length", &settings.PointLightsSSPLSContact, 0.0f, 31.875f, "%.1f x ray offset");
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("How close to the surface a ray-traced occluder still casts a screen-space contact shadow (the ray tracer starts a little off the surface).");
-			// (49h) Re-exposed (fixed on since 48o).
-			ImGui::Checkbox("Close-Contact Shadows on Characters", &settings.PointCloseContact);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On (default, as since 48o): a lamp or torch's shadow ray leaves a character's skin only 2 units out, so close contact (a hand on\n"
-				            "  the body, the nose on the cheek) still shadows. The traced face does not follow talking or blinking, so this can leave dark\n"
-				            "  patches on cheeks and lips.");
-				ImGui::Text("Off: 6 units out, like the sun: no such patches, a little less contact shadow on characters from lamps and torches.");
-			}
-			// (49i) Two switches against stair-stepped, flickering point-light shadow edges (PointDenoiseCS kPLFlagSmoothHard / kPLFlagSteadyEdges).
-			ImGui::Checkbox("Smooth Hard Edges", &settings.PointSmoothHardEdges);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On (default): sharp point-light shadow edges (contact shadows, close blockers) are blurred over about 2 pixels around the edge with a\n"
-				            "  fixed pattern: no stair steps one pixel high, no edge that jumps between frames. Edges a little softer.");
-				ImGui::Text("Off: as 49h (only the pixels right at the edge were blurred, with a pattern that turned every frame).");
-			}
-			ImGui::Checkbox("Steady Edges", &settings.PointSteadyEdges);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On (default): next to a shadow edge the shadow's history from the previous frames is kept as long as it fits the area around\n"
-				            "  the pixel, so the slightly shifted samples of each frame average into a smooth, still edge. A shadow that moves (someone\n"
-				            "  walking past a lamp) still replaces its history at once.");
-				ImGui::Text("Off: as 49h (the history was snapped to fully lit / fully dark wherever the closest pixels agreed: the edge flickered).");
-			}
-			// (49m) Shattered dark islands on characters lit from the side, and stair-stepped edges (TracePointLightsCS).
-			{
-				const char* kDarkModes[3] = { "Off", "Original (48k)", "Tolerant" };
-				settings.PointDarkSideTest = std::clamp(settings.PointDarkSideTest, 0, 2);
-				ImGui::Combo("Dark Side Test", &settings.PointDarkSideTest, kDarkModes, 3);
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::Text("Where a ray-traced surface faces away from a lamp it counts as in its own shadow without tracing a ray.");
-					ImGui::Text("  Tolerant (default): only where it clearly faces away (a little past the edge between lit and dark side, more on curved or\n"
-					            "    faceted spots), judged from a smoothed surface direction: no dark islands on skin and clothes lit from the side.");
-					ImGui::Text("  Original (48k - 49l): decided exactly at the edge, per small flat facet of the body: a mosaic of dark islands where a\n"
-					            "    lamp or torch grazes a character.");
-					ImGui::Text("  Off: no such test (before 48k): lit specks can appear along the edge between lit and dark side.");
-				}
-			}
-			ImGui::Checkbox("Grazing-Angle Offset", &settings.PointGrazingOffset);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On (default): where a lamp's light grazes a surface, its shadow ray starts a little farther from the surface (on characters\n"
-				            "  up to 6 units instead of 2), so the surface does not shadow itself in patches. Contact shadows lit head-on stay as they were.");
-				ImGui::Text("Off: as 49l.");
-			}
-			ImGui::Checkbox("Smooth Shadow Edges (extra rays)", &settings.PointEdgeRays);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On (default): pixels on a shadow edge trace 3 more rays from inside the pixel and keep the share that is lit, so a sharp\n"
-				            "  shadow edge is smooth already before the clean-up (fewer stair steps, less flicker). A little slower (only edge pixels).");
-				ImGui::Text("Off: one ray per light and pixel, as 49l.");
-			}
-			ImGui::Checkbox("Soft Hand-Off for Weak Lights", &settings.PointSoftCut);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On (default): a lamp that only just counts for a pixel (a few %% of the light there) fades its ray-traced shadow in, instead\n"
-				            "  of a hard line where the pixels next to it stop tracing that lamp. Its shadow is a little weaker right at that line.");
-				ImGui::Text("Off: as 49l.");
-			}
+			// (50b) Retired (fixed at the saved values): Fixture Clearance 20, Carrier Clearance 28, Non-RT Casters: RT Caster Contact Length 8,
+			// Close-Contact Shadows on Characters on, Smooth Hard Edges on, Steady Edges on, Dark Side Test Tolerant, Grazing-Angle Offset on,
+			// Soft Hand-Off for Weak Lights on; Smooth Shadow Edges (extra rays) deleted.
 			// (48o) Fixed on, no switches any more: (47r) Reuse the Sun's Surface Probe Everywhere; (47x) Smoother Shadow Edges, Trace Lights on
 			// Curved Surfaces Reliably, Close-Contact Shadows on Characters; (48m) Moving Characters: Clean Shadow History; (48k) Point Lights:
 			// Noise Fix with Decorrelated Sampling, Stable Penumbra, Close Blockers: Minimum Blur ((49m) Consistent Dark Side: Dark Side Test above); (47z) Window Beams:
@@ -9287,6 +9138,40 @@ void RayTracing::DrawPointLightPage()
 		}
 
 		if (ImGui::TreeNodeEx("Diagnostics")) {
+			// (50b) Moved here from the page: Window Light Beams (from Indoors) and (50a) Lights Without a Visible Flame (from Which Lights).
+			ImGui::BeginDisabled(!settings.PointLights);
+			ImGui::BeginDisabled(!settings.PointLightsInteriors);
+			ImGui::Checkbox("Window Light Beams", &settings.PointLightsWindowBeams);
+			ImGui::EndDisabled();
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): Window Shadows Ultimate's beams of sunlight through the windows (and the game's other spot lights");
+				ImGui::Text("  indoors) get a ray-traced shadow, the window frames give the pattern on the floor. Off: they keep the game's shadow maps.");
+				ImGui::Text("  Needs Indoors Too. Window Beam Softness (on the page) applies while this is on.");
+			}
+			{
+				// (50a) "Lights Without a Visible Flame" (was "Meshless Lights Near Fires"): shown Soft, Own, Skip, Snap (old); stored as the
+				// selector's mode (RayTracingPointLights::kMeshless*: 0 Own, 1 Snap, 2 Skip, 3 Soft).
+				const char* kFlameless[4] = { "Soft", "Own", "Skip", "Snap (old)" };
+				constexpr int kModeOfItem[4] = { 3, 0, 2, 1 };
+				constexpr int kItemOfMode[4] = { 1, 3, 2, 0 };
+				int item = kItemOfMode[std::clamp(settings.PointLightsMeshless, 0, 3)];
+				if (ImGui::Combo("Lights Without a Visible Flame", &item, kFlameless, 4))
+					settings.PointLightsMeshless = kModeOfItem[std::clamp(item, 0, 3)];
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("Some placed lights have nothing visible that burns: an invisible light near braziers and fires that stands for");
+					ImGui::Text("  the fire's light bouncing off the surroundings.");
+					ImGui::Text("  Soft (default): its shadow comes from where its light comes from (its own spot), but from a big, soft light:");
+					ImGui::Text("    as big as the distance to the nearest visible fire or lamp (up to about 4.5 m). A broad, soft darkening");
+					ImGui::Text("    instead of a sharp extra shadow.");
+					ImGui::Text("  Own: a sharp shadow from its own spot (an extra shadow between two braziers).");
+					ImGui::Text("  Skip: no ray-traced shadow for these lights (the old screen-space shadow, if any).");
+					ImGui::Text("  Snap (old): the shadow comes from the nearest visible fire instead. Known to break the shadows on characters");
+					ImGui::Text("    into dark patches; kept for comparison only.");
+					ImGui::Text("A light right next to a candle / torch holder / brazier model is that model's own light and keeps a normal shadow.");
+				}
+			}
+			ImGui::EndDisabled();
+			ImGui::Separator();
 			if (PointLightsOn() && InteriorsOn() && settings.Enabled && Util::IsInterior()) {
 				const auto& sc = scene.GetStats();
 				const auto& st = backend.GetStats();
@@ -9445,24 +9330,33 @@ void RayTracing::DrawAOPage()
 
 		// (48o) Fixed on, no switches any more: (47n) RTAO: Tight History Near Moving Things and SSGI Contact AO: Uncovered-Area Test,
 		// 4-Frame History; (47r) RTAO: Filter Only Where Traced.
-		// (49a) S1
-		ImGui::SeparatorText("Reflections");
+		// (50b) Mode (outdoors) and Mode Indoors merged into one choice (it writes both keys). A saved pair that differs shows "Mixed".
 		ImGui::BeginDisabled(!settings.AO);
-		ImGui::Checkbox("RT Specular Occlusion", &settings.AOSpecOcc);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): the AO rays also note which way each spot is open, and the environment reflection (cubemap) is darkened");
-			ImGui::Text("  by how much of the reflected direction is blocked, not just by how dark the AO is overall: shiny floors along walls,");
-			ImGui::Text("  under tables, in doorways and inside armour folds stop glowing, while reflections that point into the open stay bright.");
-			ImGui::Text("Only where RTAO is traced (about 1.4 m around each surface) and only the cubemap part (SSRT's own reflections are");
-			ImGui::Text("  unchanged); rough surfaces keep the old darkening. Off: exactly as before (the composite is rebuilt once).");
+		{
+			const char* modes[] = { "RTAO (keeps SSGI contact AO)", "Darker of RTAO and SSGI AO" };
+			settings.AOMode = std::clamp(settings.AOMode, 0, static_cast<int>(AOModeKind::Count) - 1);
+			settings.AOModeInterior = std::clamp(settings.AOModeInterior, 0, static_cast<int>(AOModeKind::Count) - 1);
+			const bool mixed = settings.AOMode != settings.AOModeInterior;
+			const std::string preview = mixed ? std::format("Mixed (outdoors: {}, indoors: {})", modes[settings.AOMode], modes[settings.AOModeInterior]) :
+			                                    std::string(modes[settings.AOMode]);
+			if (ImGui::BeginCombo("Combine with SSGI AO", preview.c_str())) {
+				for (int i = 0; i < IM_ARRAYSIZE(modes); ++i) {
+					if (ImGui::Selectable(modes[i], !mixed && settings.AOMode == i)) {
+						settings.AOMode = i;
+						settings.AOModeInterior = i;
+					}
+				}
+				ImGui::EndCombo();
+			}
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("How the ray-traced AO joins Screen Space GI's AO, outdoors and indoors alike.");
+				ImGui::Text("RTAO (default): ray-traced AO replaces Screen Space GI's AO; SSGI's small contact AO (cm-scale creases) is kept and both");
+				ImGui::Text("  darken together (each crease counted once).");
+				ImGui::Text("Darker of RTAO and SSGI AO: per pixel the darker of the two (fullest darkening; SSGI's AO is never lost; may bring");
+				ImGui::Text("  back some fine crease darkening).");
+				ImGui::Text("(50b: was Mode and Mode Indoors.)");
+			}
 		}
-		ImGui::BeginDisabled(!settings.AOSpecOcc);
-		ImGui::SliderFloat("Specular Occlusion Strength", &settings.AOSpecOccStrength, 0.0f, 1.0f, "%.2f");
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("1 (default) = the direction-aware darkening where it is trusted; 0 = the old darkening.");
-		ImGui::EndDisabled();
-		if (!specOccFault.empty())
-			RtErrorLine("RT Specular Occlusion was switched off for this session", specOccFault);
 		ImGui::EndDisabled();
 
 		if (ImGui::TreeNodeEx("Advanced")) {
@@ -9494,15 +9388,13 @@ void RayTracing::DrawAOPage()
 					ImGui::Text("Off (Low to High): the broad AO is blurred at quarter resolution (wide, smooth, cheap).");
 					ImGui::Text("On (Ultra): blurred at full render resolution with a smaller reach (sharper edges, a little grainier, more GPU time).");
 				}
-				ImGui::BeginDisabled(!settings.AOTemporal);
 				changed |= ImGui::Checkbox("Temporal v2", &v.temporalV2);
 				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::Text("Needs Temporal. On (Medium and above): a smarter history. Each pixel remembers how many frames it has been seen and");
+					ImGui::Text("On (Medium and above): a smarter history. Each pixel remembers how many frames it has been seen and");
 					ImGui::Text("  averages more of them the longer it stays (up to 10), so still scenes get much calmer. A spot that was just");
 					ImGui::Text("  uncovered is recognised by its depth and direction and starts fresh from a wider blur of this frame. Resets at");
 					ImGui::Text("  camera cuts. Off (Low): the 47k history.");
 				}
-				ImGui::EndDisabled();
 				changed |= ImGui::Checkbox("Smooth Normals", &v.smoothNormals);
 				if (auto _tt = Util::HoverTooltipWrapper()) {
 					ImGui::Text("On (Medium and above): the AO rays leave each pixel around the smooth surface direction (last frame's G-buffer");
@@ -9538,41 +9430,25 @@ void RayTracing::DrawAOPage()
 				ImGui::Text("How close an object has to be to count as fine detail (Detail Strength); farther ones count for Strength.");
 				ImGui::Text("  Default 20 (about 28 cm). At most half the Ray Length.");
 			}
-			{
-				const char* modes[] = { "RTAO (keeps SSGI contact AO)", "Darker of RTAO and SSGI AO" };
-				settings.AOMode = std::clamp(settings.AOMode, 0, static_cast<int>(AOModeKind::Count) - 1);
-				ImGui::Combo("Mode", &settings.AOMode, modes, IM_ARRAYSIZE(modes));
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::Text("Outdoors (indoors has its own Mode Indoors below).");
-					ImGui::Text("RTAO (default): ray-traced AO replaces Screen Space GI's AO; SSGI's small contact AO (cm-scale creases) is kept");
-					ImGui::Text("  and both darken together.");
-					ImGui::Text("Darker of RTAO and SSGI AO: per pixel the darker of the two (fullest darkening; SSGI's AO is never lost).");
-				}
+			// (49a) S1 RT Specular Occlusion: (50b) moved here from the page.
+			ImGui::BeginDisabled(!settings.AO);
+			ImGui::Checkbox("RT Specular Occlusion", &settings.AOSpecOcc);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): the AO rays also note which way each spot is open, and the environment reflection (cubemap) is darkened");
+				ImGui::Text("  by how much of the reflected direction is blocked, not just by how dark the AO is overall: shiny floors along walls,");
+				ImGui::Text("  under tables, in doorways and inside armour folds stop glowing, while reflections that point into the open stay bright.");
+				ImGui::Text("Only where RTAO is traced (about 1.4 m around each surface) and only the cubemap part (SSRT's own reflections are");
+				ImGui::Text("  unchanged); rough surfaces keep the old darkening. Off: exactly as before (the composite is rebuilt once).");
 			}
-			ImGui::BeginDisabled(!settings.AOInteriors);
-			{
-				const char* modes[] = { "RTAO + SSGI contact AO", "Darker of both" };
-				settings.AOModeInterior = std::clamp(settings.AOModeInterior, 0, static_cast<int>(AOModeKind::Count) - 1);
-				ImGui::Combo("Mode Indoors", &settings.AOModeInterior, modes, IM_ARRAYSIZE(modes));
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::Text("RTAO + SSGI contact AO (default): indoors the ray-traced AO replaces Screen Space GI's AO; SSGI's small contact AO");
-					ImGui::Text("  (cm-scale creases) is kept and both darken together.");
-					ImGui::Text("Darker of both: per pixel the darker of RTAO and SSGI's whole AO.");
-				}
-			}
+			ImGui::BeginDisabled(!settings.AOSpecOcc);
+			ImGui::SliderFloat("Specular Occlusion Strength", &settings.AOSpecOccStrength, 0.0f, 1.0f, "%.2f");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("1 (default) = the direction-aware darkening where it is trusted; 0 = the old darkening.");
 			ImGui::EndDisabled();
-			// (49h)
-			ImGui::Checkbox("Count Contact Once", &settings.AOContactOnce);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On (default): in the RTAO + SSGI contact AO modes, the fine ray-traced detail and SSGI's contact AO see the same small");
-				ImGui::Text("  creases; per pixel only the darker of the two counts, so a crease is not darkened twice (no muddy double darkening).");
-				ImGui::Text("Off: as in 49g (both multiplied). No effect in Darker of both.");
-			}
-			ImGui::Checkbox("Temporal", &settings.AOTemporal);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On (default): after the edge-aware blur the last frames are blended in (held close to this frame's own values,");
-				ImGui::Text("  so moving objects leave no dark trail). Off: this frame's blurred rays only (a little grainier).");
-			}
+			if (!specOccFault.empty())
+				RtErrorLine("RT Specular Occlusion was switched off for this session", specOccFault);
+			ImGui::EndDisabled();
+			// (50b) Retired, always on: (49h) Count Contact Once, (46f) Temporal.
 			{
 				const char* kBudget[] = { "Blocked (as before)", "Half Open", "Open" };
 				settings.AOAlphaBudget = std::clamp(settings.AOAlphaBudget, 0, 2);
@@ -9715,6 +9591,8 @@ void RayTracing::DrawDiagnostics()
 	}
 
 	if (ImGui::TreeNodeEx("Diagnostics")) {
+		DrawLoadingScreens();  // (50b) the loading-screen kill switch, first in Diagnostics
+		ImGui::Separator();
 		const char* views[] = { "Off", "Shadow Source", "RT vs Shadow Map", "BLAS Coverage", "Raw RT Visibility", "RT Hit vs Depth", "Penumbra Radius",
 			"History Length", "Adaptive Rays", "SSS: RT Casters", "Distance Quality", "Character Rays", "Point Lights: Candidates", "Point Lights: Traced Lights",
 			"Point Lights: Raw Rays", "Point Lights: Denoised", "Point Lights: SSPLS Coverage", "Point Lights: Moving Pixels", "Point Lights: Filter Path" };  // (48m) + 2
@@ -9998,9 +9876,9 @@ std::string RayTracing::DescribeForProfile() const
 	// (46b) (47n) the point tier in effect
 	const PointTierParams pt = ResolvePointTier();
 	const AOTierParams at = ResolveAOTier();
-	text += std::format(", point lights {} {} (K {}, max {}, distance {:.0f}, size {:.1f}, clearance {:.0f}{}{})",
+	text += std::format(", point lights {} {} (K {}, max {}, distance {:.0f}, size {:.1f}{})",
 		settings.PointLights ? "on" : "off", kTierNames[std::clamp(settings.PointQuality, 0, kTierCustom) + 1], pt.k, pt.maxSources, pt.distance,
-		settings.PointLightsSize, settings.PointLightsClearance, "", pointOffReason.empty() ? "" : ", switched off: " + pointOffReason);
+		settings.PointLightsSize, pointOffReason.empty() ? "" : ", switched off: " + pointOffReason);
 	// (46c)
 	text += std::format(", indoors {} (K {}, window beams {}{})", settings.PointLightsInteriors ? "on" : "off",
 		pt.kInterior, settings.PointLightsWindowBeams ? "on" : "off",
@@ -10024,9 +9902,9 @@ std::string RayTracing::DescribeForProfile() const
 	// (46f)
 	static constexpr const char* kAOModes[] = { "RTAO (keeps SSGI contact AO)", "darker of RTAO and SSGI AO" };
 	static constexpr const char* kAOViews[] = { "off", "raw", "filtered", "split", "raw detail", "filtered detail", "final", "normal confidence", "normal Ns", "normal Ng", "specular occlusion" };
-	text += std::format(", RTAO {} {} (mode {}, ray length {:.0f}, strength {:.2f}, temporal {}, max distance {:.0f}, debug view {}{})", settings.AO ? "on" : "off",
+	text += std::format(", RTAO {} {} (mode {}, ray length {:.0f}, strength {:.2f}, max distance {:.0f}, debug view {}{})", settings.AO ? "on" : "off",
 		kTierNames[std::clamp(settings.AOQuality, 0, kTierCustom) + 1], kAOModes[std::clamp(settings.AOMode, 0, 1)], settings.AORayLength, settings.AOStrength,
-		settings.AOTemporal ? "on" : "off", at.distance, kAOViews[std::clamp(static_cast<int>(aoDebugView), 0, 10)], aoOffReason.empty() ? "" : ", switched off: " + aoOffReason);
+		at.distance, kAOViews[std::clamp(static_cast<int>(aoDebugView), 0, 10)], aoOffReason.empty() ? "" : ", switched off: " + aoOffReason);
 	// (46t)
 	static constexpr const char* kAOBudget[] = { "blocked", "half open", "open" };
 	text += std::format(", RTAO detail strength {:.2f}, detail ray length {:.0f}, detail rays {}, full-resolution filter {}, "
@@ -10034,8 +9912,7 @@ std::string RayTracing::DescribeForProfile() const
 		settings.AODetailStrength, settings.AODetailLength, at.detailRays, at.fullResFilter ? "on" : "off", kAOBudget[std::clamp(settings.AOAlphaBudget, 0, 2)],
 		aoExtrasFault.empty() ? "" : ", detail / full-res filter switched off: " + aoExtrasFault);
 	// (46y)
-	text += std::format(", RTAO broad ray rate {}, point lights: screen-space shadows for non-RT casters on (contact {:.1f})", kBroadRateNames[std::clamp(at.broadRate, 0, 2)],
-		settings.PointLightsSSPLSContact);
+	text += std::format(", RTAO broad ray rate {}", kBroadRateNames[std::clamp(at.broadRate, 0, 2)]);
 	// (47q)
 	text += std::format(", NPCs all parts within {}", NpcFullDistance() > 0.0f ? std::format("{:.0f}", NpcFullDistance()) : std::string("no limit"));
 	// (47l) (47n)
@@ -10049,8 +9926,8 @@ std::string RayTracing::DescribeForProfile() const
 	text += std::format(", loading screens {:.0f} ms per frame, black window {:.0f} ms, {:.0f} ms per loaded cell", settings.LoadingPumpMs, settings.BlackWindowMs,
 		settings.CellEventMs);
 	// (46p, 46q)
-	text += std::format(", residency priority {}, submit worker in effect {}, carrier clearance {:.0f}", backend.ResidencyHigh() ? "high" : "normal",
-		backend.SubmitWorkerInEffect() ? "yes" : "no", settings.CarrierClearance);
+	text += std::format(", residency priority {}, submit worker in effect {}", backend.ResidencyHigh() ? "high" : "normal",
+		backend.SubmitWorkerInEffect() ? "yes" : "no");
 	// (46s)
 	static constexpr const char* kMeshless[4] = { "own", "snap (old)", "skip", "soft" };  // (50a) by mode
 	text += std::format(", lights without a visible flame {}", kMeshless[std::clamp(settings.PointLightsMeshless, 0, 3)]);
@@ -10106,17 +9983,8 @@ nlohmann::json RayTracing::DescribeJson() const
 	j["characters_rt"] = settings.Characters;
 	j["physics_parts_rt"] = settings.PhysicsParts;
 	j["hair_rt"] = settings.Hair;
-	j["hair_faint_strands"] = settings.HairFaintStrands;  // (49h)
-	j["point_close_contact"] = settings.PointCloseContact;  // (49h)
-	j["point_smooth_hard_edges"] = settings.PointSmoothHardEdges;  // (49i)
-	j["point_steady_edges"] = settings.PointSteadyEdges;            // (49i)
-	j["point_dark_side_test"] = settings.PointDarkSideTest;         // (49m) 0 off, 1 original, 2 tolerant
-	j["point_grazing_offset"] = settings.PointGrazingOffset;
-	j["point_edge_rays"] = settings.PointEdgeRays;
 	j["particles_smooth_sheets"] = settings.ParticlesSmoothSheets;  // (50a)
 	j["lights_without_flame"] = settings.PointLightsMeshless;     // (50a) 0 own, 1 snap (old), 2 skip, 3 soft
-	j["point_soft_cut"] = settings.PointSoftCut;
-	j["char_refresh_shapes"] = settings.CharRefreshShapes;
 	j["first_person_player_rt"] = settings.FirstPersonPlayer;
 	j["denoiser"] = settings.Denoiser;
 	j["rt_contact_scale"] = settings.RtContactScale;
@@ -10228,8 +10096,8 @@ nlohmann::json RayTracing::DescribeJson() const
 		const PointTierParams pt = ResolvePointTier();
 		j["point_lights"] = { { "enabled", settings.PointLights }, { "k", pt.k }, { "max_sources", pt.maxSources },
 			{ "distance", pt.distance }, { "keep_sspls", false },
-			{ "sspls_non_rt", true }, { "sspls_contact", settings.PointLightsSSPLSContact },  // (46y)
-			{ "size", settings.PointLightsSize }, { "clearance", settings.PointLightsClearance }, { "traced", pointThisFrame }, { "sources", ps.sources },
+			{ "sspls_non_rt", true },  // (46y) ((50b) sspls_contact retired: fixed 8)
+			{ "size", settings.PointLightsSize }, { "traced", pointThisFrame }, { "sources", ps.sources },
 			{ "candidates", ps.candidates }, { "merged", ps.merged }, { "capped", ps.capped }, { "native_lights", ps.native }, { "gpu_ms", stats.lastPointGpuMs },
 			{ "rays_per_frame", stats.pointRaysPerFrame }, { "water_rays_per_frame", stats.pointWaterRaysPerFrame },  // (47j)
 			 { "denoise_gpu_ms", Util::GpuPassTimers::GetSingleton()->SmoothedMs(Util::GpuBucket::RayTracingPointDenoise) },
@@ -10249,7 +10117,7 @@ nlohmann::json RayTracing::DescribeJson() const
 	}
 	// (46f)
 	j["rtao"] = { { "enabled", settings.AO }, { "mode", settings.AOMode }, { "ray_length", settings.AORayLength }, { "strength", settings.AOStrength },
-		{ "temporal", settings.AOTemporal }, { "max_distance", ResolveAOTier().distance }, { "debug_view", static_cast<int>(aoDebugView) },
+		{ "max_distance", ResolveAOTier().distance }, { "debug_view", static_cast<int>(aoDebugView) },
 		{ "composited", aoComposited }, { "gpu_ms", stats.lastAOGpuMs }, { "rays_per_frame", stats.aoRaysPerFrame },
 		{ "filter_gpu_ms", Util::GpuPassTimers::GetSingleton()->SmoothedMs(Util::GpuBucket::RayTracingAO) },
 		{ "sync_gpu_ms", Util::GpuPassTimers::GetSingleton()->SmoothedMs(Util::GpuBucket::RayTracingAOSync) }, { "off_reason", aoOffReason },

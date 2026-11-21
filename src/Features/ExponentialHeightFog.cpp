@@ -1173,20 +1173,27 @@ void ExponentialHeightFog::DrawRayTracedFogSettings()
     const auto& palette = Menu::GetSingleton()->GetTheme().StatusPalette;
     ImGui::BeginDisabled(!loaded);
     // (49b) Ray-traced visibility in the fog (needs Ray Tracing; last frame's rays, brought into this frame by the fog's own reprojection).
-    ImGui::Checkbox("RT Sun Shafts in Fog", &volumetric.RTSunShafts);
-    if (auto _tt = Util::HoverTooltipWrapper())
-        ImGui::Text(
-            "On (default): with Ray Tracing on, trees, plants, characters and objects block the sun in the 3D fog again\n"
-            "(Ray Tracing takes them out of the game's shadow map, so the fog had no light shafts from them).\n"
-            "One ray per fog cell toward the sun; where Ray Tracing has no data the shadow map is used as before.\n"
-            "Off: as before. Ray Tracing off: no effect. Costs about 0.15-0.35 ms with Ray Tracing on.");
-    ImGui::Checkbox("RT Light Shadows in Fog", &volumetric.RTLightShadows);
-    if (auto _tt = Util::HoverTooltipWrapper())
-        ImGui::Text(
-            "On (default): torches, campfires, lamps and window beams no longer light the fog through walls and objects:\n"
-            "per fog cell the four strongest lights that Ray Tracing shadows (Point Light Shadows on) get one short ray each.\n"
-            "Indoors this needs Skip Volumetric Fog Indoors off. Off: as before (no shadows for lights in the fog).\n"
-            "Costs about 0.2-0.5 ms where many lights shine into fog.");
+    // (50b) RT Sun Shafts in Fog + RT Light Shadows in Fog merged into one checkbox (it writes both 49b keys). A saved pair that differs shows
+    // unticked with a note; ticking sets both.
+    {
+        bool both = volumetric.RTSunShafts && volumetric.RTLightShadows;
+        if (ImGui::Checkbox("RT Shadows in Volumetric Fog", &both)) {
+            volumetric.RTSunShafts = both;
+            volumetric.RTLightShadows = both;
+        }
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "On (default): with Ray Tracing on, the 3D fog takes the ray-traced shadows:\n"
+                "  sun shafts: trees, plants, characters and objects block the sun in the fog again (Ray Tracing takes them out of the\n"
+                "  game's shadow map); one ray per fog cell toward the sun, the shadow map where Ray Tracing has no data;\n"
+                "  lights: torches, campfires, lamps and window beams no longer light the fog through walls and objects (per fog cell\n"
+                "  the four strongest lights Ray Tracing shadows get one short ray each; indoors needs Skip Volumetric Fog Indoors off).\n"
+                "Off: as before. Ray Tracing off: no effect. Costs about 0.15-0.35 ms (sun) plus 0.2-0.5 ms where many lights shine into fog.\n"
+                "(50b: was two checkboxes, RT Sun Shafts in Fog and RT Light Shadows in Fog.)");
+        if (volumetric.RTSunShafts != volumetric.RTLightShadows)
+            ImGui::TextDisabled("Saved as sun shafts %s, lights %s (an older choice); ticking sets both.", volumetric.RTSunShafts ? "on" : "off",
+                volumetric.RTLightShadows ? "on" : "off");
+    }
     ImGui::EndDisabled();
     // Prerequisites, only when unmet.
     if (!loaded)

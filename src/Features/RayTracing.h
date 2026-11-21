@@ -165,7 +165,9 @@ public:
 		int PointLightsMaxSources = 64;
 		float PointLightsDistance = 4000.0f;  // light centre to camera (units)
 		float PointLightsSize = 6.0f;        // emitter radius (soft edges)
-		float PointLightsClearance = 32.0f;  // the ray stops this far before the light (its own fixture casts nothing)
+		// The ray stops this far before the light (its own fixture casts nothing). (50b) Retired: fixed at the user's saved 20 (was the
+		// "Fixture Clearance" slider, default 32; key ignored).
+		static constexpr float PointLightsClearance = 20.0f;
 		// (46c) Interiors: the interior cell is captured and its point lights (and window beams) traced; no sun trace.
 		bool PointLightsInteriors = true;
 		int PointLightsPerPixelInterior = 4;    // K indoors: 1, 2 or 4
@@ -187,7 +189,7 @@ public:
 		int AOMode = 0;                // AOMode: 0 RTAO (keeps SSGI contact AO, darker of both), 1 darker of RTAO and SSGI AO
 		float AORayLength = 100.0f;    // units (70 = 1 m): 35 - 210
 		float AOStrength = 1.0f;
-		bool AOTemporal = true;        // clamped history after the spatial filter
+		static constexpr bool AOTemporal = true;  // clamped history after the spatial filter; (50b) retired, fixed on (key ignored)
 		float AODistance = 4000.0f;    // from the camera: RTAO fades back to SSGI AO over the last quarter of it (outdoors)
 		// (46h) RTAO indoors (the interior frame; the whole interior is in the TLAS). Only with RTAO on (itself default off), so
 		// nothing changes until the user ticks RT Ambient Occlusion; then indoors follows this box (on). No distance fade indoors:
@@ -196,7 +198,7 @@ public:
 		int AOModeInterior = 0;        // AOModeKind (indoors)
 		// (49h) AOContactOnce "RTAO: Count Contact Once" (RT Ambient Occlusion > Advanced, under Mode Indoors): in the RTAO + contact AO mode
 		// the darker of the RTAO detail term and the contact AO, not their product (RTAOCompositeCS kFlagContactOnce). Off = 49g.
-		bool AOContactOnce = true;
+		static constexpr bool AOContactOnce = true;  // (50b) retired, fixed on (key ignored)
 		// (46k) Transitions (Ray Tracing > Advanced): the loading pump (always on since 47m) prepares the destination behind the
 		// loading screen; its CPU per loading-screen frame; the frames after the loading screen still counted as black (the Fader
 		// Menu cannot tell when its fade-in starts).
@@ -209,7 +211,7 @@ public:
 		float CellEventMs = 12.0f;
 		// (46q) Outside the settings macro too. Carrier Casts Shadows (always on since 47m): a light carried by a traced character is
 		// blocked by the carrier's own body except within CarrierClearance units of the light.
-		float CarrierClearance = 28.0f;
+		static constexpr float CarrierClearance = 28.0f;  // (50b) retired, fixed (key ignored)
 		// (46s) Outside the settings macro too. Meshless Lights Near Fires: placed lights without a mesh named like a fixture
 		// (vanilla "torch" lights at no visible fire) -- 0 Own (46r), 1 Snap to the nearest visible fixture's source, 2 Skip.
 		// (50a) "Lights Without a Visible Flame" (RayTracingPointLights::kMeshless*): 3 Soft (default: a fill light, own position, large
@@ -233,7 +235,7 @@ public:
 		// Shadows decides). RTAO Single Long Ray: the long direction is one closest-hit ray classified by its hit distance (same
 		// near / far result as the two segments; off = 46x). RTAO Half-Resolution Broad Term: the far part is traced on a checkerboard
 		// that alternates every frame (the filter fills the other half from the neighbours; off = 46x, default off).
-		float PointLightsSSPLSContact = 8.0f;
+		static constexpr float PointLightsSSPLSContact = 8.0f;  // (50b) retired, fixed (key ignored)
 		// (47q) AOBroadRate replaces AOHalfResFar (read once, for the migration): the RTAO Custom tier's broad (long) ray rate, 0 every
 		// pixel, 1 half (checkerboard swapped every frame), 2 one in four (each 2x2 block, rotating over 4 frames).
 		int AOBroadRate = 0;
@@ -281,10 +283,11 @@ public:
 		// for GPU Copies": meanwhile the thread presenting the loading screen makes the cut-out texture copies and the grass uploads (D3D11).
 		// ReserveUpFront "Reserve Shaders and Memory Up Front": 49b D (point-denoiser wide variants at the main menu, slot 4 - 5 kept), E (alpha
 		// record buffers at full size); (49h) F (Advanced Skin remembers missing skin-mod textures) is always on now. Master off = 48o / 49a.
+		// (50b) The master moved to the main page's Diagnostics (kill switch); its three parts are retired, fixed on (keys ignored).
 		bool LoadFinish = true;
-		bool LoadPrepareArrival = true;
-		bool LoadThreadCopies = true;
-		bool ReserveUpFront = true;
+		static constexpr bool LoadPrepareArrival = true;
+		static constexpr bool LoadThreadCopies = true;
+		static constexpr bool ReserveUpFront = true;
 		// (47l) Outside the settings macro too. FoliageSway "Sway in RT Shadows" (under Foliage): with Foliage ray traced / Both, tree-
 		// animated leaves, bushes and branches are traced with the game's wind (a wind BLAS per mesh, posed and refit every frame).
 		// Off = 47k (frozen at their rest pose). No effect with Foliage = Shadow map.
@@ -341,37 +344,38 @@ public:
 		// PointCloseContact "Close-Contact Shadows on Characters": the point lights' character ray starts 2 units out instead of 6 (6 kept
 		// where the light grazes or faces away from the depth normal: the terminator). The sun's character ray is unchanged.
 		// (49h) Re-exposed (Point Light Shadows > Point Lights > Advanced), default on (= 48o-49g). Off: the 6-unit start, as the sun.
-		bool PointCloseContact = true;
+		static constexpr bool PointCloseContact = true;  // (50b) retired, fixed on (key ignored)
 		// (49i) Outside the settings macro (keys PointSmoothHardEdges / PointSteadyEdges), Point Light Shadows > Point Lights > Advanced, each
 		// default on, off = 49h. PointDenoiseCS (PL_FIX variant, Stable Penumbra's slots, not on a moving receiver), on pixels whose 3x3
 		// disagrees or whose history is partial:
 		// PointSmoothHardEdges "Smooth Hard Edges": a sharp edge (penumbra formula <= 2.5 px) in the 5x5 -> the fixed 5x5 Gaussian (sigma 1 px)
 		// instead of the rotated 2-px Poisson disc.
 		// PointSteadyEdges "Steady Edges": the history clamp on edge pixels = the 5x5 Gaussian mean +- max(2 sigma, 0.25), static weight 0.1.
-		bool PointSmoothHardEdges = true;
-		bool PointSteadyEdges = true;
+		// (50b) Both retired, fixed on (keys ignored); they act in the old Penumbra denoiser only (Penumbra v2 has its own rules).
+		static constexpr bool PointSmoothHardEdges = true;
+		static constexpr bool PointSteadyEdges = true;
 		// (49m) Outside the settings macro, Point Light Shadows > Point Lights > Advanced (TracePointLightsCS; each "old" choice = 49j exactly):
 		// PointDarkSideTest "Dark Side Test": 0 Off (no test, as before 48k), 1 Original (48k: blocked without a ray where the 1- / 2-pixel
 		// depth normal faces away, N.L <= 0), 2 Tolerant (default: the mean of the 1- to 8-pixel fits, blocked only below N.L = -margin, the
 		// margin growing with the fits' spread; kFlagDarkTolerant).
-		int PointDarkSideTest = 2;
+		static constexpr int PointDarkSideTest = 2;  // (50b) retired, fixed Tolerant (key ignored)
 		// PointGrazingOffset "Grazing-Angle Offset": the scene ray starts up to 2x farther out where the light grazes the surface, and the
 		// close-contact character ray's TMin is 2 / N.L (within 2 .. 6) instead of the 47x ramp (kFlagGrazeOffset).
-		bool PointGrazingOffset = true;
+		static constexpr bool PointGrazingOffset = true;  // (50b) retired, fixed on (key ignored)
 		// PointEdgeRays "Smooth Shadow Edges (extra rays)": slots 0 - 3 whose ray disagrees with a neighbour's trace 3 more rays from sub-pixel
 		// positions and store the lit fraction (kFlagEdgeRays; the denoiser reads the fractional encoding).
-		bool PointEdgeRays = false;  // (50a) default off: the stair-steps it targeted were the particle grid (Smooth Shadows on Smoke and Water Sheets)
+		// (50b) Retired and deleted (the trace's edge-ray loop is gone); the key is ignored.
 		// PointSoftCut "Soft Hand-Off for Weak Lights": a light traced just above its cut has its shadow faded in up to 1.5x the cut, so the
 		// edge between traced and untraced pixels of that light is not a hard line (kFlagSoftCut; fractional encoding).
-		bool PointSoftCut = true;
+		static constexpr bool PointSoftCut = true;  // (50b) retired, fixed on (key ignored)
 		// (49m) CharRefreshShapes "Refresh Changed Character Shapes" (Objects in Ray Tracing > Characters): on each full scan a sparse sample
 		// of a skinned / face shape's vertex positions is compared with the one it was captured with; a change (an in-place body morph, a
 		// face expression) re-captures it, at most every Characters::kRefreshMinFrames per shape and one shape per frame.
-		bool CharRefreshShapes = true;
+		static constexpr bool CharRefreshShapes = true;  // (50b) retired, fixed on (key ignored)
 		// (49h) HairFaintStrands "Hair: Ignore Faint Strands in RT" (Objects in Ray Tracing > Characters > Hair): hair cards keep alpha >= 0.5
 		// in the trace (their faint fringe made a solid board), and every kGreater alpha test (characters and cut-out objects) keeps alpha >
 		// threshold instead of >= threshold. A change re-captures characters and the scene.
-		bool HairFaintStrands = true;
+		static constexpr bool HairFaintStrands = true;  // (50b) retired, fixed on (key ignored)
 		// (47y) Outside the settings macro. Grainy RT shadows on moving characters; each on by default, off = 47x exactly.
 		// MovingKeepHistory "Moving Characters: Keep Shadow History" (sun and point lights): where the camera-only reprojection finds no
 		// valid history (a moving surface), the denoisers also try last frame's motion vectors at constant velocity (the trace runs
@@ -550,7 +554,7 @@ public:
 
 	virtual void DrawSettings() override;
 	// (46g) The Ray Tracing category: the feature entry (master switch, status, diagnostics) and three more entries.
-	void DrawMasterHeader();
+	void DrawMasterHeader(bool a_switch = false);  // (50b) the checkbox on the main page only (a_switch), a status line elsewhere
 	void DrawSunPage();
 	/// (47n) Main page: the per-kind rows (sun, point lights and RTAO share them).
 	void DrawObjectRows();
