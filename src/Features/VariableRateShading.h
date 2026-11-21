@@ -50,6 +50,10 @@ struct VariableRateShading : Feature
 		float Quality = 0.5f;       // 0..1, higher keeps more tiles at full rate
 		float MotionPixels = 8.0f;  // speed (px/frame) at which the threshold doubles, 0 = off
 		bool DebugOverlay = false;  // (48o) not saved: always starts off
+		// (49k) Soft blended effects (smoke, mist, the mountain clouds, steam, glows) at full rate. Off = the 47p effects window: every
+		// soft effect draw at 2x2, which shades the soft-particle depth fade and the alpha once per 2x2 block (blocky, flickering edges
+		// where bright mist meets a dark object behind or in front of it).
+		bool FullRateSoftEffects = true;
 		// (44h) removed RateMode, CoarsestRate, ProtectNormals, IncludeGrass, IncludeAlphaTested, PeripheryRadius
 		// and CoarsenFrames, now fixed: Adaptive mode (screen-edge modes gone), coarsest rate 2x2, normal detail
 		// protected, grass included, other cut-out objects excluded (they left holes), coarsen delay 8 frames.
