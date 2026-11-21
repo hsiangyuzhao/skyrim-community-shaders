@@ -36,12 +36,9 @@ void IBL::DrawSettings()
 	ImGui::SliderFloat("Diffuse IBL Scale", &settings.DiffuseIBLScale, 0.0f, 10.0f, "%.2f");
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text("Overall brightness of the IBL ambient light. Higher = brighter shadows and ambient areas.");
-	ImGui::SliderFloat("Diffuse IBL Saturation", &settings.IBLSaturation, 0.0f, 2.0f, "%.2f");
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text("Colour strength of the IBL ambient light. 0 = grey, 1 = unchanged, above 1 = more colourful.");
-
-	// (B7) The two halves the ambient probe is split into, trimmable independently. The pair
-	// above stays the master gate on the combined result; these four sit underneath it.
+	// (49i) Slider order (user decision): the three scales, the three saturations, DALC Amount.
+	// (B7) The two halves the ambient probe is split into, trimmable independently. The Diffuse pair stays the master gate on the
+	// combined result; the Env / Sky ones sit underneath it.
 	ImGui::SliderFloat("Env IBL Scale", &settings.EnvIBLScale, 0.0f, 10.0f, "%.2f");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text(
@@ -54,6 +51,9 @@ void IBL::DrawSettings()
 			"Brightness of light from the sky. Strongest in the open and on upward-facing surfaces, fading out under cover.\n"
 			"Lower it if open outdoor areas look too blue.");
 	}
+	ImGui::SliderFloat("Diffuse IBL Saturation", &settings.IBLSaturation, 0.0f, 2.0f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Colour strength of the IBL ambient light. 0 = grey, 1 = unchanged, above 1 = more colourful.");
 	ImGui::SliderFloat("Env IBL Saturation", &settings.EnvIBLSaturation, 0.0f, 2.0f, "%.2f");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("Colour strength of the bounced (surroundings) light only. 0 = grey, 1 = unchanged.");
@@ -62,7 +62,6 @@ void IBL::DrawSettings()
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("Colour strength of the sky light only. 0 = grey, 1 = unchanged.");
 	}
-
 	ImGui::SliderFloat("DALC Amount", &settings.DALCAmount, 0.0f, 1.0f, "%.2f");
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text("How much of Skyrim's own ambient light (DALC, directional ambient lighting) is kept when IBL is on. 1 = all of it.");
