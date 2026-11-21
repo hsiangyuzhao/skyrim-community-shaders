@@ -3230,15 +3230,16 @@ void PhysicalSky::UpdateOutdoorCalibration()
 	const uint32_t frame = globals::state->frameCount;
 	if (amb.calibrationFrame != UINT32_MAX && frame - amb.calibrationFrame < 64u && !outdoorFrame.timeJump)
 		return;
-	amb.calibrationFrame = frame;
 	amb.calibration = 0.f;
 	amb.cloudAmbientCal = 0.f;
 	if (!UpdateCpuSkyModel())
-		return;
+		return;  // tried again next frame
+	amb.calibrationFrame = frame;
 	const float sinTilt = std::abs(std::sin(DirectX::XMConvertToRadians(globals::features::skySync.GetSunAngle())));
 	const double peak = std::asin(std::clamp(static_cast<double>(sinTilt), 0.17, 1.0));  // a flat path's peak counted no lower than 10 deg
 	const PhysicalSkyModel::Light sun = { { std::cos(peak), 0.0, std::sin(peak) }, { settings.sunlightColor.x, settings.sunlightColor.y, settings.sunlightColor.z } };
-	const double cameraRadius = static_cast<double>(cbData.zCameraPlanet) * Util::Units::GAME_UNIT_TO_KM;
+	// A fixed observer 0.5 km above the planet's ground (a constant, not the camera's height; the camera's own sky is used "now").
+	const double cameraRadius = static_cast<double>(std::max(settings.planetRadius, 1.f)) + 0.5;
 	const auto tr = skyModelCpu.Transmittance(cameraRadius, sun.dir);
 	const float3 direct = float3(static_cast<float>(sun.color[0] * tr[0]), static_cast<float>(sun.color[1] * tr[1]), static_cast<float>(sun.color[2] * tr[2])) *
 	                      static_cast<float>(std::sin(peak));
@@ -3280,7 +3281,7 @@ void PhysicalSky::UpdateOutdoorAmbient(const RE::NiPoint3& a_lutSunDir)
 
 	// Luminance from physics: the sky as drawn (the sun family's scattering through cbData.sunlightColor, the moons' glows, the night glow) +
 	// the ground's bounce of it and of the direct sun and moons, x the one calibration constant.
-	const double cameraRadius = static_cast<double>(cbData.zCameraPlanet) * Util::Units::GAME_UNIT_TO_KM;
+	const double cameraRadius = std::max(static_cast<double>(cbData.zCameraPlanet) * Util::Units::GAME_UNIT_TO_KM, static_cast<double>(std::max(settings.planetRadius, 1.f)) + 0.01);
 	const PhysicalSkyModel::Light lights[3] = {
 		{ UnitVec(a_lutSunDir.x, a_lutSunDir.y, a_lutSunDir.z), { cbData.sunlightColor.x, cbData.sunlightColor.y, cbData.sunlightColor.z } },
 		{ UnitVec(cbData.masserDir.x, cbData.masserDir.y, cbData.masserDir.z), { cbData.masserColor.x, cbData.masserColor.y, cbData.masserColor.z } },
