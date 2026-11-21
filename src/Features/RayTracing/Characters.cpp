@@ -129,6 +129,61 @@ namespace RayTracingCharacters
 			return hash;
 		}
 
+		/// (49m) Refresh Changed Character Shapes: a sample of the positions Capture reads, kContentSamples vertices spread over the shape
+		/// (a face's morphed positions; else the skin partition's CPU vertex copy, 8 bytes at the position: half3 + one more half, or the
+		/// first two floats). 0 = none (a rigid shape, or nothing readable). Read without the engine's lock: a torn read only means one early
+		/// re-capture.
+		std::uint64_t ContentHash(RE::BSGeometry* a_geometry)
+		{
+			const auto& runtime = a_geometry->GetGeometryRuntimeData();
+			auto* skin = runtime.skinInstance.get();
+			if (!skin)
+				return 0;
+			SkinRefs refs;
+			if (!ReadSkinRefs(skin, refs) || refs.vertexCount == 0 || refs.partitions == 0)
+				return 0;
+			const std::uint32_t count = refs.vertexCount;
+			std::uint64_t hash = Mix(0x51ED27A3ull, count);
+			bool any = false;
+			if (a_geometry->GetType().get() == RE::BSGeometry::Type::kDynamicTriShape) {
+				auto& dynamicData = static_cast<RE::BSDynamicTriShape*>(a_geometry)->GetDynamicTrishapeRuntimeData();
+				const auto* base = static_cast<const std::uint8_t*>(dynamicData.dynamicData);
+				if (base && dynamicData.dataSize >= static_cast<std::size_t>(count) * 16) {
+					for (std::uint32_t i = 0; i < kContentSamples; ++i) {
+						const std::size_t v = (static_cast<std::size_t>(i) * 2 + 1) * count / (kContentSamples * 2);
+						std::uint64_t bits[2]{};
+						if (SafeCopy(bits, base + v * 16, 12)) {
+							hash = Mix(Mix(hash, bits[0]), bits[1]);
+							any = true;
+						}
+					}
+				}
+			}
+			if (!any) {
+				RE::NiSkinPartition::Partition partition{};
+				if (!SafeCopy(&partition, refs.partitionData, sizeof(partition)) || !partition.buffData)
+					return 0;
+				RE::BSGraphics::TriShape buffer{};
+				if (!SafeCopy(&buffer, partition.buffData, sizeof(buffer)) || !buffer.rawVertexData)
+					return 0;
+				std::uint64_t descBits = 0;
+				std::memcpy(&descBits, &buffer.vertexDesc, sizeof(descBits));
+				const std::uint32_t stride = static_cast<std::uint32_t>(descBits & 0xF) * 4;
+				const std::uint32_t offset = buffer.vertexDesc.GetAttributeOffset(RE::BSGraphics::Vertex::VA_POSITION);
+				if (stride == 0 || !(buffer.vertexDesc.GetFlags() & RE::BSGraphics::Vertex::VF_VERTEX) || offset + 8 > stride)
+					return 0;
+				for (std::uint32_t i = 0; i < kContentSamples; ++i) {
+					const std::size_t v = (static_cast<std::size_t>(i) * 2 + 1) * count / (kContentSamples * 2);
+					std::uint64_t bits = 0;
+					if (SafeCopy(&bits, buffer.rawVertexData + v * stride + offset, 8)) {
+						hash = Mix(hash, bits);
+						any = true;
+					}
+				}
+			}
+			return any ? (hash == 0 ? 1 : hash) : 0;
+		}
+
 		bool HasHdtData(RE::NiAVObject* a_node)
 		{
 			const std::uint16_t count = a_node->GetExtraDataSize();
@@ -561,7 +616,7 @@ namespace RayTracingCharacters
 		}
 	}
 
-	void Characters::Enumerate(Actor& a_actor, std::vector<Found>& o_found)
+	void Characters::Enumerate(Actor& a_actor, std::vector<Found>& o_found, bool a_content)
 	{
 		o_found.clear();
 		static thread_local std::vector<std::pair<RE::NiAVObject*, int>> stack;  // (46m) per read lane, no allocation per call
@@ -592,7 +647,11 @@ namespace RayTracingCharacters
 			const auto type = geometry->GetType().get();
 			if (type != RE::BSGeometry::Type::kTriShape && type != RE::BSGeometry::Type::kDynamicTriShape)
 				continue;
-			o_found.push_back(Found{ geometry, Signature(geometry) });
+			// (49m) Refresh Changed Character Shapes: the vertex sample of the shapes already captured (a new one is sampled at its capture).
+			std::uint64_t content = 0;
+			if (a_content && std::any_of(a_actor.shapes.begin(), a_actor.shapes.end(), [&](const std::unique_ptr<Shape>& a_shape) { return a_shape->geometry.get() == geometry; }))
+				content = ContentHash(geometry);
+			o_found.push_back(Found{ geometry, Signature(geometry), content });
 		}
 	}
 
@@ -606,7 +665,7 @@ namespace RayTracingCharacters
 		return ReadBoneMatrices(a_shape.bones.data(), count, a_origin, o_matrices.data());
 	}
 
-	void Characters::ReadActor(Actor& a_actor, bool a_scan)
+	void Characters::ReadActor(Actor& a_actor, bool a_scan, bool a_content)
 	{
 		a_actor.readOk = false;
 		a_actor.scanned = a_scan;
@@ -617,7 +676,7 @@ namespace RayTracingCharacters
 		a_actor.origin[1] = translate.y;
 		a_actor.origin[2] = translate.z;
 		if (a_scan) {
-			Enumerate(a_actor, a_actor.found);
+			Enumerate(a_actor, a_actor.found, a_content);
 		} else {
 			// The known shapes only: still attached under the root and not hidden, their signature (a changed one is
 			// captured again by Update, a gone one retires). New shapes are found by the next full scan.
@@ -625,7 +684,7 @@ namespace RayTracingCharacters
 			for (const auto& shape : a_actor.shapes) {
 				RE::BSGeometry* geometry = shape->geometry.get();
 				if (geometry && Attached(geometry, root, a_actor.player))
-					a_actor.found.push_back(Found{ geometry, Signature(geometry) });
+					a_actor.found.push_back(Found{ geometry, Signature(geometry), 0 });  // (49m) no content sample between full scans
 			}
 		}
 		for (auto& shape : a_actor.shapes) {
@@ -1315,12 +1374,13 @@ namespace RayTracingCharacters
 			{
 				std::vector<std::unique_ptr<Actor>>* actors;
 				const std::uint8_t* scan;
-			} job{ &actors_, scan.data() };
+				bool content;  // (49m) Refresh Changed Character Shapes: vertex samples on full scans
+			} job{ &actors_, scan.data(), refreshShapes_ };
 			auto run = [](void* a_context, std::uint32_t a_index) {
 				auto& readJob = *static_cast<ReadJob*>(a_context);
 				auto& actor = *(*readJob.actors)[a_index];
 				try {
-					ReadActor(actor, readJob.scan[a_index] != 0);
+					ReadActor(actor, readJob.scan[a_index] != 0, readJob.content);
 				} catch (...) {
 					actor.readOk = false;  // (allocation failure) this actor stays as it was this frame
 				}
@@ -1338,6 +1398,7 @@ namespace RayTracingCharacters
 		const std::int64_t captureStart = Qpc();
 		const std::int64_t deadline = start + static_cast<std::int64_t>(a_budgetMs / std::max(QpcMs(), 1e-9));
 		std::uint32_t captures = 0;
+		std::uint32_t refreshes = 0;  // (49m) Refresh Changed Character Shapes: at most one per frame
 		for (auto& actor : actors_) {
 			if (!actor->readOk)
 				continue;  // its reads failed this frame: its shapes stay as they were
@@ -1348,7 +1409,20 @@ namespace RayTracingCharacters
 				for (std::size_t s = 0; s < actor->shapes.size(); ++s) {
 					auto& shape = actor->shapes[s];
 					const auto it = std::find_if(found.begin(), found.end(), [&](const Found& a_found) { return a_found.geometry == shape->geometry.get(); });
-					if (it != found.end() && it->signature == shape->signature) {
+					bool same = it != found.end() && it->signature == shape->signature;
+					// (49m) Refresh Changed Character Shapes: same identity, but its vertex sample (read on this full scan) differs from the one
+					// it was captured with -> re-captured below (rate-limited; the old one is still traced this frame).
+					if (same && refreshShapes_ && it->content != 0) {
+						if (shape->content == 0) {
+							shape->content = it->content;  // captured without a sample (switch turned on later): adopt this one
+						} else if (it->content != shape->content && refreshes == 0 && frame_ >= shape->capturedFrame + kRefreshMinFrames &&
+								   captures == 0) {
+							same = false;
+							++refreshes;
+							++stats_.refreshedShapes;
+						}
+					}
+					if (same) {
 						if (keep != s)
 							actor->shapes[keep] = std::move(shape);
 						++keep;
@@ -1376,8 +1450,12 @@ namespace RayTracingCharacters
 				}
 				++captures;
 				auto shape = Capture(a_backend, *actor, entry.geometry, entry.signature);
-				if (shape)
+				if (shape) {
+					// (49m) Refresh Changed Character Shapes: the vertex sample it was captured with.
+					shape->content = refreshShapes_ ? ContentHash(entry.geometry) : 0;
+					shape->capturedFrame = frame_;
 					actor->shapes.push_back(std::move(shape));  // its matrices are this frame's (read at capture)
+				}
 				else
 					actor->refused.insert(entry.signature);  // judged once (a changed shape has a new signature)
 			}

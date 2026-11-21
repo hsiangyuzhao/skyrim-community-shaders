@@ -57,6 +57,10 @@ namespace RayTracingCharacters
 	// player every frame), and for kEquipScanFrames frames after it equipped / unequipped something.
 	inline constexpr std::uint32_t kRescanFrames = 8;
 	inline constexpr std::uint32_t kEquipScanFrames = 30;
+	// (49m) Refresh Changed Character Shapes: a shape whose vertex sample changed is re-captured at most every kRefreshMinFrames frames, one
+	// shape per frame; kContentSamples vertices are sampled per shape on each full scan.
+	inline constexpr std::uint32_t kRefreshMinFrames = 64;
+	inline constexpr std::uint32_t kContentSamples = 16;
 	inline constexpr std::uint32_t kReadLanes = 4;  // (46m) per-actor reads: this thread + 3 workers
 	// (47q) The NPC rule: an NPC turns body-only beyond the distance + this, back to all its parts within the distance - this.
 	inline constexpr float kBodyOnlyHysteresis = 105.0f;  // 1.5 m
@@ -73,6 +77,7 @@ namespace RayTracingCharacters
 		std::uint32_t alphaShapes = 0;
 		std::uint64_t vertices = 0;        // of the captured shapes
 		std::uint32_t retiredShapes = 0;   // total: equip / dismember / unload changes
+		std::uint32_t refreshedShapes = 0;  // (49m) total: re-captured because their vertex sample changed (Refresh Changed Character Shapes)
 		// Left to the shadow map (totals since the scene was dropped; each distinct shape once).
 		std::uint32_t skipPhysicsOff = 0;  // physics part with the switch off
 		std::uint32_t skipHairOff = 0;     // (45j) hair with Hair on Shadow map
@@ -132,6 +137,9 @@ namespace RayTracingCharacters
 		void Configure(bool a_physics, bool a_hair, bool a_alpha, bool a_firstPersonPlayer, bool a_dropTiny);
 		/// (47p) Bone matrices within float noise of the last skinned ones count as a still pose (no re-skinning).
 		void SetBonesTolerant(bool a_on) { bonesTolerant_ = a_on; }
+		/// (49m) "Refresh Changed Character Shapes": a sparse vertex sample per skinned / face shape on each full scan; a changed one is re-captured
+		/// (kRefreshMinFrames, one shape per frame).
+		void SetRefreshShapes(bool a_on) { refreshShapes_ = a_on; }
 		/// (49h) "Hair: Ignore Faint Strands in RT": strict kGreater alpha thresholds and hair cards cut at alpha 0.5. A change re-captures
 		/// every character (next Update).
 		void SetStrictAlpha(bool a_on)
@@ -203,6 +211,8 @@ namespace RayTracingCharacters
 			RE::NiPointer<RE::BSGeometry> geometry;
 			RE::NiPointer<RE::NiSkinInstance> skin;  // held: its bone list and partitions stay valid
 			std::uint64_t signature = 0;
+			std::uint64_t content = 0;        // (49m) its vertex sample when captured (0 = none)
+			std::uint64_t capturedFrame = 0;  // (49m)
 			RayTracingRT::SkinHandle handle = RayTracingRT::kInvalidSkin;
 			std::vector<Bone> bones;
 			bool physics = false;
@@ -228,6 +238,7 @@ namespace RayTracingCharacters
 		{
 			RE::BSGeometry* geometry;
 			std::uint64_t signature;
+			std::uint64_t content = 0;  // (49m) its vertex sample (full scans with Refresh Changed Character Shapes; 0 = not read)
 		};
 		struct Actor
 		{
@@ -260,10 +271,10 @@ namespace RayTracingCharacters
 
 		void ReleaseShape(RayTracingRT::Backend& a_backend, Shape& a_shape);
 		void ReleaseActor(RayTracingRT::Backend& a_backend, Actor& a_actor);
-		static void Enumerate(Actor& a_actor, std::vector<Found>& o_found);
+		static void Enumerate(Actor& a_actor, std::vector<Found>& o_found, bool a_content);
 		/// (46m) One actor's reads (any read lane; touches nothing but this actor's entry): its shapes (a full scan, or a
 		/// check of the known ones: still attached under the root, not hidden, signature), its known shapes' bone matrices.
-		static void ReadActor(Actor& a_actor, bool a_scan);
+		static void ReadActor(Actor& a_actor, bool a_scan, bool a_content);
 		/// Reads, checks and hands a shape to the backend; nullptr when it is not taken (counted).
 		std::unique_ptr<Shape> Capture(RayTracingRT::Backend& a_backend, Actor& a_actor, RE::BSGeometry* a_geometry, std::uint64_t a_signature);
 		/// This frame's bone matrices; false when a bone could not be read (the last ones are kept).
@@ -281,6 +292,7 @@ namespace RayTracingCharacters
 		bool dropTiny_ = false;  // (47p)
 		bool bonesTolerant_ = false;  // (47p) "Ray tracing: ignore bone noise"
 		bool strictAlpha_ = true;     // (49h)
+		bool refreshShapes_ = true;   // (49m)
 		float bodyOnlyDistance_ = 0.0f;  // (47q) 0 = no limit
 		bool materials_ = false;         // (48g)
 		std::uint32_t stillReused_ = 0;  // (45n)

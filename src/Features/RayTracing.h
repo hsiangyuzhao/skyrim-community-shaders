@@ -358,6 +358,10 @@ public:
 		// PointSoftCut "Soft Hand-Off for Weak Lights": a light traced just above its cut has its shadow faded in up to 1.5x the cut, so the
 		// edge between traced and untraced pixels of that light is not a hard line (kFlagSoftCut; fractional encoding).
 		bool PointSoftCut = true;
+		// (49m) CharRefreshShapes "Refresh Changed Character Shapes" (Objects in Ray Tracing > Characters): on each full scan a sparse sample
+		// of a skinned / face shape's vertex positions is compared with the one it was captured with; a change (an in-place body morph, a
+		// face expression) re-captures it, at most every Characters::kRefreshMinFrames per shape and one shape per frame.
+		bool CharRefreshShapes = true;
 		// (49h) HairFaintStrands "Hair: Ignore Faint Strands in RT" (Objects in Ray Tracing > Characters > Hair): hair cards keep alpha >= 0.5
 		// in the trace (their faint fringe made a solid board), and every kGreater alpha test (characters and cut-out objects) keeps alpha >
 		// threshold instead of >= threshold. A change re-captures characters and the scene.
