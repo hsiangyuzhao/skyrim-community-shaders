@@ -2208,13 +2208,13 @@ float3 PhysicalSky::ComputeLightTransmittance(const float3& a_dir)
 void PhysicalSky::UpdateSkyAnchor(const RE::NiPoint3& a_lutSunDir, const float3& a_sun, const float3& a_masserGlow, const float3& a_secundaGlow, float a_exposure)
 {
 	// (50b) Stage 2: one factor k_sky that puts the physical sky family on the scene's (vanilla / weather) brightness scale.
-	//   The brightness a white horizontal surface sends back (DALC and Lighting's units: ambient as is, a directional light x N.L x the
-	//   vanilla diffuse multiplier):
-	//     E_v    = the weather's DALC mean (as Lighting linearises it) + its sunlight colour (light gamma, directional multiplier) x VDM x sin(elevation)
-	//              of the body that lights the scene (the sun while it is up, else the higher moon);
+	//   The brightness a white surface sends back (DALC and Lighting's units: ambient as is, a directional light x the vanilla diffuse
+	//   multiplier VDM), the directional light at normal incidence (no elevation term: a low sun lights walls facing it fully, and an N.L term
+	//   would have pushed k up exactly when the direct light is strong on walls):
+	//     E_v    = the weather's DALC mean (as Lighting linearises it) + its sunlight colour (light gamma, directional multiplier) x VDM;
 	//     E_phys = the CPU sky model's cosine-weighted sky radiance (the sun's and the moons' scattering, WITHOUT the night base light, which is
-	//              the weather's own layer) + the sun x the transmittance x VDM x sin + each moon's light x phase x the weather / horizon
-	//              visibility x the daylight fade x VDM x sin.
+	//              the weather's own layer) + the sun x the transmittance x VDM (none below the horizon, -0.5..+0.5 degree ramp) + each moon's
+	//              light x phase x the weather / horizon visibility x the daylight fade x VDM.
 	//   k = (E_v / E_phys) / (E_v,ref / E_phys,ref): the reference is the same weather's day key with the sun at kAnchorRefElevationDeg (same
 	//   azimuth, no moons), so k = 1 at a clear noon of every weather (the user's noon tuning is kept) and follows the weather's own data at
 	//   every other moment (no time keying). Clamp: [1 / kAnchorCap, kAnchorCap] (32, as Sky Fixes' factor). Moonless nights: E_phys -> 0,
@@ -2256,8 +2256,7 @@ void PhysicalSky::UpdateSkyAnchor(const RE::NiPoint3& a_lutSunDir, const float3&
 			const float masserZ = skySync.rawDirections[static_cast<int>(SkySync::Caster::Masser)].z;
 			const float secundaZ = skySync.rawDirections[static_cast<int>(SkySync::Caster::Secunda)].z;
 			const float sunZ = std::clamp(a_lutSunDir.z, -1.f, 1.f);
-			const float sinV = sunZ > 0.f ? sunZ : std::max({ masserZ, secundaZ, 0.f });
-			const float eV = dalc + sunV * vdm * sinV;
+			const float eV = dalc + sunV * vdm;  // the directional light at normal incidence (no elevation term: see above)
 			// E_v at the reference: the day keys of the same weathers.
 			auto keyDalc = [&]() {
 				auto channel = [](const RE::Color& c, int i) { return (i == 0 ? c.red : i == 1 ? c.green : c.blue) * (1.f / 255.f); };
@@ -2289,8 +2288,7 @@ void PhysicalSky::UpdateSkyAnchor(const RE::NiPoint3& a_lutSunDir, const float3&
 				return lumPow(rgb[0], rgb[1], rgb[2], lightGamma) * dirMult;
 			};
 			const double refEl = DirectX::XMConvertToRadians(kAnchorRefElevationDeg);
-			const float sinRef = static_cast<float>(std::sin(refEl));
-			const float eVRef = keyDalc() + keySun() * vdm * sinRef;
+			const float eVRef = keyDalc() + keySun() * vdm;
 			// E_phys now and at the reference (CPU model; the cosine-weighted mean as ComputeFogSkyLight, without the night base).
 			auto unit = [](double x, double y, double z) {
 				const double l = std::sqrt(x * x + y * y + z * z);
@@ -2316,7 +2314,7 @@ void PhysicalSky::UpdateSkyAnchor(const RE::NiPoint3& a_lutSunDir, const float3&
 			}
 			const float3 trSun = ComputeLightTransmittance(float3(a_lutSunDir.x, a_lutSunDir.y, a_lutSunDir.z));
 			const float3 trRef = ComputeLightTransmittance(float3(static_cast<float>(refLight.dir[0]), static_cast<float>(refLight.dir[1]), static_cast<float>(refLight.dir[2])));
-			const float sunDirect = lum(a_sun * trSun) * vdm * std::max(sunZ, 0.f);
+			const float sunDirect = lum(a_sun * trSun) * vdm * SkySync::SmoothStep(-0.5f, 0.5f, DirectX::XMConvertToDegrees(std::asin(sunZ)));  // below the horizon: none
 			float moonDirect = 0.f;
 			const float dayFade = SkySync::MoonDayFade(DirectX::XMConvertToDegrees(std::asin(std::clamp(skySync.rawDirections[static_cast<int>(SkySync::Caster::Sun)].z, -1.f, 1.f))));
 			const RE::Moon* moons[2] = { sky->masser, sky->secunda };
@@ -2327,10 +2325,10 @@ void PhysicalSky::UpdateSkyAnchor(const RE::NiPoint3& a_lutSunDir, const float3&
 					continue;
 				const float strength = SkySync::PhaseFactorFromTexture(moons[i]) * MoonHorizonVisibility(moons[i], sky, moonZ[i]) * dayFade *
 				                       (i == 1 ? SkySync::SecundaIntensityFactor : 1.f);
-				moonDirect += lum(*colors[i] * a_exposure) * strength * vdm * std::max(moonZ[i], 0.f);
+				moonDirect += lum(*colors[i] * a_exposure) * strength * vdm;  // the visibility holds the -2..3 degree rise
 			}
 			const double ePhys = skyNow + sunDirect + moonDirect;
-			const double ePhysRef = skyRef + lum(a_sun * trRef) * vdm * sinRef;
+			const double ePhysRef = skyRef + lum(a_sun * trRef) * vdm;
 			dbg.eVanilla = eV;
 			dbg.ePhys = static_cast<float>(ePhys);
 			dbg.eVanillaRef = eVRef;
