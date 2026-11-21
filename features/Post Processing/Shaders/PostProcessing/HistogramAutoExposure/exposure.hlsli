@@ -1,5 +1,8 @@
 #ifndef __PP_AUTO_EXPOSURE_MATH_HLSLI__
 #define __PP_AUTO_EXPOSURE_MATH_HLSLI__
+#if defined(EYE_MODE)
+#	include "Common/Color.hlsli"  // (50a) ExposeColorEye
+#endif
 
 /// (44e) The adapt pass's per-pixel exposure and Purkinje shift, shared with the passes it can be
 /// folded into (Local Exposure). Moved here unchanged from adapt.cs.hlsl.
@@ -98,6 +101,42 @@ float3 PurkinjeShift(float3 c, float nightAdaptation)
 		}
 		return color;
 	}
+
+#if defined(EYE_MODE)
+	// (50a) Eye Model, mesopic vision (design review stage 1): per pixel, from the pixel's real luminance L = scene luminance x R. Stage 1 has
+	// no physical input yet, so R = R_day: one calibration constant (a clear-noon average scene, ~0.15 in the game's scene units, is about
+	// 4000 cd/m2). Full photopic (no shift) above kPhotopicNits, full mesopic shift below kScotopicNits, log-linear between; the shift
+	// desaturates toward the pixel's luminance with a cool tint (luminance 1: no brightness change).
+	static const float kSceneToNits = 25000.0;
+	static const float kPhotopicNits = 3.0;
+	static const float kScotopicNits = 0.01;
+	static const float3 kMesopicTint = float3(0.881, 1.006, 1.296);
+
+	/// The eye's per-pixel exposure: 0.18 x compensation / the eye's divisor (adaptation buffer [0]), then the mesopic shift (mesopic > 0) or,
+	/// at mesopic 0, Classic's Purkinje settings keyed on the eye's adapted level (buffer [1]) as Classic keys them on its own.
+	float3 ExposeColorEye(float3 rgb, float divisor, float adaptedLum, float exposureCompensation, float purkinjeStartEV, float purkinjeMaxEV, float purkinjeStrength,
+		float mesopic)
+	{
+		const static float logEV = -3;  // log2(0.125), as ExposeColor
+		const float3 scene = abs(rgb);
+		float3 color = scene * (0.18 * exposureCompensation / max(divisor, 1e-30));
+		[branch] if (mesopic > 1e-3)
+		{
+			const float nits = Color::RGBToLuminance(scene) * kSceneToNits;
+			const float m = saturate((log2(kPhotopicNits) - log2(max(nits, 1e-12))) / (log2(kPhotopicNits) - log2(kScotopicNits))) * saturate(mesopic);
+			[branch] if (m > 1e-4)
+				color = lerp(color, Color::RGBToLuminance(color) * kMesopicTint, m);
+		}
+		else if (purkinjeStrength > 1e-3)
+		{
+			const float mixTerm = (log2(max(adaptedLum, 1e-30)) - logEV - purkinjeMaxEV) / (purkinjeStartEV - purkinjeMaxEV);
+			const float purkinjeMix = lerp(purkinjeStrength, 0.f, saturate(mixTerm));
+			if (purkinjeMix > 1e-3)
+				color = PurkinjeShift(color, purkinjeMix);
+		}
+		return color;
+	}
+#endif
 }
 
 #endif  // __PP_AUTO_EXPOSURE_MATH_HLSLI__

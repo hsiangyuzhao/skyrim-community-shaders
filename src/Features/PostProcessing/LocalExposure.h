@@ -110,6 +110,10 @@ struct LocalExposure : public PostProcessFeature
 	// (44e) FOLD_AUTO_EXPOSURE variants: the setup and apply passes expose the image on load.
 	winrt::com_ptr<ID3D11ComputeShader> setupFoldCS = nullptr;
 	winrt::com_ptr<ID3D11ComputeShader> applyFoldCS = nullptr;
+	// (50a) Eye Model variants (EYE_MODE): the fold reads the eye's divisor and adapted level; the apply adds Minimum Visibility.
+	winrt::com_ptr<ID3D11ComputeShader> setupFoldEyeCS = nullptr;
+	winrt::com_ptr<ID3D11ComputeShader> applyFoldEyeCS = nullptr;
+	winrt::com_ptr<ID3D11ComputeShader> applyEyeCS = nullptr;
 	/// (44e) Everything the folded Draw needs is there (it can never skip the exposure).
 	bool CanFold() const;
 

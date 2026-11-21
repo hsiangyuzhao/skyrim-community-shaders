@@ -294,7 +294,8 @@ void LocalExposure::ReleaseResources()
 
 void LocalExposure::ClearShaderCache()
 {
-	for (auto shader : { &setupCS, &downsampleCS, &blurHorizontalCS, &blurVerticalCS, &gridCS, &applyCS, &setupFoldCS, &applyFoldCS })
+	for (auto shader : { &setupCS, &downsampleCS, &blurHorizontalCS, &blurVerticalCS, &gridCS, &applyCS, &setupFoldCS, &applyFoldCS, &setupFoldEyeCS, &applyFoldEyeCS,
+			 &applyEyeCS })
 		*shader = nullptr;
 
 	CompileComputeShaders();
@@ -327,11 +328,21 @@ void LocalExposure::CompileComputeShaders()
 		setupFoldCS.attach(rawPtr);
 	if (auto rawPtr = reinterpret_cast<ID3D11ComputeShader*>(Util::CompileShader(path.c_str(), { { "FOLD_AUTO_EXPOSURE", "" } }, "cs_5_0", "CSApplyLocalExposure")))
 		applyFoldCS.attach(rawPtr);
+	// (50a) Histogram Auto Exposure's Eye Model.
+	if (auto rawPtr = reinterpret_cast<ID3D11ComputeShader*>(Util::CompileShader(path.c_str(), { { "FOLD_AUTO_EXPOSURE", "" }, { "EYE_MODE", "" } }, "cs_5_0", "CSSetupLogLuminance")))
+		setupFoldEyeCS.attach(rawPtr);
+	if (auto rawPtr = reinterpret_cast<ID3D11ComputeShader*>(Util::CompileShader(path.c_str(), { { "FOLD_AUTO_EXPOSURE", "" }, { "EYE_MODE", "" } }, "cs_5_0", "CSApplyLocalExposure")))
+		applyFoldEyeCS.attach(rawPtr);
+	if (auto rawPtr = reinterpret_cast<ID3D11ComputeShader*>(Util::CompileShader(path.c_str(), { { "EYE_MODE", "" } }, "cs_5_0", "CSApplyLocalExposure")))
+		applyEyeCS.attach(rawPtr);
 }
 
 bool LocalExposure::CanFold() const
 {
-	return setupCS && downsampleCS && blurHorizontalCS && blurVerticalCS && gridCS && applyCS && setupFoldCS && applyFoldCS &&
+	// (50a) With the Eye Model in effect the fold needs its eye variants (else the adapt pass runs and this effect takes the exposed image).
+	const auto* autoExposure = GetActiveAutoExposure();
+	const bool eyeOk = !(autoExposure && autoExposure->EyeActive()) || (setupFoldEyeCS && applyFoldEyeCS);
+	return setupCS && downsampleCS && blurHorizontalCS && blurVerticalCS && gridCS && applyCS && setupFoldCS && applyFoldCS && eyeOk &&
 	       texOutput && texLogLuminance && numMips > 0;
 }
 
@@ -394,8 +405,12 @@ void LocalExposure::Draw(TextureInfo& inout_tex)
 		.LogLuminanceMin = -13.f,
 		.LogLuminanceMax = 18.f,
 		.MiddleGreyCompensation = autoExposure ? std::max(autoExposure->lastExposureCompensation, 1e-3f) : 1.f,
-		.pad = 0.f,
+		.pad = 0.f,  // (50a) EYE_MODE variants: Minimum Visibility (below)
 	};
+	// (50a) Histogram Auto Exposure's Eye Model: its variants of this effect (fold: the eye's exposure; apply: Minimum Visibility on the base).
+	const bool eye = autoExposure && autoExposure->EyeActive() && applyEyeCS && setupFoldEyeCS && applyFoldEyeCS;
+	if (eye)
+		cbData.pad = autoExposure->eyeLocalMinVisibility;
 	localExposureCB->Update(cbData);
 
 	ID3D11Buffer* cb = localExposureCB->CB();
@@ -435,7 +450,7 @@ void LocalExposure::Draw(TextureInfo& inout_tex)
 		srvs[0] = inout_tex.srv;
 		uavs[0] = logLuminanceMipUAVs[0].get();
 		bind();
-		context->CSSetShader(fold ? setupFoldCS.get() : setupCS.get(), nullptr, 0);
+		context->CSSetShader(fold ? (eye ? setupFoldEyeCS.get() : setupFoldCS.get()) : setupCS.get(), nullptr, 0);  // (50a)
 		context->Dispatch((fullW + 7) >> 3, (fullH + 7) >> 3, 1);
 		resetViews();
 	}
@@ -486,7 +501,7 @@ void LocalExposure::Draw(TextureInfo& inout_tex)
 		srvs[3] = texBlurredLuminance->srv.get();
 		uavs[0] = texOutput->uav.get();
 		bind();
-		context->CSSetShader(fold ? applyFoldCS.get() : applyCS.get(), nullptr, 0);
+		context->CSSetShader(fold ? (eye ? applyFoldEyeCS.get() : applyFoldCS.get()) : (eye ? applyEyeCS.get() : applyCS.get()), nullptr, 0);  // (50a)
 		context->Dispatch((fullW + 7) >> 3, (fullH + 7) >> 3, 1);
 		resetViews();
 	}

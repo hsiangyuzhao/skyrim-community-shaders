@@ -42,7 +42,11 @@ cbuffer LocalExposureCB : register(b1)
 	float LogLuminanceMin;
 	float LogLuminanceMax;
 	float MiddleGreyCompensation;  // auto exposure's Exposure Compensation (linear), else 1
+#if defined(EYE_MODE)
+	float MinVisibility;  // (50a) Eye Model: Minimum Visibility, a soft floor of the local base as a fraction of middle grey (0 = off)
+#else
 	float Padding1;
+#endif
 };
 
 Texture2D<float4> TexColor : register(t0);
@@ -66,12 +70,34 @@ cbuffer AutoExposureFoldCB : register(b2)
 	float AEPurkinjeStartEV;
 	float AEPurkinjeMaxEV;
 	float AEPurkinjeStrength;
+#	if defined(EYE_MODE)
+	// (50a) Eye Model: the auto exposure CB's eye fields (common.hlsli, same layout from offset 48).
+	float3 AEPad;
+	float AEEyeLogLo;
+	float AEEyeLogHi;
+	float AEEyeNightDarkness;
+	float AEEyeMinVisibility;
+	float AEEyeTauBright;
+	float AEEyeTauDark;
+	float AEEyeMaxRate;
+	float AEEyeDeadband;
+	float AEEyeWobble;
+	float AEEyeMesopic;
+	float AEEyeDt;
+	uint AEEyeFlags;
+#	endif
 };
 StructuredBuffer<float> AEAdaptation : register(t4);
 
 float4 LoadSceneColor(uint2 tid)
 {
+#	if defined(EYE_MODE)
+	return float4(AutoExposureMath::ExposeColorEye(TexColor[tid].rgb, AEAdaptation[0], AEAdaptation[1], AEExposureCompensation, AEPurkinjeStartEV, AEPurkinjeMaxEV,
+					  AEPurkinjeStrength, AEEyeMesopic),
+		1);
+#	else
 	return float4(AutoExposureMath::ExposeColor(TexColor[tid].rgb, AEAdaptation[0], AEExposureCompensation, AEAdaptationRange, AEPurkinjeStartEV, AEPurkinjeMaxEV, AEPurkinjeStrength), 1);
+#	endif
 }
 #else
 float4 LoadSceneColor(uint2 tid)
@@ -235,6 +261,15 @@ float ComputeLocalExposure(float sceneLogLuminance, float baseLogLuminance, floa
 	float remappedBase = middleGrey + RemapBaseContrast(exposedBase - middleGrey);
 	float targetLogLuminance = remappedBase + detail * DetailStrength;
 	float logAdjustment = (targetLogLuminance - exposedLogLuminance) * Strength;
+#if defined(EYE_MODE)
+	// (50a) Eye Model, Minimum Visibility on the local base: the base as shown after this pass's own adjustment, relative to middle grey
+	// (b = exposedBase + logAdjustment - middleGrey), gets a soft floor 2^b' = 2^b + MinVisibility; the detail rides on it.
+	[branch] if (MinVisibility > 0.0)
+	{
+		const float shownBase = exposedBase + logAdjustment - middleGrey;
+		logAdjustment += log2(exp2(shownBase) + MinVisibility) - shownBase;
+	}
+#endif
 	return exp2(clamp(logAdjustment, -8.0, 8.0));
 }
 
