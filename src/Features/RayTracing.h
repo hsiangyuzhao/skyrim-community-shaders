@@ -344,6 +344,20 @@ public:
 		// PointSteadyEdges "Steady Edges": the history clamp on edge pixels = the 5x5 Gaussian mean +- max(2 sigma, 0.25), static weight 0.1.
 		bool PointSmoothHardEdges = true;
 		bool PointSteadyEdges = true;
+		// (49m) Outside the settings macro, Point Light Shadows > Point Lights > Advanced (TracePointLightsCS; each "old" choice = 49j exactly):
+		// PointDarkSideTest "Dark Side Test": 0 Off (no test, as before 48k), 1 Original (48k: blocked without a ray where the 1- / 2-pixel
+		// depth normal faces away, N.L <= 0), 2 Tolerant (default: the mean of the 1- to 8-pixel fits, blocked only below N.L = -margin, the
+		// margin growing with the fits' spread; kFlagDarkTolerant).
+		int PointDarkSideTest = 2;
+		// PointGrazingOffset "Grazing-Angle Offset": the scene ray starts up to 2x farther out where the light grazes the surface, and the
+		// close-contact character ray's TMin is 2 / N.L (within 2 .. 6) instead of the 47x ramp (kFlagGrazeOffset).
+		bool PointGrazingOffset = true;
+		// PointEdgeRays "Smooth Shadow Edges (extra rays)": slots 0 - 3 whose ray disagrees with a neighbour's trace 3 more rays from sub-pixel
+		// positions and store the lit fraction (kFlagEdgeRays; the denoiser reads the fractional encoding).
+		bool PointEdgeRays = true;
+		// PointSoftCut "Soft Hand-Off for Weak Lights": a light traced just above its cut has its shadow faded in up to 1.5x the cut, so the
+		// edge between traced and untraced pixels of that light is not a hard line (kFlagSoftCut; fractional encoding).
+		bool PointSoftCut = true;
 		// (49h) HairFaintStrands "Hair: Ignore Faint Strands in RT" (Objects in Ray Tracing > Characters > Hair): hair cards keep alpha >= 0.5
 		// in the trace (their faint fringe made a solid board), and every kGreater alpha test (characters and cut-out objects) keeps alpha >
 		// threshold instead of >= threshold. A change re-captures characters and the scene.
@@ -1142,6 +1156,7 @@ private:
 	// frames at K <= 4 (or with the point textures).
 	DenoiseTexture pointWide[2];
 	bool pointWideThisFrame = false;     // this frame's trace / denoiser use slots 4 - 5 (also: the light tags carry kTagWide)
+	bool pointFractionalThisFrame = false;  // (49m) this frame's trace wrote the fractional encoding (PointDenoiseCS kPLFlagFractional)
 	bool pointWideTraced = false;        // last frame's trace wrote slots 4 - 5 (the trace's sticky selection may read them)
 	bool pointWideHistoryValid = false;  // pointWide[read] holds last frame's denoised slots 4 - 5
 	std::uint32_t pointWideIdleFrames = 0;

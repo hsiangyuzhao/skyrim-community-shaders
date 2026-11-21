@@ -14,7 +14,7 @@
 // Outputs (R8G8B8A8_UNORM, shared with D3D11), per slot s = 0..3 (slots past K are empty; (48c) unless Extra Lights Where Crowded
 // traced a rank there, kFlagExtra):
 //   PLVis[s]: 1 = lit; < 1 = blocked, the value is sqrt(blocker distance / light distance) * 254/255
-//             (the denoiser's penumbra width);
+//             (the denoiser's penumbra width); (49m) with kFlagEdgeRays / kFlagSoftCut the fractional encoding (see kFlagSoftCut);
 //   PLIdx[s]: byte = source slot + 1 (0 = empty slot), bit 7 of byte s = bit s of the pixel's candidate
 //             count (0..15, the debug view). (46y) The count has 3 bits (bytes 0-2, 0..7); bit 7 of byte 3 = the visible
 //             surface is a ray-traced caster (kFlagRtSurface; Screen-Space Shadows for Non-RT Casters, SSPLS.hlsli).
@@ -137,6 +137,39 @@ static const float kExtraShare = 0.07;
 // the rays do not see (grass, culled leaves) keep their rays: no wrongly darkened backlit cut-outs. Not for beam-like sources (Beam Smooth).
 static const uint kFlagNoiseDecorrelate = 262144u;
 static const uint kFlagNoiseDarkSide = 524288u;
+// (49m) "Dark Side Test: Tolerant" (with kFlagNoiseDarkSide; Point Lights > Advanced): the 48k test above decided per depth facet (NRank:
+// 1- and 2-pixel fits) at N.L = 0 exactly, so on a faceted body lit at a grazing angle (a torch beside a character) every facet tilted a few
+// degrees away became a hard 0 next to lit facets: a mosaic of dark islands on skin and cloth while the smooth shading normal is still lit.
+// Tolerant: the normal is the mean of the 1-, 2-, 4- and 8-pixel fits (those within 60 degrees of the 1-pixel one), and a sample counts as
+// blocked without a ray only below N.L = -margin, margin = kDarkMarginBase + kDarkMarginSpread x the largest angle (radians) between those
+// fits (a faceted / curved spot gets more slack), at most kDarkMarginMax. True back faces (well past the terminator) stay in their own
+// shadow as in 48k; in the band between, rays are traced (the character ray skips its first 6 units there).
+static const uint kFlagDarkTolerant = 1048576u;
+static const float kDarkMarginBase = 0.12;
+static const float kDarkMarginSpread = 1.0;
+static const float kDarkMarginMax = 0.35;
+// (49m) "Grazing-Angle Offset": where a light grazes the surface the ray start moves out further: the scene ray's normal offset x (1 + the
+// grazing share, saturate(1 - N.L / kGrazeStart): up to 2x at N.L <= 0), and with Close-Contact Shadows the character ray's TMin is
+// kCloseContactTMin / N.L (clamped to [kCloseContactTMin, Bias.z]) instead of the 47x linear ramp: a mismatch d between the raster and the traced
+// surface along the normal is crossed after d / N.L along the ray (47x: 2 units down to N.L = 0.3, so a 1-unit mismatch shadowed a body lit at
+// N.L 0.3 - 0.5). Off: exactly 49j.
+static const uint kFlagGrazeOffset = 2097152u;
+static const float kGrazeStart = 0.5;
+// (49m) "Smooth Shadow Edges (extra rays)": slots 0 - 3 whose main ray disagrees with a neighbour's ray to the same light (8 neighbours in the
+// same wave: no group barrier, WaveReadLaneAt with the neighbour's lane checked) trace kEdgeExtraRays more rays from sub-pixel positions on
+// the pixel's plane (kEdgeOffsets, in pixels) with their own disc samples; the slot stores the lit fraction (kFlagFractional encoding).
+static const uint kFlagEdgeRays = 4194304u;
+static const uint kEdgeExtraRays = 3u;
+// Only on sharp edges: the penumbra width (2 emitter q / (1 - q), q = the nearest blocker's distance ratio seen at the edge, self or
+// neighbours) at most kEdgeHardWidth x the trace's footprint (dist x 2 / height, about 1.7 pixels at the game's field of view); wider
+// penumbras are the denoiser's (its Stable Penumbra filter), and 1-ray noise there would make nearly every pixel an "edge".
+static const float kEdgeHardWidth = 3.0;
+// (49m) "Soft Hand-Off for Weak Lights": a light traced only just above its cut (the share cut / absolute minimum / sun gate, or the 7 % of an
+// extra rank) has its shadow faded in: full only from kSoftCutRange x that cut up; at the cut it is lit, as on the untraced side next to it.
+static const uint kFlagSoftCut = 8388608u;
+static const float kSoftCutRange = 1.5;
+// (49m) Encoding with kFlagEdgeRays or kFlagSoftCut (PointDenoiseCS kPLFlagFractional): 255 = lit; 128..254 = partly lit, (b - 128) / 126 the
+// lit fraction (no blocker distance); 0..127 = blocked, b / 127 = sqrt(blocker distance / light distance). Without them: as before.
 static const uint kTracedPixelWord = 3u;     // (48c) RayCounter words (kFlagExtra only): [3] pixels with a traced light,
 static const uint kExtraPixelWord = 4u;      //   [4] of which with at least one extra rank traced,
 static const uint kExtraWideWantWord = 5u;   //   [5] pixels where an extra rank 4 - 5 passed its cut (traced, or not for want of PLWide)
@@ -435,6 +468,152 @@ bool SphereOnSegment(float3 origin, float3 dir, float tMax, float4 sphere)
 	return dot(closest, closest) <= sphere.w * sphere.w;
 }
 
+// (49m) Dark Side Test: Tolerant: the depth normal fitted over the s-pixel neighbours (per axis the side with the smaller depth step, as the
+// 1-pixel one), facing the camera; false where none can be made.
+bool FitNormal(int2 p, int s, float depth, float3 P, float3 V, int2 maxP, out float3 o_n)
+{
+	const int2 pl = int2(max(p.x - s, 0), p.y), pr = int2(min(p.x + s, maxP.x), p.y);
+	const int2 pu = int2(p.x, max(p.y - s, 0)), pd = int2(p.x, min(p.y + s, maxP.y));
+	const float dl = abs(DepthMask[pl]), dr = abs(DepthMask[pr]), du = abs(DepthMask[pu]), dd = abs(DepthMask[pd]);
+	const float3 dx = abs(dl - depth) < abs(dr - depth) ? P - PositionAt(pl, dl) : PositionAt(pr, dr) - P;
+	const float3 dy = abs(du - depth) < abs(dd - depth) ? P - PositionAt(pu, du) : PositionAt(pd, dd) - P;
+	const float3 n = cross(dy, dx);
+	const float len = length(n);
+	o_n = len > 1e-12 ? n / len : V;
+	if (dot(o_n, V) < 0.0)
+		o_n = -o_n;
+	return len > 1e-12;
+}
+
+// (49m) What a slot's rays share (split out of the slot loop: the main ray and the edge rays use it; the values are the 49j ones unless
+// Grazing-Angle Offset is on).
+struct SlotGeom
+{
+	float3 rayTarget;
+	float3 T;
+	float3 B;
+	float emitter;
+	float offset;    // the ray start's distance from the surface along the depth normal
+	float charTMin;  // the character ray's TMin
+	bool isBeam;
+	bool beamLike;
+	bool softBeam;
+};
+
+SlotGeom MakeSlotGeom(PLSource src, float3 P, float3 N, float3 NRank, float bias, uint flags)
+{
+	SlotGeom g;
+	g.isBeam = (src.Info.x & kSourceBeam) != 0u;
+	// (46x) A direct fill aimed at its window spot: its rays go to the spot like the beam's (it is the beam's floor patch).
+	const bool isAim = (src.Info.x & kSourceAim) != 0u;
+	g.beamLike = g.isBeam || isAim;
+	// (46o) A soft window beam: the disc subtends the beam's angular size seen from the surface (like the sun's cone).
+	g.softBeam = g.beamLike && C.Bounds.w > 0.0;
+	g.rayTarget = isAim ? src.Spot.xyz : src.PosRadius.xyz;
+	const float3 toTarget = g.rayTarget - P;
+	const float ndl = dot(NRank, toTarget) * rsqrt(max(dot(toTarget, toTarget), 1e-6));
+	g.offset = bias;
+	[branch] if ((flags & kFlagGrazeOffset) && !g.beamLike)
+	{
+		g.offset = bias * (1.0 + saturate(1.0 - ndl / kGrazeStart));  // (49m) Grazing-Angle Offset
+	}
+	// A point on the emitter's disc facing the surface.
+	const float3 L0 = g.rayTarget - (P + N * g.offset);
+	const float len0 = length(L0);
+	const float3 Ln = L0 / max(len0, 1e-3);
+	const float3 helper = abs(Ln.z) < 0.999 ? float3(0, 0, 1) : float3(1, 0, 0);
+	g.T = normalize(cross(helper, Ln));
+	g.B = cross(Ln, g.T);
+	// (46x) A direct fill without a window spot: its own (larger) emitter.
+	g.emitter = g.softBeam ? len0 * C.Bounds.w : (((src.Info.x & kSourceEmitter) && !isAim) ? src.Spot.w : C.Bias.w);
+	// (47x) Close-Contact Shadows on Characters: TMin 2 units, back to Bias.z (6) where the light grazes the surface. (49m) Grazing-Angle
+	// Offset: 2 / N.L, within [2, Bias.z].
+	g.charTMin = C.Bias.z;
+	[branch] if (flags & kFlagCloseContact)
+	{
+		[branch] if (flags & kFlagGrazeOffset)
+			g.charTMin = clamp(kCloseContactTMin / max(ndl, 1e-3), min(kCloseContactTMin, C.Bias.z), C.Bias.z);
+		else
+			g.charTMin = lerp(C.Bias.z, min(kCloseContactTMin, C.Bias.z), saturate(ndl / kCloseContactGraze));
+	}
+	return g;
+}
+
+// (49m) One ray of a slot from origin toward the point rayTarget + (T cos + B sin) sqrt(u.x) emitter (split out of the slot loop, unchanged:
+// the main ray and the edge rays). Returns true = blocked (o_tHit; 0 = into the surface without a ray), false = lit; o_skip: the surface lies
+// inside the fixture clearance (lit, no ray). darkN / darkLimit: Consistent Dark Side's normal and N.L limit (48k: NRank, 0).
+bool SlotRay(PLSource src, SlotGeom g, float3 origin, float2 u, float3 P, float3 V, float3 N, float dist, uint flags, bool characters,
+	bool beamSmooth, bool darkSide, float3 darkN, float darkLimit, bool rtSurface, inout bool darkProbed, inout bool darkTraced, inout uint rays,
+	out float o_tHit, out float o_len, out bool o_skip)
+{
+	float sn, cs;
+	sincos(6.2831853 * u.y, sn, cs);
+	const float3 target = g.rayTarget + (g.T * cs + g.B * sn) * (sqrt(u.x) * g.emitter);
+	const float3 L = target - origin;
+	const float len = length(L);
+	const float3 dir = L / max(len, 1e-3);
+	o_len = len;
+	o_tHit = 0.0;
+	o_skip = false;
+	float tMax = len - asfloat(src.Info.y);
+	// (46c) A window beam's light is far outside: the ray ends where it leaves the captured interior. (46x) So does an aimed fill's.
+	if (g.beamLike)
+		tMax = min(tMax, ExitDistance(origin, dir));
+	// (48a) Window Beams: Smooth Edges: a beam ray into the surface it starts from (depth normal facing away from it) is blocked there,
+	// with no ray (47z traced it: front faces culled for beams, the character ray's first units skipped, so it often came out lit).
+	bool intoSurface = beamSmooth && g.beamLike && dot(N, dir) <= 0.0;
+	// (48k) Consistent Dark Side: the smoothed surface faces away from this sample of the light -> blocked, on traced casters only (not
+	// inside the fixture clearance: lit there as before). (49m) Tolerant: darkN / darkLimit as set by the pixel.
+	[branch] if (darkSide && !g.beamLike && tMax > 1.0 && dot(darkN, dir) <= darkLimit)
+	{
+		if (!darkProbed) {
+			darkProbed = true;
+			[branch] if (flags & kFlagRtSurface)
+			{
+				darkTraced = rtSurface;
+			}
+			else
+			{
+				darkTraced = SurfaceProbe(P, V, N, dist);
+				rays += 1u;
+			}
+		}
+		intoSurface = darkTraced;
+	}
+	if (tMax <= 1.0 && !intoSurface) {
+		o_skip = true;  // the surface is inside the clearance: lit
+		return false;
+	}
+	float tHit = 0.0;
+	const float footprint = dist * 2.0 * C.RenderSize.w;  // about a pixel's size there (alpha mip choice)
+	bool blocked = true;
+	[branch] if (!intoSurface)
+	{
+		blocked = Blocked(origin, dir, tMax, kSceneMask, 0.0, footprint, g.beamLike ? kBeamCull : RAY_FLAG_NONE, tHit);
+		rays += 1u;
+	}
+	if (!blocked && characters) {
+		// (46d) The player's own light: the player's body (torch, arm, torso) is not tested, only the other actors.
+		const bool ownLight = (src.Info.x & kSourceNoPlayer) != 0u;
+		bool test = true;
+		if (flags & kFlagCharCull)
+			test = (!ownLight && SphereOnSegment(origin, dir, tMax, C.Spheres[0])) || SphereOnSegment(origin, dir, tMax, C.Spheres[1]);
+		if (test) {
+			// (46e) A light carried by a traced character (Info.w = its key): that character's body is not tested.
+			const uint owner = src.Info.w & 0xFFFFFFu;
+			// (46q) Carrier Casts Shadows (Extra.w >= 0): its body blocks except within the carrier clearance of the light.
+			const float ownerTMax = max(len - max(C.Extra.w, 0.0), 0.0);
+			if (owner != 0u)
+				blocked = BlockedExcept(origin, dir, tMax, ownLight ? kNpcMask : kCharacterMasks, g.charTMin, footprint, owner, ownerTMax, tHit);
+			else
+				blocked = Blocked(origin, dir, tMax, ownLight ? kNpcMask : kCharacterMasks, g.charTMin, footprint, RAY_FLAG_NONE, tHit);
+			rays += 1u;
+		}
+	}
+	o_tHit = tHit;
+	return blocked;
+}
+
 // (47i) Point Light Shadows on Water: the pixel's traced sources (idx, same slots and jitter as its own rays) traced again from
 // the water surface at waterDist along this frame's view ray (normal up). 1 = lit, 0 = blocked (no denoiser: one ray each).
 float4 TraceFromWater(int2 p, uint4 idx, float waterDist, uint flags, float n0, float n1, inout uint rays)
@@ -705,7 +884,6 @@ groupshared uint gsMask[2];
 	}
 
 	const float bias = C.Bias.x + C.Bias.y * dist;
-	const float3 origin = P + N * bias;
 	const float n0 = InterleavedGradientNoise(float2(p), uint(C.Params.y));
 	const float n1 = InterleavedGradientNoise(float2(p.yx) + float2(29.0, 61.0), uint(C.Params.y) * 7u + 3u);
 	const bool characters = (flags & kFlagCharacters) && !((flags & kFlagFirstPerson) && dist < kFirstPersonNear);
@@ -725,15 +903,41 @@ groupshared uint gsMask[2];
 	const bool darkSide = (flags & kFlagNoiseDarkSide) != 0u;              // (48k)
 	bool darkProbed = false;   // (48k) Consistent Dark Side: the traced-caster test made for this pixel (lazily, once)
 	bool darkTraced = false;   // ... its result
+	// (48k) The dark side's normal and N.L limit; (49m) Dark Side Test: Tolerant: the mean of the 1- / 2- / 4- / 8-pixel fits and a margin
+	// growing with their spread (kFlagDarkTolerant).
+	float3 darkN = NRank;
+	float darkLimit = 0.0;
+	[branch] if (darkSide && (flags & kFlagDarkTolerant))
+	{
+		float3 nSum = N;
+		float minCos = 1.0;
+		[unroll] for (uint ds = 0u; ds < 3u; ++ds)
+		{
+			float3 nf;
+			if (FitNormal(p, int(2u << ds), depth, P, V, maxP, nf) && dot(nf, N) > 0.5) {
+				nSum += nf;
+				minCos = min(minCos, dot(nf, N));
+			}
+		}
+		darkN = normalize(nSum);
+		const float spread = sqrt(max(2.0 * (1.0 - minCos), 0.0));  // the chord of the largest angle (about the angle in radians)
+		darkLimit = -clamp(kDarkMarginBase + kDarkMarginSpread * spread, kDarkMarginBase, kDarkMarginMax);
+	}
+	const bool softCut = (flags & kFlagSoftCut) != 0u;  // (49m)
 	// (48a) Six slots (4 - 5 only with K > 4: otherwise bestIdx is 0 there and the slot is skipped at once).
 	float visA[6] = { 1.0, 1.0, 1.0, 1.0, 1.0, 1.0 };
 	uint idxA[6] = { 0u, 0u, 0u, 0u, 0u, 0u };
+	// (49m) Kept small (registers): per slot 3 bits of blocked rays (bits 3s..3s+2), bit 24 + s = slot s took the edge rays; the Soft Hand-Off
+	// fade-in per slot in 8 bits (255 = full shadow; slots 0 - 3 / 4 - 5). The first blocked ray's distance ratio is in visA (49j encoding).
+	uint hitBits = 0u;
+	uint fadeLo = 0xFFFFFFFFu, fadeHi = 0xFFFFu;
 	bool extraUsed = false;      // (48c) an extra rank traced here
 	bool extraWideWant = false;  // (48c) an extra rank 4 - 5 passed its cut (traced with PLWide, else left out)
 	[unroll] for (uint k = 0u; k < 6u; ++k)
 	{
 		if (bestIdx[k] == 0u || bestC[k] < ((sticky && (any(prevIdx == bestIdx[k]) || any(prevIdx2 == bestIdx[k]))) ? stickyThreshold : threshold))
 			continue;
+		float softStart = threshold;  // (49m) Soft Hand-Off: the cut this light passed (the non-sticky one)
 		// (48c) Extra Lights Where Crowded: a rank past K only with kExtraShare of the pixel's point light (half where it was traced here last
 		// frame); its slot is its rank, slots 4 - 5 only with PLWide. (Without kFlagExtra bestIdx is 0 past K: never reached.)
 		[branch] if (k >= K)
@@ -747,110 +951,167 @@ groupshared uint gsMask[2];
 					continue;
 			}
 			extraUsed = true;
+			softStart = max(softStart, total * kExtraShare);
 		}
 		const PLSource src = Sources[bestIdx[k] - 1u];
-		const bool isBeam = (src.Info.x & kSourceBeam) != 0u;
-		// (46x) A direct fill aimed at its window spot: its rays go to the spot like the beam's (it is the beam's floor patch).
-		const bool isAim = (src.Info.x & kSourceAim) != 0u;
-		const bool beamLike = isBeam || isAim;
-		// (46o) A soft window beam: the disc subtends the beam's angular size seen from the surface (like the sun's cone).
-		const bool softBeam = beamLike && C.Bounds.w > 0.0;
-		const float3 rayTarget = isAim ? src.Spot.xyz : src.PosRadius.xyz;
-		// A point on the emitter's disc facing the surface (R2 step per slot: the slots decorrelate).
-		const float3 L0 = rayTarget - origin;
-		const float len0 = length(L0);
-		const float3 Ln = L0 / max(len0, 1e-3);
-		const float3 helper = abs(Ln.z) < 0.999 ? float3(0, 0, 1) : float3(1, 0, 0);
-		const float3 T = normalize(cross(helper, Ln));
-		const float3 B = cross(Ln, T);
-		float u1 = frac(n0 + float(k) * 0.7548776662);
-		float u2 = frac(n1 + float(k) * 0.5698402910);
+		const SlotGeom g = MakeSlotGeom(src, P, N, NRank, bias, flags);
+		// A point on the emitter's disc (R2 step per slot: the slots decorrelate).
+		float2 u = float2(frac(n0 + float(k) * 0.7548776662), frac(n1 + float(k) * 0.5698402910));
 		// (48a) Window Beams: Smooth Edges: the beam's disc sample from its own static pattern stepped along R2 per frame.
 		// (48k) Decorrelated Sampling: every slot takes the beam pattern.
-		[branch] if ((beamSmooth && softBeam) || noiseDecorrelate)
+		[branch] if ((beamSmooth && g.softBeam) || noiseDecorrelate)
 		{
-			const float2 u = BeamSample(float2(p), uint(C.Params.y), k);
-			u1 = u.x;
-			u2 = u.y;
+			u = BeamSample(float2(p), uint(C.Params.y), k);
 		}
-		float sn, cs;
-		sincos(6.2831853 * u2, sn, cs);
-		// (46x) A direct fill without a window spot: its own (larger) emitter.
-		const float emitter = softBeam ? len0 * C.Bounds.w : (((src.Info.x & kSourceEmitter) && !isAim) ? src.Spot.w : C.Bias.w);
-		const float3 target = rayTarget + (T * cs + B * sn) * (sqrt(u1) * emitter);
-		const float3 L = target - origin;
-		const float len = length(L);
-		const float3 dir = L / max(len, 1e-3);
-		float tMax = len - asfloat(src.Info.y);
-		// (46c) A window beam's light is far outside: the ray ends where it leaves the captured interior. (46x) So does an aimed fill's.
-		if (beamLike)
-			tMax = min(tMax, ExitDistance(origin, dir));
 		idxA[k] = bestIdx[k];
-		// (48a) Window Beams: Smooth Edges: a beam ray into the surface it starts from (depth normal facing away from it) is blocked there,
-		// with no ray (47z traced it: front faces culled for beams, the character ray's first units skipped, so it often came out lit).
-		bool intoSurface = beamSmooth && beamLike && dot(N, dir) <= 0.0;
-		// (48k) Consistent Dark Side: the smoothed surface faces away from this sample of the light -> blocked, on traced casters only (not
-		// inside the fixture clearance: lit there as before).
-		[branch] if (darkSide && !beamLike && tMax > 1.0 && dot(NRank, dir) <= 0.0)
+		// (49m) Soft Hand-Off for Weak Lights: no shadow at the cut, the full shadow from kSoftCutRange x the cut.
+		[branch] if (softCut)
 		{
-			if (!darkProbed) {
-				darkProbed = true;
-				[branch] if (flags & kFlagRtSurface)
-				{
-					darkTraced = rtSurface;
-				}
-				else
-				{
-					darkTraced = SurfaceProbe(P, V, N, dist);
-					rays += 1u;
-				}
-			}
-			intoSurface = darkTraced;
+			const uint fade = uint(round(smoothstep(softStart, softStart * kSoftCutRange, bestC[k]) * 255.0));
+			if (k < 4u)
+				fadeLo = (fadeLo & ~(0xFFu << (8u * k))) | (fade << (8u * k));
+			else
+				fadeHi = (fadeHi & ~(0xFFu << (8u * (k - 4u)))) | (fade << (8u * (k - 4u)));
 		}
-		if (tMax <= 1.0 && !intoSurface)
+		float tHit, len;
+		bool skip;
+		const bool blocked = SlotRay(src, g, P + N * g.offset, u, P, V, N, dist, flags, characters, beamSmooth, darkSide, darkN, darkLimit, rtSurface,
+			darkProbed, darkTraced, rays, tHit, len, skip);
+		if (skip)
 			continue;  // the surface is inside the clearance: lit
-		float tHit = 0.0;
-		const float footprint = dist * 2.0 * C.RenderSize.w;  // about a pixel's size there (alpha mip choice)
-		bool blocked = true;
-		[branch] if (!intoSurface)
-		{
-			blocked = Blocked(origin, dir, tMax, kSceneMask, 0.0, footprint, beamLike ? kBeamCull : RAY_FLAG_NONE, tHit);
-			rays += 1u;
+		if (blocked) {
+			visA[k] = min(sqrt(saturate(tHit / (g.softBeam ? kBeamBlockerRange : max(len, 1.0)))), 1.0) * (254.0 / 255.0);
+			hitBits |= 1u << (3u * k);
 		}
-		if (!blocked && characters) {
-			// (46d) The player's own light: the player's body (torch, arm, torso) is not tested, only the other actors.
-			const bool ownLight = (src.Info.x & kSourceNoPlayer) != 0u;
-			bool test = true;
-			if (flags & kFlagCharCull)
-				test = (!ownLight && SphereOnSegment(origin, dir, tMax, C.Spheres[0])) || SphereOnSegment(origin, dir, tMax, C.Spheres[1]);
-			if (test) {
-				// (46e) A light carried by a traced character (Info.w = its key): that character's body is not tested.
-				const uint owner = src.Info.w & 0xFFFFFFu;
-				// (46q) Carrier Casts Shadows (Extra.w >= 0): its body blocks except within the carrier clearance of the light.
-				const float ownerTMax = max(len - max(C.Extra.w, 0.0), 0.0);
-				// (47x) Close-Contact Shadows on Characters: TMin 2 units, back to Bias.z (6) where the light grazes the surface.
-				float charTMin = C.Bias.z;
-				[branch] if (flags & kFlagCloseContact)
-				{
-					const float3 toTarget = rayTarget - P;
-					const float ndlRay = dot(NRank, toTarget) * rsqrt(max(dot(toTarget, toTarget), 1e-6));
-					charTMin = lerp(C.Bias.z, min(kCloseContactTMin, C.Bias.z), saturate(ndlRay / kCloseContactGraze));
-				}
-				if (owner != 0u)
-					blocked = BlockedExcept(origin, dir, tMax, ownLight ? kNpcMask : kCharacterMasks, charTMin, footprint, owner, ownerTMax, tHit);
-				else
-					blocked = Blocked(origin, dir, tMax, ownLight ? kNpcMask : kCharacterMasks, charTMin, footprint, RAY_FLAG_NONE, tHit);
-				rays += 1u;
-			}
-		}
-		if (blocked)
-			visA[k] = min(sqrt(saturate(tHit / (softBeam ? kBeamBlockerRange : max(len, 1.0)))), 1.0) * (254.0 / 255.0);
-		if (isBeam && beamSample) {
+		if (g.isBeam && beamSample) {
 			const uint word = kBeamWordBase + (bestIdx[k] - 1u) * 2u;
 			uint previousBeam;
 			RayCounter.InterlockedAdd(word * 4u, 1u, previousBeam);
 			if (blocked)
 				RayCounter.InterlockedAdd((word + 1u) * 4u, 1u, previousBeam);
+		}
+	}
+	// (49m) Smooth Shadow Edges (extra rays): slots 0 - 3 whose ray disagrees with a neighbour's ray to the same light. The neighbours come from
+	// the same wave (rows of this 8x8 group; no group barrier: lanes left above are not active), each lane's index checked against the
+	// neighbour's own group index, so a different lane layout only means fewer neighbours, never wrong ones.
+	[branch] if (flags & kFlagEdgeRays)
+	{
+		uint packed = 0u;   // per slot: source + 1 (7 bits), bit 7 = the main ray was lit
+		uint packedQ = 0u;  // per slot: the blocked main ray's sqrt(blocker / light distance) x 254 (255 = lit)
+		[unroll] for (uint ps = 0u; ps < 4u; ++ps)
+		{
+			const bool hit = ((hitBits >> (3u * ps)) & 7u) != 0u;
+			packed |= ((idxA[ps] & 0x7Fu) | (hit ? 0u : 0x80u)) << (8u * ps);
+			packedQ |= (hit ? uint(round(saturate(visA[ps] * (255.0 / 254.0)) * 254.0)) : 255u) << (8u * ps);
+		}
+		const uint lane = WaveGetLaneIndex();
+		const int laneCount = int(WaveGetLaneCount());
+		const uint4 activeLanes = WaveActiveBallot(true);
+		const int2 gt = int2(dtid.xy & 7u);
+		uint edgeSlots = 0u;
+		uint edgeQ = packedQ;  // per slot: the nearest blocker seen at the edge (self or the disagreeing neighbours), x 254
+		[unroll] for (int nb = 0; nb < 9; ++nb)
+		{
+			const int2 o = int2(nb % 3 - 1, nb / 3 - 1);
+			const int delta = o.x + o.y * 8;
+			const int want = int(lane) + delta;
+			const uint L = uint(clamp(want, 0, laneCount - 1));
+			const uint theirPacked = WaveReadLaneAt(packed, L);
+			const uint theirQ = WaveReadLaneAt(packedQ, L);
+			const uint theirIndex = WaveReadLaneAt(gi, L);
+			const int2 gn = gt + o;
+			const bool ok = nb != 4 && all(gn >= 0) && all(gn < 8) && want == int(L) && ((activeLanes[L >> 5u] >> (L & 31u)) & 1u) != 0u &&
+			                theirIndex == uint(int(gi) + delta);
+			[unroll] for (uint es = 0u; es < 4u; ++es)
+			{
+				const uint mine = (packed >> (8u * es)) & 0xFFu;
+				[unroll] for (uint et = 0u; et < 4u; ++et)
+				{
+					const uint theirs = (theirPacked >> (8u * et)) & 0xFFu;
+					if (ok && (mine & 0x7Fu) != 0u && (theirs & 0x7Fu) == (mine & 0x7Fu) && theirs != mine) {
+						edgeSlots |= 1u << es;
+						const uint tq = (theirQ >> (8u * et)) & 0xFFu;
+						const uint cq = (edgeQ >> (8u * es)) & 0xFFu;
+						if (tq < cq)
+							edgeQ = (edgeQ & ~(0xFFu << (8u * es))) | (tq << (8u * es));
+					}
+				}
+			}
+		}
+		[branch] if (edgeSlots != 0u)
+		{
+			// Sub-pixel positions on the pixel's plane (the 1-pixel steps of the depth normal; none across a depth jump).
+			const float stepLimit = 8.0 * dist * 2.0 * C.RenderSize.w;
+			const float3 sx = length(dx) <= stepLimit ? dx : float3(0.0, 0.0, 0.0);
+			const float3 sy = length(dy) <= stepLimit ? dy : float3(0.0, 0.0, 0.0);
+			const float hardWidth = kEdgeHardWidth * dist * 2.0 * C.RenderSize.w;
+			// One copy of the ray code for all four slots (a loop, the slot's values picked by index).
+			[loop] for (uint rs = 0u; rs < 4u; ++rs)
+			{
+				[branch] if (edgeSlots & (1u << rs))
+				{
+					const uint id = rs == 0u ? idxA[0] : (rs == 1u ? idxA[1] : (rs == 2u ? idxA[2] : idxA[3]));
+					const PLSource src = Sources[id - 1u];
+					const SlotGeom g = MakeSlotGeom(src, P, N, NRank, bias, flags);
+					// Only sharp edges: a penumbra (the denoiser's width formula, from the nearest blocker seen here) wider than
+					// kEdgeHardWidth x the footprint is left to the denoiser's wide filter.
+					const float ratio = float((edgeQ >> (8u * rs)) & 0xFFu) / 254.0;
+					const float q = saturate(ratio * ratio);
+					const float width = g.softBeam ? q * kBeamBlockerRange * 2.0 * C.Bounds.w : 2.0 * g.emitter * q / max(1.0 - q, 0.05);
+					[branch] if (width <= hardWidth)
+					{
+						// The main ray's disc sample, as above.
+						float2 u0 = float2(frac(n0 + float(rs) * 0.7548776662), frac(n1 + float(rs) * 0.5698402910));
+						[branch] if ((beamSmooth && g.softBeam) || noiseDecorrelate)
+						{
+							u0 = BeamSample(float2(p), uint(C.Params.y), rs);
+						}
+						uint hits = (hitBits >> (3u * rs)) & 7u;
+						float firstRatio = -1.0;  // a blocked edge ray's distance ratio, for a slot whose main ray was lit
+						[loop] for (uint e = 0u; e < kEdgeExtraRays; ++e)
+						{
+							const float2 o = e == 0u ? float2(-0.375, -0.125) : (e == 1u ? float2(0.375, 0.125) : float2(-0.125, 0.375));
+							const float3 Ps = P + sx * o.x + sy * o.y;
+							const float2 u = frac(u0 + float(e + 1u) * float2(0.6180339887, 0.3819660113));
+							float tHit, len;
+							bool skip;
+							const bool blocked = SlotRay(src, g, Ps + N * g.offset, u, P, V, N, dist, flags, characters, beamSmooth, darkSide, darkN,
+								darkLimit, rtSurface, darkProbed, darkTraced, rays, tHit, len, skip);
+							if (blocked) {
+								hits += 1u;
+								if (firstRatio < 0.0)
+									firstRatio = min(sqrt(saturate(tHit / (g.softBeam ? kBeamBlockerRange : max(len, 1.0)))), 1.0);
+							}
+						}
+						hitBits = (hitBits & ~(7u << (3u * rs))) | (hits << (3u * rs)) | (1u << (24u + rs));
+						[unroll] for (uint ws = 0u; ws < 4u; ++ws)
+						{
+							if (ws == rs && visA[ws] >= 1.0 && firstRatio >= 0.0)
+								visA[ws] = firstRatio * (254.0 / 255.0);
+						}
+					}
+				}
+			}
+		}
+	}
+	// (49m) The fractional encoding (kFlagEdgeRays / kFlagSoftCut; PointDenoiseCS kPLFlagFractional): lit 255, partly lit 128..254, blocked
+	// 0..127 (sqrt of the distance ratio x 127).
+	[branch] if (flags & (kFlagEdgeRays | kFlagSoftCut))
+	{
+		[unroll] for (uint fs = 0u; fs < 6u; ++fs)
+		{
+			if (idxA[fs] == 0u)
+				continue;
+			const uint hits = (hitBits >> (3u * fs)) & 7u;
+			const float traced = (fs < 4u && ((hitBits >> (24u + fs)) & 1u) != 0u) ? float(1u + kEdgeExtraRays) : 1.0;
+			const float fade = float(fs < 4u ? (fadeLo >> (8u * fs)) & 0xFFu : (fadeHi >> (8u * (fs - 4u))) & 0xFFu) / 255.0;
+			const float shadow = float(hits) / traced * fade;
+			if (shadow <= 0.0)
+				visA[fs] = 1.0;
+			else if (shadow >= 1.0)
+				visA[fs] = round(saturate(visA[fs] * (255.0 / 254.0)) * 127.0) / 255.0;
+			else
+				visA[fs] = (128.0 + round((1.0 - shadow) * 126.0)) / 255.0;
 		}
 	}
 	// (48c) Extra Lights Where Crowded: per wave, the pixels with a traced light / with an extra rank traced / wanting PLWide for one (F7
