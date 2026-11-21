@@ -27,6 +27,7 @@
 #include "Utils/EngineTiming.h"
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
+#include "Utils/ReflectionCensus.h"
 #include "Utils/WorldTiming.h"
 
 // CPU-side timing of our own work. Purely observational: every one of these is a
@@ -616,6 +617,11 @@ void Deferred::DeferredPasses()
 		Util::CpuPassScope timer("ScreenSpaceRayTracing");
 		ssrt.DrawSSRTSpecular();
 	}
+
+	// (49h stage 1, S9) The reflection census, when a saved frame asked for it (one pass over this frame's G-buffer, before the composite
+	// binds its own resources; Poll writes it into the JSON a few frames later without waiting).
+	ReflectionCensus::Poll();
+	ReflectionCensus::Dispatch(context, normalRoughness.SRV, reflectance.SRV, renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY].depthSRV);
 
 	// Deferred Composite
 	{

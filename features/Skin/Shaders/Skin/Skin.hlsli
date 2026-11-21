@@ -419,6 +419,10 @@ namespace Skin
 	static const uint kFix49aNoDirectAO = 4u;   // "No Extra AO on Direct Light"
 	bool Fix49a(uint a_bit)
 	{
+		// (49h) Pore Detail Follows the Skin and Skin Shading Fixes are permanent (fixed on since 49b): their off arms fold away. Only
+		// kFix49aNoDirectAO ("Skin AO on Direct Light", a switch again since 49h) is read.
+		if (a_bit != kFix49aNoDirectAO)
+			return true;
 		return (uint(max(wetCharParams[11].y, 0.0) + 0.5) & a_bit) != 0u;
 	}
 
@@ -635,14 +639,11 @@ namespace Skin
 			specular += fuzzSpecular * skin.FuzzWeight;
 		}
 
-		// (42c) WetFilmEnergy >= 0: the Wetness Effects film (rain and swimming merged with
-		// max, its own roughness) or (44a) the Wet Skin "New" film; otherwise the original
-		// Advanced Skin film (41b), its energy capped at 2 (only reached with Film Strength > 2).
-		const bool wetFilmOverride = skin.WetFilmEnergy >= 0.0;
-		if (wetFilmOverride ? (skin.WetFilmEnergy > 0.0) : (skin.Wetness > 0.0)) {
-			const float wetnessEnergy = wetFilmOverride ? min(skin.WetFilmEnergy, 2.5) : min(GetWetnessOpticalResponse(skin.Wetness) * max(skin.WetnessFilmStrength, 0.0f), 2.0);
+		// (44a) The Physical film (WetFilmEnergy >= 0, set by WetSkinFilm). (49h) The original (41b / Legacy) film arm is retired.
+		if (skin.WetFilmEnergy > 0.0) {
+			const float wetnessEnergy = min(skin.WetFilmEnergy, 2.5);
 			// (44a) Droplet beads: their own low roughness (0.1), inside the bead only.
-			const float wetRoughness = wetFilmOverride ? lerp(max(skin.WetFilmRoughness, 0.2), skin.WetDropletRoughness, saturate(skin.WetDropletMask)) : WATER_ROUGHNESS;
+			const float wetRoughness = lerp(max(skin.WetFilmRoughness, 0.2), skin.WetDropletRoughness, saturate(skin.WetDropletMask));
 			float3 wetnessF;
 			float WNdotL = clamp(dot(WN, L), 1e-5, 1.0);
 			float WNdotV = saturate(abs(dot(WN, V)) + 1e-5);
@@ -690,17 +691,7 @@ namespace Skin
 				wetSpecular *= wetnessEnergy;
 				waterTransmission = lerp(1.0, 1.0 - (skin.WetF0 * wetSpecularBRDF.x + wetSpecularBRDF.y), wetnessEnergy);
 			}
-		} else if (skin.Wetness > 0.0) {
-			const float wetnessAmount = GetWetnessOpticalResponse(skin.Wetness);
-			// (44a) Capped at 2 (only reached with Film Strength > 2).
-			const float wetnessEnergy = min(wetnessAmount * max(skin.WetnessFilmStrength, 0.0f), 2.0);
-			float WNdotV = saturate(dot(WN, V));
-			float2 wetSpecularBRDF = BRDF::EnvBRDF(WATER_ROUGHNESS, WNdotV);
-			wetSpecular += WATER_F0 * wetSpecularBRDF.x + wetSpecularBRDF.y;
-			wetSpecular *= 1 + WATER_F0 * (1 / (wetSpecularBRDF.x + wetSpecularBRDF.y) - 1);
-			wetSpecular *= wetnessEnergy;
-			waterTransmission = lerp(1.0, 1.0 - (WATER_F0 * wetSpecularBRDF.x + wetSpecularBRDF.y), saturate(wetnessEnergy));
-		}
+		}  // (49h) the original (41b / Legacy) indirect film is retired
 
 		// (49a) "Skin Shading Fixes": the diffuse keeps what the specular lobe (per channel, at most all of it) leaves (upstream #3154);
 		// 48n subtracted the specular's red and green channels, i.e. twice the specular of grey skin.
@@ -785,41 +776,6 @@ namespace Skin
 #if defined(PSHADER)
 	// (44c) uv_pixel_footprint passed in: callers in divergent control flow take it where the
 	// derivatives are defined.
-	float FBMFootprint(float2 uv, float uv_pixel_footprint, float base_scale, int octaves, float lacunarity, float persistence, float z_offset_multiplier)
-	{
-		// (47c) Skip Invisible Work ((47o) permanent): an octave faded out completely (octave_filter == 0) adds
-		// lerp(0.5, n, 0) = 0.5 exactly, so its noise is not evaluated. With Lacunarity < 1 the
-		// first octave is the finest, so the skipped ones are not at the end of the loop.
-		float total = 0.0;
-		float frequency = base_scale;
-		float amplitude = 1.0;
-		float max_amplitude = 0.0;
-		[loop] for (int i = 0; i < octaves; i++)  // (47g) compile time: not unrolled (same result)
-		{
-			const float2 octave_uv = uv * frequency;
-			const float pixel_footprint = uv_pixel_footprint * abs(frequency);
-			// Fade only this octave as its grid approaches the pixel Nyquist
-			// limit. An unresolved Perlin octave contributes its expected mean
-			// instead of a temporally unstable point sample. Scale, lacunarity and
-			// persistence still control the same frequency/amplitude progression.
-			const float octave_filter = 1.0f - smoothstep(0.25f, 0.5f, pixel_footprint);
-			float octave_value = 0.5f;
-			[branch] if (octave_filter > 0.0f)
-			{
-				const float octave_noise = (Random::perlinNoise(float3(octave_uv, (float)i * z_offset_multiplier)) + 1.0f) * 0.5f;
-				octave_value = lerp(0.5f, octave_noise, octave_filter);
-			}
-			total += amplitude * octave_value;
-
-			max_amplitude += amplitude;
-			amplitude *= persistence;
-			frequency *= lacunarity;
-		}
-		if (max_amplitude > 0.0) {
-			return total / max_amplitude;
-		}
-		return 0.0;
-	}
 
 	// ---- (47c) Faster Noise: a 2D gradient noise on a cheap integer hash -------------------------
 	//
@@ -897,53 +853,8 @@ namespace Skin
 		return 0.0;
 	}
 
-	float FBM(float2 uv, float base_scale, int octaves, float lacunarity, float persistence, float z_offset_multiplier)
-	{
-		return FBMFootprint(uv, max(length(ddx(uv)), length(ddy(uv))), base_scale, octaves, lacunarity, persistence, z_offset_multiplier);
-	}
 
-	float PerlinNoise(float2 uv, float scale, float lacunarity, float persistence, float strength)
-	{
-		if (strength <= 0.001f)
-		{
-			return 0.0f;
-		}
-		if (strength >= 0.999f)
-		{
-			return 1.0f;
-		}
-		int octaves = 5;
-		float z_offset_multiplier = 7.375f;
-
-		float noise_value = FBM(uv, scale, octaves, lacunarity, persistence, z_offset_multiplier);
-
-		float dynamic_threshold = 1.0f - strength;
-		// Band-limiting the FBM octaves is not sufficient on its own: the wet/dry
-		// threshold below creates a new high-frequency edge, and the final 0.1
-		// power strongly magnifies tiny samples around that edge. Analytically
-		// box-filter the positive ramp over one pixel, preserving the exact old
-		// response outside the transition footprint.
-		const float threshold_distance = noise_value - dynamic_threshold;
-		const float threshold_half_width = max(fwidth(noise_value) * 0.5f, 1e-5f);
-		float filtered_positive;
-		if (threshold_distance <= -threshold_half_width) {
-			filtered_positive = 0.0f;
-		} else if (threshold_distance >= threshold_half_width) {
-			filtered_positive = threshold_distance;
-		} else {
-			const float covered_ramp = threshold_distance + threshold_half_width;
-			filtered_positive = covered_ramp * covered_ramp / (4.0f * threshold_half_width);
-		}
-
-		float sweat_intensity = saturate(filtered_positive / strength);
-		sweat_intensity = pow(sweat_intensity, 1.5f);
-
-		if (strength > 0.8f) {
-			sweat_intensity = sweat_intensity * saturate(0.99f - (strength - 0.8f) * 5.0f) + (strength - 0.8f) * 5.0f;
-		}
-
-		return pow(sweat_intensity, 0.1f);
-	}
+	// (49h) PerlinNoise / FBM / FBMFootprint (the Legacy pre-42c film) are retired.
 
 	// ---- (44a) Wet Skin "New" model, (47o) the Physical model's look ------------------------------
 	//
@@ -1269,20 +1180,5 @@ namespace Skin
 	}
 #endif
 
-	float2 GetWetness(float z, float3 modelNormal)
-	{
-		if (skinPerGeometry.x == 0.f && skinPerGeometry.y == 0.f)
-			return 0.f;
-
-		float waterWet = 0.0f;
-		float waterLevel = skinPerGeometry.z + skinPerGeometry.w;
-		
-		waterWet = skinPerGeometry.y * (1 - smoothstep(waterLevel - 2.5f, waterLevel + 2.5f, z));
-
-		float sweatWet = skinPerGeometry.x;
-#if !defined(SKIN)
-		sweatWet *= 1.0f - saturate(dot(modelNormal, float3(0, 0, 1)));
-#endif
-		return float2(sweatWet, waterWet);
-	}
+	// (49h) GetWetness (the Legacy pre-42c sweat / swim timers) is retired.
 }

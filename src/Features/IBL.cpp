@@ -29,6 +29,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 
 void IBL::DrawSettings()
 {
+	ImGui::TextDisabled("Lighting Fixes: Sky > Physical Sky > Scene Lighting");  // (49h stage 1) pointer to the Lighting Fixes rules
 	ImGui::Checkbox("Enable Diffuse IBL", (bool*)&settings.EnableDiffuseIBL);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text("Adds ambient light coloured by the real surroundings and sky (IBL, image-based lighting) alongside Skyrim's flat ambient light (see DALC Amount).");

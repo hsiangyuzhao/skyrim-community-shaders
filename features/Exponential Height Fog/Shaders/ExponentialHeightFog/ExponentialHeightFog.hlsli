@@ -2,6 +2,7 @@
 #define __EXPONENTIAL_HEIGHT_FOG_HLSLI__
 
 #include "Common/SharedData.hlsli"
+#include "Common/PhysicalLighting.hlsli"  // (49h stage 1, S6)
 
 #   if defined(DYNAMIC_CUBEMAPS)
 #       include "DynamicCubemaps/DynamicCubemaps.hlsli"
@@ -133,7 +134,7 @@ namespace ExponentialHeightFog
 
         bool cubemapColored = false;
 #   if defined(DYNAMIC_CUBEMAPS)
-        if (SharedData::exponentialHeightFogSettings.useDynamicCubemaps > 0)
+        if (SharedData::exponentialHeightFogSettings.useDynamicCubemaps > 0 && !PhysLight::On(PhysLight::kFarFog))  // (49h stage 1, S6) off: the weather fog colour
         {
             float3 tintColor = lerp(fogColor, SharedData::exponentialHeightFogSettings.inscatteringTint.xyz, SharedData::exponentialHeightFogSettings.inscatteringTint.w);
             float3 cubemapColor = DynamicCubemaps::EnvReflectionsTexture.SampleLevel(SampColorSampler, normalize(positionWS), SharedData::exponentialHeightFogSettings.cubemapMipLevel).xyz;
@@ -253,6 +254,54 @@ namespace ExponentialHeightFog
         return result;
     }
 
+    /// (49h stage 1, S6) "Far Fog Continues the Near Fog": the light the volumetric fog's medium sends toward the camera at the far end
+    /// of its range along this pixel's ray (sun x phase x shadow, sky light, the weather top-up: everything the froxels scatter), from
+    /// the integrated volume's last two slices: S = (L_N - L_N-1) / (T_N-1 - T_N). The analytical fog beyond takes this colour, so
+    /// it continues the volume without a seam. False where the last slice holds (almost) no medium.
+    bool GetVolumeEndColor(float3 positionWS, uint eyeIndex, out float3 a_color)
+    {
+        a_color = 0.0f;
+        float4 clipPosition = mul(FrameBuffer::CameraViewProj[eyeIndex], float4(positionWS, 1.0f));
+        [branch] if (!(clipPosition.w > 0.0f))
+            return false;
+        const bool far = SharedData::volumetricFogSettings.FarEnabled != 0;
+        uint width, height, depth;
+        [branch] if (far)
+            ExponentialHeightFogIntegratedLightScatteringFar.GetDimensions(width, height, depth);
+        else
+            ExponentialHeightFogIntegratedLightScattering.GetDimensions(width, height, depth);
+        [branch] if (width == 0 || height == 0 || depth < 2)
+            return false;
+        float2 uv = saturate(clipPosition.xy / clipPosition.w * float2(0.5f, -0.5f) + 0.5f);
+        uv = Stereo::ConvertToStereoUV(uv, eyeIndex);
+        const float2 size = float2(width, height);
+        float2 uvMin = 0.5f / size;
+        float2 uvMax = 1.0f - uvMin;
+#if defined(VR)
+        uvMin.x += eyeIndex == 0 ? 0.0f : 0.5f;
+        uvMax.x -= eyeIndex == 0 ? 0.5f : 0.0f;
+#endif
+        uv = clamp(uv, uvMin, uvMax);
+        const float zLast = 1.0f - 0.5f / float(depth);
+        const float zPrev = 1.0f - 1.5f / float(depth);
+        float4 last, prev;
+        [branch] if (far)
+        {
+            last = ExponentialHeightFogIntegratedLightScatteringFar.SampleLevel(SampColorSampler, float3(uv, zLast), 0);
+            prev = ExponentialHeightFogIntegratedLightScatteringFar.SampleLevel(SampColorSampler, float3(uv, zPrev), 0);
+        }
+        else
+        {
+            last = ExponentialHeightFogIntegratedLightScattering.SampleLevel(SampColorSampler, float3(uv, zLast), 0);
+            prev = ExponentialHeightFogIntegratedLightScattering.SampleLevel(SampColorSampler, float3(uv, zPrev), 0);
+        }
+        const float dT = prev.a - last.a;
+        [branch] if (!(dT > 1e-4f))
+            return false;
+        a_color = max((last.rgb - prev.rgb) / dT, 0.0f);
+        return all(isfinite(a_color));
+    }
+
     /// Height fog with the volumetric fog in front of it. The analytical fog only covers the
     /// part of the ray beyond the volumetric fog's range, and the two are composited front
     /// (volume) to back (analytical). Exactly the 37c fog whenever the volumes are off.
@@ -274,6 +323,10 @@ namespace ExponentialHeightFog
         }
 
         float4 analyticalFog = GetAnalyticalHeightFog(positionWS, cameraWS, fogColor, excludeDistance);
+        // (49h stage 1, S6) beyond the volume: its far-end colour (no extra glow: the froxels already scattered the sun with their phase).
+        float3 volumeEndColor;
+        [branch] if (applied && PhysLight::On(PhysLight::kFarFog) && GetVolumeEndColor(positionWS, eyeIndex, volumeEndColor))
+            analyticalFog.rgb = volumeEndColor;
 
         float4 result = analyticalFog;
         [branch] if (applied)
@@ -293,7 +346,7 @@ namespace ExponentialHeightFog
     {
         bool cubemapColored = false;
 #   if defined(DYNAMIC_CUBEMAPS)
-        if (SharedData::exponentialHeightFogSettings.useDynamicCubemaps > 0)
+        if (SharedData::exponentialHeightFogSettings.useDynamicCubemaps > 0 && !PhysLight::On(PhysLight::kFarFog))  // (49h stage 1, S6) off: the weather fog colour
         {
             float3 tintColor = lerp(fogColor, SharedData::exponentialHeightFogSettings.inscatteringTint.xyz, SharedData::exponentialHeightFogSettings.inscatteringTint.w);
             fogColor = tintColor * DynamicCubemaps::EnvReflectionsTexture.SampleLevel(SampColorSampler, normalize(positionWS), SharedData::exponentialHeightFogSettings.cubemapMipLevel).xyz;
@@ -343,15 +396,23 @@ namespace ExponentialHeightFog
         const float4 heightFog = GetAnalyticalHeightFog(positionWS, cameraWS, fogColor, excludeDistance);
         const float weatherOpacity = WeatherFog::Opacity(positionWS, weatherStart, a_weatherAmount);
 
+        float4 heightFogColored = heightFog;
         float3 directional;
         const float3 baseColor = GetInscatteringColor(positionWS, fogColor, directional);
-        const float3 weatherColor = (baseColor + directional * WeatherFog::SunTransmittance(0.0f)) * a_fade;
+        float3 weatherColor = (baseColor + directional * WeatherFog::SunTransmittance(0.0f)) * a_fade;
+        // (49h stage 1, S6) beyond the volume both layers take its far-end colour (the weather layer is in the volume too).
+        float3 volumeEndColor;
+        [branch] if (applied && PhysLight::On(PhysLight::kFarFog) && GetVolumeEndColor(positionWS, eyeIndex, volumeEndColor))
+        {
+            heightFogColored.rgb = volumeEndColor;
+            weatherColor = volumeEndColor * a_fade;
+        }
 
         // One fog: opacities combine as 1 - (1 - aw)(1 - ae), colours by each layer's share.
         const float ae = saturate(heightFog.w);
         const float opacity = 1.0f - (1.0f - weatherOpacity) * (1.0f - ae);
         const float share = weatherOpacity + ae;
-        float4 result = float4(share > 1e-5f ? (weatherOpacity * weatherColor + ae * heightFog.rgb) / share : heightFog.rgb, opacity);
+        float4 result = float4(share > 1e-5f ? (weatherOpacity * weatherColor + ae * heightFogColored.rgb) / share : heightFogColored.rgb, opacity);
 
         [branch] if (applied)
         {

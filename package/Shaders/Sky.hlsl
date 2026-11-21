@@ -1,6 +1,7 @@
 #include "Common/Color.hlsli"
 #include "Common/FastMath.hlsli"
 #include "Common/FrameBuffer.hlsli"
+#include "Common/PhysicalLighting.hlsli"
 #include "Common/Random.hlsli"
 #include "Common/VR.hlsli"
 
@@ -261,34 +262,7 @@ float GetReflectionSkyShadow(float3 viewDir)
 #		endif
 }
 
-// (batch 37c) Glow around the procedural sun, drawn into the sky dome. The disk alone is a few
-// dozen pixels of "far above white": the tonemapper turns it into a flat white dot, and nothing
-// spreads it (vanilla bloom is skipped by "Disable Vanilla Tonemapping", COD Bloom is opt-in).
-// Real eyes and cameras see the sun through a bright scattered glow; this adds it, coloured by
-// the same transmittance as the disk so noon is white and sunset orange. Units: 1 = a sunlit
-// white diffuse wall (sunlight / pi). Not in reflections (the water shader adds its own sun).
-float3 GetProceduralSunGlow(float3 viewDir)
-{
-	const float intensity = SharedData::physSkyExtData.SunGlowIntensity;
-	const float diskCos = SharedData::physSkyData.sunDiskCos;
-	[branch] if (intensity <= 0.0 || diskCos <= 0.0)
-		return 0.0;
-
-	const float3 sunDir = normalize(SharedData::physSkyData.sunDir);
-	const float cosTheta = dot(viewDir, sunDir);
-	[branch] if (cosTheta <= 0.0)
-		return 0.0;
-
-	// atan2 form: acos() of a cosine this close to 1 loses most of its precision in fp32.
-	const float theta = atan2(length(cross(viewDir, sunDir)), cosTheta);
-	const float diskRadius = atan2(sqrt(saturate(1.0 - diskCos * diskCos)), diskCos);
-	const float x = max(theta - diskRadius, 0.0);
-	const float width = max(SharedData::physSkyExtData.SunGlowWidth, 1e-4);
-	const float falloff = 0.85 * exp(-x / width) + 0.15 * exp(-x / (5.0 * width));
-
-	const float3 sunTransmittance = PhysSky::SampleTr(sunDir, PhysSky::SampTr);
-	return SharedData::physSkyData.sunlightColor * sunTransmittance * (intensity * falloff / Math::PI);
-}
+// (49h) The procedural sun (its glow, disc and replace mode) is retired: Physical Sky draws the game's sun with the Sky Fixes halo.
 
 // (47a) "Sky Fixes": PhysicalSky::NightFlags bit 3 and the NightCbData fields it fills, named here so
 // that SharedData.hlsli (which every Lighting shader includes) stays byte-identical.
@@ -598,8 +572,6 @@ PS_OUTPUT main(PS_INPUT input)
 			skyColor = PhysSky::SampleSkyShadow(normalize(input.WorldPosition.xyz), GetReflectionSkyShadow(normalize(input.WorldPosition.xyz)), PhysSky::SampSv);
 		else
 			skyColor = PhysSky::SampleSky(normalize(input.WorldPosition.xyz), input.Position.xy, PhysSky::SampSv);
-		if (!(Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InReflection))
-			skyColor += GetProceduralSunGlow(normalize(input.WorldPosition.xyz));
 		psout.Color = lerp(float4(skyColor, 1.0), psout.Color, SharedData::physSkyData.vanillaMix);  // upstream 5846ad833 ((47o) SkyAlphaOpaque always on)
 
 		// (47a) Sky Fixes: the main target (R11G11B10_FLOAT: 6 significant bits in red and green, 5 in blue)
@@ -630,8 +602,7 @@ PS_OUTPUT main(PS_INPUT input)
 			psout.Color.w *= SkyFixes::StarVisibility(normalize(input.WorldPosition.xyz), Color::RGBToLuminance(baseColor.xyz) * baseColor.w,
 				moonStarFade ? MoonSky::StarDrown(SampBaseSampler) : 0.0);
 #		elif defined(DEFERRED) && defined(TEX) && !defined(MOONMASK)
-		// (batch 37c) Not the moon/star mask: it is TEX too, but a sun disk has no business on it.
-		const uint extFlags = SharedData::physSkyExtData.Flags;
+		// (batch 37c) Not the moon/star mask: it is TEX too. (49h) The procedural sun disc that was drawn here is retired.
 		// (40d) Moon Physical Brightness: the vanilla disc (phase picture and fade alpha kept) is
 		// brightened to moonlight / disc solid angle, so it stands out of its own sky glow.
 		// IsMoon is only set on the two discs, never on the star mask.
@@ -690,61 +661,6 @@ PS_OUTPUT main(PS_INPUT input)
 			discLuminance *= (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsSecunda) ? SharedData::physSkyMoonData.SecundaDiskScale : SharedData::physSkyMoonData.MasserDiskScale;
 			psout.Color.w *= rcp(1.0 + SharedData::physSkyCloudData.MoonDaylightFade * max(skyLuminance, 0.0) / max(discLuminance, 1e-4));
 		}
-		// (batch 37b) Replace mode: the disk lives on the vanilla sun quad only (main view, not
-		// reflections), and the quad's own texture is dropped. Without it the disk is added on
-		// top of every TEX quad as in 37a -- including the glare quad.
-		const bool replaceSun = (extFlags & SharedData::PhysSkyExtFlags::SunReplace) && SharedData::physSkyData.sunDiskCos > 0.0 &&
-		                        (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InWorld) &&
-		                        !(Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InReflection);
-		const bool isSunQuad = (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsSun) != 0;
-
-		float3 sunDir = normalize(SharedData::physSkyData.sunDir);
-		float cosTheta = saturate(dot(normalize(input.WorldPosition.xyz), sunDir));
-		if (cosTheta > SharedData::physSkyData.sunDiskCos && SharedData::physSkyData.sunDiskCos > 0.0 && (!replaceSun || isSunQuad))
-		{
-			float sunDiskSin = sqrt(1.0 - SharedData::physSkyData.sunDiskCos * SharedData::physSkyData.sunDiskCos);
-			float tanTheta = sqrt(1.0 - cosTheta * cosTheta) / cosTheta;
-			float normDist = tanTheta * SharedData::physSkyData.sunDiskCos * rcp(sunDiskSin);
-			float3 limbFactor = PhysSky::LimbDarkenHestroffer(normDist);
-
-			// (batch 37b) TrLut edge fix: the LUT through Physical Sky's own clamp sampler (upstream
-			// fec65ed15 swapped samplers for the same reason) instead of the sun texture's sampler.
-			const float3 sunTransmittance = PhysSky::SampleTr(normalize(input.WorldPosition.xyz), PhysSky::SampTr);  // (47o) TrLutEdgeFix always on
-
-			float3 dirLightColor;
-			[branch] if (extFlags & SharedData::PhysSkyExtFlags::SunPhysicalRadiance)
-			{
-				// Upstream 728eedd61 + d08484aef: the light colour is an irradiance, the disk shows
-				// radiance = irradiance / solid angle. Capped, keeping the hue (upstream clamps each
-				// channel at a fixed 62250).
-				const float sunSolidAngle = Math::TAU * (1.0 - SharedData::physSkyData.sunDiskCos);
-				float3 radiance = SharedData::physSkyData.sunlightColor / max(sunSolidAngle, 1e-6);
-				radiance *= sunTransmittance;
-				const float peak = max(max(radiance.r, radiance.g), radiance.b);
-				radiance *= min(1.0, SharedData::physSkyExtData.SunRadianceCap / max(peak, 1e-6));
-				dirLightColor = radiance * limbFactor;
-			}
-			else
-			{
-				dirLightColor = SharedData::physSkyData.sunlightColor * limbFactor;
-				dirLightColor *= sunTransmittance;
-			}
-
-			[branch] if (extFlags & SharedData::PhysSkyExtFlags::SunSoftEdge)
-			{
-				// Upstream fec65ed15: fade the outer 1/8 of the disk instead of a hard cut.
-				dirLightColor *= saturate(8.0 * (cosTheta - SharedData::physSkyData.sunDiskCos) / (1.0 - SharedData::physSkyData.sunDiskCos));
-			}
-
-			if (replaceSun)
-				psout.Color.xyz = dirLightColor;
-			else
-				psout.Color.xyz += dirLightColor;
-			psout.Color.w = 1.0;
-		} else if (replaceSun && isSunQuad) {
-			// Upstream 735ec68e4: the rest of the vanilla sun quad is cleared.
-			psout.Color = 0.0;
-		}
 #		endif
 
 #		if defined(TEX) && !defined(MOONMASK) && !defined(CLOUDS) && !defined(OCCLUSION)
@@ -752,7 +668,7 @@ PS_OUTPUT main(PS_INPUT input)
 		// above owns that quad) and its glare: halo smoothed and dithered; the glare also hides behind ridges.
 		[branch] if (SkyFixes::On())
 		{
-			const bool vanillaSunQuad = (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsSun) && SharedData::physSkyData.sunDiskCos <= 0.0;
+			const bool vanillaSunQuad = (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsSun) != 0;  // (49h) no procedural sun any more
 			const bool sunGlareQuad = (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsSunGlare) != 0;
 			[branch] if (vanillaSunQuad || sunGlareQuad)
 			{
@@ -763,12 +679,6 @@ PS_OUTPUT main(PS_INPUT input)
 		}
 #		endif
 
-#		if !defined(OCCLUSION)
-		// (batch 37b) Optionally hide the vanilla sun glare while the procedural sun is on.
-		if ((SharedData::physSkyExtData.Flags & SharedData::PhysSkyExtFlags::HideSunGlare) && SharedData::physSkyData.sunDiskCos > 0.0 &&
-			(Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsSunGlare))
-			psout.Color = 0.0;
-#		endif
 	}
 #endif
 

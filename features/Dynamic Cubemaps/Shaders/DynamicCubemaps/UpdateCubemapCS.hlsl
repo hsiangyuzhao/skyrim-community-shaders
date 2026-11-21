@@ -1,5 +1,6 @@
 #include "Common/Color.hlsli"
 #include "Common/FrameBuffer.hlsli"
+#include "Common/PhysicalLighting.hlsli"
 #include "Common/SharedData.hlsli"
 #include "Common/VR.hlsli"
 
@@ -9,8 +10,31 @@ RWTexture2DArray<float4> DynamicCubemapPosition : register(u2);
 
 Texture2D<float> DepthTexture : register(t0);
 Texture2D<float4> ColorTexture : register(t1);
+// (49h stage 1, S3a) the G-buffer albedo and masks (Masks.z = the forward ambient's luminance), bound by UpdateCubemapCapture.
+// Unbound (other callers): zeros, nothing is taken out.
+Texture2D<float4> AlbedoTexture : register(t2);
+Texture2D<float4> MasksTexture : register(t3);
 
+// (49h stage 1, S3a) "Screen Light Probe Without Feedback": the IBL part of the ambient MAIN already holds (forward Lighting added
+// DALC x DALCAmount + IBL, x albedo; Masks.z is its luminance) is taken out of the captured colour, so the probe the IBL is built
+// from no longer contains its own light (probe -> IBL -> MAIN -> probe ran away on bright snow). The weather ambient part stays.
 SamplerState LinearSampler : register(s0);
+
+float3 RemoveIblFeedback(float3 a_color, float2 a_uv)
+{
+	float3 result = a_color;
+	[branch] if (PhysLight::On(PhysLight::kIblNoFeedback) && SharedData::iblSettings.EnableDiffuseIBL && (!SharedData::InInterior || SharedData::iblSettings.EnableInterior))
+	{
+		const float3 albedo = max(AlbedoTexture.SampleLevel(LinearSampler, a_uv, 0).rgb, 0.0);
+		const float ambientY = max(MasksTexture.SampleLevel(LinearSampler, a_uv, 0).z, 0.0);
+		const float3 dalc = Color::Ambient(max(0, mul(SharedData::DirectionalAmbient, float4(0, 0, 0, 1)))) * SharedData::iblSettings.DALCAmount;
+		const float iblY = max(ambientY - Color::RGBToLuminance(dalc * albedo), 0.0);
+		const float albedoY = Color::RGBToLuminance(albedo);
+		const float3 iblPart = albedoY > 1e-4 ? albedo * (iblY / albedoY) : 0.0;
+		result = max(a_color - iblPart, 0.0);
+	}
+	return result;
+}
 
 // Calculate normalized sampling direction vector based on current fragment coordinates.
 // This is essentially "inverse-sampling": we reconstruct what the sampling vector would be if we wanted it to "hit"
@@ -90,7 +114,7 @@ float smoothbumpstep(float edge0, float edge1, float x)
 
 			position += positionCS.xyz;
 
-			color += ColorTexture.SampleLevel(LinearSampler, uv, 0).rgb;
+			color += RemoveIblFeedback(ColorTexture.SampleLevel(LinearSampler, uv, 0).rgb, uv);  // (49h stage 1, S3a)
 			weight++;
 		}
 

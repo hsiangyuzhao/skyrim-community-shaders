@@ -13,6 +13,9 @@ struct GlintParameters
 
 struct TruePBR
 {
+	/// (49h stage 1) The last frame a True PBR land block was drawn (Physical Lighting S5: the LOD land then uses the PBR light scale).
+	static inline std::atomic<uint32_t> lastPbrLandFrame{ 0 };
+
 public:
 	static TruePBR* GetSingleton()
 	{

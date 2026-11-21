@@ -846,10 +846,7 @@ WetnessEffects::PerFrame WetnessEffects::GetCommonBufferData() const
 	data.settings.EnableWetDarkening = 1;
 	const auto& wetSkin = globals::features::wetSkin;
 	data.settings.PorositySkin = std::clamp(wetSkin.settings.Darkening, 0.0f, 2.0f);
-	if (wetSkin.IsOriginal()) {
-		data.settings.EnableWetFilm = 0;
-		data.settings.EnableWetDarkening = 0;
-	}
+	// (49h) The Legacy model that turned both off is retired: always 1.
 	data.settings.EnableRainSkinFilm = 0;
 	data.settings.PorosityCloth = 1.0f;
 	data.settings.PorosityMetal = 0.0f;

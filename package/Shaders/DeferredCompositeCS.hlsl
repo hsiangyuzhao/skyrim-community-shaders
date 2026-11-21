@@ -3,6 +3,7 @@
 #include "Common/FrameBuffer.hlsli"
 #include "Common/GBuffer.hlsli"
 #include "Common/MotionBlur.hlsli"
+#include "Common/PhysicalLighting.hlsli"
 #include "Common/SharedData.hlsli"
 #include "Common/Spherical Harmonics/SphericalHarmonics.hlsli"
 #include "Common/VR.hlsli"
@@ -262,11 +263,15 @@ bool ReflectionFixOn()
 		// Fold the lower hemisphere up, as the forward path and the fallback both do.
 		float3 ambientFoldedNormal = normalize(float3(normalWS.xy, max(0, normalWS.z)));
 
-		float rawVisibility = SphericalHarmonics::FuncProductIntegral(ambientSkylightingSH, SphericalHarmonics::EvaluateCosineLobe(ambientFoldedNormal)) / Math::PI;
+		// (49h stage 1, S8) "Small Lighting Fixes": as forward Lighting (Lighting.hlsl SKYLIGHTING ambient): the real normal, no upward boost.
+		const bool forwardParity = PhysLight::On(PhysLight::kSmallFixes);
+		float rawVisibility = SphericalHarmonics::FuncProductIntegral(ambientSkylightingSH, SphericalHarmonics::EvaluateCosineLobe(forwardParity ? normalWS : ambientFoldedNormal)) / Math::PI;
 		rawVisibility = saturate(rawVisibility);
 		rawVisibility = lerp(1.0, rawVisibility, Skylighting::getFadeOutFactor(ambientPositionMS));
 
 		ambientSkyVisibility = rawVisibility * (1.0 + saturate(normalWS.z) * (1.0 - SharedData::skylightingSettings.MinDiffuseVisibility));
+		[flatten] if (forwardParity)
+			ambientSkyVisibility = rawVisibility;
 		ambientSkyVisibility = Skylighting::mixDiffuse(SharedData::skylightingSettings, ambientSkyVisibility);
 	}
 #	endif

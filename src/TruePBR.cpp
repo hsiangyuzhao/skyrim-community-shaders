@@ -722,6 +722,7 @@ bool TruePBR::BSLightingShader_SetupMaterial(RE::BSLightingShader* shader, RE::B
 		RE::BSGraphics::Renderer::PreparePSConstantGroup(RE::BSGraphics::ConstantGroupLevel::PerMaterial);
 
 		if (lightingType == MTLand || lightingType == MTLandLODBlend) {
+			lastPbrLandFrame.store(globals::state->frameCount, std::memory_order_relaxed);  // (49h stage 1)
 			auto* pbrMaterial = static_cast<const BSLightingShaderMaterialPBRLandscape*>(material);
 
 			constexpr size_t NormalStartIndex = 7;

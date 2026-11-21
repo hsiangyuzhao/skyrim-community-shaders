@@ -102,7 +102,7 @@ ScreenSpacePointLightShadows::PerFrame ScreenSpacePointLightShadows::GetCommonBu
 		// (46y) bit 3: Ray Tracing debug view SSPLS Coverage (drawn by Lighting.hlsl; only while SSPLS is on).
 		// (47h) bit 4 Skip on Translucent Surfaces, (47k) bits 5-7 Skip Weak Lights, Smarter Steps, Skip SSPLS on Water: (47o) permanent in
 		// the shaders, still set (reserved); bits 8-11: Max Shadowed Lights per Pixel (0 = unlimited).
-		.Enable = settings.Enable ? (1u | 2u | 4u | (globals::features::rayTracing.SSPLSCoverageView() ? 8u : 0u) | 16u | 32u | 64u | 128u |
+		.Enable = settings.Enable ? (1u | 2u | 4u | 16u | 32u | 64u | 128u |
 										((settings.MaxShadowedLights >= 1u && settings.MaxShadowedLights < 8u) ? (settings.MaxShadowedLights << 8) : 0u)) :
 		                            0u,
 		.Strength = settings.Strength,

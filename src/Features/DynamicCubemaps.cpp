@@ -27,6 +27,7 @@ std::vector<std::pair<std::string_view, std::string_view>> DynamicCubemaps::GetS
 
 void DynamicCubemaps::DrawSettings()
 {
+	ImGui::TextDisabled("Lighting Fixes: Sky > Physical Sky > Scene Lighting");  // (49h stage 1) pointer to the Lighting Fixes rules
 	// (49h) Reflections: the cubemap reflection's brightness (composite).
 	if (ImGui::TreeNodeEx("Reflections", ImGuiTreeNodeFlags_DefaultOpen)) {
 		ImGui::Checkbox("Reflection Brightness Fix", &reflectionBrightnessFix);
@@ -344,8 +345,11 @@ void DynamicCubemaps::UpdateCubemapCapture(bool a_reflections)
 	auto& depth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
 	auto& main = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
 
-	ID3D11ShaderResourceView* srvs[2] = { depth.depthSRV, main.SRV };
-	context->CSSetShaderResources(0, 2, srvs);
+	// (49h stage 1, S3a) t2 / t3: the G-buffer albedo and masks, for "Screen Light Probe Without Feedback" (UpdateCubemapCS).
+	auto& albedoRT = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kINDIRECT];
+	auto& masksRT = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kRAWINDIRECT_PREVIOUS];
+	ID3D11ShaderResourceView* srvs[4] = { depth.depthSRV, main.SRV, albedoRT.SRV, masksRT.SRV };
+	context->CSSetShaderResources(0, 4, srvs);
 
 	uint index = a_reflections ? 1 : 0;
 
@@ -405,7 +409,9 @@ void DynamicCubemaps::UpdateCubemapCapture(bool a_reflections)
 
 	srvs[0] = nullptr;
 	srvs[1] = nullptr;
-	context->CSSetShaderResources(0, 2, srvs);
+	srvs[2] = nullptr;
+	srvs[3] = nullptr;
+	context->CSSetShaderResources(0, 4, srvs);
 
 	buffer = nullptr;
 	context->CSSetConstantBuffers(0, 1, &buffer);

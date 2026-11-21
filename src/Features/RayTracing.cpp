@@ -9580,9 +9580,22 @@ void RayTracing::DrawDiagnostics()
 			"History Length", "Adaptive Rays", "SSS: RT Casters", "Distance Quality", "Character Rays", "Point Lights: Candidates", "Point Lights: Traced Lights",
 			"Point Lights: Raw Rays", "Point Lights: Denoised", "Point Lights: SSPLS Coverage", "Point Lights: Moving Pixels", "Point Lights: Filter Path" };  // (48m) + 2
 		static_assert(IM_ARRAYSIZE(views) == static_cast<int>(DebugView::Count));
-		int view = static_cast<int>(debugView);
-		if (ImGui::Combo("Debug View", &view, views, IM_ARRAYSIZE(views)))
-			debugView = static_cast<DebugView>(std::clamp(view, 0, static_cast<int>(DebugView::Count) - 1));
+		// (49h) "Point Lights: SSPLS Coverage" is retired (its Lighting code is gone): the list skips it; the enum keeps its value.
+		if (debugView == DebugView::PLSsplsCoverage)
+			debugView = DebugView::Off;
+		const char* shown[IM_ARRAYSIZE(views) - 1];
+		int shownView[IM_ARRAYSIZE(views) - 1];
+		int shownCount = 0, pick = 0;
+		for (int i = 0; i < IM_ARRAYSIZE(views); ++i) {
+			if (i == static_cast<int>(DebugView::PLSsplsCoverage))
+				continue;
+			if (i == static_cast<int>(debugView))
+				pick = shownCount;
+			shown[shownCount] = views[i];
+			shownView[shownCount++] = i;
+		}
+		if (ImGui::Combo("Debug View", &pick, shown, shownCount))
+			debugView = static_cast<DebugView>(shownView[std::clamp(pick, 0, shownCount - 1)]);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("Not saved.");
 			ImGui::Text("Shadow Source: red = ray-traced shadow, blue = shadow-map shadow (characters, trees, grass, terrain), green = lit,");
@@ -9609,11 +9622,6 @@ void RayTracing::DrawDiagnostics()
 			ImGui::Text("Point Lights: Candidates: shadow-casting lights that reach the pixel (its lit side): green 1, yellow 2, orange 3-4, red 5+.");
 			ImGui::Text("Point Lights: Traced Lights: a colour per light; stripes = a second (third, fourth) light traced there too.");
 			ImGui::Text("Point Lights: Raw Rays / Denoised: the point-light shadows before / after the clean-up (white = lit).");
-			ImGui::Text("Point Lights: SSPLS Coverage (needs Screen Space Point Light Shadows on): what shadows the point lights at each pixel get,");
-			ImGui::Text("  mixed by how bright each light is there: green = ray traced only, cyan = ray traced + screen-space for the non-RT casters,");
-			ImGui::Text("  orange = screen-space and / or the game's shadow map only (the light is not traced here: not a source, more lights than");
-			ImGui::Text("  traced per pixel, outside the traced area), red = no shadow at all (also a light whose game shadow map Skip the Game's");
-			ImGui::Text("  Shadow Maps left out, where the pixel did not trace it: it shines unshadowed there). Dark grey = no point light.");
 			// (48m)
 			ImGui::Text("Point Lights: Moving Pixels: where the lamp-shadow clean-up sees a moving surface (game motion vectors): red = it took that");
 			ImGui::Text("  surface's own last frame, yellow = none usable (this frame only), magenta = moving but Clean Shadow History is not running (its shader did not compile).");
@@ -10227,4 +10235,10 @@ void RayTracing::ReleaseForwardShadowMap()
 	forwardMergedDesc = {};
 	forwardMergedFrame = UINT32_MAX;
 	forwardMergedFrom = nullptr;
+}
+
+bool RayTracing::SunTracingActive() const
+{
+	// (49h stage 1, S4a) For the A4 sun-bits distance (UpstreamEngineFixes): the RT sun shadows are drawn this frame.
+	return loaded && RtWanted() && SunOn() && status == Status::Active && handedOff;
 }

@@ -6,6 +6,8 @@
 #include <intrin.h>
 
 #include "Globals.h"
+#include "Features/PhysicalSky.h"
+#include "Features/RayTracing.h"
 #include "Utils/FileSystem.h"
 #include "Utils/Format.h"
 #include "Utils/UI.h"
@@ -262,6 +264,9 @@ namespace UpstreamEngineFixes
 		RE::BSShaderAccumulator** mainAccumulator = nullptr;
 		const std::uint8_t* sunShadowSkipped = nullptr;
 		const float* shadowDistance = nullptr;
+		/** @brief (49h stage 1, S4a) Distance out to which full objects get the sun bits: the game's shadow distance, or with "Far Objects Keep Their
+		 * Shadows" and RT sun shadows drawn, the loaded grid's edge (the RT scene covers the loaded cells). Written once per frame. */
+		std::atomic<float> sunBitsDistance = 0.0f;
 		bool sunMaskReady = false;
 		bool overlayReady = false;
 
@@ -289,6 +294,20 @@ namespace UpstreamEngineFixes
 				}
 			}
 			sunLightMask.store(mask, std::memory_order_relaxed);
+			float distance = shadowDistance ? *shadowDistance : 0.0f;
+			const auto& physicalSky = globals::features::physicalSky;
+			if (mask && physicalSky.PhysLightingOn(physicalSky.settings.physicalLighting.farShadows) && globals::features::rayTracing.SunTracingActive()) {
+				const auto* tes = RE::TES::GetSingleton();
+				uint32_t grids = (tes && tes->gridCells) ? tes->gridCells->length : 0;
+				if (grids == 0 || grids > 63) {
+					auto* setting = RE::GetINISetting("uGridsToLoad:General");
+					grids = setting ? setting->GetUInt() : 0;
+				}
+				if (grids == 0 || grids > 63)
+					grids = 5;
+				distance = std::max(distance, 0.5f * static_cast<float>(grids) * 4096.0f);
+			}
+			sunBitsDistance.store(distance, std::memory_order_relaxed);
 		}
 
 		bool ShouldSetSunBits(const RE::BSLightingShaderProperty* a_property, const RE::BSGeometry* a_geometry, std::uint32_t a_renderMode, const RE::BSShaderAccumulator* a_accumulator, std::uint32_t a_mask)
@@ -306,7 +325,7 @@ namespace UpstreamEngineFixes
 
 			const auto& eye = *reinterpret_cast<const RE::NiPoint3*>(reinterpret_cast<std::uintptr_t>(a_accumulator) + AccumulatorEyePositionOffset);
 			const auto& bound = a_geometry->worldBound;
-			return (bound.center - eye).Length() - bound.radius < *shadowDistance;
+			return (bound.center - eye).Length() - bound.radius < sunBitsDistance.load(std::memory_order_relaxed);  // (49h stage 1, S4a) was *shadowDistance
 		}
 
 		/** @brief One hook on BSLightingShaderProperty::GetRenderPasses (vtable 0x2A) for both A4 and A3. */

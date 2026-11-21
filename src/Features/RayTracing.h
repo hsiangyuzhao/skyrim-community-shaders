@@ -30,6 +30,8 @@
 struct RayTracing : Feature
 {
 public:
+	/// (49h stage 1, S4a) The ray-traced sun shadows are drawn this frame (active, handed off after a loading screen).
+	[[nodiscard]] bool SunTracingActive() const;
 	virtual inline std::string GetName() override { return "Ray Tracing"; }
 	virtual inline std::string GetShortName() override { return "RayTracing"; }
 	virtual inline std::string_view GetCategory() const override { return "Ray Tracing"; }  // (46g) its own category

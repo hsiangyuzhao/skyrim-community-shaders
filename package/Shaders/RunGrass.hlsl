@@ -3,6 +3,7 @@
 #include "Common/GBuffer.hlsli"
 #include "Common/Math.hlsli"
 #include "Common/MotionBlur.hlsli"
+#include "Common/PhysicalLighting.hlsli"
 #include "Common/Random.hlsli"
 #include "Common/SharedData.hlsli"
 #include "Common/Permutation.hlsli"
@@ -756,7 +757,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float3 transmissionColor = 0;
 #			endif  // TRUE_PBR
 
-	float llDirLightMult = (SharedData::linearLightingSettings.enableLinearLighting && !SharedData::linearLightingSettings.isDirLightLinear) ? SharedData::linearLightingSettings.dirLightMult : 1.0f;
+	float llDirLightMult = PhysLight::DirLightMultApplies() ? SharedData::linearLightingSettings.dirLightMult /* (49h stage 1, S8) + not indoors */ : 1.0f;
 	float3 dirLightColor = Color::DirectionalLight(SharedData::DirLightColor.xyz / max(llDirLightMult, 1e-5), SharedData::linearLightingSettings.isDirLightLinear) * llDirLightMult;
 	float3 dirLightColorMultiplier = 1;
 
@@ -823,7 +824,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #				if defined(SKYLIGHTING)
 	float skylightingFadeOutFactor = 1.0;
 	if (!SharedData::InInterior) {
-		skylightingFadeOutFactor = Skylighting::getFadeOutFactor(input.WorldPosition.xyz);
+		skylightingFadeOutFactor = Skylighting::getFadeOutFactorRaw(input.WorldPosition.xyz);  // (49h stage 1) raw: also the vertex AO hand-off
 		vertexColor = lerp(input.VertexColor.xyz * input.VertexMult, vertexColor, skylightingFadeOutFactor);
 	}
 #				endif
@@ -951,7 +952,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		sh2 skylightingSH = Skylighting::sample(SharedData::skylightingSettings, Skylighting::SkylightingProbeArray, Skylighting::stbn_vec3_2Dx1D_128x128x64, input.HPosition.xy, positionMSSkylight, normal);
 		skylightingDiffuse = SphericalHarmonics::FuncProductIntegral(skylightingSH, SphericalHarmonics::EvaluateCosineLobe(normal)) / Math::PI;
 		skylightingDiffuse = saturate(skylightingDiffuse);
-		skylightingDiffuse = lerp(1.0, skylightingDiffuse, skylightingFadeOutFactor);
+		skylightingDiffuse = lerp(1.0, skylightingDiffuse, PhysLight::On(PhysLight::kFarSkylight) ? 1.0 : skylightingFadeOutFactor);  // (49h stage 1, S4b) far fallback in the probe
 		skylightingDiffuse = Skylighting::mixDiffuse(SharedData::skylightingSettings, skylightingDiffuse);
 	}
 #				endif  // SKYLIGHTING
@@ -1124,7 +1125,7 @@ PS_OUTPUT main(PS_INPUT input)
 #			endif
 	}
 
-	float llDirLightMult = (SharedData::linearLightingSettings.enableLinearLighting && !SharedData::linearLightingSettings.isDirLightLinear) ? SharedData::linearLightingSettings.dirLightMult : 1.0f;
+	float llDirLightMult = PhysLight::DirLightMultApplies() ? SharedData::linearLightingSettings.dirLightMult /* (49h stage 1, S8) + not indoors */ : 1.0f;
 	float3 diffuseColor = Color::DirectionalLight(SharedData::DirLightColor.xyz / max(llDirLightMult, 1e-5), SharedData::linearLightingSettings.isDirLightLinear) * dirShadow * dirDetailShadow * 0.5 * llDirLightMult;
 #			if defined(EXP_HEIGHT_FOG)
 	diffuseColor *= WeatherFog::SunlightAttenuation(input.WorldPosition.z);  // (47d) 1 unless "CS Fog Takes Over" applies
@@ -1189,7 +1190,7 @@ PS_OUTPUT main(PS_INPUT input)
 #			if defined(SKYLIGHTING)
 	float skylightingFadeOutFactor = 1.0;
 	if (!SharedData::InInterior) {
-		skylightingFadeOutFactor = Skylighting::getFadeOutFactor(input.WorldPosition.xyz);
+		skylightingFadeOutFactor = Skylighting::getFadeOutFactorRaw(input.WorldPosition.xyz);  // (49h stage 1) raw: also the vertex AO hand-off
 		vertexColor = lerp(input.VertexColor.xyz * input.VertexMult, vertexColor, skylightingFadeOutFactor);
 	}
 #			endif
@@ -1213,7 +1214,7 @@ PS_OUTPUT main(PS_INPUT input)
 		sh2 skylightingSH = Skylighting::sample(SharedData::skylightingSettings, Skylighting::SkylightingProbeArray, Skylighting::stbn_vec3_2Dx1D_128x128x64, input.HPosition.xy, positionMSSkylight, normal);
 		skylightingDiffuse = SphericalHarmonics::FuncProductIntegral(skylightingSH, SphericalHarmonics::EvaluateCosineLobe(normal)) / Math::PI;
 		skylightingDiffuse = saturate(skylightingDiffuse);
-		skylightingDiffuse = lerp(1.0, skylightingDiffuse, skylightingFadeOutFactor);
+		skylightingDiffuse = lerp(1.0, skylightingDiffuse, PhysLight::On(PhysLight::kFarSkylight) ? 1.0 : skylightingFadeOutFactor);  // (49h stage 1, S4b) far fallback in the probe
 		skylightingDiffuse = Skylighting::mixDiffuse(SharedData::skylightingSettings, skylightingDiffuse);
 	}
 #			endif  // SKYLIGHTING

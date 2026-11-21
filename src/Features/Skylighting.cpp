@@ -69,6 +69,7 @@ void Skylighting::ResetSkylighting()
 
 void Skylighting::DrawSettings()
 {
+	ImGui::TextDisabled("Lighting Fixes: Sky > Physical Sky > Scene Lighting");  // (49h stage 1) pointer to the Lighting Fixes rules
 	ImGui::Text("Minimum visibility values. Diffuse darkens objects. Specular removes the sky from reflections.");
 	ImGui::SliderFloat("Diffuse Min Visibility", &settings.MinDiffuseVisibility, 0.01f, 1.f, "%.2f");
 	ImGui::SliderFloat("Specular Min Visibility", &settings.MinSpecularVisibility, 0.01f, 1.f, "%.2f");

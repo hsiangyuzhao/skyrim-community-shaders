@@ -217,7 +217,7 @@ float3 GetDirectionalLightColor()
 {
 	// Same conversion as Effect.hlsl's lit effects: the scene's directional light, linearised
 	// under Linear Lighting exactly as the surfaces receive it.
-	float llDirLightMult = (SharedData::linearLightingSettings.enableLinearLighting && !SharedData::linearLightingSettings.isDirLightLinear) ? SharedData::linearLightingSettings.dirLightMult : 1.0f;
+	float llDirLightMult = PhysLight::DirLightMultApplies() ? SharedData::linearLightingSettings.dirLightMult /* (49h stage 1, S8) + not indoors */ : 1.0f;
 	float3 color = Color::DirectionalLight(SharedData::DirLightColor.xyz / max(llDirLightMult, 1e-5), SharedData::linearLightingSettings.isDirLightLinear) * llDirLightMult;
 	// (49h) x Physical Sky's transmittance toward the light, as every surface, effect and the height fog get it (PhysSky::SampleTr);
 	// the CPU leaves 1 without Physical Sky.

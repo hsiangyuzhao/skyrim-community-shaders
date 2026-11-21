@@ -2,6 +2,7 @@
 #include "Common/FrameBuffer.hlsli"
 #include "Common/GBuffer.hlsli"
 #include "Common/MotionBlur.hlsli"
+#include "Common/PhysicalLighting.hlsli"
 #include "Common/Random.hlsli"
 #include "Common/SharedData.hlsli"
 #include "Common/VR.hlsli"
@@ -296,7 +297,9 @@ PS_OUTPUT main(PS_INPUT input)
 	float3 ddy = ddy_coarse(input.WorldPosition.xyz);
 	float3 normal = -normalize(cross(ddx, ddy));
 
-	float3 directionalAmbientColor = max(0, Color::Ambient(mul(SharedData::DirectionalAmbient, float4(normal, 1.0))));
+	const float3 treeDalcRaw = mul(SharedData::DirectionalAmbient, float4(normal, 1.0));
+	// (49h stage 1, S8) max before the conversion (pow(abs()) turned a negative DALC lobe positive). Off: 49g.
+	float3 directionalAmbientColor = PhysLight::On(PhysLight::kSmallFixes) ? Color::Ambient(max(0, treeDalcRaw)) : max(0, Color::Ambient(treeDalcRaw));
 #			if defined(SKYLIGHTING)
 	// (F10) The real probe visibility, replacing the literal 1.0 this call used to pass. Same
 	// chain and same order as Lighting.hlsl:3233-3237 -- cosine-lobe product integral, saturate,
@@ -317,6 +320,9 @@ PS_OUTPUT main(PS_INPUT input)
 		skylightingDiffuse = lerp(1.0, skylightingDiffuse, Skylighting::getFadeOutFactor(input.WorldPosition.xyz));
 		treeSkylighting = Skylighting::mixDiffuse(SharedData::skylightingSettings, skylightingDiffuse);
 	}
+	// (49h stage 1, S8) the weather ambient is blocked by roofs and canopies like the IBL sky term (was not). Off: 49g.
+	[flatten] if (PhysLight::On(PhysLight::kSmallFixes))
+		directionalAmbientColor = Color::IrradianceToGamma(Color::IrradianceToLinear(directionalAmbientColor) * treeSkylighting);
 #			endif
 #			if defined(IBL)
 	float3 iblColor = 0;
@@ -380,7 +386,9 @@ PS_OUTPUT main(PS_INPUT input)
 	float3 ddy = ddy_coarse(input.WorldPosition.xyz);
 	float3 normal = normalize(cross(ddx, ddy));
 
-	float3 directionalAmbientColor = Color::Ambient(mul(SharedData::DirectionalAmbient, float4(normal, 1.0)));
+	const float3 treeDalcRaw = mul(SharedData::DirectionalAmbient, float4(normal, 1.0));
+	// (49h stage 1, S8) clamped like the branch above (was neither clamped before nor after). Off: 49g.
+	float3 directionalAmbientColor = PhysLight::On(PhysLight::kSmallFixes) ? Color::Ambient(max(0, treeDalcRaw)) : Color::Ambient(treeDalcRaw);
 #			if defined(SKYLIGHTING)
 	// (F10) Same fix as the branch above, which this block mirrors apart from the normal's sign.
 	float treeSkylighting = SharedData::skylightingSettings.MinDiffuseVisibility;
@@ -396,6 +404,9 @@ PS_OUTPUT main(PS_INPUT input)
 		skylightingDiffuse = lerp(1.0, skylightingDiffuse, Skylighting::getFadeOutFactor(input.WorldPosition.xyz));
 		treeSkylighting = Skylighting::mixDiffuse(SharedData::skylightingSettings, skylightingDiffuse);
 	}
+	// (49h stage 1, S8) the weather ambient is blocked by roofs and canopies like the IBL sky term (was not). Off: 49g.
+	[flatten] if (PhysLight::On(PhysLight::kSmallFixes))
+		directionalAmbientColor = Color::IrradianceToGamma(Color::IrradianceToLinear(directionalAmbientColor) * treeSkylighting);
 #			endif
 #			if defined(IBL)
 	float3 iblColor = 0;
