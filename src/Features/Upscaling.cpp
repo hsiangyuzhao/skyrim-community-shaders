@@ -1524,8 +1524,8 @@ void Upscaling::CopySharedD3D12Resources()
 
 	if (settings.enableDLSSRR) {
 		auto& ssrt = globals::features::screenSpaceRayTracing;
-		if (ssrt.loaded && ssrt.settings.EnableSpecular) {
-			if (ssrt.texHitDistance && dx12SwapChain.specHitDistanceShared12) {
+		if (ssrt.loaded && ssrt.settings.EnableSpecular && ssrt.texHitDistance && dx12SwapChain.specHitDistanceShared12) {
+			{
 				// (46q) The SSRT texture may be render-sized (SSRT/SSGI Buffers at Render Resolution): its whole extent, top-left.
 				D3D11_TEXTURE2D_DESC sharedDesc{};
 				dx12SwapChain.specHitDistanceShared12->resource11->GetDesc(&sharedDesc);
@@ -1536,6 +1536,16 @@ void Upscaling::CopySharedD3D12Resources()
 					context->CopySubresourceRegion(dx12SwapChain.specHitDistanceShared12->resource11, 0, 0, 0, 0, ssrt.texHitDistance->resource.get(), 0, &box);
 				}
 			}
+		} else if (dx12SwapChain.specHitDistanceShared12) {
+			// (50e) SSRT specular off: Ray Reconstruction still gets this texture tagged as the specular hit distance, and it held
+			// whatever SSRT wrote last (or nothing at all). Fill it with SSRT's own "no hit" value (65536 units, ssrt_raymarch) every
+			// frame (one clear of an R32 texture: no measurable cost; robust against the texture being recreated).
+			auto* target = dx12SwapChain.specHitDistanceShared12.get();
+			constexpr float kNoHit[4] = { 65536.0f, 65536.0f, 65536.0f, 65536.0f };
+			if (target->rtv)
+				context->ClearRenderTargetView(target->rtv, kNoHit);
+			else if (target->uav)
+				context->ClearUnorderedAccessViewFloat(target->uav, kNoHit);
 		}
 
 		auto& sss = globals::features::subsurfaceScattering;

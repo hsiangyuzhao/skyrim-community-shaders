@@ -86,10 +86,12 @@ sl::DLSSPreset GetForcedDLSSPreset(DLSSModelPreset a_preset)
 
 const char* GetDLSSDModelPresetName(DLSSDModelPreset a_preset)
 {
-	// Only kD and kF survive LoadSettings, so everything else lands on the D arm.
+	// D, E and F survive LoadSettings (45k); anything else lands on the D arm. (50e) E printed as D before.
 	switch (a_preset) {
 	case DLSSDModelPreset::kF:
 		return "F (DLSS 4.5, NVIDIA's current default)";
+	case DLSSDModelPreset::kE:
+		return "E (latest transformer, DoF guide)";
 	case DLSSDModelPreset::kD:
 	default:
 		return "D (previous default)";
