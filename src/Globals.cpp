@@ -21,6 +21,7 @@
 #include "Features/LinearLighting.h"
 #include "Features/NRD.h"
 #include "Features/PerformanceOverlay.h"
+#include "Features/PhysicalLighting.h"
 #include "Features/PhysicalSky.h"
 #include "Features/PostProcessing.h"
 #include "Features/RenderDoc.h"
@@ -78,6 +79,7 @@ namespace globals
 		InverseSquareLighting inverseSquareLighting{};
 		NRD nrd{};
 		PhysicalSky physicalSky{};
+		PhysicalLighting physicalLighting{};  // (52a)
 		ScreenSpaceGI screenSpaceGI{};
 		ScreenSpacePointLightShadows screenSpacePointLightShadows{};
 		ScreenSpaceRayTracing screenSpaceRayTracing{};

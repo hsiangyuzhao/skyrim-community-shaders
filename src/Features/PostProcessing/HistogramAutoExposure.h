@@ -60,7 +60,10 @@ struct HistogramAutoExposure : public PostProcessFeature
 		float PurkinjeMaxEV;
 		float PurkinjeStrength;
 
-		float pad[3];  // HLSL: float pad[3] (Classic variants) / float3 pad (EYE_MODE variants, R5): the eye fields start at offset 48 either way
+		// (52a) Physical Lighting: 1 / S (the frame's pre-exposure x wobble): the histogram meters luminance x this and the exposure applies x this.
+		// Exactly 1 with the master off (a multiply by 1.0f). HLSL: after PurkinjeStrength in both variants (offset 36).
+		float SceneScaleInv = 1.0f;
+		float pad[2];  // HLSL: float pad[2] (Classic variants) / float2 pad (EYE_MODE variants, R5): the eye fields start at offset 48 either way
 
 		// (50a) Eye Model (common.hlsli, EYE_MODE). Not read by the classic shaders.
 		float EyeLogLo;
@@ -137,5 +140,6 @@ struct HistogramAutoExposure : public PostProcessFeature
 	void GetUserExposureParameters(float& exposureCompensation, float2& adaptationRange) const;
 	static constexpr float kEyePassThroughEV = 60.0f;  // +- this many EV of 0.125: the consumers' clamp never acts
 };
+static_assert(offsetof(HistogramAutoExposure::AutoExposureCB, SceneScaleInv) == 36, "(52a) AutoExposureCB SceneScaleInv must match common.hlsli");
 static_assert(offsetof(HistogramAutoExposure::AutoExposureCB, EyeLogLo) == 48 && sizeof(HistogramAutoExposure::AutoExposureCB) == 96,
 	"AutoExposureCB must match common.hlsli (EYE_MODE layout)");

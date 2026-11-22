@@ -17,6 +17,7 @@
 #include "Utils/DisplayHDRInfo.h"
 
 #include "Features/PerformanceOverlay.h"
+#include "Features/PhysicalLighting.h"
 #include "Features/PerformanceOverlay/ABTesting/ABTesting.h"
 #include "Features/VR.h"
 
@@ -91,6 +92,7 @@ bool OverlayRenderer::ShouldSkipRendering()
 			 abTestingManager->IsEnabled() ||
 			 (failed && !hide) ||
 			 globals::features::performanceOverlay.settings.ShowInOverlay ||
+			 (globals::features::physicalLighting.loaded && globals::features::physicalLighting.meterOn) ||  // (52a) the light meter's panel
 			 ABCompare::WantsOverlayFrame() ||
 			 renderDoc->IsAvailable());
 }

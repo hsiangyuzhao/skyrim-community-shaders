@@ -85,9 +85,19 @@ struct LinearLighting : Feature
 		float litSmokeMult;
 		float unlitSmokeMult;
 		float unlitSceneScale;
-		float pad[3];
+		// (52a) Physical Lighting's effect scalars (PhysicalLighting::GetEffectScalars; Effect.hlsl reads them only while flags has
+		// kFlagUnitScalars, so an unbound or zeroed buffer means 1). All exactly 1.0f with the master off.
+		float selfLitScale = 1.0f;     // self-lit part of non-fire effects
+		float fireScale = 1.0f;        // fire and magic
+		float unlitScale = 1.0f;       // unlit smoke and mist
+		float dLightScale = 1.0f;      // engine DLightColor (effects not following the scene)
+		float fogScale = 1.0f;         // vanilla fog colour
+		float normDivScale = 1.0f;     // IBL effect normalisation x 1 / S
+		float ambientRawScale = 1.0f;  // raw (gamma) DALC readers
 	};
-	static_assert(sizeof(EffectSceneData) == 32);
+	static_assert(sizeof(EffectSceneData) == 48 && offsetof(EffectSceneData, selfLitScale) == 20 && offsetof(EffectSceneData, dLightScale) == 32,
+		"(52a) EffectSceneCB must match Effect.hlsl");
+	static constexpr uint kEffectFlagUnitScalars = 8u;  // (52a)
 	std::unique_ptr<ConstantBuffer> EffectSceneCB;
 
 	/** Lowest scale for unlit smoke and mist (very dark scenes keep a trace of it). */

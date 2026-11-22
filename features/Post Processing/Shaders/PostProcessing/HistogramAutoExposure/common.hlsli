@@ -11,7 +11,8 @@ cbuffer AutoExposureCB : register(b1)
 #if defined(EYE_MODE)
 	// (50a) Eye Model (physical lighting redo, stage 1): the eye variants only (EYE_MODE), so the classic shaders compile from the same text as
 	// before. R5 (49i f3416d4dd): a float3 pad (the old float pad[3] took three registers), the eye fields from offset 48 (C++ asserts).
-	float3 pad;
+	float SceneScaleInv;  // (52a) Physical Lighting: 1 / S (1 with the master off); offset 36 as in the Classic variants
+	float2 pad;
 	float EyeLogLo;          // log2 of the user's Adaptation Range minimum (scene luminance, x 0.125 as Classic)
 	float EyeLogHi;          // ... maximum
 	float EyeNightDarkness;  // 1 = the scene's own darkness below the range kept (as Classic), 0 = fully adapted
@@ -25,7 +26,8 @@ cbuffer AutoExposureCB : register(b1)
 	float EyeDt;             // real seconds since the last frame
 	uint EyeFlags;           // kEyeSnap / kEyeGlobalFloor / kEyeInstant
 #else
-	float pad[3];
+	float SceneScaleInv;  // (52a) Physical Lighting: the frame's 1 / S (1 with the master off): metered and exposed buffer x this
+	float pad[2];
 #endif
 };
 

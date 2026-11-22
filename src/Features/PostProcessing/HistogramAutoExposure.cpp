@@ -4,6 +4,7 @@
 #include "Util.h"
 #include "Utils/GpuTimers.h"
 
+#include "Features/PhysicalLighting.h"
 #include "Features/PostProcessing.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
@@ -386,6 +387,7 @@ void HistogramAutoExposure::Draw(TextureInfo& inout_tex)
 		.PurkinjeStartEV = settings.PurkinjeStartEV,
 		.PurkinjeMaxEV = settings.PurkinjeMaxEV,
 		.PurkinjeStrength = settings.PurkinjeStrength,
+		.SceneScaleInv = globals::features::physicalLighting.SceneScaleInv(),  // (52a) 1.0f with the master off
 	};
 	if (freezeAdaptation)
 		cbData.AdaptLerp = 0.f;  // (50b) Sky Light Wobble: the classic adaptation holds its level

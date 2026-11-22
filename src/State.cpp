@@ -11,6 +11,7 @@
 #include "FeatureIssues.h"
 #include "Features/CloudShadows.h"
 #include "Features/PerformanceOverlay.h"
+#include "Features/PhysicalLighting.h"
 #include "Features/RayTracing.h"
 #include "Features/Skin.h"
 #include "Features/TerrainBlending.h"
@@ -196,6 +197,9 @@ void State::Debug()
 
 void State::Reset()
 {
+	// (52a) Physical Lighting: this frame's S (pre-exposure x wobble) before any feature computes its uploads.
+	if (globals::features::physicalLighting.loaded)
+		globals::features::physicalLighting.BeginFrame();
 	for (auto* feature : Feature::GetFeatureList())
 		if (feature->loaded)
 			feature->Reset();
@@ -845,6 +849,11 @@ void State::UpdateSharedData([[maybe_unused]] bool a_inWorld, [[maybe_unused]] b
 	{
 		SharedDataCB data{};
 
+		// (52a) Physical Lighting: the engine's directional light colour and DALC x their class factor (the engine's own values kept;
+		// nothing is touched while the factor stays exactly 1).
+		if (globals::features::physicalLighting.loaded)
+			globals::features::physicalLighting.ApplyEngineLights();
+
 		const auto shaderManager = globals::game::smState;
 		const RE::NiTransform& dalcTransform = shaderManager->directionalAmbientTransform;
 		Util::StoreTransform3x4NoScale(data.DirectionalAmbient, dalcTransform);
@@ -918,6 +927,9 @@ void State::UpdateSharedData([[maybe_unused]] bool a_inWorld, [[maybe_unused]] b
 
 	{
 		auto [data, size] = GetFeatureBufferData(a_inWorld);
+		// (52a) Physical Lighting: FeatureData-carried light values x their class factor, shader scalars in unread pad slots (1.0f off).
+		// Always: the shaders multiply by those slots, so they must hold 1.0f even when the feature is not loaded.
+		globals::features::physicalLighting.PatchFeatureData(data, size);
 
 		featureDataCB->Update(data, size);
 

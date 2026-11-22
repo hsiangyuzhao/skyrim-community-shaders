@@ -22,6 +22,7 @@
 #include "Features/PerformanceOverlay/ABTesting/ABTestAggregator.h"
 #include "Features/GrassOptimizations.h"
 #include "Features/NRD.h"
+#include "Features/PhysicalLighting.h"
 #include "Features/RayTracing.h"
 #include "Features/PerformanceOverlay/ABTesting/ABTesting.h"
 #include "Features/Upscaling.h"
@@ -5372,6 +5373,8 @@ nlohmann::json PerformanceOverlay::BuildFrameJson(const PerfView::ViewConfig& a_
 			{ "cpu_limited_pct", st.cpuLimitedPct } };
 		j["cpu_wait_split"] = std::move(split);
 	}
+	// ---- (52a) Physical Lighting: S, P, registry, the light meter's current and captured readings ----
+	j["physical_lighting"] = globals::features::physicalLighting.MeterJson();
 	return j;
 }
 

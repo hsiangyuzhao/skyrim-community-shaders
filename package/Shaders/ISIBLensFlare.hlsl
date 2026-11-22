@@ -1,5 +1,6 @@
 #include "Common/DummyVSTexCoord.hlsl"
 #include "Common/FrameBuffer.hlsli"
+#include "Common/SharedData.hlsli"  // (52a) Physical Lighting's frame scale
 
 typedef VS_OUTPUT PS_INPUT;
 
@@ -37,7 +38,9 @@ cbuffer PerGeometry : register(b2)
 
 float4 GetSampleColor(float2 texCoord)
 {
-	float4 color = DownScaledBlurredHDRTex.Sample(DownScaledBlurredHDRSampler, texCoord);
+	// (52a) Physical Lighting: the source is pre-exposed by S; the threshold and the saturate work on the classic scale (x 1 / S,
+	// VolumetricShadowsSettings.pad0.y, unread before 52a; exactly 1.0 off).
+	float4 color = DownScaledBlurredHDRTex.Sample(DownScaledBlurredHDRSampler, texCoord) * asfloat(SharedData::volumetricShadowsSettings.pad0.y);
 	if (saturate(color.x - lightsRangeDownshift) + saturate(color.y - lightsRangeDownshift) +
 			saturate(color.z - lightsRangeDownshift) <=
 		0) {
@@ -61,7 +64,9 @@ PS_OUTPUT main(PS_INPUT input)
 		}
 		lensColor += sampleColor;
 	}
-	psout.Color = globalIntensity * lensColor;
+	// (52a) Back to the frame's scale as the composite reads it (through Color::GammaToLinear with Linear Lighting: S^(1/1.6);
+	// PostProcessingSettings.pad0.y, unread before 52a; exactly 1.0 off).
+	psout.Color = globalIntensity * lensColor * asfloat(SharedData::postProcessingSettings.pad0.y);
 
 	return psout;
 }

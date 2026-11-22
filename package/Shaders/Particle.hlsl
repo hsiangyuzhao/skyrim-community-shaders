@@ -282,7 +282,8 @@ PS_OUTPUT main(PS_INPUT input)
 	baseColor.w = grayScaleAlpha;
 #	endif
 
-	psout.Color.xyz = ColorScale * baseColor.xyz;
+	// (52a) Physical Lighting: x the precipitation class factor (VolumetricLightingSettings.pad0.x, unread before 52a; 1.0 off).
+	psout.Color.xyz = ColorScale * baseColor.xyz * SharedData::volumetricLightingSettings.pad0.x;
 	psout.Color.w = baseColor.w;
 	psout.Normal.w = baseColor.w;
 	psout.Normal.xyz = float3(0, 1, 0);

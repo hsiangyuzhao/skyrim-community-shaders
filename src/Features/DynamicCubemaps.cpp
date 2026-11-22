@@ -1,4 +1,5 @@
 #include "DynamicCubemaps.h"
+#include "Features/PhysicalLighting.h"
 
 #include <DDSTextureLoader.h>
 #include <DirectXTex.h>
@@ -381,6 +382,8 @@ void DynamicCubemaps::UpdateCubemapCapture(bool a_reflections)
 	updateData.CameraPreviousPosAdjust = cameraPreviousPosAdjust[index];
 	// (batch 39b) Faster convergence while Dynamic Cubemaps alone feeds the water reflections.
 	updateData.CaptureWeight = a_reflections ? Batch39Engine::DynamicCubemapCaptureWeight() : 0.5f;
+	// (52a) Physical Lighting: the capture's history (seconds to minutes old) is rescaled to this frame's S.
+	updateData.HistoryScale = globals::features::physicalLighting.CubemapHistoryScale(static_cast<int>(index));
 
 	auto eyePosition = Util::GetEyePosition(0);
 

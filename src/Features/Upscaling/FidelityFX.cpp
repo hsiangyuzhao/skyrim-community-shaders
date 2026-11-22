@@ -4,6 +4,7 @@
 
 #include "../../State.h"
 #include "../../Utils/FileSystem.h"
+#include "../PhysicalLighting.h"
 #include "../Upscaling.h"
 #include "DX12SwapChain.h"
 
@@ -311,7 +312,8 @@ void FidelityFX::Upscale(ID3D11Resource* a_upscalingTexture, ID3D11Resource* a_r
 		dispatchParameters.cameraFovAngleVertical = Util::GetVerticalFOVRad();
 		dispatchParameters.viewSpaceToMetersFactor = 0.01428222656f;
 		dispatchParameters.reset = false;
-		dispatchParameters.preExposure = 1.0f;
+		// (52a) Physical Lighting: the colour input is pre-exposed by S (exactly 1 with the master off).
+		dispatchParameters.preExposure = globals::features::physicalLighting.SceneScale();
 
 		dispatchParameters.flags = 0;
 

@@ -78,6 +78,8 @@ cbuffer UpdateData : register(b0)
 {
 	float3 CameraPreviousPosAdjust2;
 	float CaptureWeight;  // (batch 39b) share of a new capture; Dynamic Cubemaps always used 0.5
+	float HistoryScale;   // (52a) Physical Lighting: S now / S at this capture's previous update (exactly 1.0 with the master off)
+	float3 Pad52a;
 }
 
 float smoothbumpstep(float edge0, float edge1, float x)
@@ -128,11 +130,12 @@ float smoothbumpstep(float edge0, float edge1, float x)
 			float lerpFactor = CaptureWeight;
 
 			DynamicCubemapPosition[ThreadID] = lerp(DynamicCubemapPosition[ThreadID], positionFinal, lerpFactor);
-			DynamicCubemapRaw[ThreadID] = max(0, lerp(DynamicCubemapRaw[ThreadID], colorFinal, lerpFactor));
+			// (52a) the history in this frame's scale first (x 1.0 off)
+			DynamicCubemapRaw[ThreadID] = max(0, lerp(DynamicCubemapRaw[ThreadID] * float4(HistoryScale.xxx, 1.0), colorFinal, lerpFactor));
 
 			colorFinal *= sqrt(saturate(0.5 * length(position.xyz)));
 
-			DynamicCubemap[ThreadID] = max(0, lerp(DynamicCubemap[ThreadID], colorFinal, lerpFactor));
+			DynamicCubemap[ThreadID] = max(0, lerp(DynamicCubemap[ThreadID] * float4(HistoryScale.xxx, 1.0), colorFinal, lerpFactor));
 
 			return;
 		}
@@ -143,6 +146,13 @@ float smoothbumpstep(float edge0, float edge1, float x)
 	DynamicCubemapPosition[ThreadID] = position;
 
 	float4 color = DynamicCubemapRaw[ThreadID];
+	// (52a) Physical Lighting: texels the camera does not see keep their history; it is rescaled to this frame's S (and written back, so
+	// the next frame's ratio applies to it). Nothing is written while the scale is exactly 1.
+	[branch] if (HistoryScale != 1.0)
+	{
+		color.rgb *= HistoryScale;
+		DynamicCubemapRaw[ThreadID] = color;
+	}
 
 	float distance = length(position.xyz);
 	float distanceFactor = smoothbumpstep(0.0, 2.0, distance);

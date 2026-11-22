@@ -72,7 +72,7 @@ float4 ComputeBoxBounds(float2 dims)
 
 	if (inBox) {
 		float3 color = TexColor[pxCoord].rgb;
-		float luma = Color::RGBToLuminance(color);
+		float luma = Color::RGBToLuminance(color) * SceneScaleInv;  // (52a) the buffer is pre-exposed by S: meter buffer / S
 
 		// Optimized bin calculation - avoid unnecessary saturate
 		if (luma > 1e-10) {

@@ -1,6 +1,7 @@
 #include "WindowLight.h"
 
 #include "Features/LinearLighting.h"
+#include "Features/PhysicalLighting.h"
 #include "Features/SkySync.h"
 #include "Features/WindowLightMath.h"
 #include "State.h"
@@ -469,6 +470,11 @@ namespace WindowLight
 		return false;
 	}
 
+	namespace
+	{
+		RE::NiColor glassScratch{};  // (52a) a scaled copy of the region's glass colour for the one draw being set up
+	}
+
 	void SetupGlass(RE::BSRenderPass* a_pass, RE::BSLightingShaderProperty* a_property)
 	{
 		g.swapProperty = nullptr;
@@ -502,7 +508,13 @@ namespace WindowLight
 			return;
 		g.swapProperty = a_property;
 		g.swapOriginal = a_property->emissiveColor;
-		a_property->emissiveColor = &region->glass;
+		// (52a) Physical Lighting: the window class relative to the emissive class (in emitColorMult); 1 at identity = the region's colour.
+		const float unitScale = globals::features::physicalLighting.GlassColorScale();
+		if (unitScale != 1.0f) {
+			glassScratch = RE::NiColor(region->glass.red * unitScale, region->glass.green * unitScale, region->glass.blue * unitScale);
+			a_property->emissiveColor = &glassScratch;
+		} else
+			a_property->emissiveColor = &region->glass;
 	}
 
 	void RestoreGlass()

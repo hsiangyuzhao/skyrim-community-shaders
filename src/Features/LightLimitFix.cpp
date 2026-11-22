@@ -1,6 +1,7 @@
 #include "LightLimitFix.h"
 #include "InverseSquareLighting.h"
 #include "LinearLighting.h"
+#include "PhysicalLighting.h"
 #include "RayTracing.h"
 #include "RayTracing/Wind.h"
 
@@ -292,6 +293,8 @@ void LightLimitFix::BSLightingShader_SetupGeometry_GeometrySetupConstantPointLig
 			light.lightFlags.set(LightFlags::Shadow);
 		}
 		light.rtShadow = globals::features::rayTracing.PointLightTag(bsLight);  // (46b) strict (interior) lights: 0 until 46c
+		// (52a) Physical Lighting: linear-flag and window lights carry their class factor in the fade (1 with the master off).
+		light.fade *= globals::features::physicalLighting.LightFadeScale(niLight, light.lightFlags.any(LightFlags::Linear));
 
 		strictLightDataTemp.StrictLights[i] = light;
 	}
@@ -524,6 +527,8 @@ void LightLimitFix::UpdateLights()
 						light.rtShadow = rayTracing.PointLightTag(bsLight);  // (46b) 0 unless this frame's trace has a shadow source for it
 
 						if ((light.color.x + light.color.y + light.color.z) * light.fade > 1e-4 && light.radius > 1e-4) {
+							// (52a) Physical Lighting: after the cull (which keeps the 50e threshold), linear-flag and window lights x their class factor.
+							light.fade *= globals::features::physicalLighting.LightFadeScale(niLight, light.lightFlags.any(LightFlags::Linear));
 							lightsData.push_back(light);
 							fogIdsData.push_back(rayTracing.FogLightId(bsLight));  // (49b)
 							if (census)
