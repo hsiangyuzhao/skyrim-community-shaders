@@ -169,6 +169,8 @@ void PhysicalSky::LoadSettings(json& o_json)
 			ol.clouds = j.value("clouds", d.clouds);
 			ol.smoothSun = j.value("smoothSun", d.smoothSun);
 			ol.realOzone = j.value("realOzone", d.realOzone);
+			ol.moonArtFactor = j.value("moonArtFactor", d.moonArtFactor);
+			ol.eyeAdaptation = j.value("eyeAdaptation", d.eyeAdaptation);
 		}
 		settings.moonStarFadeStrength = o_json.value("moonStarFadeStrength", defaults.moonStarFadeStrength);
 		settings.moonPlanetshineStrength = o_json.value("moonPlanetshineStrength", defaults.moonPlanetshineStrength);
@@ -189,6 +191,8 @@ void PhysicalSky::LoadSettings(json& o_json)
 		ol.weatherGloominess = std::isfinite(ol.weatherGloominess) ? std::clamp(ol.weatherGloominess, 0.f, 1.f) : 1.f;
 		ol.nightSkyGlow = std::isfinite(ol.nightSkyGlow) ? std::clamp(ol.nightSkyGlow, 0.f, 100.f) : 1.f;
 		ol.ambientTint = std::isfinite(ol.ambientTint) ? std::clamp(ol.ambientTint, 0.f, 1.f) : 1.f;
+		ol.moonArtFactor = std::isfinite(ol.moonArtFactor) ? std::clamp(ol.moonArtFactor, 1.f, 100.f) : 8.f;
+		ol.eyeAdaptation = std::isfinite(ol.eyeAdaptation) ? std::clamp(ol.eyeAdaptation, 0.f, 1.f) : 0.77f;
 	}
 
 	// (batch 37b) A saved whitelist replaces the default one wholesale. Merge the defaults back
@@ -338,7 +342,8 @@ void PhysicalSky::SaveSettings(json& o_json)
 		const auto& ol = settings.outdoorLight;  // (51a)
 		o_json["physicalOutdoorLight"] = { { "enabled", ol.enabled }, { "sunFamily", ol.sunFamily }, { "weatherGloominess", ol.weatherGloominess },
 			{ "moonFamily", ol.moonFamily }, { "nightGlow", ol.nightGlow }, { "nightSkyGlow", ol.nightSkyGlow }, { "ambient", ol.ambient },
-			{ "ambientTint", ol.ambientTint }, { "clouds", ol.clouds }, { "smoothSun", ol.smoothSun }, { "realOzone", ol.realOzone } };
+			{ "ambientTint", ol.ambientTint }, { "clouds", ol.clouds }, { "smoothSun", ol.smoothSun }, { "realOzone", ol.realOzone },
+			{ "moonArtFactor", ol.moonArtFactor }, { "eyeAdaptation", ol.eyeAdaptation } };
 	}
 	o_json["moonStarFadeStrength"] = settings.moonStarFadeStrength;
 	o_json["moonPlanetshineStrength"] = settings.moonPlanetshineStrength;
@@ -1112,8 +1117,10 @@ void PhysicalSky::UpdateMoonData(float a_exposure, float a_sunElevation, float3&
 	// glow in the scattering LUTs is scaled here.
 	const auto& s = effective;
 	const float strength = std::clamp(s.moonGlowStrength, 0.f, 1.f);
-	a_masserGlow = settings.masserColor * (a_exposure * strength);
-	a_secundaGlow = settings.secundaColor * (a_exposure * strength);
+	// (51a, D1) In the physical scene with Physical Outdoor Light's moon (x 1.0f otherwise).
+	const float moonPhysical = MoonPhysicalScale();
+	a_masserGlow = settings.masserColor * (a_exposure * strength * moonPhysical);
+	a_secundaGlow = settings.secundaColor * (a_exposure * strength * moonPhysical);
 	moonCbData = {};
 	moonStarFadeAmount[0] = moonStarFadeAmount[1] = 0.f;  // (48b)
 	moonPlanetshineAmount[0] = moonPlanetshineAmount[1] = 0.f;
@@ -1150,7 +1157,10 @@ void PhysicalSky::UpdateMoonData(float a_exposure, float a_sunElevation, float3&
 				return 1.f;
 			const float sinR = radius / dist;
 			const float solidAngle = 2.f * DirectX::XM_PI * (1.f - std::sqrt(1.f - sinR * sinR));
-			const float irradiance = (0.2126f * a_color.x + 0.7152f * a_color.y + 0.0722f * a_color.z) * a_exposure;
+			const float irradiance = (0.2126f * a_color.x + 0.7152f * a_color.y + 0.0722f * a_color.z) * a_exposure * moonPhysical;
+			// (51a) Physical Outdoor Light: the physical moon x the perceptual factor S (in skyAnchorApplied), then the cap and the floor of 1.
+			if (outdoorActive)
+				return std::clamp(irradiance * skyAnchorApplied / std::max(solidAngle, 1e-6f), 1.f, cap);
 			// (50b) x k_sky (with its cap: the disc follows the family; x 1.0f off).
 			return std::clamp(irradiance / std::max(solidAngle, 1e-6f), 1.f, cap) * skyAnchorApplied;
 		};
@@ -1200,7 +1210,7 @@ void PhysicalSky::UpdateMoonSky(float a_exposure, float a_sunElevation)
 			const float cosZenith = std::max(sinElevation[i], 0.f);
 			const float airmass = 1.f / (cosZenith + 0.025f * std::exp(-11.f * cosZenith));
 			const float height = std::pow(10.f, -0.4f * kMoonSkyExtinction * (airmass - 1.f));
-			const float3 light = *colors[i] * a_exposure;
+			const float3 light = *colors[i] * (a_exposure * MoonPhysicalScale());  // (51a, D1; x 1.0f otherwise)
 			const float luminance = std::max(0.2126f * light.x + 0.7152f * light.y + 0.0722f * light.z, 0.f);
 			const float amount = strength * kMoonStarFadeScale * SkySync::PhaseFactorFromTexture(moons[i]) *
 			                     MoonVisibility(moons[i], sky, sinElevation[i]) * dayFade * height * luminance *
@@ -1566,7 +1576,7 @@ void PhysicalSky::UpdateCloudData(float a_exposure, float a_sunElevation)
 	const bool outdoorMoon = OutdoorActive(settings.outdoorLight.moonFamily);
 	if (outdoorSun)
 		cloudCbData.sunColor = settings.sunlightColor * (a_exposure * outdoorFrame.sigmaRef * outdoorFrame.sunScale / pbrCompensation);
-	const float moonScale = outdoorMoon ? a_exposure / pbrCompensation : scale;
+	const float moonScale = outdoorMoon ? a_exposure * MoonPhysicalScale() / pbrCompensation : scale;  // (D1) the physical moon
 
 	// The moons: phase, the true elevation with the weather (the 41b glow visibility) and, as for the
 	// ground light in Sky Sync's Combined model, gone as the sun comes up (the moonlight colours are
@@ -1688,7 +1698,11 @@ void PhysicalSky::Reset()
 	}
 	const bool outdoorSun = OutdoorActive(settings.outdoorLight.sunFamily);
 	const bool outdoorMoon = OutdoorActive(settings.outdoorLight.moonFamily);
-	const float outdoorSunScale = outdoorSun ? outdoorFrame.sunScale : 1.f;
+	// The sun family x g; below -15 degrees (astronomical twilight, where the physical sky is already ~0) the sun's colour fades out by -18, so
+	// that no numerical residue of the LUTs is lifted by the perceptual factor at night.
+	const float outdoorSunScale = outdoorSun ? outdoorFrame.sunScale *
+	                                               SkySync::SmoothStep(-18.f, -15.f, DirectX::XMConvertToDegrees(std::asin(std::clamp(skySync.rawDirections[static_cast<int>(SkySync::Caster::Sun)].z, -1.f, 1.f)))) :
+	                                           1.f;
 
 	// resolution
 	float2 res = globals::state->screenSize;
@@ -1763,8 +1777,32 @@ void PhysicalSky::Reset()
 	// (51a) Physical Outdoor Light replaces the anchor while it is in effect (the sun family is physical, the moon is the art moon).
 	const bool stage2 = Stage2On(true);
 	const bool anchor = Stage2On(settings.lightingStage2.skyAnchor) && !outdoorActive;
+	// (51a, D2) The perceptual factor S on the natural-light family: target from the CPU model (every 4th frame, at once on a time jump), smoothed
+	// in log2 with the auto exposure's speeds (snapping on time jumps and when the model starts). It rides in skyAnchorApplied, which every
+	// natural-light upload already carries; the night glow gets it below.
+	if (outdoorActive) {
+		UpdateNaturalLight(lutSunDir, masserDir, secundaDir, outdoorSunScale);
+		auto& nl = naturalLight;
+		const float target = nl.valid ? nl.target : 1.f;
+		if (nl.snap || outdoorFrame.timeJump || !(nl.scale > 0.f) || !std::isfinite(nl.scale)) {
+			nl.scale = target;
+		} else {
+			const float dt = globals::game::deltaTime ? std::clamp(*globals::game::deltaTime, 0.f, 1.f) : 0.f;
+			const float logS = std::log2(std::max(nl.scale, 1e-12f));
+			const float logT = std::log2(std::max(target, 1e-12f));
+			// S rises when the scene darkens: into the dark is the larger S.
+			const float tau = logT > logS ? HistogramAutoExposure::naturalTauDark : HistogramAutoExposure::naturalTauBright;
+			nl.scale = std::exp2(logS + (logT - logS) * (1.f - std::exp(-dt / std::max(tau, 1e-3f))));
+		}
+		if (!std::isfinite(nl.scale) || !(nl.scale > 0.f))
+			nl.scale = 1.f;
+		nl.snap = false;
+	} else {
+		naturalLight.snap = true;
+		naturalLight.scale = 1.f;
+	}
 	{
-		float applied = anchor ? skyAnchorK : 1.f;
+		float applied = anchor ? skyAnchorK : (outdoorActive ? naturalLight.scale : 1.f);
 		if (stage2 && skyLightWobble) {
 			const double t = static_cast<double>(GetTickCount64()) * 1e-3 - skyLightWobbleStart;
 			applied *= static_cast<float>(std::exp2(std::sin(2.0 * 3.14159265358979 * t / 4.0)));
@@ -1774,6 +1812,15 @@ void PhysicalSky::Reset()
 	}
 	if (!anchor)
 		skyAnchorSnap = true;  // snap when it comes back
+	if (outdoorActive && OutdoorActive(settings.outdoorLight.nightGlow) && (nightCbData.flags & kNightBaseLight)) {
+		// (51a, D2) The CS night glow is natural light: x S (which also lifts the physical 7.5e-9 above the LUTs' float precision).
+		const float glowScale = skyAnchorApplied;
+		nightCbData.baseUpper = nightCbData.baseUpper * glowScale;
+		nightCbData.baseHorizon = nightCbData.baseHorizon * glowScale;
+		nightCbData.baseLower = nightCbData.baseLower * glowScale;
+		nightBaseUnfadedUpper = nightBaseUnfadedUpper * glowScale;
+		nightBaseUnfadedHorizon = nightBaseUnfadedHorizon * glowScale;
+	}
 
 	float3 masserGlow, secundaGlow;
 	// (48b) The sun's true elevation, as for the clouds just below.
@@ -1862,8 +1909,8 @@ void PhysicalSky::Reset()
 		// constant, no time keying); the art moon takes none. Both factors are exactly 1 with the items off.
 		const float sunImagespace = outdoorSun ? outdoorFrame.sigmaRef / std::max(outdoorFrame.sigmaNow, 1e-3f) : 1.f;
 		const float moonImagespace = outdoorMoon ? 1.f / std::max(outdoorFrame.sigmaNow, 1e-3f) : 1.f;
-		skySync.lightColors = { LightConvFn(cbData.sunlightColor * sunImagespace), LightConvFn(settings.masserColor * exposure * skyAnchorApplied * moonImagespace),
-			LightConvFn(settings.secundaColor * exposure * skyAnchorApplied * moonImagespace) };
+		skySync.lightColors = { LightConvFn(cbData.sunlightColor * sunImagespace), LightConvFn(settings.masserColor * exposure * skyAnchorApplied * moonImagespace * MoonPhysicalScale()),
+			LightConvFn(settings.secundaColor * exposure * skyAnchorApplied * moonImagespace * MoonPhysicalScale()) };
 	} else {
 		linearLighting.isDirLightLinear = false;
 	}
@@ -2655,6 +2702,13 @@ void PhysicalSky::SettingsOutdoorLight()
 			"shows. Interiors and other worldspaces are unchanged. Off: exactly as 50d (stage 2's section below applies again).");
 	ImGui::BeginDisabled(!ol.enabled);
 	ImGui::Indent();
+	ImGui::SliderFloat("Eye Adaptation", &ol.eyeAdaptation, 0.f, 1.f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"How much your eye adapts to the natural light (sun, sky, moon, night glow, the ambient from them, clouds): 0.77 (default) = a scene\n"
+			"really 100x darker looks about 3x darker. 0 = no adaptation (like a camera with fixed exposure: real nights are black), 1 = full\n"
+			"adaptation (day and night look equally bright). A clear noon always looks as before. Lamps, fire, windows, glowing things, stars,\n"
+			"the weather's fog colour, rain and water are not changed by it; the frame keeps your auto exposure.");
 	ImGui::Checkbox("Physical Sun and Sky", &ol.sunFamily);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text(
@@ -2672,10 +2726,18 @@ void PhysicalSky::SettingsOutdoorLight()
 	ImGui::Checkbox("Moon by Phase, Height and Weather", &ol.moonFamily);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text(
-			"On (default): the moonlight is your moon colour (Celestials) x phase x height x how visible the weather leaves the moon (its night moon\n"
-			"glare against this world's clear weathers; overcast and rain dim it, a black glare still hides it). The same rule for the ground, the\n"
-			"sky's moon glow, the clouds and the stars. Full moonlight once the sun is 1 degree below the horizon, none by +3 degrees.\n"
-			"The weather's night sunlight scale no longer multiplies it.");
+			"On (default): the moonlight is a real moon x Moon Brightness (below), in your moon colour (Celestials), x phase x height x how visible\n"
+			"the weather leaves the moon (its night moon glare against this world's clear weathers; overcast and rain dim it, a black glare still\n"
+			"hides it). The same rule for the ground, the sky's moon glow, the clouds, the discs and the stars. Full moonlight once the sun is 1\n"
+			"degree below the horizon, none by +3 degrees. The weather's night sunlight scale no longer multiplies it.");
+	ImGui::BeginDisabled(!ol.moonFamily);
+	ImGui::SliderFloat("Moon Brightness (x real moon)", &ol.moonArtFactor, 1.f, 100.f, "x%.1f", ImGuiSliderFlags_Logarithmic);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"The moonlight as a real full moon times this (Skyrim's moons are larger than ours: an art choice). 8 (default) = a clear full-moon\n"
+			"night as bright as the old picture with Eye Adaptation 0.77. Your moon colours (Celestials) keep their colour and their relative\n"
+			"strength (Masser 0.2 luminance = 1 moon; doubling a colour doubles that moon).");
+	ImGui::EndDisabled();
 	ImGui::Checkbox("Night Sky Glow from CS", &ol.nightGlow);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text(
@@ -2722,6 +2784,8 @@ void PhysicalSky::SettingsOutdoorLight()
 			ImGui::TextDisabled("Not in effect here (interior, or a worldspace without the physical sky).");
 		} else {
 			const auto& f = outdoorFrame;
+			ImGui::TextDisabled("Eye: natural light x%.4g (target x%.4g), adaptation level %.3g cd/m2 (clear noon %.3g)", naturalLight.scale, naturalLight.target,
+				naturalLight.lAdapt * SceneToCandela(), naturalLight.lNoon * SceneToCandela());
 			ImGui::TextDisabled("Gloominess %.2f (current %.2f, last %.2f) -> sun family x%.3f; sunlight scale now %.2f, clear-day %.2f", f.g, f.gCurrent, f.gLast, f.sunScale, f.sigmaNow, f.sigmaRef);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				static constexpr const char* kSources[] = { "none (neutral)", "this world's region weather lists", "the parent world's region weather lists", "the climate's list" };
@@ -3232,6 +3296,7 @@ void PhysicalSky::UpdateOutdoorCalibration()
 		return;
 	amb.calibration = 0.f;
 	amb.cloudAmbientCal = 0.f;
+	naturalLight.lNoon = 0.f;
 	if (!UpdateCpuSkyModel())
 		return;  // tried again next frame
 	amb.calibrationFrame = frame;
@@ -3249,6 +3314,14 @@ void PhysicalSky::UpdateOutdoorCalibration()
 		for (int side = 0; side < 2; ++side)
 			mean += Lum3(noon.e[axis][side]);
 	mean /= 6.f;
+	// (D2) The perceptual factor's K: S = 1 at this clear noon (the same adaptation level as UpdateNaturalLight measures).
+	{
+		constexpr float kInvPi = 0.318309886f;
+		const float skyMean = Lum3(noon.horizontal) * kInvPi;
+		const float ground = kAdaptGroundReflectance * (Lum3(noon.horizontal) + Lum3(direct)) * kInvPi;
+		const float l = std::sqrt(std::max(skyMean * ground, 0.f));
+		naturalLight.lNoon = std::isfinite(l) ? l : 0.f;
+	}
 	const auto& ref = weatherRef;
 	const RE::TESWeather* current = globals::game::sky ? globals::game::sky->currentWeather : nullptr;
 	const WeatherKeys fallback = ref.source == 0 ? ReadWeatherKeys(current) : WeatherKeys{};
@@ -3307,7 +3380,7 @@ void PhysicalSky::UpdateOutdoorAmbient(const RE::NiPoint3& a_lutSunDir)
 			const float sinEl = skySync.rawDirections[static_cast<int>(casters[i])].z;
 			const float strength = SkySync::PhaseFactorFromTexture(moons[i]) * MoonVisibility(moons[i], sky, sinEl) * dayFade * (i == 1 ? SkySync::SecundaIntensityFactor : 1.f);
 			const auto trMoon = skyModelCpu.Transmittance(cameraRadius, lights[1 + i].dir);
-			const float3 c = *colors[i] * (strength * std::max(sinEl, 0.f));
+			const float3 c = *colors[i] * (strength * std::max(sinEl, 0.f) * MoonPhysicalScale() * skyAnchorApplied);  // as on the ground (D1, S)
 			direct += float3(c.x * static_cast<float>(trMoon[0]), c.y * static_cast<float>(trMoon[1]), c.z * static_cast<float>(trMoon[2]));
 		}
 	}
@@ -3440,8 +3513,99 @@ std::string PhysicalSky::DescribeOutdoorLight() const
 	const auto& f = outdoorFrame;
 	return std::format(
 		"physical outdoor light on ({}; sun family {} g {:.3f} -> x{:.3f} [strength {:.2f}], sunlight scale now {:.2f} ref {:.2f}; moon family {}; night glow {} x{:.1f}; "
-		"ambient {} tint {:.2f} cal {:.4f}; clouds {}; smooth sun {}; real ozone {}; reference source {} ({} entries))",
+		"ambient {} tint {:.2f} cal {:.4f}; clouds {}; smooth sun {}; real ozone {}; reference source {} ({} entries); eye a {:.2f} S {:.4g} L {:.3g} cd/m2; moon x{:.1f} real)",
 		outdoorActive ? "active" : "not here", ol.sunFamily ? "on" : "off", f.g, f.sunScale, ol.weatherGloominess, f.sigmaNow, f.sigmaRef,
 		ol.moonFamily ? "on" : "off", ol.nightGlow ? "on" : "off", ol.nightSkyGlow, ol.ambient ? "on" : "off", ol.ambientTint, outdoorAmbient.calibration,
-		ol.clouds ? "on" : "off", ol.smoothSun ? "on" : "off", ol.realOzone ? "on" : "off", weatherRef.source, weatherRef.entries);
+		ol.clouds ? "on" : "off", ol.smoothSun ? "on" : "off", ol.realOzone ? "on" : "off", weatherRef.source, weatherRef.entries, ol.eyeAdaptation,
+		naturalLight.scale, naturalLight.lAdapt * SceneToCandela(), ol.moonArtFactor);
+}
+
+float PhysicalSky::MoonPhysicalScale() const
+{
+	if (!OutdoorActive(settings.outdoorLight.moonFamily))
+		return 1.f;
+	const float sun = std::max(0.2126f * settings.sunlightColor.x + 0.7152f * settings.sunlightColor.y + 0.0722f * settings.sunlightColor.z, 0.f);
+	const float factor = std::clamp(settings.outdoorLight.moonArtFactor, 1.f, 100.f);
+	return sun * kFullMoonPerSolarIlluminance * factor / kMoonColourReference;
+}
+
+float PhysicalSky::SceneToCandela() const
+{
+	const float sun = 0.2126f * settings.sunlightColor.x + 0.7152f * settings.sunlightColor.y + 0.0722f * settings.sunlightColor.z;
+	return kSolarIlluminanceLux / std::max(sun, 1e-6f);
+}
+
+float PhysicalSky::EyeSceneToNits() const
+{
+	if (!outdoorActive || !OutdoorOn(true) || !(naturalLight.scale > 0.f))
+		return 0.f;
+	const float v = SceneToCandela() / naturalLight.scale;
+	return std::isfinite(v) ? v : 0.f;
+}
+
+void PhysicalSky::UpdateNaturalLight(const RE::NiPoint3& a_lutSunDir, const RE::NiPoint3& a_masserDir, const RE::NiPoint3& a_secundaDir, float a_sunScale)
+{
+	auto& nl = naturalLight;
+	const uint32_t frame = globals::state->frameCount;
+	if (nl.valid && nl.frame != UINT32_MAX && frame - nl.frame < 4u && !outdoorFrame.timeJump && !nl.snap)
+		return;
+	nl.frame = frame;
+	nl.valid = false;
+	auto* sky = globals::game::sky;
+	if (!sky || !UpdateCpuSkyModel())
+		return;
+	UpdateOutdoorCalibration();
+	if (!(nl.lNoon > 0.f))
+		return;
+
+	// The natural light before S, as it will be uploaded: the sun x g, the moons' glows and light (D1 physical moon), the CS night glow.
+	const double cameraRadius = std::max(static_cast<double>(cbData.zCameraPlanet) * Util::Units::GAME_UNIT_TO_KM, static_cast<double>(std::max(settings.planetRadius, 1.f)) + 0.01);
+	const auto& skySync = globals::features::skySync;
+	const float moonPhysical = MoonPhysicalScale();
+	const float glowStrength = std::clamp(effective.moonGlowStrength, 0.f, 1.f);
+	const float dayFade = SkySync::MoonDayFade(DirectX::XMConvertToDegrees(std::asin(std::clamp(skySync.rawDirections[static_cast<int>(SkySync::Caster::Sun)].z, -1.f, 1.f))));
+	const RE::Moon* moons[2] = { sky->masser, sky->secunda };
+	const float3* colors[2] = { &settings.masserColor, &settings.secundaColor };
+	const SkySync::Caster casters[2] = { SkySync::Caster::Masser, SkySync::Caster::Secunda };
+	const RE::NiPoint3* moonDirs[2] = { &a_masserDir, &a_secundaDir };
+	const float3 sun = settings.sunlightColor * a_sunScale;
+	PhysicalSkyModel::Light lights[3] = { { UnitVec(a_lutSunDir.x, a_lutSunDir.y, a_lutSunDir.z), { sun.x, sun.y, sun.z } }, {}, {} };
+	float3 direct = {};
+	{
+		const auto trSun = skyModelCpu.Transmittance(cameraRadius, lights[0].dir);
+		const float up = static_cast<float>(std::max(lights[0].dir[2], 0.0));
+		direct += float3(sun.x * static_cast<float>(trSun[0]), sun.y * static_cast<float>(trSun[1]), sun.z * static_cast<float>(trSun[2])) * up;
+	}
+	for (int i = 0; i < 2; ++i) {
+		lights[1 + i].dir = UnitVec(moonDirs[i]->x, moonDirs[i]->y, moonDirs[i]->z);
+		if (!moons[i])
+			continue;
+		const float sinEl = skySync.rawDirections[static_cast<int>(casters[i])].z;
+		const float phase = SkySync::PhaseFactorFromTexture(moons[i]);
+		const float visibility = MoonVisibility(moons[i], sky, sinEl);
+		const float3 glow = *colors[i] * (glowStrength * moonPhysical * phase * visibility);  // as UpdateMoonData
+		lights[1 + i].color = { glow.x, glow.y, glow.z };
+		const float strength = phase * visibility * dayFade * (i == 1 ? SkySync::SecundaIntensityFactor : 1.f);  // as Sky Sync lights the ground
+		const auto trMoon = skyModelCpu.Transmittance(cameraRadius, lights[1 + i].dir);
+		const float3 c = *colors[i] * (strength * moonPhysical * std::max(sinEl, 0.f));
+		direct += float3(c.x * static_cast<float>(trMoon[0]), c.y * static_cast<float>(trMoon[1]), c.z * static_cast<float>(trMoon[2]));
+	}
+	const bool glowNatural = OutdoorActive(settings.outdoorLight.nightGlow) && (nightCbData.flags & kNightBaseLight);
+	const float3 glowUpper = glowNatural ? nightCbData.baseUpper : float3{};
+	const float3 glowHorizon = glowNatural ? nightCbData.baseHorizon : float3{};
+	const SkyIrradiance now = IntegrateSky(skyModelCpu, cameraRadius, lights, 3, glowUpper, glowHorizon, direct, settings.groundAlbedo);
+
+	// The adaptation level: the geometric mean of a grey ground (reflectance 0.18) under the sky's and the direct light's horizontal illuminance
+	// and the sky's cosine-weighted mean radiance (a frame about half ground, half sky; both in the sky's units).
+	constexpr float kInvPi = 0.318309886f;
+	const float skyMean = std::max(Lum3(now.horizontal) * kInvPi, 0.f);
+	const float ground = kAdaptGroundReflectance * std::max(Lum3(now.horizontal) + Lum3(direct), 0.f) * kInvPi;
+	nl.lAdapt = std::sqrt(skyMean * ground);
+	const float a = std::clamp(settings.outdoorLight.eyeAdaptation, 0.f, 1.f);
+	// No adaptation floor; the bound is numeric only (a scene without any natural light, e.g. the CS glow off on a moonless night).
+	const float ratio = std::max(nl.lAdapt / nl.lNoon, 1e-14f);
+	nl.target = std::clamp(std::pow(ratio, -a), 1e-4f, 2e6f);
+	if (!std::isfinite(nl.target))
+		return;
+	nl.valid = true;
 }

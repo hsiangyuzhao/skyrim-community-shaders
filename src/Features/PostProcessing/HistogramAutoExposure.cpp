@@ -5,6 +5,7 @@
 #include "Utils/GpuTimers.h"
 
 #include "Features/PostProcessing.h"
+#include "Features/PhysicalSky.h"  // (51a) the natural light's perceptual factor and the mesopic conversion
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	HistogramAutoExposure::Settings,
@@ -443,6 +444,12 @@ void HistogramAutoExposure::Draw(TextureInfo& inout_tex)
 		eyeLocalMinVisibility = 0.0f;
 	}
 	eyeSnapFrames = std::max(eyeSnapFrames - 1, 0);
+	// (51a) Physical Outdoor Light: its perceptual factor on the natural light follows this auto exposure's speeds (both modes), and the Eye
+	// Model's mesopic shift gets the real-luminance conversion of the natural light (cd/m2 per scene unit; the EYE_MODE variants read pad[0],
+	// the classic ones never do; 0 = the shader's own constant).
+	naturalTauBright = 1.0f / std::max(settings.AdaptSpeed, 1e-3f);
+	naturalTauDark = naturalTauBright * std::clamp(settings.EyeDarkAdaptSlower, 1.0f, 20.0f);
+	cbData.pad[0] = eye ? globals::features::physicalSky.EyeSceneToNits() : 0.0f;
 	autoExposureCB->Update(cbData);
 	lastExposureCompensation = cbData.ExposureCompensation;
 

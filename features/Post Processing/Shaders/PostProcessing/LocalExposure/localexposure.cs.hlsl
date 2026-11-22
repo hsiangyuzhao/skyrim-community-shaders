@@ -72,7 +72,8 @@ cbuffer AutoExposureFoldCB : register(b2)
 	float AEPurkinjeStrength;
 #	if defined(EYE_MODE)
 	// (50a) Eye Model: the auto exposure CB's eye fields (common.hlsli, same layout from offset 48).
-	float3 AEPad;
+	float AEEyeSceneToNits;  // (51a) common.hlsli EyeSceneToNits
+	float2 AEPad;
 	float AEEyeLogLo;
 	float AEEyeLogHi;
 	float AEEyeNightDarkness;
@@ -93,7 +94,7 @@ float4 LoadSceneColor(uint2 tid)
 {
 #	if defined(EYE_MODE)
 	return float4(AutoExposureMath::ExposeColorEye(TexColor[tid].rgb, AEAdaptation[0], AEAdaptation[1], AEExposureCompensation, AEPurkinjeStartEV, AEPurkinjeMaxEV,
-					  AEPurkinjeStrength, AEEyeMesopic),
+					  AEPurkinjeStrength, AEEyeMesopic, AEEyeSceneToNits),
 		1);
 #	else
 	return float4(AutoExposureMath::ExposeColor(TexColor[tid].rgb, AEAdaptation[0], AEExposureCompensation, AEAdaptationRange, AEPurkinjeStartEV, AEPurkinjeMaxEV, AEPurkinjeStrength), 1);

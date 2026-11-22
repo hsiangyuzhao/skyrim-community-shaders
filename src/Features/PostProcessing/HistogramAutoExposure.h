@@ -96,6 +96,9 @@ struct HistogramAutoExposure : public PostProcessFeature
 	double eyeWobbleStart = 0.0;
 	/// (50b) Physical Sky's "Sky Light Wobble" self-test: the adaptation holds its level (classic: no lerp; eye: no change, no snap) while set.
 	static inline bool freezeAdaptation = false;
+	/// (51a) The adaptation time constants (s) toward brighter / darker scenes, for Physical Sky's perceptual factor on the natural light.
+	static inline float naturalTauBright = 1.0f / 1.5f;
+	static inline float naturalTauDark = 1.0f / 1.5f;
 	/// (50a) Snap bookkeeping: a loading screen seen since the last Draw, the game hour of the last Draw, the eye mode of the last Draw.
 	int eyeSnapFrames = 3;
 	float eyeLastGameHours = -1.0f;

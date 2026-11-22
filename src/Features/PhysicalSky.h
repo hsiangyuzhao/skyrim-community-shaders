@@ -247,6 +247,8 @@ struct PhysicalSky final : public Feature
 			bool clouds = true;             // clouds lit only by CS light (sun x g, moons, the physical sky); no weather cloud colour
 			bool smoothSun = true;          // Sky Sync's sun path keeps descending below the horizon (SunWarp slope cap)
 			bool realOzone = true;          // ozone absorption 0.650 / 1.881 / 0.085 per Mm (Hillaire 2020 / Bruneton 2017), layer 10-40 km
+			float moonArtFactor = 8.f;      // D1: the moon = a physical full moon x this (x masserColor / kMoonColourReference), 1..100
+			float eyeAdaptation = 0.77f;    // D2: a in S = K L_adapt^-a on the natural-light family, 0..1 (0: no adaptation)
 		} outdoorLight;
 		/// (48b) Its strength, 0-3. 1: Masser full and high on a clear night keeps about 40% of the Milky Way's light.
 		float moonStarFadeStrength = 1.f;
@@ -643,6 +645,35 @@ struct PhysicalSky final : public Feature
 	bool outdoorWasActive = false;
 	/// R4 in effect (OutdoorActive(moonFamily)) or the 41b rule: every caller of the moon visibility goes through here.
 	static float MoonVisibility(const RE::Moon* a_moon, const RE::Sky* a_sky, float a_sinElevation);
+	/// D1: the moon colours (masserColor / secundaColor) in the physical scene: a real full moon's illuminance per top-of-atmosphere solar
+	/// illuminance (0.27 lx / 128 klx) x the sun colour's luminance x "Moon Brightness" / kMoonColourReference (the colour luminance that stands for
+	/// one moon: the user's tuned Masser is 0.193). Exactly 1 unless OutdoorActive(moonFamily).
+	float MoonPhysicalScale() const;
+	static constexpr float kFullMoonPerSolarIlluminance = 0.27f / 128000.f;
+	static constexpr float kMoonColourReference = 0.2f;
+	/// D2: the perceptual factor S on the natural-light family (sun x g, moons, night glow, the rewritten DALC, clouds, fog sky light, the LUT inputs):
+	/// S = K L_adapt^-a with L_adapt the natural light's adaptation level from the CPU model (geometric mean of a grey ground, reflectance 0.18,
+	/// under the sky's and the direct light's horizontal illuminance, and the sky's cosine-weighted mean radiance), K so S = 1 at the clear-noon
+	/// reference. Smoothed in log2 with the auto exposure's speeds, snapping on time jumps. The frame keeps the user's auto exposure.
+	struct NaturalLight
+	{
+		bool valid = false;
+		float lAdapt = 0.f;         // this frame's target level (scene units, unscaled physical)
+		float lNoon = 0.f;          // the clear-noon reference level (UpdateOutdoorCalibration)
+		float target = 1.f;         // S target
+		float scale = 1.f;          // S as applied (smoothed)
+		bool snap = true;
+		uint32_t frame = UINT32_MAX;
+	} naturalLight;
+	/// a_lutSunDir / moon directions as uploaded; a_glowUpper / a_glowHorizon: the night glow before S. Every 4th frame or on a time jump.
+	void UpdateNaturalLight(const RE::NiPoint3& a_lutSunDir, const RE::NiPoint3& a_masserDir, const RE::NiPoint3& a_secundaDir, float a_sunScale);
+	/// Natural-light luminance (scene units, before S) -> cd/m2: the top-of-atmosphere sun is 128 klx.
+	float SceneToCandela() const;
+	/// For the Eye Model's mesopic shift (HistogramAutoExposure, AE cbuffer pad[0]): cd/m2 per scene unit after S (SceneToCandela / S) while the
+	/// outdoor model runs; 0 = the shader's own constant (25000).
+	float EyeSceneToNits() const;
+	static constexpr float kSolarIlluminanceLux = 128000.f;
+	static constexpr float kAdaptGroundReflectance = 0.18f;
 	/// R4: the weather's night moon glare relative to the reference's (0..1), the engine's exact-black hide kept, x the -2..3 deg rise.
 	float MoonVisibilityR4(const RE::Moon* a_moon, const RE::Sky* a_sky, float a_sinElevation) const;
 	/// (The moons' day fade with moonFamily in effect: SkySync::MoonDayFade, full below -1 deg, gone at +3.)

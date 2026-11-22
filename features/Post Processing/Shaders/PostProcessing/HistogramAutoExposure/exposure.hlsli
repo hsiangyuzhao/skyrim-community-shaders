@@ -115,14 +115,15 @@ float3 PurkinjeShift(float3 c, float nightAdaptation)
 	/// The eye's per-pixel exposure: 0.18 x compensation / the eye's divisor (adaptation buffer [0]), then the mesopic shift (mesopic > 0) or,
 	/// at mesopic 0, Classic's Purkinje settings keyed on the eye's adapted level (buffer [1]) as Classic keys them on its own.
 	float3 ExposeColorEye(float3 rgb, float divisor, float adaptedLum, float exposureCompensation, float purkinjeStartEV, float purkinjeMaxEV, float purkinjeStrength,
-		float mesopic)
+		float mesopic, float sceneToNits)
 	{
 		const static float logEV = -3;  // log2(0.125), as ExposeColor
 		const float3 scene = abs(rgb);
 		float3 color = scene * (0.18 * exposureCompensation / max(divisor, 1e-30));
 		[branch] if (mesopic > 1e-3)
 		{
-			const float nits = Color::RGBToLuminance(scene) * kSceneToNits;
+			// (51a) With Physical Outdoor Light the conversion of its natural light (cd/m2 per scene unit after its perceptual factor), else R_day.
+			const float nits = Color::RGBToLuminance(scene) * (sceneToNits > 0.0 ? sceneToNits : kSceneToNits);
 			const float m = saturate((log2(kPhotopicNits) - log2(max(nits, 1e-12))) / (log2(kPhotopicNits) - log2(kScotopicNits))) * saturate(mesopic);
 			[branch] if (m > 1e-4)
 				color = lerp(color, Color::RGBToLuminance(color) * kMesopicTint, m);

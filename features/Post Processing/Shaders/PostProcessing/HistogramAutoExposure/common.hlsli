@@ -11,7 +11,8 @@ cbuffer AutoExposureCB : register(b1)
 #if defined(EYE_MODE)
 	// (50a) Eye Model (physical lighting redo, stage 1): the eye variants only (EYE_MODE), so the classic shaders compile from the same text as
 	// before. R5 (49i f3416d4dd): a float3 pad (the old float pad[3] took three registers), the eye fields from offset 48 (C++ asserts).
-	float3 pad;
+	float EyeSceneToNits;    // (51a) cd/m2 per scene unit for the mesopic shift (Physical Outdoor Light's natural light); 0 = kSceneToNits
+	float2 pad;
 	float EyeLogLo;          // log2 of the user's Adaptation Range minimum (scene luminance, x 0.125 as Classic)
 	float EyeLogHi;          // ... maximum
 	float EyeNightDarkness;  // 1 = the scene's own darkness below the range kept (as Classic), 0 = fully adapted
