@@ -38,6 +38,19 @@
 //     n0 is at most kCleanMovingLen (this frame weighs at least 1 / 2); where the 3x3 agrees the history is clamped to it exactly;
 //   - every pixel: the clamp band at most kCleanBandMax (a thin limb's 2 - 3 samples gave a band of +-0.75 .. 1: no clamp at all), and a
 //     light that moved (PLMotion byte b < 255, a carried torch) keeps n0 x (1 - b / 255) of its history length (the old filter's HistoryDrop).
+// (50g) PL_MATCH = "Penumbra v2: Precise Surface Match" (Point Light Shadows page). All its code is inside #if defined(PL_MATCH) blocks:
+// the variants without it are the 50f shaders. With it:
+//   - F1 every history tap is placed in space (its HistDist along the history frame's own jittered camera ray, PLMatchHistInv, moved into
+//     this frame's camera space by CameraDelta) and must lie within kMatch* plane tolerance of this pixel's tangent plane (camera
+//     reprojection), or of the plane through the best tap (motion-vector history: the surface moved along its normal by an amount the 2D
+//     vectors do not give; that best tap within kMatchMotionAxes x its own motion of this plane), on top of the 50f distance gate. Where fewer than kMatchResolvedNeighbours of the 8 neighbours lie
+//     on this pixel's tangent plane (grass, foliage, hair strands: no plane at pixel scale) only the 50f gate applies, as before;
+//   - F2 a slot has history only where at least kMatchMinCoverage of the bilinear footprint passed, and its length n0 is scaled by that
+//     share (the failing taps count as length 0);
+//   - F3 (with kPLFlagClean) a moving receiver keeps accumulating: n0 <= max(1, its penumbra radius / its own motion, both in px), no exact
+//     clamp to an agreeing 3x3; the motion-vector history is taken under the F2 rule instead of kCleanMinTapWeight;
+//   - F5 the moving test calls a pixel "uncovered" (not moving) when the surface at its motion vector's source was clearly nearer (the
+//     background a moving character has just uncovered): normal path, cyan in the Moving Pixels view, PLCleanCounter word 3.
 
 #include "RayTracing/Common.hlsli"
 
@@ -48,12 +61,17 @@ cbuffer PointDenoiseCB : register(b1)
 	uint4 PLMotion[4];  // per source slot one byte: history dropped this frame (255 = new / reassigned / jumped: no history)
 	uint4 PLEmitter;  // x / y source slots 0-31 / 32-63 with their own emitter radius (uint bits), z that radius (float bits), w frame
 	uint4 PLFillEmitter[4];  // (50a) Soft fill lights: per source slot one byte = emitter radius / 2 units, 0 = none
-#if defined(PL_CLEAN)
+#if defined(PL_CLEAN) || defined(PL_MATCH)
 	// (50f) The moving test's interval: the motion vectors at t6 are the last rendered frame's (its point of view -> the frame before it).
 	row_major float4x4 PLCleanPrevInv;   // that frame's CameraViewProjInverse (jittered, relative to its camera: rays through its pixel centres)
 	row_major float4x4 PLCleanPrevCur;   // its CameraViewProjUnjittered (the "now" of its motion vectors)
 	row_major float4x4 PLCleanPrevPrev;  // its CameraPreviousViewProjUnjittered, taking positions relative to its camera (the "then")
 	float4 PLCleanParams;                // xyz this frame's camera - that frame's camera; w flags (asuint): kCleanHistIsPrev
+#endif
+#if defined(PL_MATCH)
+	// (50g) The history frame's (the last denoised frame: it wrote HistDist / HistVis) CameraViewProjInverse, jittered, relative to its camera
+	// (the rays through its pixel centres; Common.hlsli's PrevViewProj / CameraDelta are the same frame's).
+	row_major float4x4 PLMatchHistInv;
 #endif
 };
 
@@ -129,6 +147,38 @@ static const float kCleanMovingLen = 1.0;
 static const float kCleanBandMax = 0.3;
 static const uint kViewPLMoving = 17u;  // RayTracing::DebugView::PLMoving
 static const uint kCleanHistIsPrev = 2u;  // (50f) PLCleanParams.w: HistDist holds the last rendered frame's distances (it was denoised)
+#endif
+#if defined(PL_MATCH)
+// (50g) Precise Surface Match. The plane tolerance of a history tap (or a 3x3 neighbour), in units:
+//   footprint x (kMatchTapNormalPx / max(|N.V|, kMatchGrazingNoV) + kMatchStaticMotionPx) + distance x kMatchDistPrecision.
+// kMatchTapNormalPx = sqrt(2) px x sin(45 deg) = 1: the farthest bilinear tap (or diagonal neighbour) is sqrt(2) px from the point it
+//   stands for; a tap of the same surface then lies off this pixel's tangent plane only by that separation times the error of the normal,
+//   and a normal from one-sided depth differences at 1-px scale may be off by up to 45 deg (sin 45 deg). Divided by |N.V|: one pixel on
+//   screen covers 1 / |N.V| footprints along a tilted surface.
+// kMatchGrazingNoV = 0.25 (75.5 deg): below it a pixel spans more than 4 footprints of surface, its depth-derived normal comes from a single
+//   depth step that long and the plane test stops being informative; the 50f distance gate, which every tap must pass too, bounds the
+//   rest (the SVGF / ReBLUR practice of capping the slope term).
+// kMatchStaticMotionPx = 1.5 = the moving test's kCleanResidualPx: a surface whose own motion stays below it counts as static (idle
+//   breathing, a swaying arm), so its own displacement up to 1.5 footprints per frame (in any direction) must still pass.
+// kMatchDistPrecision = 2^-11: HistDist is R16_FLOAT (11 significant bits: rounding <= 2^-11 of the value); the current depth (R32) is
+//   far more precise.
+// For scale: 200 units away at 1440p (footprint ~0.16 units), facing the camera: ~0.5 units; at |N.V| = 0.5: ~0.65 units. A strap, an
+// armour lip or an arm a few units in front of the torso no longer passes (50f: 2 % + 8 = 12 units).
+static const float kMatchTapNormalPx = 1.0;
+static const float kMatchGrazingNoV = 0.25;
+static const float kMatchStaticMotionPx = 1.5;
+static const float kMatchDistPrecision = 1.0 / 2048.0;
+// Motion-vector history: the surface's own displacement along its normal is at most its own displacement, of which the motion vectors show
+// the lateral part (own motion, px x footprint); kMatchMotionAxes = sqrt(2) allows an equal part towards / away from the camera. Faster
+// radial motion (walking straight at the camera) loses that history (young slot, v2's wide estimate) rather than take another surface's.
+static const float kMatchMotionAxes = 1.41421356;
+// At least 3 of the 8 neighbours on this pixel's tangent plane (same tolerance) = a surface resolved at pixel scale: a straight edge
+// leaves 5 on its side, a convex corner 3; a 1-px blade, strand or wire leaves 2 (the two along it). Fewer: the plane test is not
+// applied (only the 50f gate: grass and foliage keep their history as in 50f).
+static const uint kMatchResolvedNeighbours = 3u;
+// F2: the majority of the bilinear reconstruction footprint must belong to this surface for a history to exist; n0 x the passing share.
+static const float kMatchMinCoverage = 0.5;
+static const uint kMatchViewUncovered = 4u;  // movingState: uncovered (F5)
 #endif
 
 #if defined(PL_WIDE)
@@ -281,6 +331,84 @@ float HistoryTaps(float2 prevPos, float expected, float tolerance, uint4 ids, bo
 	return valid;
 }
 
+#if defined(PL_MATCH)
+// (50g) The surface a history tap shows, in this frame's camera space: its distance from the history frame's camera along that frame's
+// (jittered) ray through the tap's pixel centre -- exactly how the history frame's denoiser computed OutDist -- minus the camera's move.
+float3 MatchHistPos(int2 a_q, float a_hd)
+{
+	const float2 uv = (float2(a_q) + 0.5) / float2(Size.xy);
+	const float4 h = mul(PLMatchHistInv, float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.5, 1.0));
+	const float3 ray = h.xyz / h.w;
+	return ray * (a_hd / max(length(ray), 1e-6)) - CameraDelta.xyz;
+}
+
+// (50g) HistoryTaps with the surface match (F1). Each tap passes the 50f gate (|HistDist - expected| <= tolerance) and, on a resolved surface,
+// the plane test: a_anchored = false (camera reprojection: a static surface returns to exactly where it was) |N.(Y - P)| <= a_planeTol;
+// a_anchored = true (motion-vector history: the surface moved, by an unknown amount along its normal, motion vectors being 2D) the taps
+// must agree with the plane through the gated tap nearest to this pixel's tangent plane, |N.(Y - Y_best)| <= a_planeTol (a tap straddling
+// the edge to another limb or the background fails), and that best tap itself must lie within a_anchorMax of this pixel's tangent plane
+// (how far the surface can have moved along its normal: a static surface whose taps all show a nearer one -- the torso pixel an arm hid
+// last frame -- finds nothing there either).
+float HistoryTapsMatch(float2 prevPos, float expected, float tolerance, bool a_anchored, float a_anchorMax, float3 a_P, float3 a_N, float a_planeTol,
+	bool a_resolved, uint4 ids, bool a_wideHistory, bool a_len, int2 maxP, out float4 hv, out float4 hw, out float4 hn)
+{
+	hv = 0.0;
+	hw = 0.0;
+	hn = 0.0;
+	float valid = 0.0;
+	const int2 base = int2(floor(prevPos));
+	const float2 f = prevPos - float2(base);
+	float planeDist[4] = { 0.0, 0.0, 0.0, 0.0 };
+	bool gate[4] = { false, false, false, false };
+	float anchor = 0.0, best = 3.4e38;
+	[unroll] for (int t0 = 0; t0 < 4; ++t0)
+	{
+		const int2 o = int2(t0 & 1, t0 >> 1);
+		const int2 q = clamp(base + o, int2(0, 0), maxP);
+		const float hd = HistDist[q];
+		const float bw = (o.x ? f.x : 1.0 - f.x) * (o.y ? f.y : 1.0 - f.y);
+		gate[t0] = hd > 0.0 && abs(hd - expected) <= tolerance && bw > 0.0;
+		[branch] if (gate[t0] && a_resolved)
+		{
+			planeDist[t0] = dot(a_N, MatchHistPos(q, hd) - a_P);
+			if (abs(planeDist[t0]) < best) {
+				best = abs(planeDist[t0]);
+				anchor = planeDist[t0];
+			}
+		}
+	}
+	if (!a_anchored)
+		anchor = 0.0;
+	const bool anchorOk = abs(anchor) <= a_anchorMax;  // the surface cannot have moved along its normal by more than a_anchorMax
+	[unroll] for (int t = 0; t < 4; ++t)
+	{
+		const int2 o = int2(t & 1, t >> 1);
+		const int2 q = clamp(base + o, int2(0, 0), maxP);
+		const float bw = (o.x ? f.x : 1.0 - f.x) * (o.y ? f.y : 1.0 - f.y);
+		[branch] if (gate[t] && (!a_resolved || (anchorOk && abs(planeDist[t] - anchor) <= a_planeTol)))
+		{
+			valid += bw;
+			const uint4 hid = Ids(HistIdx[q]);
+			const float4 hvis = HistVis[q];
+			float4 hwide = float4(0.0, 0.0, 1.0, 1.0);
+			[branch] if (kVariantWide && a_wideHistory)
+				hwide = HistWide[q];
+			const uint lenBits = a_len ? HistLen[q] : 0u;
+			[unroll] for (uint s = 0u; s < 4u; ++s)
+			{
+				const int slot = FindSlot(hid, hwide, ids[s]);
+				if (slot >= 0) {
+					hv[s] += SlotValue(hvis, hwide, slot) * bw;
+					hw[s] += bw;
+					hn[s] += (a_len ? float((lenBits >> (4u * uint(slot))) & 15u) : kAssumedLen) * bw;
+				}
+			}
+		}
+	}
+	return valid;
+}
+#endif
+
 #if defined(PL_CLEAN)
 // (50f) The moving test, like with like. The motion vectors at t6 belong to the last rendered frame: at its pixel q they hold where that
 // frame's surface was one frame earlier (uv then - uv now, unjittered). 50e compared them with THIS frame's camera reprojection (this frame
@@ -290,7 +418,15 @@ float HistoryTaps(float2 prevPos, float expected, float tolerance, uint4 ids, bo
 // when last frame was denoised; else this pixel's surface moved back by the camera), projected with the very matrices the game wrote the
 // vectors with. A static surface then gives exactly the camera's vector whatever the frame times; only the surface's own motion is left.
 // o_mc: q's position one frame back (the motion-vector history candidate, as in 50e).
+#if defined(PL_MATCH)
+// (50g) o_residualPx: the surface's own motion (px per frame), o_uncovered (F5): the surface at the vector's source qc was clearly nearer
+// than this pixel's surface can have been (HistDist[qc] below the distance from that frame's camera by more than the motion-vector
+// history's own same-surface gate, kCleanTolScale x distance + kCleanTolBase): this pixel was hidden behind it -- the background a moving
+// character just uncovered inherits that character's vector at qc. Not moving then (normal path, its own colour in the view).
+bool CleanMoving(int2 p, float3 P, out float2 o_mc, out float o_residualPx, out bool o_uncovered)
+#else
 bool CleanMoving(int2 p, float3 P, out float2 o_mc)
+#endif
 {
 	const float2 size = float2(Size.xy);
 	const float2 uvc = (float2(p) + 0.5) / size;
@@ -305,6 +441,12 @@ bool CleanMoving(int2 p, float3 P, out float2 o_mc)
 	const float2 mv = mc - uvc;  // the game's vector at qc
 	float3 Y = P + PLCleanParams.xyz;
 	const float hd = (asuint(PLCleanParams.w) & kCleanHistIsPrev) ? HistDist[qc] : -1.0;
+#if defined(PL_MATCH)
+	{
+		const float expectedThen = length(Y);
+		o_uncovered = hd > 0.0 && hd < expectedThen - (expectedThen * kCleanTolScale + kCleanTolBase);
+	}
+#endif
 	[branch] if (hd > 0.0)
 	{
 		const float2 uvq = (float2(qc) + 0.5) / size;
@@ -321,7 +463,12 @@ bool CleanMoving(int2 p, float3 P, out float2 o_mc)
 		camera = float2(clipThen.x / clipThen.w - clipNow.x / clipNow.w, clipNow.y / clipNow.w - clipThen.y / clipThen.w) * 0.5;
 	const float residualPx = length((mv - camera) * size);
 	const float cameraPx = length(camera * size);
+#if defined(PL_MATCH)
+	o_residualPx = residualPx;
+	return !o_uncovered && residualPx > max(kCleanResidualPx, kCleanResidualShare * cameraPx);
+#else
 	return residualPx > max(kCleanResidualPx, kCleanResidualShare * cameraPx);
+#endif
 }
 #endif
 
@@ -337,6 +484,9 @@ struct PixelFrame
 	float rotation;  // the taps' rotation (radians), per pixel and frame
 #if defined(PL_CLEAN)
 	bool moving;  // (50e) a moving receiver, used (kPLFlagClean)
+#endif
+#if defined(PL_MATCH)
+	float ownMotion;  // (50g) a moving receiver's own motion (px per frame, CleanMoving's residual; 0 = not moving)
 #endif
 };
 
@@ -411,19 +561,40 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw, 
 			resA[s] = m;
 			continue;
 		}
+#if defined(PL_MATCH)
+		// (50g) F2: a history only where the majority of the bilinear footprint passed; n0 x the passing share.
+		const bool hasHist = (flags & kPLFlagHistory) != 0u && hw[s] >= kMatchMinCoverage && SourceByte(PLMotion, id) < 255u;
+		const float coverage = saturate(hw[s]);
+#else
 		const bool hasHist = (flags & kPLFlagHistory) != 0u && hw[s] >= 0.05 && SourceByte(PLMotion, id) < 255u;
+#endif
 		const float h = hasHist ? hv[s] / hw[s] : 0.0;
 #if defined(PL_CLEAN)
 		float n0 = hasHist ? clamp(hn[s] / hw[s], 0.0, kLenMax) : 0.0;
+#if defined(PL_MATCH)
+		n0 *= coverage;
+#endif
 		[branch] if (cleanOn)
 		{
 			// (50e) A light that moved keeps (1 - its PLMotion byte / 255) of the history length; a moving receiver at most kCleanMovingLen.
 			n0 *= 1.0 - float(SourceByte(PLMotion, id)) / 255.0;
+#if defined(PL_MATCH)
+			// (50g) F3: a moving receiver keeps its history for as many frames as it needs to cross its penumbra (radius from the 3x3's
+			// blocked samples, px / own motion, px per frame): an older history would show the shadow where the surface was. No blocked
+			// sample in the 3x3: no penumbra to cross here (the binomial clamp handles a shadow edge arriving).
+			if (cleanMoving && qCount[s] > 0.0)
+				n0 = min(n0, max(1.0, PhysicalRadius(id, qSum[s] / qCount[s], a_px.footprint) / max(a_px.ownMotion, kCleanResidualPx)));
+#else
 			if (cleanMoving)
 				n0 = min(n0, kCleanMovingLen);
+#endif
 		}
 #else
+#if defined(PL_MATCH)
+		const float n0 = hasHist ? clamp(hn[s] / hw[s], 0.0, kLenMax) * coverage : 0.0;
+#else
 		const float n0 = hasHist ? clamp(hn[s] / hw[s], 0.0, kLenMax) : 0.0;
+#endif
 #endif
 		const float youth = saturate(1.0 - n0 / kYouthFrames);
 
@@ -513,7 +684,13 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw, 
 			{
 				// (50e) The band at most kCleanBandMax; a moving receiver whose 3x3 agrees: the history clamped to it exactly.
 				band = min(band, kCleanBandMax);
+#if defined(PL_MATCH)
+				// (50g) F3: no exact clamp to an agreeing 3x3 any more: in a penumbra 9 single rays agree by chance often (at m = 0.9 in 39 % of
+				// frames), and snapping a now same-surface history to that is grain; the binomial band (the 3x3's Neff ~ 7.7: +-0.26 at m = 1) stays.
+				clamped = clamp(h, m - band, m + band);
+#else
 				clamped = (cleanMoving && weights[s] > 0.0 && hi[s] <= lo[s]) ? lo[s] : clamp(h, m - band, m + band);
+#endif
 			}
 			else
 				clamped = clamp(h, m - band, m + band);
@@ -538,8 +715,12 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw, 
 
 #if defined(PL_CLEAN)
 // (50f) The per-pixel work; main (end of file) adds the group's counts to PLCleanCounter. o_count: x a traced light here, y the moving test
-// ran, z moving.
+// ran, z moving; (50g) w uncovered (PL_MATCH).
+#if defined(PL_MATCH)
+void DenoisePixel(uint3 dtid, inout uint4 o_count) {
+#else
 void DenoisePixel(uint3 dtid, inout uint3 o_count) {
+#endif
 #else
 [numthreads(8, 8, 1)] void main(uint3 dtid : SV_DispatchThreadID) {
 #endif
@@ -595,6 +776,27 @@ void DenoisePixel(uint3 dtid, inout uint3 o_count) {
 		px.moving = false;
 		o_count.x = 1u;
 #endif
+#if defined(PL_MATCH)
+		px.ownMotion = 0.0;
+		// (50g) F1: the history taps' plane tolerance (kMatch* constants) and whether this pixel's tangent plane describes its 3x3 (at least
+		// kMatchResolvedNeighbours of the 8 neighbours on it, same tolerance: the neighbours are 1 - sqrt(2) px away like the bilinear taps).
+		const float noV = abs(dot(px.N, P)) / max(dist, 1e-6);
+		const float matchTol = px.footprint * (kMatchTapNormalPx / max(noV, kMatchGrazingNoV) + kMatchStaticMotionPx) + dist * kMatchDistPrecision;
+		uint coplanar = 0u;
+		[unroll] for (int kn = 0; kn < 9; ++kn)
+		{
+			const int2 qn = clamp(p + int2(kn % 3 - 1, kn / 3 - 1), int2(0, 0), maxP);
+			const float dqn = abs(DepthMask[qn]);
+			[branch] if (any(qn != p) && !RTIsSky(dqn))
+			{
+				if (abs(dot(px.N, RTPosition(qn, dqn) - P)) <= matchTol)
+					++coplanar;
+			}
+		}
+		const bool resolved = coplanar >= kMatchResolvedNeighbours;
+		bool histAnchored = false;  // the taken history came from the motion vectors (anchored plane test)
+		float histAnchorMax = matchTol;  // ... and the largest plane offset of its surface allowed there
+#endif
 
 		// History taps: the camera reprojection, (47y) last frame's motion vectors where it finds (almost) nothing.
 		float4 hv = 0.0, hw = 0.0, hn = 0.0;
@@ -616,8 +818,16 @@ void DenoisePixel(uint3 dtid, inout uint3 o_count) {
 			[branch] if ((flags & kPLFlagCleanDetect) && all(prevUv >= 0.0) && all(prevUv < 1.0))
 			{
 				float2 mc;
+#if defined(PL_MATCH)
+				float ownMotion;
+				bool uncovered;
+				const bool moving = CleanMoving(p, P, mc, ownMotion, uncovered);
+				movingState = moving ? 3u : (uncovered ? kMatchViewUncovered : 0u);
+				o_count.w = uncovered ? 1u : 0u;
+#else
 				const bool moving = CleanMoving(p, P, mc);
 				movingState = moving ? 3u : 0u;
+#endif
 				o_count.y = 1u;
 				o_count.z = moving ? 1u : 0u;
 				[branch] if (moving && (flags & kPLFlagClean))
@@ -627,13 +837,27 @@ void DenoisePixel(uint3 dtid, inout uint3 o_count) {
 					px.moving = true;
 					px.planeTolerance = dist * kCleanPlaneScale + kCleanPlaneBase;
 					movingState = 2u;
+#if defined(PL_MATCH)
+					px.ownMotion = ownMotion;
+#endif
 					[branch] if (all(mc >= 0.0) && all(mc < 1.0))
 					{
 						const float tolc = expected * kCleanTolScale + kCleanTolBase;
 						const float2 motionPos = mc * float2(Size.xy) - 0.5;
 						float4 mv, mw, mn;
+#if defined(PL_MATCH)
+						// (50g) F1 anchored to the best tap; F2 replaces kCleanMinTapWeight (the majority of the footprint, then per slot).
+						// The surface moved along its normal by at most kMatchMotionAxes x its own motion (CleanMoving residual, px) x footprint.
+						const float anchorMax = matchTol + kMatchMotionAxes * ownMotion * px.footprint;
+						const float motionWeight = HistoryTapsMatch(motionPos, expected, tolc, true, anchorMax, P, px.N, matchTol, resolved, ids, wideHistory,
+							lenHistory, maxP, mv, mw, mn);
+						if (motionWeight >= kMatchMinCoverage) {
+							histAnchored = true;
+							histAnchorMax = anchorMax;
+#else
 						const float motionWeight = HistoryTaps(motionPos, expected, tolc, ids, wideHistory, lenHistory, maxP, mv, mw, mn);
 						if (motionWeight >= kCleanMinTapWeight) {
+#endif
 							hv = mv;
 							hw = mw;
 							hn = mn;
@@ -653,7 +877,12 @@ void DenoisePixel(uint3 dtid, inout uint3 o_count) {
 				histPos = prevUv * float2(Size.xy) - 0.5;
 				histTolerance = tolerance;
 				histTaken = true;
+#if defined(PL_MATCH)
+				tapWeight = HistoryTapsMatch(histPos, expected, tolerance, false, matchTol, P, px.N, matchTol, resolved, ids, wideHistory, lenHistory, maxP, hv, hw,
+					hn);
+#else
 				tapWeight = HistoryTaps(histPos, expected, tolerance, ids, wideHistory, lenHistory, maxP, hv, hw, hn);
+#endif
 			}
 #if defined(PL_CLEAN)
 			[branch] if (!movingClean && (flags & kPLFlagMotion) && tapWeight < kMotionTryBelow)
@@ -672,8 +901,20 @@ void DenoisePixel(uint3 dtid, inout uint3 o_count) {
 				{
 					float4 mv, mw, mn;
 					const float2 motionPos = m * float2(Size.xy) - 0.5;
+#if defined(PL_MATCH)
+					// (50g) Own motion here = the vectors' position minus the camera reprojection (px; none known behind the camera: 0, strict).
+					const float ownPx = prevClip.w > 1e-4 ? length((m - prevUv) * float2(Size.xy)) : 0.0;
+					const float motionAnchorMax = matchTol + kMatchMotionAxes * ownPx * px.footprint;
+					const float motionWeight = HistoryTapsMatch(motionPos, expected, tolerance + kMotionTolerance, true, motionAnchorMax, P, px.N, matchTol,
+						resolved, ids, wideHistory, lenHistory, maxP, mv, mw, mn);
+#else
 					const float motionWeight = HistoryTaps(motionPos, expected, tolerance + kMotionTolerance, ids, wideHistory, lenHistory, maxP, mv, mw, mn);
+#endif
 					if (motionWeight > tapWeight) {
+#if defined(PL_MATCH)
+						histAnchored = true;
+						histAnchorMax = motionAnchorMax;
+#endif
 						hv = mv;
 						hw = mw;
 						hn = mn;
@@ -691,7 +932,12 @@ void DenoisePixel(uint3 dtid, inout uint3 o_count) {
 		{
 			float4 hv2 = 0.0, hw2 = 0.0, hn2 = 0.0;
 			[branch] if (histTaken)
+#if defined(PL_MATCH)
+				HistoryTapsMatch(histPos, histExpected, histTolerance, histAnchored, histAnchorMax, P, px.N, matchTol, resolved, wideIds, wideHistory, lenHistory,
+					maxP, hv2, hw2, hn2);
+#else
 				HistoryTaps(histPos, histExpected, histTolerance, wideIds, wideHistory, lenHistory, maxP, hv2, hw2, hn2);
+#endif
 			float4 wLen, wRadius, wWeight;
 			wideResult = DenoiseSet(px, wideIds, float4(wideRaw.zw, 1.0, 1.0), hv2, hw2, hn2, wLen, wRadius, wWeight).xy;
 			wideLen = wLen.xy;
@@ -780,6 +1026,11 @@ void DenoisePixel(uint3 dtid, inout uint3 o_count) {
 				debug = float4(1.0, 0.9, 0.1, 0.6);
 			else if (movingState == 3u)
 				debug = float4(1.0, 0.2, 1.0, 0.6);
+#if defined(PL_MATCH)
+			// (50g) Cyan: uncovered (the motion vector's source was a nearer surface: background a moving character just uncovered), not moving.
+			else if (movingState == kMatchViewUncovered)
+				debug = float4(0.1, 0.9, 1.0, 0.6);
+#endif
 		}
 #endif
 		DebugColor[p] = debug;
@@ -789,6 +1040,30 @@ void DenoisePixel(uint3 dtid, inout uint3 o_count) {
 #if defined(PL_CLEAN)
 // (50f) Per group: the counts of DenoisePixel, then one add per word into PLCleanCounter (cleared every frame, read back a few frames late:
 // F7 rt_pl_moving_pct, the Diagnostics line). Every thread reaches both barriers (DenoisePixel returns for threads past the edge).
+#if defined(PL_MATCH)
+// (50g) + word 3: uncovered pixels (F5).
+groupshared uint gsCleanCount[4];
+
+[numthreads(8, 8, 1)] void main(uint3 dtid : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+	if (gi < 4u)
+		gsCleanCount[gi] = 0u;
+	GroupMemoryBarrierWithGroupSync();
+	uint4 count = 0u;
+	DenoisePixel(dtid, count);
+	uint previous;
+	if (count.x != 0u)
+		InterlockedAdd(gsCleanCount[0], 1u, previous);
+	if (count.y != 0u)
+		InterlockedAdd(gsCleanCount[1], 1u, previous);
+	if (count.z != 0u)
+		InterlockedAdd(gsCleanCount[2], 1u, previous);
+	if (count.w != 0u)
+		InterlockedAdd(gsCleanCount[3], 1u, previous);
+	GroupMemoryBarrierWithGroupSync();
+	if (gi < 4u && gsCleanCount[gi] != 0u)
+		PLCleanCounter.InterlockedAdd(gi * 4u, gsCleanCount[gi], previous);
+}
+#else
 groupshared uint gsCleanCount[3];
 
 [numthreads(8, 8, 1)] void main(uint3 dtid : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
@@ -808,4 +1083,5 @@ groupshared uint gsCleanCount[3];
 	if (gi < 3u && gsCleanCount[gi] != 0u)
 		PLCleanCounter.InterlockedAdd(gi * 4u, gsCleanCount[gi], previous);
 }
+#endif
 #endif

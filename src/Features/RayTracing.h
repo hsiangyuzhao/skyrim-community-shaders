@@ -293,6 +293,10 @@ public:
 		// point rays' disc samples from an independent per pixel / frame / slot / source hash (TracePointLightsCS kFlagWhiteNoise) instead
 		// of the blue noise; the other denoisers unchanged. Outside the settings macro.
 		bool PointV2CleanHistory = true;
+		// (50g) PointV2PreciseMatch "Penumbra v2: Precise Surface Match" (PointDenoiseV2CS PL_MATCH: last frame's result taken only from the
+		// same surface, history length by the matching share, moving receivers keep accumulating, uncovered background not "moving";
+		// off: the 50f shaders exactly). Outside the settings macro.
+		bool PointV2PreciseMatch = true;
 		bool PointRRWhiteNoise = true;
 		bool ParticlesRTShadows = true;
 		// (50a) "Smooth Shadows on Smoke and Water Sheets": lit effects interpolate the point-light visibility between the fog grid's cells
@@ -895,6 +899,7 @@ private:
 	// Last combined frame's camera (history reprojection). (45l) The 45j history textures are gone: Temporal
 	// uses the Penumbra history (History4) now.
 	float prevViewProj[16]{};
+	float prevInvViewProj[16]{};  // (50g) its inverse (CameraViewProjInverse of the same frame)
 	float prevViewProjUnjittered[16]{};  // (45l) SIGMA motion vectors
 	double prevCamera[3]{};
 	bool prevCameraValid = false;
@@ -945,6 +950,7 @@ private:
 		float toSun[3]{};
 		double camera[3]{};
 		float viewProj[16]{}, viewProjUnjittered[16]{};
+		float invViewProj[16]{};  // (50g) CameraViewProjInverse (jittered, camera-relative): the history frame's rays for PointDenoiseV2CS PL_MATCH
 	};
 	PendingFrame pending;
 	void FinishFrame();
@@ -1187,9 +1193,14 @@ private:
 		float CleanPrevCur[16];
 		float CleanPrevPrev[16];
 		float CleanParams[4];
+		// (50g) Penumbra v2: Precise Surface Match (read only by PointDenoiseV2CS's PL_MATCH variants, which declare the PL_CLEAN constants
+		// above too; every other variant's cbuffer ends earlier): the history frame's (the last denoised frame) jittered inverse view-
+		// projection, relative to its camera (prevInvViewProj; Common.hlsli's PrevViewProj / CameraDelta are the same frame's).
+		float MatchHistInv[16];
 	};
 	STATIC_ASSERT_ALIGNAS_16(PointDenoiseCB);
-	static_assert(offsetof(PointDenoiseCB, FillEmitter) == 112 && offsetof(PointDenoiseCB, CleanPrevInv) == 176 && sizeof(PointDenoiseCB) == 384,
+	static_assert(offsetof(PointDenoiseCB, FillEmitter) == 112 && offsetof(PointDenoiseCB, CleanPrevInv) == 176 && offsetof(PointDenoiseCB, MatchHistInv) == 384 &&
+					  sizeof(PointDenoiseCB) == 448,
 		"PointDenoiseCB must match PointDenoiseCS.hlsl / PointDenoiseV2CS.hlsl");
 	static constexpr std::uint32_t kCleanHistIsPrev = 2u;  // (50f) PointDenoise*CS PL_CLEAN: HistDist holds the last rendered frame's distances
 	// (50f) The matrices the game wrote each frame's motion vectors with (recorded at every Prepass; the moving test of frame N uses frame
@@ -1215,7 +1226,7 @@ private:
 	std::array<std::uint32_t, kPointCleanRing> pointCleanStagingFrame{};  // frame written (0 = empty)
 	std::uint32_t pointCleanCursor = 0;
 	bool pointCleanCounterFailed = false;
-	std::uint32_t pointCleanStats[3]{};      // the newest read-back
+	std::uint32_t pointCleanStats[4]{};      // the newest read-back ((50g) [3] uncovered pixels, PL_MATCH; 0 otherwise)
 	std::uint32_t pointCleanStatsFrame = 0;  // ... its frame (0 = none)
 	bool pointCleanStatsNew = false;         // ... arrived this frame (F7 shows it once, with its age)
 	ID3D11UnorderedAccessView* PointCleanCounterBegin();
@@ -1318,7 +1329,8 @@ private:
 	// decoded rays Lighting reads in the DLSS RR mode (slots 0 - 3 / 4 - 5), while the lit effects get the filtered copy in pointVis /
 	// pointWide (BindEffectPointVisibility / RestoreEffectPointVisibility around every effect draw).
 	// (50e) [2] / [3]: the PL_CLEAN twins (Moving Characters: Clean Shadow History for v2, or its Moving Pixels view).
-	winrt::com_ptr<ID3D11ComputeShader> pointDenoiseV2CS[4];
+	// (50g) [4] - [7]: the same four with PL_MATCH (Penumbra v2: Precise Surface Match); index = wide | clean << 1 | match << 2.
+	winrt::com_ptr<ID3D11ComputeShader> pointDenoiseV2CS[8];
 	DenoiseTexture pointLen[2], pointRaw, pointRawWide;
 	std::uint64_t pointV2D3D11Bytes = 0;
 	bool pointLenValid = false;   // pointLen[read] holds last frame's lengths (written by PointDenoiseV2CS)
@@ -1326,8 +1338,9 @@ private:
 	bool pointEffectSwapped = false;
 	bool pointV2Failed = false;   // PointDenoiseV2CS did not compile / its textures failed: Penumbra this session
 	bool pointV2CleanFailed = false;  // (50e) a PL_CLEAN variant of PointDenoiseV2CS did not compile: v2 without it this session
+	bool pointV2MatchFailed = false;  // (50g) a PL_MATCH variant did not compile: v2 without Precise Surface Match this session
 	int pointModeThisFrame = -1;  // the point denoiser that ran this frame (PointDenoiserMode), -1 none
-	ID3D11ComputeShader* PointDenoiseV2Shader(bool a_wide, bool a_clean = false);
+	ID3D11ComputeShader* PointDenoiseV2Shader(bool a_wide, bool a_clean = false, bool a_match = false);
 	bool EnsurePointV2(std::uint32_t a_width, std::uint32_t a_height, bool a_rr, bool a_wide);
 	void ReleasePointV2();
 	void FinishPointLightsV2(int a_mode);

@@ -2112,6 +2112,7 @@ void RayTracing::LoadSettings(json& o_json)
 			settings.SunDenoiserNonRR = static_cast<int>(DenoiserMode::Penumbra);
 		settings.PointBlueNoise = read("PointBlueNoise", defaults.PointBlueNoise);
 		settings.PointV2CleanHistory = read("PointV2CleanHistory", defaults.PointV2CleanHistory);  // (50e)
+		settings.PointV2PreciseMatch = read("PointV2PreciseMatch", defaults.PointV2PreciseMatch);  // (50g)
 		settings.PointRRWhiteNoise = read("PointRRWhiteNoise", defaults.PointRRWhiteNoise);  // (50e)
 		settings.LoadFinish = read("LoadFinish", defaults.LoadFinish);  // (49c) (49b Hitch* keys: no longer read)
 		settings.PointQuality = read("PointQuality", -1);
@@ -2362,6 +2363,7 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["SunDenoiserNonRR"] = settings.SunDenoiserNonRR;
 	o_json["PointBlueNoise"] = settings.PointBlueNoise;
 	o_json["PointV2CleanHistory"] = settings.PointV2CleanHistory;  // (50e)
+	o_json["PointV2PreciseMatch"] = settings.PointV2PreciseMatch;  // (50g)
 	o_json["PointRRWhiteNoise"] = settings.PointRRWhiteNoise;  // (50e)
 	o_json["LoadFinish"] = settings.LoadFinish;  // (49c)
 }
@@ -2557,6 +2559,14 @@ void RayTracing::PrecompileShaders()
 			PointDenoiseV2Shader(false, true);
 			PointDenoiseV2Shader(true, true);
 		}
+		if (settings.PointV2PreciseMatch && !pointV2MatchFailed) {  // (50g) Penumbra v2: Precise Surface Match
+			PointDenoiseV2Shader(false, false, true);
+			PointDenoiseV2Shader(true, false, true);
+			if (settings.PointV2CleanHistory && !pointV2CleanFailed) {
+				PointDenoiseV2Shader(false, true, true);
+				PointDenoiseV2Shader(true, true, true);
+			}
+		}
 		GetShader(pointMaskCS, L"Data\\Shaders\\RayTracing\\PointMaskCS.hlsl", "PointMaskCS");
 	}
 	if (settings.PointLights && settings.PointDenoiser == kPointPenumbra) {
@@ -2662,11 +2672,21 @@ ID3D11ComputeShader* RayTracing::PointDenoiseShader(bool a_wide, bool a_beam, bo
 	return GetShader(pointDenoiseCS, kPath, "PointDenoiseCS");
 }
 
-ID3D11ComputeShader* RayTracing::PointDenoiseV2Shader(bool a_wide, bool a_clean)
+ID3D11ComputeShader* RayTracing::PointDenoiseV2Shader(bool a_wide, bool a_clean, bool a_match)
 {
 	// (50b) Penumbra v2 / Off / DLSS RR: one shader, PL_WIDE for slots 4 - 5. (50e) PL_CLEAN twins: Moving Characters: Clean Shadow History
 	// (without it its code is not compiled: the 50d shaders).
 	const wchar_t* kPath = L"Data\\Shaders\\RayTracing\\PointDenoiseV2CS.hlsl";
+	if (a_match) {
+		// (50g) PL_MATCH: Penumbra v2: Precise Surface Match (without it its code is not compiled: the 50f shaders).
+		if (a_clean && a_wide)
+			return GetShaderDefined(pointDenoiseV2CS[7], kPath, "PointDenoiseV2CS (slots 4-5, clean history, surface match)", "PL_WIDE,PL_CLEAN,PL_MATCH");
+		if (a_clean)
+			return GetShaderDefined(pointDenoiseV2CS[6], kPath, "PointDenoiseV2CS (clean history, surface match)", "PL_CLEAN,PL_MATCH");
+		if (a_wide)
+			return GetShaderDefined(pointDenoiseV2CS[5], kPath, "PointDenoiseV2CS (slots 4-5, surface match)", "PL_WIDE,PL_MATCH");
+		return GetShaderDefined(pointDenoiseV2CS[4], kPath, "PointDenoiseV2CS (surface match)", "PL_MATCH");
+	}
 	if (a_clean && a_wide)
 		return GetShaderDefined(pointDenoiseV2CS[3], kPath, "PointDenoiseV2CS (slots 4-5, clean history)", "PL_WIDE,PL_CLEAN");
 	if (a_clean)
@@ -4573,6 +4593,7 @@ void RayTracing::RunFrame()
 	pending.camera[1] = camY;
 	pending.camera[2] = camZ;
 	std::memcpy(pending.viewProj, &fb.GetCameraViewProj(0), sizeof(pending.viewProj));
+	std::memcpy(pending.invViewProj, &fb.GetCameraViewProjInverse(0), sizeof(pending.invViewProj));  // (50g) PointDenoiseV2CS PL_MATCH
 	std::memcpy(pending.viewProjUnjittered, &viewProjUnjittered, sizeof(pending.viewProjUnjittered));
 
 	activeThisFrame = true;
@@ -4799,6 +4820,7 @@ void RayTracing::RunNoSunFrame(ID3D11ShaderResourceView* a_depth, ID3D11ShaderRe
 	pending.camera[1] = a_camY;
 	pending.camera[2] = a_camZ;
 	std::memcpy(pending.viewProj, &fb.GetCameraViewProj(0), sizeof(pending.viewProj));
+	std::memcpy(pending.invViewProj, &fb.GetCameraViewProjInverse(0), sizeof(pending.invViewProj));  // (50g) PointDenoiseV2CS PL_MATCH
 	std::memcpy(pending.viewProjUnjittered, &fb.GetCameraViewProjUnjittered(0), sizeof(pending.viewProjUnjittered));
 
 	activeThisFrame = true;
@@ -4872,6 +4894,7 @@ void RayTracing::FinishFrame()
 				[](const RayTracingPointLights::MaskEntry& a, const RayTracingPointLights::MaskEntry& b) { return a.light < b.light; });
 		}
 		std::copy_n(pending.viewProj, 16, prevViewProj);
+		std::copy_n(pending.invViewProj, 16, prevInvViewProj);  // (50g)
 		std::copy_n(pending.viewProjUnjittered, 16, prevViewProjUnjittered);
 		std::copy_n(pending.camera, 3, prevCamera);
 		prevCameraValid = true;
@@ -5050,6 +5073,7 @@ void RayTracing::FinishFrame()
 	}
 	// This frame's camera is the history's next time.
 	std::copy_n(pending.viewProj, 16, prevViewProj);
+	std::copy_n(pending.invViewProj, 16, prevInvViewProj);  // (50g)
 	std::copy_n(pending.viewProjUnjittered, 16, prevViewProjUnjittered);
 	std::copy_n(pending.camera, 3, prevCamera);
 	prevCameraValid = true;
@@ -6288,7 +6312,18 @@ void RayTracing::FinishPointLightsV2(int a_mode)
 	const bool cleanUsed = settings.PointV2CleanHistory && a_mode != kPointOff && motionSRV && !pointV2CleanFailed;
 	bool clean = cleanUsed || (plDebug && debugView == DebugView::PLMoving && a_mode != kPointOff && motionSRV && !pointV2CleanFailed);
 	ID3D11ComputeShader* shader = nullptr;
-	if (clean) {
+	// (50g) Penumbra v2: Precise Surface Match (same page): the PL_MATCH variants (with or without PL_CLEAN); off (or Off mode: no history to
+	// match): the 50f shaders exactly. A PL_MATCH variant failing: without it from then on.
+	bool match = settings.PointV2PreciseMatch && a_mode != kPointOff && !pointV2MatchFailed;
+	if (match) {
+		shader = PointDenoiseV2Shader(wide, clean, true);
+		if (!shader) {
+			match = false;
+			pointV2MatchFailed = true;
+			logger::warn("[RayTracing] PointDenoiseV2CS (surface match) did not compile: Penumbra v2: Precise Surface Match is off this session");
+		}
+	}
+	if (!shader && clean) {
 		shader = PointDenoiseV2Shader(wide, true);
 		if (!shader) {  // either twin failing: without it from then on (the plain shaders below keep their own fallbacks)
 			clean = false;
@@ -6335,6 +6370,8 @@ void RayTracing::FinishPointLightsV2(int a_mode)
 	std::uint32_t flags = (history ? kPointDenoiseHistory : 0u) | (plDebug ? kPointDenoiseDebug : 0u) | (motionSRV ? kPointDenoiseMotion : 0u);
 	if (clean)  // (50e) only read by the PL_CLEAN twin; (50f) the moving test only with last frame's motion-vector matrices (FillCleanMotion)
 		flags |= (FillCleanMotion(cb) ? kPointDenoiseCleanDetect : 0u) | (cleanUsed ? kPointDenoiseClean : 0u);
+	if (match)  // (50g) the history frame's rays (prevViewProj's frame = the last denoised one whenever the history is used)
+		std::copy_n(prevInvViewProj, 16, cb.MatchHistInv);
 	if (pointFractionalThisFrame)
 		flags |= kPointDenoiseFractional;
 	const bool wideHistory = wide && pointWideHistoryValid && history;
@@ -8569,6 +8606,7 @@ void RayTracing::RunInteriorFrame()
 	pending.camera[1] = camY;
 	pending.camera[2] = camZ;
 	std::memcpy(pending.viewProj, &fb.GetCameraViewProj(0), sizeof(pending.viewProj));
+	std::memcpy(pending.invViewProj, &fb.GetCameraViewProjInverse(0), sizeof(pending.invViewProj));  // (50g) PointDenoiseV2CS PL_MATCH
 	std::memcpy(pending.viewProjUnjittered, &fb.GetCameraViewProjUnjittered(0), sizeof(pending.viewProjUnjittered));
 
 	activeThisFrame = true;
@@ -9706,6 +9744,22 @@ void RayTracing::DrawPointLightPage()
 				if (pointV2CleanFailed)
 					ImGui::Text("Not available this session (its shader did not compile): Penumbra v2 runs without it.");
 			}
+			// (50g) Penumbra v2: Precise Surface Match (PointDenoiseV2CS PL_MATCH).
+			ImGui::Checkbox("Penumbra v2: Precise Surface Match", &settings.PointV2PreciseMatch);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Penumbra v2 (and the DLSS RR route's copy for smoke and other lit effects). On (default): last frame's shadow is reused");
+				ImGui::Text("  only where it was computed for the very same surface: each old sample is placed back in 3D and must lie on this pixel's");
+				ImGui::Text("  surface within about a pixel's width (before: within 2 %% of the distance + 8 units, so an arm, a strap or armour a few");
+				ImGui::Text("  units in front of the body could lend its lit result to the body behind it). Fixes the short white streaks on a");
+				ImGui::Text("  character's shadowed side during a fast camera turn. An old result that only half matches counts less.");
+				ImGui::Text("With Moving Characters: Clean Shadow History on (needed for this part): a moving body keeps building on its own last");
+				ImGui::Text("  frames for as long as it takes to cross its shadow edge, instead of starting over every frame (smoother, less blotchy");
+				ImGui::Text("  shadow edges on someone walking past a fire); the background a moving character uncovers is no longer marked");
+				ImGui::Text("  \"moving\" (cyan in Debug View \"Point Lights: Moving Pixels\").");
+				ImGui::Text("Grass, leaves and hair (no flat surface at pixel scale) keep the old, looser match. Off: Penumbra v2 exactly as in 50f.");
+				if (pointV2MatchFailed)
+					ImGui::Text("Not available this session (its shader did not compile): Penumbra v2 runs without it.");
+			}
 		}
 		ImGui::SliderFloat("Light Size", &settings.PointLightsSize, 0.0f, 32.0f, "%.1f units");
 		if (auto _tt = Util::HoverTooltipWrapper())
@@ -10348,6 +10402,9 @@ void RayTracing::DrawDiagnostics()
 			ImGui::Text("Point Lights: Moving Pixels: where the lamp-shadow clean-up sees a moving surface (game motion vectors): red = it took that");
 			ImGui::Text("  surface's own last frame, yellow = none usable (this frame only), magenta = moving but Clean Shadow History is not running");
 			ImGui::Text("  (Penumbra v2: its switch on the Point Light Shadows page is off; Penumbra: its shader did not compile). (50e) Penumbra v2 too.");
+			// (50g)
+			ImGui::Text("  Cyan (Penumbra v2 with Precise Surface Match on) = background a moving character has just uncovered: not moving, treated");
+			ImGui::Text("  as a normal pixel (it has no last frame of its own anyway).");
 			ImGui::Text("Point Lights: Filter Path: the strongest traced light per pixel. Even rows: red = window beam path, green = Stable Penumbra,");
 			ImGui::Text("  blue = standard path, brighter = wider blur (full at 12 px). Odd rows: how much of this frame goes in (dark = 10 %, white = all).");
 			// (47h)
@@ -10537,10 +10594,13 @@ void RayTracing::DrawDiagnostics()
 				ImGui::Text("All should stay 0 (short gaps: 1 - 3 frames without the point-light result between two frames that had it; each is");
 				ImGui::Text("described in the log with its reason, at most one line every 2 s).");
 			}
-			if (pointCleanStatsFrame != 0)
-				ImGui::Text("Point lights, newest read-back: %u pixels with a traced light, moving-pixel test on %u, moving %u (%.1f %%)", pointCleanStats[0],
+			if (pointCleanStatsFrame != 0) {
+				ImGui::Text("Point lights, newest read-back: %u pixels with a traced light, moving-pixel test on %u, moving %u (%.1f %%), uncovered %u", pointCleanStats[0],
 					pointCleanStats[1], pointCleanStats[2],
-					pointCleanStats[1] ? 100.0 * static_cast<double>(pointCleanStats[2]) / static_cast<double>(pointCleanStats[1]) : 0.0);
+					pointCleanStats[1] ? 100.0 * static_cast<double>(pointCleanStats[2]) / static_cast<double>(pointCleanStats[1]) : 0.0, pointCleanStats[3]);
+				if (auto _tt = Util::HoverTooltipWrapper())  // (50g)
+					ImGui::Text("Uncovered: background a moving character has just uncovered (Penumbra v2: Precise Surface Match; not counted as moving).");
+			}
 			if (ImGui::TreeNodeEx("Skipped objects")) {
 				ImGui::Text("Characters %u, markers/other %u, disabled/no 3D %u, tree-animated parts of static objects %u",
 					skip.actors, skip.markers, skip.disabled, skip.foliage);
@@ -10612,6 +10672,7 @@ std::string RayTracing::DescribeForProfile() const
 		kPointDenoisers[pointModeThisFrame < 0 ? 4 : std::clamp(pointModeThisFrame, 0, 3)], settings.PointBlueNoise ? (backend.PointBlueNoiseFailed() ? "failed" : "on") : "off");
 	text += std::format(", point RR white noise {}, v2 clean shadow history {}", settings.PointRRWhiteNoise ? "on" : "off",
 		settings.PointV2CleanHistory ? (pointV2CleanFailed ? "failed" : "on") : "off");  // (50e)
+	text += std::format(", v2 precise surface match {}", settings.PointV2PreciseMatch ? (pointV2MatchFailed ? "failed" : "on") : "off");  // (50g)
 	// (48o) The fixed switches (47x - 48m) are no longer listed; the measurements stay.
 	text += std::format(", buildings kept in the sun shadow map: {} draws", RayTracingCasterFilter::KeptLastFrame());
 	text += std::format(", lights per pixel this frame {}{}",
@@ -10716,6 +10777,7 @@ nlohmann::json RayTracing::DescribeJson() const
 	j["point_blue_noise"] = settings.PointBlueNoise ? (backend.PointBlueNoiseFailed() ? "failed" : "on") : "off";
 	j["point_rr_white_noise"] = settings.PointRRWhiteNoise;  // (50e)
 	j["point_v2_clean_history"] = settings.PointV2CleanHistory ? (pointV2CleanFailed ? "failed" : "on") : "off";
+	j["point_v2_precise_match"] = settings.PointV2PreciseMatch ? (pointV2MatchFailed ? "failed" : "on") : "off";  // (50g)
 	j["point_v2_mb"] = static_cast<double>(pointV2D3D11Bytes + backend.PointBlueNoiseBytes()) / (1024.0 * 1024.0);
 	j["rt_contact_scale"] = settings.RtContactScale;
 	// (48o) The fixed switches (47n - 48m) are no longer written; their measurements stay.
