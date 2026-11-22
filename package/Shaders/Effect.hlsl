@@ -1389,11 +1389,12 @@ PS_OUTPUT main(PS_INPUT input)
 		float3 iblColor = ImageBasedLighting::GetIBLColor(float3(0, 0, 0));
 #		endif
 		float iblLuminance = Color::RGBToLuminance(iblColor);
-		effectNormalization = iblLuminance * SharedData::iblSettings.DiffuseIBLScale + directionalAmbientColorLuminance * SharedData::iblSettings.DALCAmount;
+		// (52a) the raw DALC term x S^(1 - 1/gamma) (it carries f^(1/gamma) from the engine transform; x 1.0 off)
+		effectNormalization = iblLuminance * SharedData::iblSettings.DiffuseIBLScale + directionalAmbientColorLuminance * EffectScene::Unit(EffectAmbientRawScale) * SharedData::iblSettings.DALCAmount;
 		effectNormalization *= SharedData::iblSettings.EffectNormalizationMult;
-		// (52a) Physical Lighting: the IBL / DALC in it carry S and so does the self-lit colour it multiplies: / S here keeps the product
-		// and the absolute floor as before (x 1.0 off); the raw DALC term gets its gamma correction.
-		effectNormalization = (effectNormalization + directionalAmbientColorLuminance * SharedData::iblSettings.DALCAmount * SharedData::iblSettings.EffectNormalizationMult * (EffectScene::Unit(EffectAmbientRawScale) - 1.0)) * EffectScene::Unit(EffectNormDivScale);
+		// (52a) Physical Lighting: the IBL / DALC in it carry S and so does the self-lit colour it multiplies: x 1 / S here keeps the product
+		// and the absolute floor as before (x 1.0 off).
+		effectNormalization *= EffectScene::Unit(EffectNormDivScale);
 		effectNormalization = max(effectNormalization, SharedData::iblSettings.MinEffectMult);
 	}
 #	endif
