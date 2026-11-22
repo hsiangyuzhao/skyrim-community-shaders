@@ -276,6 +276,10 @@ public:
 	/// (40d) Brightness factor of the moon's current phase picture (new 0.05 .. full 1), read
 	/// from the texture on its disc, as the phase factor above.
 	static float PhaseFactorFromTexture(const RE::Moon* moon);
+	/// (52a) The Combined model's body this frame (0 sun, 1 Masser, 2 Secunda, 3 none) and the sun's raw direction, for Physical
+	/// Lighting's light classes and meter (read only).
+	[[nodiscard]] int DominantCaster() const { return lastDominant; }
+	[[nodiscard]] RE::NiPoint3 RawDirection(int a_index) const { return rawDirections[std::clamp(a_index, 0, 2)]; }
 	/// (40d) World-space direction from the sky's centre to the moon's disc; false if unknown.
 	static bool OnScreenDirection(const RE::Moon* moon, const RE::Sky* sky, RE::NiPoint3& outDir);
 

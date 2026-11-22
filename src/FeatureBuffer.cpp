@@ -163,4 +163,76 @@ namespace
 		"(47f) SharedData::horizonFixData moved; update the HLSL mirror and this offset together.");
 	static_assert(sizeof(FeatureDataLayoutMirror) == 1936,  // (47f) + HorizonFixData 16; (47d) + WeatherFogData 16; (44h) + DynamicSnowMapData 48; (44h) + LODBlending 16 (32 -> 48, every offset above +16); (42c) + WetnessEffects 32; (42b) + PhysSkyCloudData 64; (41b) + PhysSkyNightData 64; (40d) + PhysSkyMoonData 16; (batch 39c) DynamicSnow 80 -> 112
 		"FeatureData's total size changed; check every offset above against fxc's reflection listing.");
+
+	// (52a) The in-block offsets Physical Lighting relies on, against the HLSL packing of SharedData.hlsli (verified with fxc's
+	// reflection listing of the FeatureData cbuffer, see specs/spec-batch52a.md).
+	using PhysSkyCb = decltype(FeatureDataLayoutMirror::physicalSky);
+	using NightCb = decltype(FeatureDataLayoutMirror::physicalSkyNight);
+	using MoonCb = decltype(FeatureDataLayoutMirror::physicalSkyMoon);
+	using CloudCb = decltype(FeatureDataLayoutMirror::physicalSkyCloud);
+	using HorizonCb = decltype(FeatureDataLayoutMirror::horizonFix);
+	using LinearCb = decltype(FeatureDataLayoutMirror::linearLighting);
+	using IblCb = decltype(FeatureDataLayoutMirror::ibl);
+	using PostCb = decltype(FeatureDataLayoutMirror::postProcessing);
+	using CloudShadowsCb = decltype(FeatureDataLayoutMirror::cloudShadows);
+	using LodCb = decltype(FeatureDataLayoutMirror::lodBlending);
+	using TerrainVariationCb = decltype(FeatureDataLayoutMirror::terrainVariation);
+	using VolLightCb = decltype(FeatureDataLayoutMirror::volumetricLighting);
+	using VolShadowCb = decltype(FeatureDataLayoutMirror::volumetricShadows);
+	static_assert(offsetof(PhysSkyCb, sunlightColor) == 48 && offsetof(PhysSkyCb, masserColor) == 80 && offsetof(PhysSkyCb, secundaColor) == 112 &&
+				  offsetof(PhysSkyCb, enabled) == 124 && offsetof(PhysSkyCb, _pad5) == 188,
+		"(52a) PhysSkyData packing");
+	static_assert(offsetof(NightCb, baseUpper) == 16 && offsetof(NightCb, baseHorizon) == 32 && offsetof(NightCb, baseLower) == 48, "(52a) PhysSkyNightData packing");
+	static_assert(offsetof(MoonCb, masserDiskScale) == 0 && offsetof(MoonCb, secundaDiskScale) == 4, "(52a) PhysSkyMoonData packing");
+	static_assert(offsetof(CloudCb, sunColor) == 0 && offsetof(CloudCb, masserColor) == 16 && offsetof(CloudCb, secundaColor) == 32, "(52a) PhysSkyCloudData packing");
+	static_assert(offsetof(HorizonCb, fogSkyLight) == 12, "(52a) HorizonFixData packing");
+	static_assert(offsetof(LinearCb, pointLightMult) == 92 && offsetof(LinearCb, emitColorMult) == 96 && offsetof(LinearCb, glowmapMult) == 100, "(52a) LinearLightingSettings packing");
+	static_assert(offsetof(IblCb, pad) == 60 && sizeof(IblCb) == 64, "(52a) IBLSettings.pad");
+	static_assert(offsetof(PostCb, pad) == 4 && sizeof(PostCb) == 16, "(52a) PostProcessingSettings.pad0");
+	static_assert(offsetof(CloudShadowsCb, pad) == 4 && sizeof(CloudShadowsCb) == 16, "(52a) CloudShadowsSettings.pad0");
+	static_assert(offsetof(LodCb, pad0) == 36 && sizeof(LodCb) == 48, "(52a) LODBlendingSettings.pad0");
+	static_assert(offsetof(TerrainVariationCb, pad0) == 8 && sizeof(TerrainVariationCb) == 16, "(52a) TerrainVariationSettings.pad0");
+	static_assert(offsetof(VolLightCb, pad0) == 8 && sizeof(VolLightCb) == 16, "(52a) VolumetricLightingSettings.pad0");
+	static_assert(offsetof(VolShadowCb, pad0) == 8 && offsetof(VolShadowCb, pad1) == 12 && sizeof(VolShadowCb) == 16, "(52a) VolumetricShadowsSettings.pad0");
+}
+
+const FeatureDataUnitOffsets& GetFeatureDataUnitOffsets()
+{
+	using M = FeatureDataLayoutMirror;
+	static const FeatureDataUnitOffsets offsets = {
+		.total = sizeof(M),
+		.sunlightColor = offsetof(M, physicalSky) + offsetof(PhysSkyCb, sunlightColor),
+		.masserColor = offsetof(M, physicalSky) + offsetof(PhysSkyCb, masserColor),
+		.secundaColor = offsetof(M, physicalSky) + offsetof(PhysSkyCb, secundaColor),
+		.nightBaseUpper = offsetof(M, physicalSkyNight) + offsetof(NightCb, baseUpper),
+		.nightBaseHorizon = offsetof(M, physicalSkyNight) + offsetof(NightCb, baseHorizon),
+		.nightBaseLower = offsetof(M, physicalSkyNight) + offsetof(NightCb, baseLower),
+		.masserDiskScale = offsetof(M, physicalSkyMoon) + offsetof(MoonCb, masserDiskScale),
+		.secundaDiskScale = offsetof(M, physicalSkyMoon) + offsetof(MoonCb, secundaDiskScale),
+		.cloudSunColor = offsetof(M, physicalSkyCloud) + offsetof(CloudCb, sunColor),
+		.cloudMasserColor = offsetof(M, physicalSkyCloud) + offsetof(CloudCb, masserColor),
+		.cloudSecundaColor = offsetof(M, physicalSkyCloud) + offsetof(CloudCb, secundaColor),
+		.fogSkyLight = offsetof(M, horizonFix) + offsetof(HorizonCb, fogSkyLight),
+		.pointLightMult = offsetof(M, linearLighting) + offsetof(LinearCb, pointLightMult),
+		.emitColorMult = offsetof(M, linearLighting) + offsetof(LinearCb, emitColorMult),
+		.glowmapMult = offsetof(M, linearLighting) + offsetof(LinearCb, glowmapMult),
+		.physSkyEnabled = offsetof(M, physicalSky) + offsetof(PhysSkyCb, enabled),
+		.padCharacterLight = offsetof(M, physicalSky) + offsetof(PhysSkyCb, _pad5),
+		.padSnowRim = offsetof(M, ibl) + offsetof(IblCb, pad),
+		.padFog = offsetof(M, postProcessing) + offsetof(PostCb, pad) + 0,
+		.padFlareOut = offsetof(M, postProcessing) + offsetof(PostCb, pad) + 4,
+		.padSkyDome = offsetof(M, cloudShadows) + offsetof(CloudShadowsCb, pad) + 0,
+		.padSkyStars = offsetof(M, cloudShadows) + offsetof(CloudShadowsCb, pad) + 4,
+		.padSkySunDisc = offsetof(M, cloudShadows) + offsetof(CloudShadowsCb, pad) + 8,
+		.padSkyMoonBase = offsetof(M, lodBlending) + offsetof(LodCb, pad0) + 0,
+		.padSkyCloud = offsetof(M, lodBlending) + offsetof(LodCb, pad0) + 4,
+		.padWaterGlint = offsetof(M, lodBlending) + offsetof(LodCb, pad0) + 8,
+		.padWaterBody = offsetof(M, terrainVariation) + offsetof(TerrainVariationCb, pad0) + 0,
+		.padWaterFallback = offsetof(M, terrainVariation) + offsetof(TerrainVariationCb, pad0) + 4,
+		.padPrecipitation = offsetof(M, volumetricLighting) + offsetof(VolLightCb, pad0) + 0,
+		.padSparkle = offsetof(M, volumetricLighting) + offsetof(VolLightCb, pad0) + 4,
+		.padFrameS = offsetof(M, volumetricShadows) + offsetof(VolShadowCb, pad0),
+		.padFrameInvS = offsetof(M, volumetricShadows) + offsetof(VolShadowCb, pad1),
+	};
+	return offsets;
 }

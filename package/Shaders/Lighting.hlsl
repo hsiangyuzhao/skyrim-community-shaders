@@ -826,7 +826,8 @@ float3 GetSnowSpecularColor(PS_INPUT input, float3 worldNormal, float3 viewDirec
 #		endif
 		float normalFactor = 1 - saturate(dot(worldNormal, viewDirection));
 		float geometryNormalFactor = 1 - saturate(dot(modelGeometryNormal, viewDirection));
-		return (SnowRimLightParameters.x * (exp2(SnowRimLightParameters.y * log2(geometryNormalFactor)) * exp2(SnowRimLightParameters.z * log2(normalFactor)))).xxx;
+		// (52a) Physical Lighting: x the snow rim class factor (IBLSettings.pad, unread before 52a; exactly 1.0 with the master off).
+		return (SnowRimLightParameters.x * (exp2(SnowRimLightParameters.y * log2(geometryNormalFactor)) * exp2(SnowRimLightParameters.z * log2(normalFactor))) * SharedData::iblSettings.pad).xxx;
 	} else {
 		return 0.0.xxx;
 	}
@@ -4617,7 +4618,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	if (Permutation::PixelShaderDescriptor & Permutation::LightingFlags::CharacterLight) {
 		float charLightMul = saturate(dot(viewDirection, worldNormal.xyz)) * CharacterLightParams.x + CharacterLightParams.y * saturate(dot(float2(0.164398998, -0.986393988), worldNormal.yz));
 		float charLightColor = min(CharacterLightParams.w, max(0, CharacterLightParams.z * TexCharacterLightProjNoiseSampler.Sample(SampCharacterLightProjNoiseSampler, baseShadowUV).x));
-		diffuseColor += (charLightMul * charLightColor).xxx;
+		// (52a) Physical Lighting: x the character light class factor (PhysSkyData._pad5, unread before 52a; exactly 1.0 with the master off).
+		diffuseColor += (charLightMul * charLightColor * SharedData::physSkyData._pad5).xxx;
 	}
 #	endif
 
@@ -5170,7 +5172,9 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 #	if !defined(DEFERRED)
 	color.xyz = Color::IrradianceToGamma(Color::IrradianceToLinear(color.xyz) + specularColor);
-	float3 fogColor = Color::Fog(input.FogParam.xyz);
+	// (52a) Physical Lighting: the weather fog colour x the fog class factor (PostProcessingSettings.pad0.x, unread before 52a; exactly 1.0
+	// with the master off).
+	float3 fogColor = Color::Fog(input.FogParam.xyz) * asfloat(SharedData::postProcessingSettings.pad0.x);
 	float fogFactor = Color::FogAlpha(input.FogParam.w);
 	float weatherFogAmount = 0.0;  // (47b) share of the view the game's fog covers under the height fog
 #		if defined(IBL)

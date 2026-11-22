@@ -7,6 +7,7 @@
 #include "Features/ExponentialHeightFog.h"  // (49b) Particles Use RT Shadows needs its volumetric fog grid
 #include "Features/GrassOptimizations.h"  // (49c) the loading-screen thread's grass uploads, the grass staging probe
 #include "Features/LightLimitFix.h"  // (48g) the hit shading reads its light list
+#include "Features/PhysicalLighting.h"  // (52a) the engine's own sun colour for the point lights' sun gate
 #include "Features/Skylighting.h"    // (48g) and its probes
 #include "Features/ScreenSpaceGI.h"
 #include "Features/ScreenSpacePointLightShadows.h"
@@ -4260,8 +4261,9 @@ void RayTracing::RunFrame()
 	// (46b) The sun's (or the moon's) brightness, for the point lights' sun gate.
 	float sunStrength = 0.0f;
 	{
-		const auto& sunData = sunLight->GetLightRuntimeData();
-		sunStrength = std::max({ sunData.diffuse.red, sunData.diffuse.green, sunData.diffuse.blue });
+		// (52a) The engine's own colour (Physical Lighting may hold a scaled copy in the light this frame; the gate keeps its 50e meaning).
+		const RE::NiColor sunDiffuse = globals::features::physicalLighting.EngineDirLightDiffuse(sunLight);
+		sunStrength = std::max({ sunDiffuse.red, sunDiffuse.green, sunDiffuse.blue });
 		if (!std::isfinite(sunStrength) || sunStrength < 0.0f)
 			sunStrength = 0.0f;
 	}

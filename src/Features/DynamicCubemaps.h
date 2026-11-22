@@ -46,8 +46,11 @@ public:
 	{
 		float3 CameraPreviousPosAdjust;
 		float CaptureWeight;  ///< (batch 39b) share of a new capture (was a fixed 0.5 in the shader)
+		float HistoryScale = 1.0f;  ///< (52a) Physical Lighting: S now / S at this capture's previous update (exactly 1 with the master off)
+		float pad52a[3] = { 0.0f, 0.0f, 0.0f };
 	};
 	STATIC_ASSERT_ALIGNAS_16(UpdateCubemapCB);
+	static_assert(sizeof(UpdateCubemapCB) == 32 && offsetof(UpdateCubemapCB, HistoryScale) == 16, "(52a) UpdateCubemapCS UpdateData");
 
 	ID3D11ComputeShader* updateCubemapCS = nullptr;
 	ID3D11ComputeShader* updateCubemapReflectionsCS = nullptr;

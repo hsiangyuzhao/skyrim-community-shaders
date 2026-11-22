@@ -3,6 +3,8 @@
 #include "JiayeStatement.h"
 #include "WindowLight.h"
 
+#include "PhysicalLighting.h"
+
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	LinearLighting::Settings,
 	enableLinearLighting,
@@ -284,7 +286,8 @@ float LinearLighting::ComputeUnlitSceneScale()
 	const auto* smState = globals::game::smState;
 	if (smState == nullptr)
 		return 1.0f;
-	const auto& t = smState->directionalAmbientTransform.translate;
+	// (52a) The engine's own DALC (Physical Lighting may hold a scaled copy in the engine's transform this frame).
+	const RE::NiPoint3 t = globals::features::physicalLighting.EngineDalcTranslate();
 	unlitAmbientNow = luminance(t.x, t.y, t.z);
 
 	if (const auto* sky = globals::game::sky; sky != nullptr && sky->currentWeather != nullptr) {
@@ -327,6 +330,16 @@ void LinearLighting::Prepass()
 		effectScene.litSmokeMult = settings.litSmokeEffectMult;
 		effectScene.unlitSmokeMult = settings.unlitSmokeEffectMult;
 		effectScene.unlitSceneScale = unlitSceneScale;
+		// (52a) Physical Lighting's effect scalars (1.0f with the master off).
+		const auto units = globals::features::physicalLighting.GetEffectScalars();
+		effectScene.flags |= kEffectFlagUnitScalars;
+		effectScene.selfLitScale = units.selfLit;
+		effectScene.fireScale = units.fire;
+		effectScene.unlitScale = units.unlit;
+		effectScene.dLightScale = units.dLight;
+		effectScene.fogScale = units.fog;
+		effectScene.normDivScale = units.normDiv;
+		effectScene.ambientRawScale = units.ambientRaw;
 		EffectSceneCB->Update(effectScene);
 	}
 

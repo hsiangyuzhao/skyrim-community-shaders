@@ -9,6 +9,7 @@
 #include "Features/DynamicCubemaps.h"
 #include "Features/IBL.h"
 #include "Features/NRD.h"
+#include "Features/PhysicalLighting.h"
 #include "Features/PhysicalSky.h"
 #include "Features/RayTracing.h"
 #include "Features/ScreenSpaceGI.h"
@@ -717,6 +718,12 @@ void Deferred::DeferredPasses()
 		context->CSSetSamplers(0, ARRAYSIZE(samplers), samplers);
 
 		context->CSSetShader(nullptr, nullptr, 0);
+	}
+
+	// (52a) Physical Lighting > Light Meter: the composite's buffers at the crosshair (only while the meter is on).
+	if (auto& physicalLighting = globals::features::physicalLighting; physicalLighting.loaded && physicalLighting.meterOn) {
+		auto shadowMask = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kSHADOW_MASK];
+		physicalLighting.DispatchMeter(main.SRV, albedo.SRV, normalRoughness.SRV, masks.SRV, specular.SRV, depth.depthSRV, shadowMask.SRV);
 	}
 
 	if (dynamicCubemaps.loaded) {

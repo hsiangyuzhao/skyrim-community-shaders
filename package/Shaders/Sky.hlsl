@@ -517,10 +517,39 @@ namespace Stage2
 }
 #	endif
 
+// (52a) Physical Lighting: the class factor of this sky draw's absolute (engine) colours: vertex colour, texture and the additive PParams.yyy.
+// Unread FeatureData pad slots written by PhysicalLighting::PatchFeatureData, exactly 1.0 with the master off. Light already in scene units
+// (the physical sky LUTs, the relit clouds' light, the moon disc scale) carries its factor from C++.
+namespace SkyUnits
+{
+	float DrawScale()
+	{
+#	if defined(MOONMASK) || defined(OCCLUSION)
+		return 1.0;  // a mask, unit-free
+#	elif defined(DITHER)
+		return SharedData::cloudShadowsSettings.pad0.x;  // the vanilla dome
+#	elif defined(HORIZFADE)
+		return SharedData::cloudShadowsSettings.pad0.y;  // stars and the Milky Way
+#	elif defined(CLOUDS)
+		return SharedData::lodBlendingSettings.pad0.y;  // clouds' own colour and yyy (sky class)
+#	else
+		const uint extra = Permutation::ExtraShaderDescriptor;
+		if (extra & (Permutation::ExtraFlags::IsSun | Permutation::ExtraFlags::IsSunGlare))
+			return SharedData::cloudShadowsSettings.pad0.z;  // the vanilla sun quad and its glare
+		if (extra & Permutation::ExtraFlags::IsMoon)
+			return SharedData::lodBlendingSettings.pad0.x;  // moon discs (1 while Physical Sky's disc scale carries the class)
+		return SharedData::lodBlendingSettings.pad0.y;  // other sky objects (sky class)
+#	endif
+	}
+}
+
 PS_OUTPUT main(PS_INPUT input)
 {
 	PS_OUTPUT psout;
-	float3 yyy = Color::Sky(PParams.yyy);
+	// (52a) this draw's class factor (1.0 off); skyBaseScale is what the texture x vertex colour still needs (1 on relit clouds).
+	const float skyUnitScale = SkyUnits::DrawScale();
+	float skyBaseScale = skyUnitScale;
+	float3 yyy = Color::Sky(PParams.yyy) * skyUnitScale;
 
 #	if !defined(OCCLUSION)
 	// (batch 37c) A new moon: the game draws the moon with its new-moon texture, which is solid
@@ -574,6 +603,11 @@ PS_OUTPUT main(PS_INPUT input)
 			baseColor.rgb = PhysSky::RelightCloudMulti(baseColor, viewDir, float3(0, 0, 0) + viewDir * psCloudDist, PhysSky::SampTr, PhysSky::SampSv, SampBaseSampler);
 		} else
 			baseColor.rgb = PhysSky::RelightCloud(baseColor, viewDir, float3(0, 0, 0) + viewDir * psCloudDist, PhysSky::SampTr, SampBaseSampler);
+		// (52a) The relight keeps cloudOriginalMix of the texture's own (absolute) colour, all of it where alpha <= 0; that share gets the
+		// class factor here, the light share is already in scene units (+ 0 with the master off).
+		const float3 cloudOriginalShare = baseColor.w <= 0.0 ? cloudAlbedo : cloudAlbedo * SharedData::physSkyData.cloudOriginalMix;
+		baseColor.rgb += cloudOriginalShare * (skyUnitScale - 1.0);
+		skyBaseScale = 1.0;
 	}
 #		endif
 
@@ -585,10 +619,10 @@ PS_OUTPUT main(PS_INPUT input)
 		TexNoiseGradSampler.Sample(SampNoiseGradSampler, noiseGradUv).x * 0.03125 + -0.0078125;
 
 #			ifdef TEX
-	psout.Color.xyz = (Color::Sky(input.Color.xyz) * baseColor.xyz + yyy) + noiseGrad;
+	psout.Color.xyz = (Color::Sky(input.Color.xyz) * baseColor.xyz * skyBaseScale + yyy) + noiseGrad * skyUnitScale;  // (52a) x the class factor (1 off)
 	psout.Color.w = baseColor.w * input.Color.w;
 #			else
-	psout.Color.xyz = (yyy + Color::Sky(input.Color.xyz)) + noiseGrad;
+	psout.Color.xyz = (yyy + Color::Sky(input.Color.xyz) * skyBaseScale) + noiseGrad * skyUnitScale;  // (52a) x the class factor (1 off)
 	psout.Color.w = input.Color.w;
 #			endif  // TEX
 
@@ -600,11 +634,11 @@ PS_OUTPUT main(PS_INPUT input)
 	}
 
 #		elif defined(HORIZFADE)
-	psout.Color.xyz = float3(1.5, 1.5, 1.5) * (Color::Sky(input.Color.xyz) * baseColor.xyz + yyy);
+	psout.Color.xyz = float3(1.5, 1.5, 1.5) * (Color::Sky(input.Color.xyz) * baseColor.xyz * skyBaseScale + yyy);  // (52a) x the class factor (1 off)
 	psout.Color.w = input.TexCoord2.x * (baseColor.w * input.Color.w);
 #		else
 	psout.Color.w = input.Color.w * baseColor.w;
-	psout.Color.xyz = Color::Sky(input.Color.xyz) * baseColor.xyz + yyy;
+	psout.Color.xyz = Color::Sky(input.Color.xyz) * baseColor.xyz * skyBaseScale + yyy;  // (52a) x the class factor (1 off; relit clouds: above)
 #			if defined(PS_CLOUDS) && defined(CLOUD_SHADOWS)
 	psout.Color.xyz += cloudMoonLight;  // (44h) not dimmed by the (near-black night) weather cloud colour
 	// (50b) Stage 2 "Clouds Lit Like the Ground": the ground's ambient, also not dimmed by it (the sky-view LUT term is off on this path).

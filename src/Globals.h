@@ -15,6 +15,7 @@ struct InteriorSun;
 struct InverseSquareLighting;
 struct NRD;
 struct PhysicalSky;
+struct PhysicalLighting;
 struct ScreenSpaceGI;
 struct ScreenSpacePointLightShadows;
 struct ScreenSpaceRayTracing;
@@ -82,6 +83,7 @@ namespace globals
 		extern InverseSquareLighting inverseSquareLighting;
 		extern NRD nrd;
 		extern PhysicalSky physicalSky;
+		extern PhysicalLighting physicalLighting;  // (52a)
 		extern ScreenSpaceGI screenSpaceGI;
 		extern ScreenSpacePointLightShadows screenSpacePointLightShadows;
 		extern ScreenSpaceRayTracing screenSpaceRayTracing;

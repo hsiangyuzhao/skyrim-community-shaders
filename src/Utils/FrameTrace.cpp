@@ -2,6 +2,7 @@
 
 #include "Features/ExponentialHeightFog.h"
 #include "Features/PerformanceOverlay.h"
+#include "Features/PhysicalLighting.h"
 #include "Features/PhysicalSky.h"
 #include "Features/RayTracing.h"
 #include "Features/ScreenSpaceGI.h"
@@ -2834,6 +2835,8 @@ namespace Util::FrameTrace
 			g_headerRayTracing = std::format("{}; build {}", globals::features::rayTracing.DescribeForProfile(), BuildLabel::kBuild);
 			g_headerLatency = globals::features::upscaling.DescribeLatencyForTrace();
 			g_headerRendering = DescribeRendering();        // (46e)
+			// (52a) Physical Lighting's state and the light meter's current reading ride on the rendering line.
+			g_headerRendering += " | (52a) " + globals::features::physicalLighting.DescribeForTrace();
 			g_headerFG = Streamline::DescribeFGForTrace();  // (46w)
 			{
 				// (46o) M6 session uptime, M3 video memory at the start, M1 calibration, M2 switch.
