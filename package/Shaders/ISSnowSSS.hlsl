@@ -63,8 +63,10 @@ PS_OUTPUT main(PS_INPUT input)
 
 		sssColor += iterationParameters[iterationIndex].xyz * lerp(iterationSourceColor, sourceColor, iterationDiffuseFactor);
 	}
-	float sssLuminance = Color::RGBToLuminanceAlternative(sssColor);
-	float3 darkColor = max(0, lerp(g_SSSDarkColor.xyz * g_SSSDarkColor.w, sourceColor, sssLuminance));
+	// (52a) Physical Lighting: the frame is pre-exposed by S. The luminance used as a blend weight is taken back to the classic scale (x 1 / S)
+	// and the absolute dark colour gets S (VolumetricShadowsSettings.pad0.y / .x, unread before 52a; both exactly 1.0 off).
+	float sssLuminance = Color::RGBToLuminanceAlternative(sssColor) * asfloat(SharedData::volumetricShadowsSettings.pad0.y);
+	float3 darkColor = max(0, lerp(g_SSSDarkColor.xyz * g_SSSDarkColor.w * asfloat(SharedData::volumetricShadowsSettings.pad0.x), sourceColor, sssLuminance));
 	float3 snowColor = lerp(darkColor, sssColor, sssLuminance);
 
 	psout.Color = lerp(sourceColor, snowColor, snowMask);

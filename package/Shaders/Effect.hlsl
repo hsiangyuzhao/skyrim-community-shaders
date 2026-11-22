@@ -722,7 +722,15 @@ cbuffer EffectSceneCB : register(b7)
 	float EffectLitSmokeMult;     // Lit Smoke and Mist Multiplier
 	float EffectUnlitSmokeMult;   // Unlit Smoke and Mist Multiplier
 	float EffectUnlitSceneScale;  // the scene's ambient brightness now / this weather's midday, clamped (C++)
-	float3 EffectScenePad;
+	// (52a) Physical Lighting's class factors (PhysicalLighting::GetEffectScalars), read only while EffectSceneFlags has kUnitScalars (8): an
+	// unbound or zeroed buffer means 1. All exactly 1.0 with the master off.
+	float EffectSelfLitScale;     // self-lit part of non-fire effects
+	float EffectFireScale;        // fire and magic (additive / palette)
+	float EffectUnlitScale;       // unlit smoke and mist
+	float EffectDLightScale;      // the engine's DLightColor (effects not following the scene)
+	float EffectFogScale;         // the weather fog colour
+	float EffectNormDivScale;     // IBL effect normalisation x 1 / S (its floor stays absolute)
+	float EffectAmbientRawScale;  // raw (gamma-space) DALC readers: S / S^(1 / ambient gamma)
 };
 
 namespace EffectScene
@@ -730,6 +738,7 @@ namespace EffectScene
 	static const uint kMaster = 1u;
 	static const uint kLit = 2u;
 	static const uint kUnlit = 4u;
+	static const uint kUnitScalars = 8u;  // (52a)
 
 	static const uint kFireMagic = 0u;
 	static const uint kLitSmoke = 1u;
@@ -762,6 +771,23 @@ namespace EffectScene
 		return false;
 #	else
 		return true;
+#	endif
+	}
+
+	/// (52a) Physical Lighting: a class factor from EffectSceneCB, 1 when the buffer does not carry them.
+	float Unit(float a_scale)
+	{
+		return (EffectSceneFlags & kUnitScalars) != 0u ? a_scale : 1.0;
+	}
+
+	/// (52a) The self-lit (absolute) part's class factor: fire and magic, unlit smoke and mist, or the other self-lit effects. Multiplicative
+	/// blends multiply the frame (unit-free): 1.
+	float SelfLitScale(uint a_category)
+	{
+#	if defined(MULTBLEND) || defined(MULTBLEND_DECAL)
+		return 1.0;
+#	else
+		return Unit(a_category == kFireMagic ? EffectFireScale : (a_category == kUnlitSmoke ? EffectUnlitScale : EffectSelfLitScale));
 #	endif
 	}
 
@@ -989,7 +1015,7 @@ float3 GetLightingColor(float3 msPosition, float3 worldPosition, float4 screenPo
 	float4 lightDistanceSquared = (PLightPositionX[eyeIndex] - msPosition.xxxx) * (PLightPositionX[eyeIndex] - msPosition.xxxx) + (PLightPositionY[eyeIndex] - msPosition.yyyy) * (PLightPositionY[eyeIndex] - msPosition.yyyy) + (PLightPositionZ[eyeIndex] - msPosition.zzzz) * (PLightPositionZ[eyeIndex] - msPosition.zzzz);
 	float4 lightFadeMul = 1.0.xxxx - saturate(PLightingRadiusInverseSquared * lightDistanceSquared);
 
-	float3 color = DLightColor.xyz * Color::EffectLightingMult();
+	float3 color = DLightColor.xyz * Color::EffectLightingMult() * EffectScene::Unit(EffectDLightScale);  // (52a) x the class factor (1 off)
 
 	[branch] if (a_follow) {
 		// (49g) Effects Follow Scene Light > Lit Smoke and Mist: the light a matte vanilla surface gets here (EffectScene::MatteLight).
@@ -1009,6 +1035,8 @@ float3 GetLightingColor(float3 msPosition, float3 worldPosition, float4 screenPo
 		float3 ambientColor = max(0, mul(SharedData::DirectionalAmbient, float4(0, 0, 1, 1)));
 		if (PhysLight::On(PhysLight::kSmallFixes))  // (49h stage 1, S8) converted (was raw)
 			ambientColor = Color::Ambient(ambientColor);
+		else
+			ambientColor *= EffectScene::Unit(EffectAmbientRawScale);  // (52a) the raw DALC carries f^(1/gamma); x f^(1 - 1/gamma) = f (1 off)
 
 #		if defined(IBL)
 		if (SharedData::iblSettings.EnableDiffuseIBL && (!SharedData::InInterior || SharedData::iblSettings.EnableInterior)) {
@@ -1324,7 +1352,8 @@ PS_OUTPUT main(PS_INPUT input)
 	}
 #	endif
 
-	float3 lightColor = lerp(baseColor.xyz, propertyColor * baseColor.xyz, lightingInfluence.xxx);
+	// (52a) Physical Lighting: the self-lit (absolute) share x its class factor; the lit share's light is already in scene units (1 off).
+	float3 lightColor = lerp(baseColor.xyz * EffectScene::SelfLitScale(sceneCategory), propertyColor * baseColor.xyz, lightingInfluence.xxx);
 
 	// (49g) Unlit Smoke and Mist: x the scene's ambient brightness relative to this weather's midday (dims at night and indoors).
 	[branch] if (followUnlit)
@@ -1362,6 +1391,9 @@ PS_OUTPUT main(PS_INPUT input)
 		float iblLuminance = Color::RGBToLuminance(iblColor);
 		effectNormalization = iblLuminance * SharedData::iblSettings.DiffuseIBLScale + directionalAmbientColorLuminance * SharedData::iblSettings.DALCAmount;
 		effectNormalization *= SharedData::iblSettings.EffectNormalizationMult;
+		// (52a) Physical Lighting: the IBL / DALC in it carry S and so does the self-lit colour it multiplies: / S here keeps the product
+		// and the absolute floor as before (x 1.0 off); the raw DALC term gets its gamma correction.
+		effectNormalization = (effectNormalization + directionalAmbientColorLuminance * SharedData::iblSettings.DALCAmount * SharedData::iblSettings.EffectNormalizationMult * (EffectScene::Unit(EffectAmbientRawScale) - 1.0)) * EffectScene::Unit(EffectNormDivScale);
 		effectNormalization = max(effectNormalization, SharedData::iblSettings.MinEffectMult);
 	}
 #	endif
@@ -1376,7 +1408,7 @@ PS_OUTPUT main(PS_INPUT input)
 	float weatherFogAmount = 0.0;  // (47b) share of the view the game's fog covers under the height fog
 #	if !defined(MOTIONVECTORS_NORMALS)
 	float fogFactor = Color::FogAlpha(input.FogParam.w);
-	float3 fogColor = Color::Fog(input.FogParam.xyz);
+	float3 fogColor = Color::Fog(input.FogParam.xyz) * EffectScene::Unit(EffectFogScale);  // (52a) x the fog class factor (1 off)
 #		if defined(IBL)
 	if (SharedData::iblSettings.EnableDiffuseIBL && !SharedData::InInterior) {
 		fogColor = ImageBasedLighting::GetFogIBLColor(fogColor);

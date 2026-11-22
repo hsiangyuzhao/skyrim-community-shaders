@@ -9,6 +9,7 @@
 #include "../../Util.h"
 #include "Utils/FrameTrace.h"
 #include "../RenderDoc.h"
+#include "../PhysicalLighting.h"
 #include "../Upscaling.h"
 #include "DX12SwapChain.h"
 
@@ -1540,7 +1541,8 @@ void Streamline::SetDLSSOptions()
 	dlssOptions.colorBuffersHDR = sl::Boolean::eTrue;
 	dlssOptions.useAutoExposure = sl::Boolean::eTrue;
 
-	dlssOptions.preExposure = 1.0f;
+	// (52a) Physical Lighting: the colour input is pre-exposed by S (exactly 1 with the master off).
+	dlssOptions.preExposure = globals::features::physicalLighting.SceneScale();
 	dlssOptions.sharpness = 0.0f;
 
 	auto& settings = globals::features::upscaling.settings;
@@ -1716,6 +1718,8 @@ void Streamline::SetDLSSRROptions()
 	dlssdOptions.colorBuffersHDR = sl::Boolean::eTrue;
 	dlssdOptions.normalRoughnessMode = sl::DLSSDNormalRoughnessMode::ePacked;
 	dlssdOptions.alphaUpscalingEnabled = sl::Boolean::eFalse;
+	// (52a) Physical Lighting: the colour input is pre-exposed by S (exactly 1 with the master off; sl_dlss_d.h DLSSDOptions::preExposure).
+	dlssdOptions.preExposure = globals::features::physicalLighting.SceneScale();
 
 	dlssdOptions.worldToCameraView = sl::float4x4{
 		sl::float4{ worldToCameraView._11, worldToCameraView._12, worldToCameraView._13, worldToCameraView._14 },

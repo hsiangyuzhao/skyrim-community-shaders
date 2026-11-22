@@ -31,6 +31,7 @@
 #include "Features/ScreenSpaceShadows.h"
 #include "Features/Skin.h"
 #include "Features/WetSkin.h"
+#include "Features/PhysicalLighting.h"
 #include "Features/SkySync.h"
 #include "Features/Skylighting.h"
 #include "Features/SubsurfaceScattering.h"
@@ -265,6 +266,7 @@ const std::vector<Feature*>& Feature::GetFeatureList()
 		&globals::features::renderDoc,
 		&globals::features::linearLighting,
 		&globals::features::physicalSky,
+		&globals::features::physicalLighting,  // (52a) after Physical Sky (its Reset fills the sky uploads first)
 		&globals::features::postProcessing,
 		&globals::features::skin,
 		&globals::features::wetSkin,  // (44a) after Advanced Skin: takes over its 43b wetness settings

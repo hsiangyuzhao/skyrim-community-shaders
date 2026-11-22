@@ -70,9 +70,10 @@ cbuffer AutoExposureFoldCB : register(b2)
 	float AEPurkinjeStartEV;
 	float AEPurkinjeMaxEV;
 	float AEPurkinjeStrength;
+	float AESceneScaleInv;  // (52a) Physical Lighting: 1 / S (1 with the master off)
 #	if defined(EYE_MODE)
 	// (50a) Eye Model: the auto exposure CB's eye fields (common.hlsli, same layout from offset 48).
-	float3 AEPad;
+	float2 AEPad;
 	float AEEyeLogLo;
 	float AEEyeLogHi;
 	float AEEyeNightDarkness;
@@ -92,11 +93,11 @@ StructuredBuffer<float> AEAdaptation : register(t4);
 float4 LoadSceneColor(uint2 tid)
 {
 #	if defined(EYE_MODE)
-	return float4(AutoExposureMath::ExposeColorEye(TexColor[tid].rgb, AEAdaptation[0], AEAdaptation[1], AEExposureCompensation, AEPurkinjeStartEV, AEPurkinjeMaxEV,
+	return float4(AutoExposureMath::ExposeColorEye(TexColor[tid].rgb * AESceneScaleInv, AEAdaptation[0], AEAdaptation[1], AEExposureCompensation, AEPurkinjeStartEV, AEPurkinjeMaxEV,
 					  AEPurkinjeStrength, AEEyeMesopic),
 		1);
 #	else
-	return float4(AutoExposureMath::ExposeColor(TexColor[tid].rgb, AEAdaptation[0], AEExposureCompensation, AEAdaptationRange, AEPurkinjeStartEV, AEPurkinjeMaxEV, AEPurkinjeStrength), 1);
+	return float4(AutoExposureMath::ExposeColor(TexColor[tid].rgb * AESceneScaleInv, AEAdaptation[0], AEExposureCompensation, AEAdaptationRange, AEPurkinjeStartEV, AEPurkinjeMaxEV, AEPurkinjeStrength), 1);
 #	endif
 }
 #else

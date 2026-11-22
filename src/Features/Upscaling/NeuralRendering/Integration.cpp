@@ -4,6 +4,7 @@
 #include "Runtime.h"
 
 #include "Features/LinearLighting.h"
+#include "Features/PhysicalLighting.h"
 #include "Features/PostProcessing.h"
 #include "Features/Upscaling.h"
 #include "Features/Upscaling/HDROutput.h"
@@ -383,7 +384,8 @@ namespace NeuralRendering
 				float2 range{};
 				autoExposure->GetExposureParameters(compensation, range);
 				source.adaptation = autoExposure->adaptationSB->SRV();
-				source.exposureCompensation = std::exp2(compensation);
+				// (52a) Physical Lighting: the frame here is pre-exposed by S; the adaptation buffer is S-free (the AE meters buffer / S).
+				source.exposureCompensation = std::exp2(compensation) * globals::features::physicalLighting.SceneScaleInv();
 				source.adaptationMin = std::exp2(range.x) * 0.125f;
 				source.adaptationMax = std::exp2(range.y) * 0.125f;
 			}

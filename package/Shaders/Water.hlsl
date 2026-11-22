@@ -854,7 +854,7 @@ float3 GetWaterSpecularColor(PS_INPUT input, float3 normal, float3 viewDirection
 		float3 finalReflectionColor = Color::IrradianceToGamma(lerp(Color::IrradianceToLinear(reflectionColor), Color::IrradianceToLinear(finalSsrReflectionColor), ssrFraction));
 		return finalReflectionColor;
 	}
-	return ReflectionColor.xyz * VarAmounts.y;
+	return ReflectionColor.xyz * VarAmounts.y * SharedData::terrainVariationSettings.pad0.y;  // (52a) Physical Lighting: x the sky class factor (1 off)
 }
 
 float GetScreenDepthWater(float2 screenPosition, uint a_useVR = 0)
@@ -945,7 +945,7 @@ DiffuseOutput GetWaterDiffuseColor(PS_INPUT input, float3 normal, float3 viewDir
 
 	float2 refractionUV = FrameBuffer::GetDynamicResolutionAdjustedScreenPosition(refractionUvRaw);
 	float3 refractionColor = RefractionTex.Sample(RefractionSampler, refractionUV).xyz;
-	float3 refractionDiffuseColor = lerp(Color::Water(ShallowColor.xyz), Color::Water(DeepColor.xyz), distanceMul.y);
+	float3 refractionDiffuseColor = lerp(Color::Water(ShallowColor.xyz), Color::Water(DeepColor.xyz), distanceMul.y) * SharedData::terrainVariationSettings.pad0.x;  // (52a) x the water body class factor (1 off)
 
 #				if defined(UNDERWATER)
 	float refractionMul = 0;
@@ -961,7 +961,7 @@ DiffuseOutput GetWaterDiffuseColor(PS_INPUT input, float3 normal, float3 viewDir
 	return output;
 #			else
 	DiffuseOutput output;
-	output.refractionColor = lerp(Color::Water(ShallowColor.xyz), Color::Water(DeepColor.xyz), fresnel) * GetLdotN(normal);
+	output.refractionColor = lerp(Color::Water(ShallowColor.xyz), Color::Water(DeepColor.xyz), fresnel) * GetLdotN(normal) * SharedData::terrainVariationSettings.pad0.x;  // (52a) x the water body class factor (1 off)
 	output.refractionDiffuseColor = output.refractionColor;
 	output.depth = 1;
 	output.refractionMul = 1;
@@ -982,7 +982,10 @@ float3 GetSunColor(float3 normal, float3 viewDirection)
 	float reflectionMul = VarAmounts.x > 0 ? exp2(VarAmounts.x * log2(saturate(dot(reflectionDirection, SunDir.xyz)))) : 1.0;
 
 	float llDirLightMult = (SharedData::linearLightingSettings.enableLinearLighting && !SharedData::linearLightingSettings.isDirLightLinear) ? SharedData::linearLightingSettings.dirLightMult : 1.0f;
-	return reflectionMul * Color::DirectionalLight(SunColor.xyz / max(llDirLightMult, 1e-5), SharedData::linearLightingSettings.isDirLightLinear) * SunDir.w * DeepColor.w * llDirLightMult;
+	// (52a) Physical Lighting on (LODBlendingSettings.pad0.z = 1): the sun glint takes SharedData::DirLightColor (the light the scene uses, with its
+	// class factor) instead of the engine's SunColor constant. Off (0): SunColor exactly as before.
+	const float3 glintLight = SharedData::lodBlendingSettings.pad0.z > 0.5 ? SharedData::DirLightColor.xyz : SunColor.xyz;
+	return reflectionMul * Color::DirectionalLight(glintLight / max(llDirLightMult, 1e-5), SharedData::linearLightingSettings.isDirLightLinear) * SunDir.w * DeepColor.w * llDirLightMult;
 #			endif
 }
 #		endif
@@ -1169,7 +1172,7 @@ PS_OUTPUT main(PS_INPUT input)
 #				endif
 
 #				if defined(UNDERWATER)
-	float3 finalSpecularColor = lerp(Color::Water(ShallowColor.xyz), specularColor, 0.5);
+	float3 finalSpecularColor = lerp(Color::Water(ShallowColor.xyz) * SharedData::terrainVariationSettings.pad0.x, specularColor, 0.5);  // (52a) x the water body class factor (1 off)
 	float3 finalColor = saturate(1 - input.WPosition.w * 0.002) * ((1 - fresnel) * (diffuseColor - finalSpecularColor)) + finalSpecularColor;
 	// Add ripple and splash color effects for underwater
 #					if defined(WETNESS_EFFECTS) && defined(DEBUG_WETNESS_EFFECTS)
@@ -1198,7 +1201,7 @@ PS_OUTPUT main(PS_INPUT input)
 #					if defined(VC)
 	float specularFraction = lerp(1, fresnel * diffuseOutput.refractionMul, distanceFactor);
 	float3 finalColorPreFog = lerp(diffuseColor, specularColor, specularFraction) + sunColor * depthControl.w;
-	float3 fogColor = Color::Fog(input.FogParam.xyz);
+	float3 fogColor = Color::Fog(input.FogParam.xyz) * asfloat(SharedData::postProcessingSettings.pad0.x);  // (52a) x the fog class factor (1 off)
 	float fogFactor = Color::FogAlpha(input.FogParam.w);
 	float weatherFogAmount = 0.0;  // (47b)
 #						if defined(IBL)
@@ -1236,7 +1239,7 @@ PS_OUTPUT main(PS_INPUT input)
 #					else
 	float specularFraction = lerp(1, fresnel, distanceFactor);
 	float3 finalColorPreFog = lerp(diffuseOutput.refractionDiffuseColor, specularColor, specularFraction) + sunColor * depthControl.w;
-	float3 preFogColor = Color::Fog(input.FogParam.xyz);
+	float3 preFogColor = Color::Fog(input.FogParam.xyz) * asfloat(SharedData::postProcessingSettings.pad0.x);  // (52a) x the fog class factor (1 off)
 	float preFogFactor = Color::FogAlpha(input.FogParam.w);
 	float weatherFogAmount = 0.0;  // (47b)
 #						if defined(IBL)
@@ -1269,7 +1272,7 @@ PS_OUTPUT main(PS_INPUT input)
 	float3 refractionColor = diffuseOutput.refractionColor;
 
 	float fogFactor = min(FogParam.w, pow(saturate(-diffuseOutput.depth * FogParam.y - FogParam.x), FogParam.z));
-	float3 fogColor = Color::Fog(lerp(FogNearColor.xyz, FogFarColor.xyz, fogFactor));
+	float3 fogColor = Color::Fog(lerp(FogNearColor.xyz, FogFarColor.xyz, fogFactor)) * asfloat(SharedData::postProcessingSettings.pad0.x);  // (52a) x the fog class factor (1 off)
 #						if defined(EXP_HEIGHT_FOG)
 	if (SharedData::exponentialHeightFogSettings.enabled) {
 		fogFactor = 0;

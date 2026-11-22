@@ -19,11 +19,12 @@ StructuredBuffer<float> RWTexAdaptation : register(t1);
 
 #if defined(EYE_MODE)
 	// (50a) Eye Model: the eye's divisor and adapted level (CS_Average's eye variant), mesopic or Classic's Purkinje.
-	float3 color = AutoExposureMath::ExposeColorEye(TexColor[tid].rgb, RWTexAdaptation[0], RWTexAdaptation[1], ExposureCompensation, PurkinjeStartEV, PurkinjeMaxEV,
+	float3 color = AutoExposureMath::ExposeColorEye(TexColor[tid].rgb * SceneScaleInv, RWTexAdaptation[0], RWTexAdaptation[1], ExposureCompensation, PurkinjeStartEV, PurkinjeMaxEV,
 		PurkinjeStrength, EyeMesopic);
 #else
 	// (44e) The math lives in exposure.hlsli, so Local Exposure can apply it on load instead.
-	float3 color = AutoExposureMath::ExposeColor(TexColor[tid].rgb, RWTexAdaptation[0], ExposureCompensation, AdaptationRange, PurkinjeStartEV, PurkinjeMaxEV, PurkinjeStrength);
+	// (52a) Physical Lighting: x 1 / S, the frame's pre-exposure divided out (x 1.0 with the master off).
+	float3 color = AutoExposureMath::ExposeColor(TexColor[tid].rgb * SceneScaleInv, RWTexAdaptation[0], ExposureCompensation, AdaptationRange, PurkinjeStartEV, PurkinjeMaxEV, PurkinjeStrength);
 #endif
 
 	RWTexOut[tid] = float4(color, 1);

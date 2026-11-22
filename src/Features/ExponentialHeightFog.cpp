@@ -6,6 +6,7 @@
 #include "Features/InverseSquareLighting.h"
 #include "Features/LightLimitFix.h"
 #include "Features/LinearLighting.h"
+#include "Features/PhysicalLighting.h"
 #include "Features/PhysicalSky.h"
 #include "Features/RayTracing.h"
 #include "Features/Skylighting.h"
@@ -893,6 +894,16 @@ void ExponentialHeightFog::Prepass()
             const float invRange = 1.0f / std::max(vanillaFogState.fogFar - fogNear, 1.0f);
             cb.weatherNearColor = { nearColor.red, nearColor.green, nearColor.blue, 1.0f };
             cb.weatherFarColor = { farColor.red, farColor.green, farColor.blue, std::max(vanillaFogState.fogPower, 0.05f) };
+            // (52a) Physical Lighting: the weather's fog colours are light here (fog class; 1 with the master off).
+            {
+                const float fogUnits = globals::features::physicalLighting.Scale(PhysicalLighting::Class::Fog);
+                cb.weatherNearColor.x *= fogUnits;
+                cb.weatherNearColor.y *= fogUnits;
+                cb.weatherNearColor.z *= fogUnits;
+                cb.weatherFarColor.x *= fogUnits;
+                cb.weatherFarColor.y *= fogUnits;
+                cb.weatherFarColor.z *= fogUnits;
+            }
             cb.weatherFogParams = { fogNear * invRange, invRange, std::clamp(vanillaFogState.fogClamp, 0.0f, 1.0f), 0.0f };
             for (auto* value : { &cb.weatherNearColor.x, &cb.weatherNearColor.y, &cb.weatherNearColor.z, &cb.weatherFarColor.x, &cb.weatherFarColor.y,
                      &cb.weatherFarColor.z, &cb.weatherFarColor.w, &cb.weatherFogParams.x, &cb.weatherFogParams.y, &cb.weatherFogParams.z }) {
