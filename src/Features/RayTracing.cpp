@@ -333,6 +333,7 @@ namespace
 	// ((50b) 4194304u was Smooth Shadow Edges (extra rays), deleted with its trace loop).
 	constexpr std::uint32_t kPointFlagDarkTolerant = 1048576u, kPointFlagGrazeOffset = 2097152u, kPointFlagSoftCut = 8388608u;
 	constexpr std::uint32_t kPointFlagBlueNoise = 16777216u;  // (50b) TracePointLightsCS: Blue-Noise Sampling (t10)
+	constexpr std::uint32_t kPointFlagWhiteNoise = 33554432u;  // (50e) TracePointLightsCS: RR: White-Noise Sampling (the DLSS RR route only)
 	// (49m) PointDenoiseCS: the trace wrote the fractional encoding (kFlagEdgeRays / kFlagSoftCut).
 	constexpr std::uint32_t kPointDenoiseFractional = 65536u;
 	constexpr std::uint32_t kPointDenoiseNoiseDecorrelate = 256u, kPointDenoiseNoiseStable = 512u, kPointDenoiseNoiseCloseBlur = 1024u;
@@ -2110,6 +2111,8 @@ void RayTracing::LoadSettings(json& o_json)
 		if (settings.SunDenoiserNonRR == static_cast<int>(DenoiserMode::DLSSRR))
 			settings.SunDenoiserNonRR = static_cast<int>(DenoiserMode::Penumbra);
 		settings.PointBlueNoise = read("PointBlueNoise", defaults.PointBlueNoise);
+		settings.PointV2CleanHistory = read("PointV2CleanHistory", defaults.PointV2CleanHistory);  // (50e)
+		settings.PointRRWhiteNoise = read("PointRRWhiteNoise", defaults.PointRRWhiteNoise);  // (50e)
 		settings.LoadFinish = read("LoadFinish", defaults.LoadFinish);  // (49c) (49b Hitch* keys: no longer read)
 		settings.PointQuality = read("PointQuality", -1);
 		settings.AOQuality = read("AOQuality", -1);
@@ -2358,6 +2361,8 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["PointDenoiserNonRR"] = settings.PointDenoiserNonRR;
 	o_json["SunDenoiserNonRR"] = settings.SunDenoiserNonRR;
 	o_json["PointBlueNoise"] = settings.PointBlueNoise;
+	o_json["PointV2CleanHistory"] = settings.PointV2CleanHistory;  // (50e)
+	o_json["PointRRWhiteNoise"] = settings.PointRRWhiteNoise;  // (50e)
 	o_json["LoadFinish"] = settings.LoadFinish;  // (49c)
 }
 
@@ -2548,6 +2553,10 @@ void RayTracing::PrecompileShaders()
 		// (50b) Off / Penumbra v2 / DLSS RR: PointDenoiseV2CS (both variants: Extra Lights Where Crowded can ask for slots 4 - 5 anywhere).
 		PointDenoiseV2Shader(false);
 		PointDenoiseV2Shader(true);
+		if (settings.PointV2CleanHistory && !pointV2CleanFailed) {  // (50e) Moving Characters: Clean Shadow History
+			PointDenoiseV2Shader(false, true);
+			PointDenoiseV2Shader(true, true);
+		}
 		GetShader(pointMaskCS, L"Data\\Shaders\\RayTracing\\PointMaskCS.hlsl", "PointMaskCS");
 	}
 	if (settings.PointLights && settings.PointDenoiser == kPointPenumbra) {
@@ -2653,10 +2662,15 @@ ID3D11ComputeShader* RayTracing::PointDenoiseShader(bool a_wide, bool a_beam, bo
 	return GetShader(pointDenoiseCS, kPath, "PointDenoiseCS");
 }
 
-ID3D11ComputeShader* RayTracing::PointDenoiseV2Shader(bool a_wide)
+ID3D11ComputeShader* RayTracing::PointDenoiseV2Shader(bool a_wide, bool a_clean)
 {
-	// (50b) Penumbra v2 / Off / DLSS RR: one shader, PL_WIDE for slots 4 - 5.
+	// (50b) Penumbra v2 / Off / DLSS RR: one shader, PL_WIDE for slots 4 - 5. (50e) PL_CLEAN twins: Moving Characters: Clean Shadow History
+	// (without it its code is not compiled: the 50d shaders).
 	const wchar_t* kPath = L"Data\\Shaders\\RayTracing\\PointDenoiseV2CS.hlsl";
+	if (a_clean && a_wide)
+		return GetShaderDefined(pointDenoiseV2CS[3], kPath, "PointDenoiseV2CS (slots 4-5, clean history)", "PL_WIDE,PL_CLEAN");
+	if (a_clean)
+		return GetShaderDefined(pointDenoiseV2CS[2], kPath, "PointDenoiseV2CS (clean history)", "PL_CLEAN");
 	if (a_wide)
 		return GetShaderDefined(pointDenoiseV2CS[1], kPath, "PointDenoiseV2CS (slots 4-5)", "PL_WIDE");
 	return GetShader(pointDenoiseV2CS[0], kPath, "PointDenoiseV2CS");
@@ -5906,6 +5920,11 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	// (50b) Blue-Noise Sampling (loaded on first use; its copy goes out in this frame's point list before the trace).
 	if (settings.PointBlueNoise && backend.EnsurePointBlueNoise())
 		flags |= kPointFlagBlueNoise;
+	// (50e) RR: White-Noise Sampling: on the DLSS RR route (the denoiser of this frame, decided as FinishPointLights will) the disc samples
+	// come from an independent hash per pixel, frame, slot and source (Ray Reconstruction wants uncorrelated per-pixel noise; the tiled
+	// blue noise is a screen-space pattern shared by the lights). Other denoisers: unchanged.
+	if (settings.PointRRWhiteNoise && EffectivePointDenoiser() == kPointRR)
+		flags |= kPointFlagWhiteNoise;
 	if (wide)  // (48a)
 		flags |= kPointFlagWide | (widePrev ? kPointFlagWidePrev : 0u);
 	if (extra)  // (48c)
@@ -6189,7 +6208,23 @@ void RayTracing::FinishPointLightsV2(int a_mode)
 	// the filtered copy for the lit effects). A shader or texture failure: Penumbra from then on this session (pointV2Failed).
 	constexpr std::uint32_t kV2Off = 131072u, kV2RR = 262144u, kV2LenHistory = 524288u;  // PointDenoiseV2CS
 	bool wide = pointWideThisFrame && backend.PointWideSRV() && pointWide[0].texture && pointWide[1].texture;
-	ID3D11ComputeShader* shader = PointDenoiseV2Shader(wide);
+	// (50e) Moving Characters: Clean Shadow History (Point Light Shadows page): the PL_CLEAN twin, with last frame's motion vectors (t6).
+	// With the switch off it runs only for the Moving Pixels view (detection only: the picture as without it); otherwise the 50d shader.
+	ID3D11ShaderResourceView* const motionSRV = globals::game::renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGET::kMOTION_VECTOR].SRV;
+	const bool plDebug = PointDenoiserDebugView() && debugColorUAV;
+	const bool cleanUsed = settings.PointV2CleanHistory && a_mode != kPointOff && motionSRV && !pointV2CleanFailed;
+	bool clean = cleanUsed || (plDebug && debugView == DebugView::PLMoving && a_mode != kPointOff && motionSRV && !pointV2CleanFailed);
+	ID3D11ComputeShader* shader = nullptr;
+	if (clean) {
+		shader = PointDenoiseV2Shader(wide, true);
+		if (!shader) {  // either twin failing: without it from then on (the plain shaders below keep their own fallbacks)
+			clean = false;
+			pointV2CleanFailed = true;
+			logger::warn("[RayTracing] PointDenoiseV2CS (clean history) did not compile: Moving Characters: Clean Shadow History is off this session");
+		}
+	}
+	if (!shader)
+		shader = PointDenoiseV2Shader(wide);
 	if (!shader && wide) {
 		if (!pointWideDenoiseFailed) {
 			pointWideDenoiseFailed = true;
@@ -6215,13 +6250,13 @@ void RayTracing::FinishPointLightsV2(int a_mode)
 	auto* context = globals::d3d::context;
 	auto* timers = Util::GpuPassTimers::GetSingleton();
 	const std::uint32_t write = pointWrite, read = pointWrite ^ 1u;
-	const bool plDebug = PointDenoiserDebugView() && debugColorUAV;
-	ID3D11ShaderResourceView* motionSRV = globals::game::renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGET::kMOTION_VECTOR].SRV;
 	PointDenoiseCB cb{};
 	cb.Params[0] = settings.PointLightsSize;
 	cb.Params[1] = kPointHistoryWeight;  // (not read by PointDenoiseV2CS)
 	const bool history = pointHistoryValid && prevCameraValid;
 	std::uint32_t flags = (history ? kPointDenoiseHistory : 0u) | (plDebug ? kPointDenoiseDebug : 0u) | (motionSRV ? kPointDenoiseMotion : 0u);
+	if (clean)  // (50e) only read by the PL_CLEAN twin
+		flags |= kPointDenoiseCleanDetect | (cleanUsed ? kPointDenoiseClean : 0u);
 	if (pointFractionalThisFrame)
 		flags |= kPointDenoiseFractional;
 	const bool wideHistory = wide && pointWideHistoryValid && history;
@@ -9330,6 +9365,28 @@ void RayTracing::DrawPointLightPage()
 				ImGui::Text("  Practically free. Off: the 50a pattern. Needs the blue-noise texture of Skylighting (installed with it).");
 				if (backend.PointBlueNoiseFailed())
 					ImGui::Text("Not available this session (the texture could not be loaded): the 50a pattern is used.");
+				ImGui::Text("With the DLSS RR route and RR: White-Noise Sampling on, the white noise is used instead.");
+			}
+			// (50e) RR: White-Noise Sampling (TracePointLightsCS kFlagWhiteNoise, only on the DLSS RR route).
+			ImGui::Checkbox("RR: White-Noise Sampling", &settings.PointRRWhiteNoise);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Only while the point lights take the DLSS RR route. On (default): the point on the flame each ray aims at is picked");
+				ImGui::Text("  independently per pixel, frame and light (white noise), as Ray Reconstruction wants its input: no screen-space pattern,");
+				ImGui::Text("  nothing shared between lights. Off: Blue-Noise Sampling (or the 50a pattern) as with the other denoisers.");
+				ImGui::Text("Penumbra, Penumbra v2 and Off are not affected (the blue noise suits them). Practically free.");
+			}
+			// (50e) Moving Characters: Clean Shadow History for Penumbra v2 (PointDenoiseV2CS PL_CLEAN).
+			ImGui::Checkbox("Moving Characters: Clean Shadow History", &settings.PointV2CleanHistory);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Penumbra v2 (and the DLSS RR route's copy for smoke and other lit effects). On (default): a surface that moves by itself");
+				ImGui::Text("  (a running character's legs and arms; the game's motion vectors) takes its last frame only from where it really was,");
+				ImGui::Text("  with a strict match, else starts fresh with v2's wide, smooth estimate; the blur keeps to the same surface; the old");
+				ImGui::Text("  result counts at most as much as this frame; a carried torch that moves lets its old shadow go faster. No more white");
+				ImGui::Text("  smears trailing on legs and arms. Off: Penumbra v2 exactly as in 50d.");
+				ImGui::Text("Penumbra (the old denoiser) always has its own version of this. Debug View \"Point Lights: Moving Pixels\" shows");
+				ImGui::Text("  which pixels count as moving. Practically free.");
+				if (pointV2CleanFailed)
+					ImGui::Text("Not available this session (its shader did not compile): Penumbra v2 runs without it.");
 			}
 		}
 		ImGui::SliderFloat("Light Size", &settings.PointLightsSize, 0.0f, 32.0f, "%.1f units");
@@ -9971,7 +10028,8 @@ void RayTracing::DrawDiagnostics()
 			ImGui::Text("Point Lights: Raw Rays / Denoised: the point-light shadows before / after the clean-up (white = lit).");
 			// (48m)
 			ImGui::Text("Point Lights: Moving Pixels: where the lamp-shadow clean-up sees a moving surface (game motion vectors): red = it took that");
-			ImGui::Text("  surface's own last frame, yellow = none usable (this frame only), magenta = moving but Clean Shadow History is not running (its shader did not compile).");
+			ImGui::Text("  surface's own last frame, yellow = none usable (this frame only), magenta = moving but Clean Shadow History is not running");
+			ImGui::Text("  (Penumbra v2: its switch on the Point Light Shadows page is off; Penumbra: its shader did not compile). (50e) Penumbra v2 too.");
 			ImGui::Text("Point Lights: Filter Path: the strongest traced light per pixel. Even rows: red = window beam path, green = Stable Penumbra,");
 			ImGui::Text("  blue = standard path, brighter = wider blur (full at 12 px). Odd rows: how much of this frame goes in (dark = 10 %, white = all).");
 			// (47h)
@@ -10222,6 +10280,8 @@ std::string RayTracing::DescribeForProfile() const
 	static constexpr const char* kPointDenoisers[5] = { "off", "penumbra", "penumbra v2", "DLSS RR", "-" };
 	text += std::format(", point denoiser {} (in effect {}), point blue noise {}", kPointDenoisers[std::clamp(settings.PointDenoiser, 0, 3)],
 		kPointDenoisers[pointModeThisFrame < 0 ? 4 : std::clamp(pointModeThisFrame, 0, 3)], settings.PointBlueNoise ? (backend.PointBlueNoiseFailed() ? "failed" : "on") : "off");
+	text += std::format(", point RR white noise {}, v2 clean shadow history {}", settings.PointRRWhiteNoise ? "on" : "off",
+		settings.PointV2CleanHistory ? (pointV2CleanFailed ? "failed" : "on") : "off");  // (50e)
 	// (48o) The fixed switches (47x - 48m) are no longer listed; the measurements stay.
 	text += std::format(", buildings kept in the sun shadow map: {} draws", RayTracingCasterFilter::KeptLastFrame());
 	text += std::format(", lights per pixel this frame {}{}",
@@ -10324,6 +10384,8 @@ nlohmann::json RayTracing::DescribeJson() const
 	j["point_denoiser"] = settings.PointDenoiser;  // (50b) 0 off, 1 penumbra, 2 penumbra v2, 3 DLSS RR
 	j["point_denoiser_effective"] = pointModeThisFrame;
 	j["point_blue_noise"] = settings.PointBlueNoise ? (backend.PointBlueNoiseFailed() ? "failed" : "on") : "off";
+	j["point_rr_white_noise"] = settings.PointRRWhiteNoise;  // (50e)
+	j["point_v2_clean_history"] = settings.PointV2CleanHistory ? (pointV2CleanFailed ? "failed" : "on") : "off";
 	j["point_v2_mb"] = static_cast<double>(pointV2D3D11Bytes + backend.PointBlueNoiseBytes()) / (1024.0 * 1024.0);
 	j["rt_contact_scale"] = settings.RtContactScale;
 	// (48o) The fixed switches (47n - 48m) are no longer written; their measurements stay.

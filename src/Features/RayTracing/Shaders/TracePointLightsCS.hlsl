@@ -165,6 +165,10 @@ static const uint kFlagSoftCut = 8388608u;
 // numbers: blue noise as a pair, in space and over its 64 frames), the texel at the pixel shifted per slot (decorrelated slots), the slice
 // = the frame. Replaces the R2 / beam patterns for the point rays (the water rays keep theirs). Off: exactly as before.
 static const uint kFlagBlueNoise = 16777216u;
+// (50e) "RR: White-Noise Sampling" (only set while the point lights take the DLSS RR route): every point slot's disc sample from an
+// independent hash of (pixel, frame, slot, source): white noise, no screen-space pattern and nothing shared between lights, as Ray
+// Reconstruction asks of its input. Takes precedence over kFlagBlueNoise. Off: exactly as before.
+static const uint kFlagWhiteNoise = 33554432u;
 static const float kSoftCutRange = 1.5;
 // (49m) Encoding with kFlagSoftCut (PointDenoiseCS kPLFlagFractional): 255 = lit; 128..254 = partly lit, (b - 128) / 126 the
 // lit fraction (no blocker distance); 0..127 = blocked, b / 127 = sqrt(blocker distance / light distance). Without them: as before.
@@ -308,6 +312,21 @@ float2 BlueNoiseSample(uint2 p, uint frame, uint k)
 	const uint2 t = (p + uint2(37u, 71u) * k) & 127u;
 	const uint word = BlueNoise.Load(((((frame & 63u) << 7u) + t.y) << 7u | t.x) << 2u);
 	return (float2(word & 0xFFu, (word >> 8u) & 0xFFu) + 0.5) * (1.0 / 256.0);
+}
+
+// (50e) kFlagWhiteNoise: PCG hash chain (Jarzynski / Olano 2020, as PointDenoiseV2CS's) over pixel, frame, slot and source; two
+// independent 24-bit numbers.
+uint PcgHash(uint a_v)
+{
+	const uint state = a_v * 747796405u + 2891336453u;
+	const uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+	return (word >> 22u) ^ word;
+}
+float2 WhiteNoiseSample(uint2 p, uint frame, uint k, uint source)
+{
+	const uint h = PcgHash(p.x ^ PcgHash(p.y ^ PcgHash(frame ^ PcgHash(k * 131u + source * 7919u + 0x9E3779B9u))));
+	const uint h2 = PcgHash(h ^ 0x85EBCA6Bu);
+	return float2(float(h >> 8u), float(h2 >> 8u)) * (1.0 / 16777216.0);
 }
 
 // Lighting.hlsl's attenuation (InverseSquareLighting::GetAttenuation, or 1 - (d / r)^2).
@@ -987,6 +1006,10 @@ groupshared uint gsMask[2];
 		[branch] if (flags & kFlagBlueNoise)
 		{
 			u = BlueNoiseSample(uint2(p), uint(C.Params.y), k);  // (50b)
+		}
+		[branch] if (flags & kFlagWhiteNoise)
+		{
+			u = WhiteNoiseSample(uint2(p), uint(C.Params.y), k, bestIdx[k]);  // (50e) the DLSS RR route
 		}
 		idxA[k] = bestIdx[k];
 		// (49m) Soft Hand-Off for Weak Lights: no shadow at the cut, the full shadow from kSoftCutRange x the cut.

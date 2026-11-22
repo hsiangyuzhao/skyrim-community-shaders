@@ -288,6 +288,12 @@ public:
 		int PointDenoiserNonRR = kPointV2;
 		int SunDenoiserNonRR = static_cast<int>(DenoiserMode::Penumbra);
 		bool PointBlueNoise = true;
+		// (50e) PointV2CleanHistory "Moving Characters: Clean Shadow History" for Penumbra v2 (PointDenoiseV2CS PL_CLEAN: 48m's moving-
+		// receiver handling fitted to v2; off: the 50d shader exactly). PointRRWhiteNoise "RR: White-Noise Sampling": on the DLSS RR route the
+		// point rays' disc samples from an independent per pixel / frame / slot / source hash (TracePointLightsCS kFlagWhiteNoise) instead
+		// of the blue noise; the other denoisers unchanged. Outside the settings macro.
+		bool PointV2CleanHistory = true;
+		bool PointRRWhiteNoise = true;
 		bool ParticlesRTShadows = true;
 		// (50a) "Smooth Shadows on Smoke and Water Sheets": lit effects interpolate the point-light visibility between the fog grid's cells
 		// and the opaque surface behind them (Effect.hlsl RTFogVis::SmoothVisibility) instead of the nearest cell (49b: 16-px blocks).
@@ -1226,15 +1232,17 @@ private:
 	// pointLen: per pixel and slot the history length (4 bits x 6 slots, R32_UINT, ping-pong with pointWrite); pointRaw / pointRawWide: the
 	// decoded rays Lighting reads in the DLSS RR mode (slots 0 - 3 / 4 - 5), while the lit effects get the filtered copy in pointVis /
 	// pointWide (BindEffectPointVisibility / RestoreEffectPointVisibility around every effect draw).
-	winrt::com_ptr<ID3D11ComputeShader> pointDenoiseV2CS[2];
+	// (50e) [2] / [3]: the PL_CLEAN twins (Moving Characters: Clean Shadow History for v2, or its Moving Pixels view).
+	winrt::com_ptr<ID3D11ComputeShader> pointDenoiseV2CS[4];
 	DenoiseTexture pointLen[2], pointRaw, pointRawWide;
 	std::uint64_t pointV2D3D11Bytes = 0;
 	bool pointLenValid = false;   // pointLen[read] holds last frame's lengths (written by PointDenoiseV2CS)
 	bool pointRRBound = false;    // this frame's t40 / t46 hold the raw rays (DLSS RR mode): the effect draws swap in the filtered copy
 	bool pointEffectSwapped = false;
 	bool pointV2Failed = false;   // PointDenoiseV2CS did not compile / its textures failed: Penumbra this session
+	bool pointV2CleanFailed = false;  // (50e) a PL_CLEAN variant of PointDenoiseV2CS did not compile: v2 without it this session
 	int pointModeThisFrame = -1;  // the point denoiser that ran this frame (PointDenoiserMode), -1 none
-	ID3D11ComputeShader* PointDenoiseV2Shader(bool a_wide);
+	ID3D11ComputeShader* PointDenoiseV2Shader(bool a_wide, bool a_clean = false);
 	bool EnsurePointV2(std::uint32_t a_width, std::uint32_t a_height, bool a_rr, bool a_wide);
 	void ReleasePointV2();
 	void FinishPointLightsV2(int a_mode);

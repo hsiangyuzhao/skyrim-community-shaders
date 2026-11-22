@@ -26,6 +26,17 @@
 //   OutVis / OutWide get a cheap filtered copy (the 3x3 mean with the clamped history, no wide pass) for the lit effects (Effect.hlsl reads
 //   t40 / t46 there: RayTracing binds this copy for every effect draw and the raw rays again after it).
 // Variants: PL_WIDE = slots 4 - 5 (K > 4 this frame), as PointDenoiseCS.
+// (50e) PL_CLEAN = "Moving Characters: Clean Shadow History" for v2 (Point Light Shadows page). All its code is inside #if defined(PL_CLEAN)
+// blocks: the preprocessed source of the variants without it is the 50d shader. kPLFlagCleanDetect: the moving test runs (motion vectors
+// at t6; also for the Moving Pixels view with the switch off); kPLFlagClean: its result is used (48m's moving-receiver handling, fitted to v2):
+//   - moving receiver: last frame's motion vectors (two fixed-point steps from this pixel) land more than max(kCleanResidualPx,
+//     kCleanResidualShare x the camera's own motion) from the camera reprojection. There only the motion-vector candidate (from this pixel)
+//     is taken, with the strict distance test (kCleanTolScale x distance + kCleanTolBase) and at least kCleanMinTapWeight of valid taps,
+//     else no history (n = 0: v2's young-slot path, wide and smooth); the 3x3, the probe and the wide pass take the strict plane test
+//     (kCleanPlaneScale x distance + kCleanPlaneBase: taps of the floor, the background or the other leg do not count); the history length
+//     n0 is at most kCleanMovingLen (this frame weighs at least 1 / 2); where the 3x3 agrees the history is clamped to it exactly;
+//   - every pixel: the clamp band at most kCleanBandMax (a thin limb's 2 - 3 samples gave a band of +-0.75 .. 1: no clamp at all), and a
+//     light that moved (PLMotion byte b < 255, a carried torch) keeps n0 x (1 - b / 255) of its history length (the old filter's HistoryDrop).
 
 #include "RayTracing/Common.hlsli"
 
@@ -93,6 +104,20 @@ static const uint kViewPLSources = 13u;
 static const uint kViewPLRaw = 14u;
 static const uint kViewPLDenoised = 15u;
 static const uint kViewPLFilterPath = 18u;
+#if defined(PL_CLEAN)
+static const uint kPLFlagClean = 4096u;        // (50e) the values PointDenoiseCS's PL_CLEAN uses
+static const uint kPLFlagCleanDetect = 8192u;
+static const float kCleanResidualPx = 1.5;
+static const float kCleanResidualShare = 0.25;
+static const float kCleanTolScale = 0.005;
+static const float kCleanTolBase = 3.0;
+static const float kCleanMinTapWeight = 0.75;
+static const float kCleanPlaneScale = 0.002;
+static const float kCleanPlaneBase = 1.0;
+static const float kCleanMovingLen = 1.0;
+static const float kCleanBandMax = 0.3;
+static const uint kViewPLMoving = 17u;  // RayTracing::DebugView::PLMoving
+#endif
 
 #if defined(PL_WIDE)
 static const bool kVariantWide = true;
@@ -254,6 +279,9 @@ struct PixelFrame
 	float planeTolerance;
 	uint flags;
 	float rotation;  // the taps' rotation (radians), per pixel and frame
+#if defined(PL_CLEAN)
+	bool moving;  // (50e) a moving receiver, used (kPLFlagClean)
+#endif
 };
 
 // One set of four slots (slots 0 - 3, or 4 - 5 with ids.zw = 0). Returns the visibility; o_len = the new history lengths, o_radius /
@@ -267,6 +295,10 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw, 
 	const uint flags = a_px.flags;
 	const bool offMode = (flags & kPLFlagV2Off) != 0u;
 	const bool rrMode = (flags & kPLFlagV2RR) != 0u;
+#if defined(PL_CLEAN)
+	const bool cleanOn = (flags & kPLFlagClean) != 0u;
+	const bool cleanMoving = cleanOn && a_px.moving;  // (50e) the plane tolerance is already the strict one then
+#endif
 	// Per-slot results in arrays (indexable in the slot loop below), packed at the end.
 	float resA[4] = { 1.0, 1.0, 1.0, 1.0 }, lenA[4] = { 0.0, 0.0, 0.0, 0.0 }, radA[4] = { 0.0, 0.0, 0.0, 0.0 }, wA[4] = { 1.0, 1.0, 1.0, 1.0 };
 
@@ -325,7 +357,18 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw, 
 		}
 		const bool hasHist = (flags & kPLFlagHistory) != 0u && hw[s] >= 0.05 && SourceByte(PLMotion, id) < 255u;
 		const float h = hasHist ? hv[s] / hw[s] : 0.0;
+#if defined(PL_CLEAN)
+		float n0 = hasHist ? clamp(hn[s] / hw[s], 0.0, kLenMax) : 0.0;
+		[branch] if (cleanOn)
+		{
+			// (50e) A light that moved keeps (1 - its PLMotion byte / 255) of the history length; a moving receiver at most kCleanMovingLen.
+			n0 *= 1.0 - float(SourceByte(PLMotion, id)) / 255.0;
+			if (cleanMoving)
+				n0 = min(n0, kCleanMovingLen);
+		}
+#else
 		const float n0 = hasHist ? clamp(hn[s] / hw[s], 0.0, kLenMax) : 0.0;
+#endif
 		const float youth = saturate(1.0 - n0 / kYouthFrames);
 
 		// 2. The wide pass (not in the DLSS RR copy): where the 3x3 disagrees, the history is partial or the slot is young.
@@ -407,8 +450,21 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw, 
 		[branch] if (hasHist)
 		{
 			const float ne = max(neff, 1.0);
+#if defined(PL_CLEAN)
+			float band = kClampK * sqrt(saturate((saturate(m * (1.0 - m)) + 1.0 / ne) / ne));
+			float clamped;
+			[branch] if (cleanOn)
+			{
+				// (50e) The band at most kCleanBandMax; a moving receiver whose 3x3 agrees: the history clamped to it exactly.
+				band = min(band, kCleanBandMax);
+				clamped = (cleanMoving && weights[s] > 0.0 && hi[s] <= lo[s]) ? lo[s] : clamp(h, m - band, m + band);
+			}
+			else
+				clamped = clamp(h, m - band, m + band);
+#else
 			const float band = kClampK * sqrt(saturate((saturate(m * (1.0 - m)) + 1.0 / ne) / ne));
 			const float clamped = clamp(h, m - band, m + band);
+#endif
 			const float moved = abs(clamped - h) / max(band, 1e-3);
 			n = n0 * saturate(1.0 - moved);
 			const float a = max(1.0 / (n + 1.0), kMinWeight);
@@ -445,6 +501,9 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw, 
 	float2 wideLen = 0.0;
 	float dist = -1.0;
 	float4 dbgRadius = 0.0, dbgWeight = 1.0;
+#if defined(PL_CLEAN)
+	uint movingState = 0u;  // (50e) Moving Pixels view: 1 moving + history taken, 2 moving + no history, 3 moving (switch off: detection only)
+#endif
 
 	[branch] if (!RTIsSky(depth) && (any(ids != 0u) || any(wideIds != 0u)))
 	{
@@ -470,6 +529,9 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw, 
 			px.footprint = max(length(RTPosition(pr, depth) - P), 1e-3);
 		}
 		px.planeTolerance = dist * 0.01 + 2.0;
+#if defined(PL_CLEAN)
+		px.moving = false;
+#endif
 
 		// History taps: the camera reprojection, (47y) last frame's motion vectors where it finds (almost) nothing.
 		float4 hv = 0.0, hw = 0.0, hn = 0.0;
@@ -484,14 +546,62 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw, 
 			const float tolerance = expected * 0.02 + 8.0;
 			histExpected = expected;
 			float tapWeight = 0.0;
+#if defined(PL_CLEAN)
+			// (50e) Moving Characters: Clean Shadow History: is the receiver moving (last frame's motion vectors vs the camera reprojection)?
+			bool movingClean = false;
+			[branch] if ((flags & kPLFlagCleanDetect) && all(prevUv >= 0.0) && all(prevUv < 1.0))
+			{
+				const float2 uvc = (float2(p) + 0.5) / float2(Size.xy);
+				float2 mc = uvc;  // from this pixel (the camera guess may lie off a moving body: its background's vector would hide the motion)
+				[unroll] for (int ic = 0; ic < 2; ++ic)
+				{
+					const int2 qc = int2(clamp(mc, 0.0, 0.999999) * float2(Size.xy));
+					mc = uvc + PrevMotion[qc];
+				}
+				const float residualPx = length((mc - prevUv) * float2(Size.xy));
+				const float cameraPx = length((prevUv - uvc) * float2(Size.xy));
+				const bool moving = residualPx > max(kCleanResidualPx, kCleanResidualShare * cameraPx);
+				movingState = moving ? 3u : 0u;
+				[branch] if (moving && (flags & kPLFlagClean))
+				{
+					// Only the motion-vector history, strictly; none otherwise. The strict plane test for the spatial passes.
+					movingClean = true;
+					px.moving = true;
+					px.planeTolerance = dist * kCleanPlaneScale + kCleanPlaneBase;
+					movingState = 2u;
+					[branch] if (all(mc >= 0.0) && all(mc < 1.0))
+					{
+						const float tolc = expected * kCleanTolScale + kCleanTolBase;
+						const float2 motionPos = mc * float2(Size.xy) - 0.5;
+						float4 mv, mw, mn;
+						const float motionWeight = HistoryTaps(motionPos, expected, tolc, ids, wideHistory, lenHistory, maxP, mv, mw, mn);
+						if (motionWeight >= kCleanMinTapWeight) {
+							hv = mv;
+							hw = mw;
+							hn = mn;
+							histPos = motionPos;
+							histTolerance = tolc;
+							histTaken = true;
+							movingState = 1u;
+						}
+					}
+				}
+			}
+			[branch] if (!movingClean && all(prevUv >= 0.0) && all(prevUv < 1.0))
+#else
 			[branch] if (all(prevUv >= 0.0) && all(prevUv < 1.0))
+#endif
 			{
 				histPos = prevUv * float2(Size.xy) - 0.5;
 				histTolerance = tolerance;
 				histTaken = true;
 				tapWeight = HistoryTaps(histPos, expected, tolerance, ids, wideHistory, lenHistory, maxP, hv, hw, hn);
 			}
+#if defined(PL_CLEAN)
+			[branch] if (!movingClean && (flags & kPLFlagMotion) && tapWeight < kMotionTryBelow)
+#else
 			[branch] if ((flags & kPLFlagMotion) && tapWeight < kMotionTryBelow)
+#endif
 			{
 				const float2 uv = (float2(p) + 0.5) / float2(Size.xy);
 				float2 m = (all(prevUv >= 0.0) && all(prevUv < 1.0)) ? prevUv : uv;
@@ -602,6 +712,18 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw, 
 					debug = float4(saturate(dbgWeight.x).xxx, 1.0);
 			}
 		}
+#if defined(PL_CLEAN)
+		if (view == kViewPLMoving) {
+			// (50e) Red: moving receiver, motion-vector history taken; yellow: moving, no usable history (this frame only); magenta: moving
+			// with Clean Shadow History off (detection only). Nothing: not moving (or nothing traced here).
+			if (movingState == 1u)
+				debug = float4(1.0, 0.1, 0.1, 0.6);
+			else if (movingState == 2u)
+				debug = float4(1.0, 0.9, 0.1, 0.6);
+			else if (movingState == 3u)
+				debug = float4(1.0, 0.2, 1.0, 0.6);
+		}
+#endif
 		DebugColor[p] = debug;
 	}
 }
