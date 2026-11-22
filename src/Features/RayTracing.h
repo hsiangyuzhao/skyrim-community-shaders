@@ -1179,9 +1179,94 @@ private:
 		// (50a) Soft fill lights: per source slot one byte (4 per uint, as Motion) = the fill's emitter radius / kFillEmitterByteUnits
 		// (0 = not a fill: the radius above / Params[0] as before).
 		std::uint32_t FillEmitter[16];
+		// (50f) Moving Characters: Clean Shadow History's moving test (read only by the PL_CLEAN variants; the others' cbuffer ends above):
+		// the last rendered frame's jittered inverse view-projection, its unjittered view-projection and its previous unjittered one (the
+		// matrices its motion vectors were written with; the last one translated to take positions relative to that frame's camera), and
+		// xyz this frame's camera minus that frame's camera, w flags (bits, kCleanHistIsPrev).
+		float CleanPrevInv[16];
+		float CleanPrevCur[16];
+		float CleanPrevPrev[16];
+		float CleanParams[4];
 	};
 	STATIC_ASSERT_ALIGNAS_16(PointDenoiseCB);
-	static_assert(offsetof(PointDenoiseCB, FillEmitter) == 112 && sizeof(PointDenoiseCB) == 176, "PointDenoiseCB must match PointDenoiseCS.hlsl");
+	static_assert(offsetof(PointDenoiseCB, FillEmitter) == 112 && offsetof(PointDenoiseCB, CleanPrevInv) == 176 && sizeof(PointDenoiseCB) == 384,
+		"PointDenoiseCB must match PointDenoiseCS.hlsl / PointDenoiseV2CS.hlsl");
+	static constexpr std::uint32_t kCleanHistIsPrev = 2u;  // (50f) PointDenoise*CS PL_CLEAN: HistDist holds the last rendered frame's distances
+	// (50f) The matrices the game wrote each frame's motion vectors with (recorded at every Prepass; the moving test of frame N uses frame
+	// N - 1's record: the motion vectors it reads are that frame's).
+	struct MotionFrame
+	{
+		std::uint32_t frame = 0;  // State::frameCount (0 = empty)
+		float invViewProj[16]{};
+		float viewProjUnjittered[16]{};
+		float prevViewProjUnjittered[16]{};
+		double camera[3]{};
+		double prevCamera[3]{};
+	};
+	std::array<MotionFrame, 2> motionFrames{};
+	void RecordMotionFrame();
+	/// (50f) Fills the moving test's constants from the last rendered frame's record; false = no record of that frame (no test this frame).
+	bool FillCleanMotion(PointDenoiseCB& a_cb) const;
+	// (50f) Per-frame counts of the PL_CLEAN variants (u8: pixels with a traced light, moving test run, moving), read back a few frames late.
+	winrt::com_ptr<ID3D11Buffer> pointCleanCounter;
+	winrt::com_ptr<ID3D11UnorderedAccessView> pointCleanCounterUAV;
+	static constexpr std::uint32_t kPointCleanRing = 4;
+	std::array<winrt::com_ptr<ID3D11Buffer>, kPointCleanRing> pointCleanStaging;
+	std::array<std::uint32_t, kPointCleanRing> pointCleanStagingFrame{};  // frame written (0 = empty)
+	std::uint32_t pointCleanCursor = 0;
+	bool pointCleanCounterFailed = false;
+	std::uint32_t pointCleanStats[3]{};      // the newest read-back
+	std::uint32_t pointCleanStatsFrame = 0;  // ... its frame (0 = none)
+	bool pointCleanStatsNew = false;         // ... arrived this frame (F7 shows it once, with its age)
+	ID3D11UnorderedAccessView* PointCleanCounterBegin();
+	void PointCleanCounterEnd();
+	void ReadPointCleanStats();
+	void ReleasePointCleanCounter();
+	// (50f) Per-frame point-light outcome (F7 rt_pl_drop_reason; kPLDrop*), the log line for short drop-outs, early-out counts.
+	enum PointDrop : int
+	{
+		kPLDropNotRunning = -1,  // point lights off / not traced in this state (switched off, loading, no interior trace wanted)
+		kPLDropOk = 0,
+		kPLDropNotTraced = 1,     // the frame was not traced (status, no trace this frame)
+		kPLDropBusy = 2,          // no free D3D12 command context
+		kPLDropEarlySkin = 3,     // traced and denoised, but without the characters (Early Prep skinning did not pair)
+		kPLDropPrepare = 4,       // PreparePointLights returned false (no light selected, resources)
+		kPLDropFinishFrame = 5,   // FinishFrame left before the point lights (results not bound)
+		kPLDropFinishPoints = 6,  // FinishPointLights left before the denoiser (results not bound)
+		kPLDropNoHistory = 7,     // denoised, but without history (the frame after a drop-out, a reset)
+	};
+	int pointDrop = kPLDropNotRunning;
+	bool pointHistoryUsed = false;   // this frame's denoiser had last frame's history
+	bool pointEarlySkin = false;     // this frame's trace went out without the characters (Backend earlySkinMismatchFrames moved)
+	/// (50f) Right after ExecuteFrame: the drop reason of a trace that did not go out, the carried history, the sticky state of one that did.
+	void NotePointTrace(const RayTracingRT::FrameInput& a_input, bool a_traced, std::uint32_t a_busyBefore, std::uint32_t a_skinBefore);
+	std::uint32_t finishFrameEarlyOuts = 0, finishPointEarlyOuts = 0;
+	bool pointGoodLast = false;      // the last frame that wanted point lights denoised them
+	std::uint32_t pointDropRun = 0;  // frames in a row without them since then
+	int pointDropRunReasons[3]{};
+	std::uint32_t pointShortDrops = 0, pointShortDropsLogged = 0;
+	std::int64_t pointDropLogQpc = 0;
+	void NotePointOutcome();
+	// (50f) History across a frame that could not trace: the point trace was prepared but not submitted (no FinishFrame ran, so the camera
+	// of the history is still prevViewProj): the history stays valid; the slot motion of the selection made for it is carried to the next
+	// denoise (a slot reassigned in between drops its history there).
+	bool pointSkippedTrace = false;
+	std::array<std::uint8_t, RayTracingPointLights::kMaxSources> pointMotionCarry{};
+	bool pointMotionCarryOn = false;
+	void CarrySkippedMotion();
+	void FillPointMotion(PointDenoiseCB& a_cb) const;
+	std::uint32_t pointHistFrame = 0;  // State::frameCount of the last denoise (its HistDist is the moving test's when it was last frame)
+	// (50f) The trace's own count of pixels with a traced light (Backend read-back word 3): the game frame of each point trace (by its
+	// serial), the newest read-back shown once in F7 (rt_pl_id_pixels / rt_pl_id_age).
+	std::array<std::pair<std::uint64_t, std::uint32_t>, 16> pointTraceFrames{};
+	std::uint64_t pointIdReadSeen = 0;
+	// (50f) The sticky selection's camera and slot 4 - 5 state of this frame's point trace: kept only once the trace was submitted (a
+	// trace that did not run left PLIdx / PLWide with the older trace's ids: the next one reprojects those from the older camera).
+	float pointNextViewProj[16]{};
+	float pointNextJitter[2]{};
+	double pointNextCamera[3]{};
+	bool pointNextWide = false;
+	void CommitPointTraceState();
 	RayTracingPointLights::Selector pointSelector;
 	std::array<RayTracingPointLights::GpuSource, RayTracingPointLights::kMaxSources> pointSources{};
 	RayTracingRT::PointLightInput pointInput{};

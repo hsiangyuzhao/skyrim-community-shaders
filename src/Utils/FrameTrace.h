@@ -232,6 +232,15 @@ namespace Util::FrameTrace
 		float arrivalMs = -1.0f;
 		int loadThreadCopies = -1;
 		int handOffPending = -1;
+		// (50f) Point-light drop-outs: this frame's outcome (RayTracing::PointDrop: -1 not running, 0 ok, 1 not traced, 2 D3D12 busy, 3 traced
+		// without the characters, 4 nothing selected / resources, 5 FinishFrame early-out, 6 denoiser early-out, 7 denoised without history);
+		// Clean Shadow History's moving pixels (percent of the pixels its moving test ran on) and the trace's pixels with a traced light, each
+		// from a read-back shown once on the frame it arrives, with its age in frames (the measured frame is that many rows up; -1 = none).
+		int plDropReason = -1;
+		float plMovingPct = -1.0f;
+		int plMovingAge = -1;
+		std::int64_t plIdPixels = -1;
+		int plIdAge = -1;
 	};
 	void OnRayTracingDetail(const RayTracingDetail& a_detail);
 

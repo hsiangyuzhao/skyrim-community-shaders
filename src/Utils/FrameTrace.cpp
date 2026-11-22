@@ -1098,6 +1098,12 @@ namespace Util::FrameTrace
 				out << "#   loading-screen thread since the last world frame (-1 = none / off); rt_handoff_pending = items still pending at the hand-off (on the\n";
 				out << "#   hand-off frame, -1 otherwise); grass_pool_hits / grass_pool_misses = grass bucket buffer sets reused from / created outside the\n";
 				out << "#   pool by this frame's grass work, loading-screen thread included (-1 = grass not updated).\n";
+				out << "# (50f) rt_pl_drop_reason = the point-light shadows of this frame: -1 not running, 0 ok, 1 not traced, 2 D3D12 busy (no free context),\n";
+				out << "#   3 traced without the characters (Early Prep skinning did not pair), 4 no light selected / no resources, 5 FinishFrame left early,\n";
+				out << "#   6 the denoiser left early, 7 denoised without history (1, 2, 4 - 6: every light took its old shadow this frame).\n";
+				out << "#   rt_pl_moving_pct = Moving Characters: Clean Shadow History: pixels judged moving, percent of those its test ran on;\n";
+				out << "#   rt_pl_id_pixels = the point trace's pixels with a traced light (0 = it came out empty). Each is a read-back shown once; its\n";
+				out << "#   *_age = frames since the frame it measured (that many rows up); -1 = none on this row.\n";
 				out << "# (48c) rt_pl_extra_pct = Extra Lights Where Crowded: percent of the pixels with a ray-traced point light that also traced a light past\n";
 				out << "#   the lights-per-pixel count (read back a few frames late; -1 = switch off, 6 lights per pixel, or not known).\n";
 				out << "#   rt_pw_* = the work of the RT D3D12 prep submission whose GPU time is rt_prep_gpu_ms on the same row (1 = valid; early =\n";
@@ -1213,7 +1219,8 @@ namespace Util::FrameTrace
 					   "rt_refl_shade_gpu_ms,rt_refl_shade_mat_pct,rt_refl_shade_ratio,"  // (48g)
 					   "rt_refl_shade_ratio_smoothed,"  // (48h)
 					   "grass_deferred,rt_hitch_mode,rt_builds_waiting,rt_fog_sun,rt_fog_lights,"  // (49b)
-					   "rt_arrival_ms,rt_loadthread_copies,rt_handoff_pending,grass_pool_hits,grass_pool_misses\n";  // (49c) the last one
+					   "rt_arrival_ms,rt_loadthread_copies,rt_handoff_pending,grass_pool_hits,grass_pool_misses,"  // (49c)
+					   "rt_pl_drop_reason,rt_pl_moving_pct,rt_pl_moving_age,rt_pl_id_pixels,rt_pl_id_age\n";  // (50f) the last one
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
 					std::string s = std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{},{}", t.scene,
@@ -1433,6 +1440,9 @@ namespace Util::FrameTrace
 					// (49c) Loading Screens and the grass buffer pool, after rt_fog_lights (the old last column).
 					extra.pop_back();
 					extra += std::format(",{:.1f},{},{},{},{}\n", r.rt.arrivalMs, r.rt.loadThreadCopies, r.rt.handOffPending, r.grassPoolHits, r.grassPoolMisses);
+					// (50f) Point-light drop-outs, after grass_pool_misses (the old last column).
+					extra.pop_back();
+					extra += std::format(",{},{:.2f},{},{},{}\n", r.rt.plDropReason, r.rt.plMovingPct, r.rt.plMovingAge, r.rt.plIdPixels, r.rt.plIdAge);
 					if (it == a_reflex.end()) {
 						out << (r.reflexFrame == UINT32_MAX ? std::string("-1") : std::to_string(r.reflexFrame)) << ",-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" << engineColumns(r) << extra;
 						continue;

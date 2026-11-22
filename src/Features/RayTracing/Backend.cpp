@@ -895,6 +895,7 @@ namespace RayTracingRT
 		stats_.pointRaysPerFrame = -1;
 		stats_.pointWaterRaysPerFrame = -1;  // (47j)
 		stats_.pointTracedPixelsPerFrame = stats_.pointExtraPixelsPerFrame = stats_.pointExtraWideWantPerFrame = -1;  // (48c)
+		stats_.pointExtraWideWantTrace = 0;  // (50f)
 		stats_.lastPointGpuMs = -1.0f;
 		if (stagingHeap_ && device_) {
 			// Back to null views (staging: the blocks of submissions in flight keep what they were recorded with).
@@ -1133,6 +1134,7 @@ namespace RayTracingRT
 			a_list->ResolveQueryData(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase, 2, timestampReadback_.Get(), sizeof(std::uint64_t) * queryBase);
 		a_context.pointPending = true;
 		a_context.pointFrame = ++pointFrame_;
+		stats_.pointTracesSubmitted = pointFrame_;  // (50f)
 		// (47w) Adaptive skip: which light each counted slot held in this submission (read back with its counters).
 		a_context.coverage = pl.coverage;
 		a_context.coverageCount = std::min(pl.coverageCount, kPointCoverageLights);
@@ -2859,6 +2861,21 @@ namespace RayTracingRT
 		releaseStop_ = false;
 	}
 
+	void Backend::CollectCompleted(std::uint64_t a_completed, std::uint64_t a_aoCompleted)
+	{
+		// (50f) Every finished context, oldest submission first (index order collected a newer one before an older one after the ring wrapped:
+		// the older read-back was then skipped and the newer one averaged over both, hiding a single frame's count).
+		std::array<std::size_t, kContexts> order{};
+		std::size_t count = 0;
+		for (std::size_t i = 0; i < kContexts; ++i)
+			if (contexts_[i].fenceValue != 0 && contexts_[i].fenceValue <= a_completed && contexts_[i].aoFenceValue <= a_aoCompleted &&
+				contexts_[i].reflectFenceValue <= ReflectCompleted() && contexts_[i].fogFenceValue <= FogCompleted())
+				order[count++] = i;
+		std::sort(order.begin(), order.begin() + count, [this](std::size_t a, std::size_t b) { return contexts_[a].fenceValue < contexts_[b].fenceValue; });
+		for (std::size_t k = 0; k < count; ++k)
+			CollectTimestamps(order[k]);
+	}
+
 	void Backend::CollectTimestamps(std::size_t a_index)
 	{
 		auto& context = contexts_[a_index];
@@ -2875,10 +2892,16 @@ namespace RayTracingRT
 				// (46g) Top-K churn and the window beams' sampled pixels (traced / blocked), per frame.
 				stats_.pointChurnPerFrame = static_cast<std::int64_t>(static_cast<std::uint32_t>(words[1] - pointCounterWords_[1]) / frames);
 				stats_.pointWaterRaysPerFrame = static_cast<std::int64_t>(static_cast<std::uint32_t>(words[2] - pointCounterWords_[2]) / frames);  // (47j)
-				// (48c) Extra Lights Where Crowded (words 3 - 5 move only on frames that ran it: the caller knows whether it did).
+				// (48c) Extra Lights Where Crowded (words 4 - 5 move only on frames that ran it: the caller knows whether it did). (50f) Word 3
+				// (pixels with a traced light) on every point trace.
 				stats_.pointTracedPixelsPerFrame = static_cast<std::int64_t>(static_cast<std::uint32_t>(words[3] - pointCounterWords_[3]) / frames);
 				stats_.pointExtraPixelsPerFrame = static_cast<std::int64_t>(static_cast<std::uint32_t>(words[4] - pointCounterWords_[4]) / frames);
 				stats_.pointExtraWideWantPerFrame = static_cast<std::int64_t>(static_cast<std::uint32_t>(words[5] - pointCounterWords_[5]) / frames);
+				// (50f) Which trace(s) this read-back covers; a want in any of them (the undivided count) marks the newest.
+				stats_.pointCounterReadTrace = context.pointFrame;
+				stats_.pointCounterReadTraces = frames;
+				if (words[5] != pointCounterWords_[5])
+					stats_.pointExtraWideWantTrace = context.pointFrame;
 				for (std::uint32_t slot = 0; slot < kPointBeamSlots; ++slot) {
 					const std::uint32_t w = kPointBeamBase + slot * 2;
 					stats_.beamTraced[slot] = static_cast<std::uint32_t>(words[w] - pointCounterWords_[w]) / frames;
@@ -3718,9 +3741,7 @@ namespace RayTracingRT
 			}
 		}
 		lap(split.collect);
-		for (std::size_t i = 0; i < kContexts; ++i)
-			if (contexts_[i].fenceValue != 0 && contexts_[i].fenceValue <= completed && contexts_[i].aoFenceValue <= aoCompleted && contexts_[i].reflectFenceValue <= ReflectCompleted() && contexts_[i].fogFenceValue <= FogCompleted())
-				CollectTimestamps(i);
+		CollectCompleted(completed, aoCompleted);  // (50f) in submission order
 		lap(split.timestamps);  // (46g)
 		if (index == kContexts) {
 			++stats_.skippedFramesBusy;
@@ -3755,10 +3776,13 @@ namespace RayTracingRT
 		static const std::vector<SkinDraw> kNoSkinDraws;
 		const std::vector<SkinDraw>& skinDraws = a_input.skinDraws && SkinAvailable() ? *a_input.skinDraws : kNoSkinDraws;
 		if (early) {
-			// skinReady_ is PrepareFrame's, for the same draws.
+			// skinReady_ is PrepareFrame's, for the same draws. (50f) Should they not pair (45n returned false here: the whole frame, sun and
+			// every point light, went untraced and uncounted), this frame is traced without the characters: no skinned instance and no merged
+			// one is put in the TLAS (their skinning on the prep list still runs; nothing reads it this frame). Counted.
 			if (skinReady_.size() != skinDraws.size()) {
-				list->Close();
-				return false;
+				skinReady_.assign(skinDraws.size(), 0);
+				skinGroupFrame_.clear();
+				++stats_.earlySkinMismatchFrames;
 			}
 		} else {
 			if (timestampHeap_)
@@ -4375,9 +4399,7 @@ namespace RayTracingRT
 			}
 		}
 		lap(split.collect);
-		for (std::size_t i = 0; i < kContexts; ++i)
-			if (contexts_[i].fenceValue != 0 && contexts_[i].fenceValue <= completed && contexts_[i].aoFenceValue <= aoCompleted && contexts_[i].reflectFenceValue <= ReflectCompleted() && contexts_[i].fogFenceValue <= FogCompleted())
-				CollectTimestamps(i);
+		CollectCompleted(completed, aoCompleted);  // (50f) in submission order
 		lap(split.timestamps);
 		if (index == kContexts)
 			return false;
@@ -4631,9 +4653,7 @@ namespace RayTracingRT
 		}
 		if (index == kContexts)
 			return false;
-		for (std::size_t i = 0; i < kContexts; ++i)
-			if (contexts_[i].fenceValue != 0 && contexts_[i].fenceValue <= completed && contexts_[i].aoFenceValue <= aoCompleted && contexts_[i].reflectFenceValue <= ReflectCompleted() && contexts_[i].fogFenceValue <= FogCompleted())
-				CollectTimestamps(i);
+		CollectCompleted(completed, aoCompleted);  // (50f) in submission order
 		auto& context = contexts_[index];
 		cursor_ = (index + 1) % kContexts;
 		HRESULT hr;

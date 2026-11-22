@@ -172,7 +172,7 @@ static const uint kFlagWhiteNoise = 33554432u;
 static const float kSoftCutRange = 1.5;
 // (49m) Encoding with kFlagSoftCut (PointDenoiseCS kPLFlagFractional): 255 = lit; 128..254 = partly lit, (b - 128) / 126 the
 // lit fraction (no blocker distance); 0..127 = blocked, b / 127 = sqrt(blocker distance / light distance). Without them: as before.
-static const uint kTracedPixelWord = 3u;     // (48c) RayCounter words (kFlagExtra only): [3] pixels with a traced light,
+static const uint kTracedPixelWord = 3u;     // (48c) RayCounter words: [3] pixels with a traced light ((50f) every trace),
 static const uint kExtraPixelWord = 4u;      //   [4] of which with at least one extra rank traced,
 static const uint kExtraWideWantWord = 5u;   //   [5] pixels where an extra rank 4 - 5 passed its cut (traced, or not for want of PLWide)
 static const uint kReprojectRecord = 64u;  // Backend kPointReprojectRecord
@@ -1058,18 +1058,24 @@ groupshared uint gsMask[2];
 				visA[fs] = (128.0 + round((1.0 - shadow) * 126.0)) / 255.0;
 		}
 	}
-	// (48c) Extra Lights Where Crowded: per wave, the pixels with a traced light / with an extra rank traced / wanting PLWide for one (F7
-	// rt_pl_extra_pct; Ray Tracing keeps the slot 4 - 5 textures while the last one is non-zero). kFlagExtra is uniform: no work without it.
-	[branch] if (extra)
+	// (50f) Per wave, the pixels with a traced light (a non-zero id), on every trace (was only with kFlagExtra): Ray Tracing's per-frame
+	// count of them (F7 rt_pl_id_pixels; a trace that came out empty shows 0).
 	{
 		const bool tracedAny = idxA[0] != 0u || idxA[1] != 0u || idxA[2] != 0u || idxA[3] != 0u || idxA[4] != 0u || idxA[5] != 0u;
 		const uint tracedCount = WaveActiveCountBits(tracedAny);
+		if (WaveIsFirstLane() && tracedCount > 0u) {
+			uint previousTraced;
+			RayCounter.InterlockedAdd(kTracedPixelWord * 4u, tracedCount, previousTraced);
+		}
+	}
+	// (48c) Extra Lights Where Crowded: per wave, the pixels with an extra rank traced / wanting PLWide for one (F7 rt_pl_extra_pct with the
+	// count above; Ray Tracing keeps the slot 4 - 5 textures while the last one is non-zero). kFlagExtra is uniform: no work without it.
+	[branch] if (extra)
+	{
 		const uint extraCount = WaveActiveCountBits(extraUsed);
 		const uint wantCount = WaveActiveCountBits(extraWideWant);
 		if (WaveIsFirstLane()) {
 			uint previousExtra;
-			if (tracedCount > 0u)
-				RayCounter.InterlockedAdd(kTracedPixelWord * 4u, tracedCount, previousExtra);
 			if (extraCount > 0u)
 				RayCounter.InterlockedAdd(kExtraPixelWord * 4u, extraCount, previousExtra);
 			if (wantCount > 0u)

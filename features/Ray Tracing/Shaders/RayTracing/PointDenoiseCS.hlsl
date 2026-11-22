@@ -28,6 +28,13 @@ cbuffer PointDenoiseCB : register(b1)
 	uint4 PLMotion[4];  // (46d) per source slot one byte (slot s: byte s % 4 of uint s / 4): history dropped this frame, 0 keep .. 255 none
 	uint4 PLEmitter;  // (46x) x / y source slots 0-31 / 32-63 with their own emitter radius (uint bits), z that radius (float bits)
 	uint4 PLFillEmitter[4];  // (50a) Soft fill lights: per source slot one byte (slot s: byte s % 4 of uint s / 4) = emitter radius / 2 units, 0 = none
+#if defined(PL_CLEAN)
+	// (50f) The moving test's interval: the motion vectors at t6 are the last rendered frame's (its point of view -> the frame before it).
+	row_major float4x4 PLCleanPrevInv;   // that frame's CameraViewProjInverse (jittered, relative to its camera: rays through its pixel centres)
+	row_major float4x4 PLCleanPrevCur;   // its CameraViewProjUnjittered (the "now" of its motion vectors)
+	row_major float4x4 PLCleanPrevPrev;  // its CameraPreviousViewProjUnjittered, taking positions relative to its camera (the "then")
+	float4 PLCleanParams;                // xyz this frame's camera - that frame's camera; w flags (asuint): kCleanHistIsPrev
+#endif
 };
 
 Texture2D<unorm float4> PLVis : register(t0);
@@ -75,6 +82,9 @@ static const uint kPLFlagWideHistory = 64u;
 Texture2D<unorm float4> PLWide : register(t7);
 Texture2D<unorm float4> HistWide : register(t8);
 RWTexture2D<unorm float4> OutWide : register(u4);
+#if defined(PL_CLEAN)
+RWByteAddressBuffer PLCleanCounter : register(u8);  // (50f) per frame: [0] pixels with a traced light, [1] moving test run, [2] moving
+#endif
 
 // (48a) "Window Beams: Smooth Edges" (soft window-beam slots only; the other slots exactly as before):
 //   - the wide pass runs wherever the beam's penumbra can be: the 3x3 disagrees (at least kBeamMinRadiusPx: hard 0.05-degree edges too) or
@@ -157,9 +167,9 @@ static const float kSteadyBandMin = 0.25;
 // PL_WIDE / PL_BEAM / PL_FIX). All its code is inside #if defined(PL_CLEAN) blocks: the preprocessed source of the other variants is the
 // 48k one (48j with the Noise Fix master off). kPLFlagCleanDetect: the motion vectors are bound at t6 (whatever Keep Shadow History says) and
 // the moving test runs; kPLFlagClean: its result is used (the toggle; without it the variant only feeds the two debug views).
-//   Moving receiver: last frame's motion vectors (two fixed-point steps from this pixel) land more than max(kCleanResidualPx,
-//     kCleanResidualShare x the camera's own motion) from the camera-only reprojection (1.5 px: the camera reprojection is jittered, the
-//     vectors are not; the relative term: camera acceleration, the vectors being a frame old). There, on every path (46b, beams, Stable
+//   Moving receiver: the motion vector the game wrote last frame where this pixel's surface was (two fixed-point steps from this pixel)
+//     differs by more than max(kCleanResidualPx, kCleanResidualShare x the camera's own motion) from the camera's own motion over the same
+//     frame interval ((50f) CleanMoving; 48m compared it with this frame's jittered camera reprojection, one frame later). There, on every path (46b, beams, Stable
 //     Penumbra):
 //     - temporal: only the motion-vector history, with a strict distance test (kCleanTolScale x distance + kCleanTolBase) and at least
 //       kCleanMinTapWeight of valid taps; otherwise no history (the camera candidate and Keep Shadow History's are not taken). Where the
@@ -186,6 +196,7 @@ static const float kCleanStaticWeight = 0.35;
 static const float kCleanStrongChange = 0.5;
 static const uint kViewPLMoving = 17u;      // (48m) RayTracing::DebugView::PLMoving
 static const uint kViewPLFilterPath = 18u;  // (48m) RayTracing::DebugView::PLFilterPath
+static const uint kCleanHistIsPrev = 2u;  // (50f) PLCleanParams.w: HistDist holds the last rendered frame's distances (it was denoised)
 #endif
 
 // (48k) Decorrelated Sampling: a uniform [0, 1) value per (pixel, frame) from the PCG hash (independent of the trace's patterns).
@@ -388,6 +399,50 @@ float HistoryTaps(float2 prevPos, float expected, float tolerance, uint4 ids, bo
 	}
 	return valid;
 }
+
+#if defined(PL_CLEAN)
+// (50f) The moving test, like with like. The motion vectors at t6 belong to the last rendered frame: at its pixel q they hold where that
+// frame's surface was one frame earlier (uv then - uv now, unjittered). 50e compared them with THIS frame's camera reprojection (this frame
+// -> the last one): two different frame intervals, so uneven frame times or a turning camera made the whole screen "moving". Now q is
+// found as before (two fixed-point steps of the vectors from this pixel: the body this pixel shows, also when it moved), and its vector is
+// compared with the camera's own motion over the SAME interval, for the surface at q: its distance from last frame's denoiser (HistDist,
+// when last frame was denoised; else this pixel's surface moved back by the camera), projected with the very matrices the game wrote the
+// vectors with. A static surface then gives exactly the camera's vector whatever the frame times; only the surface's own motion is left.
+// o_mc: q's position one frame back (the motion-vector history candidate, as in 50e).
+bool CleanMoving(int2 p, float3 P, out float2 o_mc)
+{
+	const float2 size = float2(Size.xy);
+	const float2 uvc = (float2(p) + 0.5) / size;
+	float2 mc = uvc;
+	int2 qc = int2(0, 0);
+	[unroll] for (int ic = 0; ic < 2; ++ic)
+	{
+		qc = int2(clamp(mc, 0.0, 0.999999) * size);
+		mc = uvc + PrevMotion[qc];
+	}
+	o_mc = mc;
+	const float2 mv = mc - uvc;  // the game's vector at qc
+	float3 Y = P + PLCleanParams.xyz;
+	const float hd = (asuint(PLCleanParams.w) & kCleanHistIsPrev) ? HistDist[qc] : -1.0;
+	[branch] if (hd > 0.0)
+	{
+		const float2 uvq = (float2(qc) + 0.5) / size;
+		const float4 h = mul(PLCleanPrevInv, float4(uvq.x * 2.0 - 1.0, 1.0 - uvq.y * 2.0, 0.5, 1.0));
+		const float3 ray = h.xyz / h.w;
+		const float rayLength = length(ray);
+		if (rayLength > 1e-6)
+			Y = ray * (hd / rayLength);
+	}
+	const float4 clipNow = mul(PLCleanPrevCur, float4(Y, 1.0));
+	const float4 clipThen = mul(PLCleanPrevPrev, float4(Y, 1.0));
+	float2 camera = mv;  // behind either camera: no verdict (not moving)
+	if (clipNow.w > 1e-4 && clipThen.w > 1e-4)
+		camera = float2(clipThen.x / clipThen.w - clipNow.x / clipNow.w, clipNow.y / clipNow.w - clipThen.y / clipThen.w) * 0.5;
+	const float residualPx = length((mv - camera) * size);
+	const float cameraPx = length(camera * size);
+	return residualPx > max(kCleanResidualPx, kCleanResidualShare * cameraPx);
+}
+#endif
 
 // The pixel's geometry, shared by both slot sets.
 struct PixelFrame
@@ -880,7 +935,13 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw)
 	return result;
 }
 
+#if defined(PL_CLEAN)
+// (50f) The per-pixel work; main (end of file) adds the group's counts to PLCleanCounter. o_count: x a traced light here, y the moving test
+// ran, z moving.
+void DenoisePixel(uint3 dtid, inout uint3 o_count) {
+#else
 [numthreads(8, 8, 1)] void main(uint3 dtid : SV_DispatchThreadID) {
+#endif
 	const int2 p = int2(dtid.xy);
 	if (any(dtid.xy >= Size.xy))
 		return;
@@ -930,6 +991,7 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw)
 		px.planeTolerance = dist * 0.01 + 2.0;
 #if defined(PL_CLEAN)
 		px.moving = false;
+		o_count.x = 1u;
 #endif
 
 		// 3a. (46o) The history taps first (read only; blended in after the spatial pass as before), so that a soft beam slot
@@ -948,21 +1010,16 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw)
 			histExpected = expected;
 			float tapWeight = 0.0;
 #if defined(PL_CLEAN)
-			// (48m) Moving Characters: Clean Shadow History: is the receiver moving (last frame's motion vectors vs the camera reprojection)?
+			// (48m) Moving Characters: Clean Shadow History: is the receiver moving? (50f) Its own motion over the motion vectors' interval
+			// (CleanMoving), no longer last frame's vectors against this frame's camera reprojection.
 			bool movingClean = false;
 			[branch] if ((flags & kPLFlagCleanDetect) && all(prevUv >= 0.0) && all(prevUv < 1.0))
 			{
-				const float2 uvc = (float2(p) + 0.5) / float2(Size.xy);
-				float2 mc = uvc;  // from this pixel (the camera guess may lie off a moving body: its background's vector would hide the motion)
-				[unroll] for (int ic = 0; ic < 2; ++ic)
-				{
-					const int2 qc = int2(clamp(mc, 0.0, 0.999999) * float2(Size.xy));
-					mc = uvc + PrevMotion[qc];
-				}
-				const float residualPx = length((mc - prevUv) * float2(Size.xy));
-				const float cameraPx = length((prevUv - uvc) * float2(Size.xy));
-				const bool moving = residualPx > max(kCleanResidualPx, kCleanResidualShare * cameraPx);
+				float2 mc;
+				const bool moving = CleanMoving(p, P, mc);
 				movingState = moving ? 3u : 0u;
+				o_count.y = 1u;
+				o_count.z = moving ? 1u : 0u;
 				[branch] if (moving && (flags & kPLFlagClean))
 				{
 					// Only the motion-vector history, strictly; none otherwise. The strict plane test for the spatial passes.
@@ -1137,3 +1194,26 @@ float4 DenoiseSet(PixelFrame a_px, uint4 ids, float4 raw, float4 hv, float4 hw)
 		DebugColor[p] = debug;
 	}
 }
+#if defined(PL_CLEAN)
+// (50f) Per group: the counts of DenoisePixel, then one add per word into PLCleanCounter (cleared every frame, read back a few frames late:
+// F7 rt_pl_moving_pct, the Diagnostics line). Every thread reaches both barriers (DenoisePixel returns for threads past the edge).
+groupshared uint gsCleanCount[3];
+
+[numthreads(8, 8, 1)] void main(uint3 dtid : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+	if (gi < 3u)
+		gsCleanCount[gi] = 0u;
+	GroupMemoryBarrierWithGroupSync();
+	uint3 count = 0u;
+	DenoisePixel(dtid, count);
+	uint previous;
+	if (count.x != 0u)
+		InterlockedAdd(gsCleanCount[0], 1u, previous);
+	if (count.y != 0u)
+		InterlockedAdd(gsCleanCount[1], 1u, previous);
+	if (count.z != 0u)
+		InterlockedAdd(gsCleanCount[2], 1u, previous);
+	GroupMemoryBarrierWithGroupSync();
+	if (gi < 3u && gsCleanCount[gi] != 0u)
+		PLCleanCounter.InterlockedAdd(gi * 4u, gsCleanCount[gi], previous);
+}
+#endif

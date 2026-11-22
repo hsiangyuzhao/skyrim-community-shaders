@@ -3291,6 +3291,7 @@ void RayTracing::Prepass()
 	sunMaskWrittenThisFrame = false;  // (47h)
 	pending.active = false;
 	frameStart = Qpc();
+	RecordMotionFrame();  // (50f) the matrices of this frame's motion vectors (next frame's moving test)
 	UpdateHitchState();  // (49b)
 	// (46n) A step of the cell-event preparation faulted behind the loading screen: off here, on the world's frame.
 	if (!cellEventFault.empty() && status != Status::Failed && status != Status::Unavailable)
@@ -3305,8 +3306,18 @@ void RayTracing::Prepass()
 	waterTraced = false;  // (47i)
 	waterLodSkip = false;  // (47l) set again by this frame's point-light preparation
 	pointCpuMs = 0.0f;
-	pointHistoryValid = pointHistoryValid && pointDenoised;
+	// (50f) Also after a frame whose prepared point trace could not go out (no free context, a failed submission): nothing of the history
+	// was touched and no FinishFrame moved prevViewProj, so it reprojects from its own camera (pointSkippedTrace; the slot motion of that
+	// frame's selection is carried, CarrySkippedMotion). Any other frame without a denoise ends it as before.
+	pointHistoryValid = pointHistoryValid && (pointDenoised || pointSkippedTrace);
+	if (!pointHistoryValid)
+		pointMotionCarryOn = false;
+	pointSkippedTrace = false;
 	pointDenoised = false;
+	pointHistoryUsed = false;
+	pointEarlySkin = false;
+	// (50f) A frame that wanted point lights after a denoised one counts as "not traced" unless a later step names its reason.
+	pointDrop = RtWanted() && PointLightsOn() && pointGoodLast ? kPLDropNotTraced : kPLDropNotRunning;
 	UnbindPointLights();
 	// (46c) This frame's shadow maps are drawn: the latch ends here (skippedMaps stays for this frame's mask write).
 	skipLatched = false;
@@ -3366,6 +3377,10 @@ void RayTracing::Prepass()
 		renderThreadId.store(thread);
 	}
 
+	if (!RtWanted() || status == Status::Unavailable || status == Status::Failed) {
+		pointGoodLast = false;  // (50f) no point-light outcome on these frames (ReportFrame does not run)
+		pointDropRun = 0;
+	}
 	if (!RtWanted()) {  // (47n) also with sun, point lights and RTAO all "Off"
 		if (sssClaimed)
 			globals::features::screenSpaceShadows.DrawDeferred(nullptr, 0.0f, 0.0f, 0.0f);
@@ -3642,6 +3657,8 @@ void RayTracing::FinishPrepass()
 
 void RayTracing::ReportFrame()
 {
+	NotePointOutcome();     // (50f) F7 rt_pl_drop_reason, the short drop-out log line
+	ReadPointCleanStats();  // (50f) the moving-pixel counts of a few frames ago
 	const auto& stats = backend.GetStats();
 	if (status != loggedStatus) {
 		static constexpr const char* kNames[] = { "off", "unavailable", "failed", "paused", "loading the scene", "active" };
@@ -4020,6 +4037,23 @@ void RayTracing::PublishCpuSplit()
 		detail.loadThreadCopies = static_cast<int>(copies);
 	detail.handOffPending = handOffPendingTrace;
 	handOffPendingTrace = -1;
+	// (50f) Point-light drop-outs: this frame's outcome; the moving-pixel share and the trace's lit-pixel count, each once on arrival.
+	detail.plDropReason = pumpThisFrame ? kPLDropNotRunning : pointDrop;
+	if (pointCleanStatsNew) {
+		detail.plMovingPct = pointCleanStats[1] > 0 ? static_cast<float>(100.0 * static_cast<double>(pointCleanStats[2]) / static_cast<double>(pointCleanStats[1])) : 0.0f;
+		detail.plMovingAge = static_cast<int>(globals::state->frameCount - pointCleanStatsFrame);
+	}
+	if (backend.IsReady()) {
+		const auto& ps50 = backend.GetStats();
+		if (ps50.pointCounterReadTrace != 0 && ps50.pointCounterReadTrace != pointIdReadSeen) {
+			pointIdReadSeen = ps50.pointCounterReadTrace;
+			if (ps50.pointCounterReadTraces == 1 && ps50.pointTracedPixelsPerFrame >= 0) {  // one trace's own count
+				detail.plIdPixels = ps50.pointTracedPixelsPerFrame;
+				const auto& traced = pointTraceFrames[pointIdReadSeen % pointTraceFrames.size()];
+				detail.plIdAge = traced.first == pointIdReadSeen ? static_cast<int>(globals::state->frameCount - traced.second) : -1;
+			}
+		}
+	}
 	Util::FrameTrace::OnRayTracingDetail(detail);
 	{
 		// (46q) Submit on a Worker Thread / Budget Builds by GPU Time.
@@ -4313,6 +4347,9 @@ void RayTracing::RunFrame()
 			SwitchOffPointLights(std::format("exception in the light selection: {}", e.what()));
 		}
 		pointCpuMs = static_cast<float>(static_cast<double>(Qpc() - pointStart) * QpcMs());
+		// (50f) F7 rt_pl_drop_reason: nothing selected (or no resources), or prepared (not traced until the trace goes out).
+		if (PointLightsOn())
+			pointDrop = input.pointLights ? kPLDropNotTraced : kPLDropPrepare;
 	}
 	// (47q) The point pass reuses the sun's surface probe (both mark the traced-caster surfaces; same depth, rect and probe ray): the sun
 	// writes the probe as the point pass makes it where it probed, the point pass (its cut-out variant) takes it there, traces it elsewhere.
@@ -4460,7 +4497,9 @@ void RayTracing::RunFrame()
 	const std::int64_t executeStart = Qpc();
 	cpuLast.d3d11 = static_cast<float>(static_cast<double>(executeStart - d3d11Start) * QpcMs());
 	PrepareFogInput(input, input.sun);  // (49b)
+	const std::uint32_t busyBefore = backend.GetStats().skippedFramesBusy, skinBefore = backend.GetStats().earlySkinMismatchFrames;  // (50f)
 	const bool traced = backend.ExecuteFrame(input);
+	NotePointTrace(input, traced, busyBefore, skinBefore);  // (50f)
 	NoteFogTraced(input, traced);  // (49b)
 	FlushDeferredAONormal();  // (47u) the frame never reached its ready signal: the deferred normal prep now (nothing else reads it)
 	const std::int64_t executeEnd = Qpc();
@@ -4636,6 +4675,9 @@ void RayTracing::RunNoSunFrame(ID3D11ShaderResourceView* a_depth, ID3D11ShaderRe
 			SwitchOffPointLights(std::format("exception in the light selection: {}", e.what()));
 		}
 		pointCpuMs = static_cast<float>(static_cast<double>(Qpc() - pointStart) * QpcMs());
+		// (50f) F7 rt_pl_drop_reason: nothing selected (or no resources), or prepared (not traced until the trace goes out).
+		if (PointLightsOn())
+			pointDrop = input.pointLights ? kPLDropNotTraced : kPLDropPrepare;
 	}
 	{
 		const std::int64_t aoStart = Qpc();
@@ -4712,7 +4754,9 @@ void RayTracing::RunNoSunFrame(ID3D11ShaderResourceView* a_depth, ID3D11ShaderRe
 	const std::int64_t executeStart = Qpc();
 	cpuLast.d3d11 = static_cast<float>(static_cast<double>(executeStart - d3d11Start) * QpcMs());
 	PrepareFogInput(input, input.sun);  // (49b)
+	const std::uint32_t busyBefore = backend.GetStats().skippedFramesBusy, skinBefore = backend.GetStats().earlySkinMismatchFrames;  // (50f)
 	const bool traced = backend.ExecuteFrame(input);
+	NotePointTrace(input, traced, busyBefore, skinBefore);  // (50f)
 	NoteFogTraced(input, traced);  // (49b)
 	FlushDeferredAONormal();  // (47u)
 	cpuLast.execute = static_cast<float>(static_cast<double>(Qpc() - executeStart) * QpcMs());
@@ -4723,7 +4767,7 @@ void RayTracing::RunNoSunFrame(ID3D11ShaderResourceView* a_depth, ID3D11ShaderRe
 	history4Valid = false;  // nothing of the sun's history survives an "Off" frame
 	sigmaHistoryValid = false;
 	if (!traced) {
-		pointHistoryValid = false;
+		// (50f) The point history is decided in the next Prepass (kept when only the submission was missing: NotePointTrace).
 		++frameIndex;
 		return;
 	}
@@ -4793,6 +4837,12 @@ void RayTracing::FinishFrame()
 	// Every return before step 5 still leaves no point-light wait behind: the next trace (RunFrame) takes it first.
 	// (47n) A sun "Off" frame needs no MaskTemp (nothing is combined into the mask).
 	if (backend.HasFailed() || !mask.texture || !mask.SRV || (!maskTemp && !pending.noSun)) {
+		// (50f) Counted, and this frame's light tags withdrawn (nothing is bound for them: every reader falls back anyway, now also by tag).
+		if (pointThisFrame) {
+			pointDrop = kPLDropFinishFrame;
+			pointSelector.Publish(false);
+		}
+		++finishFrameEarlyOuts;
 		if (backend.HasFailed())
 			Disable(Status::Failed, backend.LastError());
 		history4Valid = false;
@@ -5578,6 +5628,7 @@ void RayTracing::RememberAONormalFrame(std::uint32_t a_width, std::uint32_t a_he
 void RayTracing::ReleasePointDenoiser()
 {
 	UnbindPointLights();
+	ReleasePointCleanCounter();  // (50f)
 	for (auto* t : { &pointVis[0], &pointVis[1], &pointIdx[0], &pointIdx[1], &pointDist[0], &pointDist[1] })
 		*t = {};
 	pointHistoryValid = false;
@@ -5834,7 +5885,15 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	// while the trace reports pixels whose extra rank 4 - 5 passed its cut (read back a few frames late; counted also while the textures are
 	// missing), freed like 48a after kPointWideIdleFrames point frames without. (48c) After the slot 4 - 5 denoiser failed: 4 slots.
 	const bool extra = K < 6;  // (48c) Extra Lights Where Crowded: always on (48o)
-	const bool extraWide = extra && backend.GetStats().pointExtraWideWantPerFrame > 0;
+	// (50f) Held over the read-back's blind window: the want of the trace about to go out is unknown for as many traces as are in flight
+	// (submitted, not read back yet: latency), so slots 4 - 5 stay on until the read-backs show no want for as many traces after the last
+	// one that had it. 48c followed each read-back alone: a want of a few pixels that came and went switched slots 4 - 5 per frame (ranks
+	// 5 - 6 lost their ray that frame, their history restarted on the next).
+	const auto& wideStats = backend.GetStats();
+	const std::uint64_t wideLatency =
+		wideStats.pointTracesSubmitted > wideStats.pointCounterReadTrace ? wideStats.pointTracesSubmitted - wideStats.pointCounterReadTrace : 0u;
+	const bool extraWide = extra && wideStats.pointExtraWideWantTrace != 0 && wideStats.pointCounterReadTrace >= wideStats.pointExtraWideWantTrace &&
+	                       wideStats.pointCounterReadTrace - wideStats.pointExtraWideWantTrace <= wideLatency;
 	const bool wantWide = !pointWideDenoiseFailed && (K > 4 || extraWide);
 	const bool wide = wantWide && EnsurePointWide(width, height);
 	if (K > 4 && !wide)
@@ -5850,7 +5909,7 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 		}
 	}
 	const bool widePrev = wide && pointWideTraced;
-	pointWideTraced = wide;
+	pointNextWide = wide;  // (50f) pointWideTraced follows once this trace is submitted (CommitPointTraceState)
 	pointWideThisFrame = wide;
 	pointInput.wide = wide;
 	auto& c = pointInput.constants;
@@ -5977,13 +6036,14 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 		pointInput.reproject = true;
 		flags |= kPointFlagStickyReproject;
 	}
-	std::copy_n(viewProjF, 16, pointPrevViewProj);
-	pointPrevJitter[0] = jitterNow[0];  // (48c)
-	pointPrevJitter[1] = jitterNow[1];
-	pointPrevCamera[0] = a_camX;
-	pointPrevCamera[1] = a_camY;
-	pointPrevCamera[2] = a_camZ;
-	pointPrevValid = true;
+	// (50f) This trace's camera becomes the next one's "last trace" only once it is submitted (CommitPointTraceState): 47z kept it here, so
+	// after a trace that did not go out the next one reprojected the older trace's PLIdx with the skipped frame's camera.
+	std::copy_n(viewProjF, 16, pointNextViewProj);
+	pointNextJitter[0] = jitterNow[0];  // (48c)
+	pointNextJitter[1] = jitterNow[1];
+	pointNextCamera[0] = a_camX;
+	pointNextCamera[1] = a_camY;
+	pointNextCamera[2] = a_camZ;
 	c.params[0] = static_cast<float>(scan);
 	c.params[1] = static_cast<float>(frameIndex % 1024);
 	std::memcpy(&c.params[2], &flags, sizeof(float));
@@ -6102,8 +6162,13 @@ void RayTracing::FinishPointLights()
 		SwitchOffPointLights("the point-light denoiser (PointDenoiseCS) did not compile");
 		return;
 	}
-	if (!pointVis[0].texture || !backend.PointVisibilitySRV() || !backend.PointSourcesSRV())
+	if (!pointVis[0].texture || !backend.PointVisibilitySRV() || !backend.PointSourcesSRV()) {
+		// (50f) Counted, the tags withdrawn (nothing bound for them).
+		pointDrop = kPLDropFinishPoints;
+		++finishPointEarlyOuts;
+		pointSelector.Publish(false);
 		return;
+	}
 	auto* context = globals::d3d::context;
 	auto* timers = Util::GpuPassTimers::GetSingleton();
 	const std::uint32_t write = pointWrite, read = pointWrite ^ 1u;
@@ -6122,9 +6187,10 @@ void RayTracing::FinishPointLights()
 	// (48k) The noise fix's denoiser parts (only read by the PL_FIX variant; 0 with the master off).
 	if (noiseFix)
 		flags |= kPointDenoiseNoiseDecorrelate | kPointDenoiseNoiseStable | kPointDenoiseNoiseCloseBlur;
-	// (48m) Moving Characters: Clean Shadow History (only read by the PL_CLEAN variant).
+	// (48m) Moving Characters: Clean Shadow History (only read by the PL_CLEAN variant). (50f) The moving test only with last frame's
+	// motion-vector matrices (FillCleanMotion; none = no pixel counts as moving this frame).
 	if (clean)
-		flags |= kPointDenoiseCleanDetect | kPointDenoiseClean;
+		flags |= (FillCleanMotion(cb) ? kPointDenoiseCleanDetect : 0u) | kPointDenoiseClean;
 	// (49i) Smooth Hard Edges / Steady Edges (only read by the PL_FIX variant).
 	if (noiseFix) {
 		flags |= settings.PointSmoothHardEdges ? kPointDenoiseSmoothHard : 0u;
@@ -6154,10 +6220,9 @@ void RayTracing::FinishPointLights()
 		cb.Emitter[3] = frameIndex;  // (47x) Smoother Shadow Edges: the taps' rotation changes every frame
 	}
 	{
-		// (46d) Moving / new sources: their history is dropped in proportion (slot s in byte s % 4 of Motion[s / 4]).
-		const auto& motion = pointSelector.SlotMotion();
-		for (std::uint32_t s = 0; s < RayTracingPointLights::kMaxSources; ++s)
-			cb.Motion[s / 4] |= static_cast<std::uint32_t>(motion[s]) << ((s % 4) * 8);
+		// (46d) Moving / new sources: their history is dropped in proportion (slot s in byte s % 4 of Motion[s / 4]). (50f) With the motion of a
+		// selection whose trace did not go out added (FillPointMotion).
+		FillPointMotion(cb);
 		// (50a) Soft fill lights: their emitter radius per slot (all 0 without fills: every slot as before).
 		const auto& fill = pointSelector.FillEmitterBytes();
 		for (std::uint32_t s = 0; s < RayTracingPointLights::kMaxSources; ++s)
@@ -6170,18 +6235,23 @@ void RayTracing::FinishPointLights()
 	// (48a) t7 / t8 / u4: slots 4 - 5 (null without them: the shader does not read or write them then).
 	ID3D11ShaderResourceView* srvs[9] = { backend.PointVisibilitySRV(), backend.PointSourcesSRV(), backend.DepthMaskSRV(), pointVis[read].srv.get(),
 		pointIdx[read].srv.get(), pointDist[read].srv.get(), motionSRV, wide ? backend.PointWideSRV() : nullptr, wideHistory ? pointWide[read].srv.get() : nullptr };
-	ID3D11UnorderedAccessView* uavs[5] = { pointVis[write].uav.get(), pointIdx[write].uav.get(), pointDist[write].uav.get(), plDebug ? debugColorUAV.get() : nullptr,
-		wide ? pointWide[write].uav.get() : nullptr };
+	// (50f) u8: the PL_CLEAN variant's per-frame counts (cleared here, copied for the read-back after the dispatch).
+	ID3D11UnorderedAccessView* counterUAV = clean ? PointCleanCounterBegin() : nullptr;
+	ID3D11UnorderedAccessView* uavs[9] = { pointVis[write].uav.get(), pointIdx[write].uav.get(), pointDist[write].uav.get(), plDebug ? debugColorUAV.get() : nullptr,
+		wide ? pointWide[write].uav.get() : nullptr, nullptr, nullptr, nullptr, counterUAV };
+	const UINT uavCount = counterUAV ? 9u : 5u;
 	context->CSSetConstantBuffers(0, 2, cbs);
 	context->CSSetShaderResources(0, 9, srvs);
-	context->CSSetUnorderedAccessViews(0, 5, uavs, nullptr);
+	context->CSSetUnorderedAccessViews(0, uavCount, uavs, nullptr);
 	context->CSSetShader(shader, nullptr, 0);
 	context->Dispatch((pending.width + 7) / 8, (pending.height + 7) / 8, 1);
 	ID3D11ShaderResourceView* nullSrvs[9]{};
-	ID3D11UnorderedAccessView* nullUavs[5]{};
+	ID3D11UnorderedAccessView* nullUavs[9]{};
 	ID3D11Buffer* nullCbs[2]{};
 	context->CSSetShaderResources(0, 9, nullSrvs);
-	context->CSSetUnorderedAccessViews(0, 5, nullUavs, nullptr);
+	context->CSSetUnorderedAccessViews(0, uavCount, nullUavs, nullptr);
+	if (counterUAV)
+		PointCleanCounterEnd();
 	context->CSSetConstantBuffers(0, 2, nullCbs);
 	context->CSSetShader(nullptr, nullptr, 0);
 	timers->End(Util::GpuBucket::RayTracingPointDenoise);
@@ -6195,6 +6265,9 @@ void RayTracing::FinishPointLights()
 	// (48a) t46: slots 4 - 5 (null with K <= 4; the light tags carry kTagWide only on wide frames).
 	ID3D11ShaderResourceView* wideView = wide ? pointWide[write].srv.get() : nullptr;
 	context->PSSetShaderResources(46, 1, &wideView);
+	pointHistoryUsed = (flags & kPointDenoiseHistory) != 0u;  // (50f)
+	pointHistFrame = globals::state->frameCount;
+	pointMotionCarryOn = false;
 	pointWideHistoryValid = wide;
 	pointBound = true;
 	pointWrite ^= 1u;
@@ -6245,8 +6318,13 @@ void RayTracing::FinishPointLightsV2(int a_mode)
 			shader ? "its textures could not be created" : "PointDenoiseV2CS did not compile");
 		return;
 	}
-	if (!pointVis[0].texture || !backend.PointVisibilitySRV() || !backend.PointSourcesSRV())
+	if (!pointVis[0].texture || !backend.PointVisibilitySRV() || !backend.PointSourcesSRV()) {
+		// (50f) Counted, the tags withdrawn (nothing bound for them).
+		pointDrop = kPLDropFinishPoints;
+		++finishPointEarlyOuts;
+		pointSelector.Publish(false);
 		return;
+	}
 	auto* context = globals::d3d::context;
 	auto* timers = Util::GpuPassTimers::GetSingleton();
 	const std::uint32_t write = pointWrite, read = pointWrite ^ 1u;
@@ -6255,8 +6333,8 @@ void RayTracing::FinishPointLightsV2(int a_mode)
 	cb.Params[1] = kPointHistoryWeight;  // (not read by PointDenoiseV2CS)
 	const bool history = pointHistoryValid && prevCameraValid;
 	std::uint32_t flags = (history ? kPointDenoiseHistory : 0u) | (plDebug ? kPointDenoiseDebug : 0u) | (motionSRV ? kPointDenoiseMotion : 0u);
-	if (clean)  // (50e) only read by the PL_CLEAN twin
-		flags |= kPointDenoiseCleanDetect | (cleanUsed ? kPointDenoiseClean : 0u);
+	if (clean)  // (50e) only read by the PL_CLEAN twin; (50f) the moving test only with last frame's motion-vector matrices (FillCleanMotion)
+		flags |= (FillCleanMotion(cb) ? kPointDenoiseCleanDetect : 0u) | (cleanUsed ? kPointDenoiseClean : 0u);
 	if (pointFractionalThisFrame)
 		flags |= kPointDenoiseFractional;
 	const bool wideHistory = wide && pointWideHistoryValid && history;
@@ -6278,9 +6356,7 @@ void RayTracing::FinishPointLightsV2(int a_mode)
 	std::memcpy(&cb.Emitter[2], &pointEmitterRadius, sizeof(float));
 	cb.Emitter[3] = frameIndex;  // the taps' rotation per frame
 	{
-		const auto& motion = pointSelector.SlotMotion();
-		for (std::uint32_t s = 0; s < RayTracingPointLights::kMaxSources; ++s)
-			cb.Motion[s / 4] |= static_cast<std::uint32_t>(motion[s]) << ((s % 4) * 8);
+		FillPointMotion(cb);  // (50f) + the motion of a selection whose trace did not go out
 		const auto& fill = pointSelector.FillEmitterBytes();
 		for (std::uint32_t s = 0; s < RayTracingPointLights::kMaxSources; ++s)
 			cb.FillEmitter[s / 4] |= static_cast<std::uint32_t>(fill[s]) << ((s % 4) * 8);
@@ -6292,18 +6368,23 @@ void RayTracing::FinishPointLightsV2(int a_mode)
 	ID3D11ShaderResourceView* srvs[10] = { backend.PointVisibilitySRV(), backend.PointSourcesSRV(), backend.DepthMaskSRV(), pointVis[read].srv.get(),
 		pointIdx[read].srv.get(), pointDist[read].srv.get(), motionSRV, wide ? backend.PointWideSRV() : nullptr, wideHistory ? pointWide[read].srv.get() : nullptr,
 		lenHistory ? pointLen[read].srv.get() : nullptr };
-	ID3D11UnorderedAccessView* uavs[8] = { pointVis[write].uav.get(), pointIdx[write].uav.get(), pointDist[write].uav.get(), plDebug ? debugColorUAV.get() : nullptr,
-		wide ? pointWide[write].uav.get() : nullptr, pointLen[write].uav.get(), rr ? pointRaw.uav.get() : nullptr, rr && wide ? pointRawWide.uav.get() : nullptr };
+	// (50f) u8: the PL_CLEAN twin's per-frame counts (cleared here, copied for the read-back after the dispatch).
+	ID3D11UnorderedAccessView* counterUAV = clean ? PointCleanCounterBegin() : nullptr;
+	ID3D11UnorderedAccessView* uavs[9] = { pointVis[write].uav.get(), pointIdx[write].uav.get(), pointDist[write].uav.get(), plDebug ? debugColorUAV.get() : nullptr,
+		wide ? pointWide[write].uav.get() : nullptr, pointLen[write].uav.get(), rr ? pointRaw.uav.get() : nullptr, rr && wide ? pointRawWide.uav.get() : nullptr, counterUAV };
+	const UINT uavCount = counterUAV ? 9u : 8u;
 	context->CSSetConstantBuffers(0, 2, cbs);
 	context->CSSetShaderResources(0, 10, srvs);
-	context->CSSetUnorderedAccessViews(0, 8, uavs, nullptr);
+	context->CSSetUnorderedAccessViews(0, uavCount, uavs, nullptr);
 	context->CSSetShader(shader, nullptr, 0);
 	context->Dispatch((pending.width + 7) / 8, (pending.height + 7) / 8, 1);
 	ID3D11ShaderResourceView* nullSrvs[10]{};
-	ID3D11UnorderedAccessView* nullUavs[8]{};
+	ID3D11UnorderedAccessView* nullUavs[9]{};
 	ID3D11Buffer* nullCbs[2]{};
 	context->CSSetShaderResources(0, 10, nullSrvs);
-	context->CSSetUnorderedAccessViews(0, 8, nullUavs, nullptr);
+	context->CSSetUnorderedAccessViews(0, uavCount, nullUavs, nullptr);
+	if (counterUAV)
+		PointCleanCounterEnd();
 	context->CSSetConstantBuffers(0, 2, nullCbs);
 	context->CSSetShader(nullptr, nullptr, 0);
 	timers->End(Util::GpuBucket::RayTracingPointDenoise);
@@ -6318,12 +6399,241 @@ void RayTracing::FinishPointLightsV2(int a_mode)
 	pointRRBound = rr;
 	pointEffectSwapped = false;
 	pointLenValid = true;
+	pointHistoryUsed = history || a_mode == kPointOff;  // (50f) (Off never has one: not counted as a frame without history)
+	pointHistFrame = globals::state->frameCount;
+	pointMotionCarryOn = false;
 	pointModeThisFrame = a_mode;
 	pointWideHistoryValid = wide;
 	pointBound = true;
 	pointWrite ^= 1u;
 	pointHistoryValid = true;
 	pointDenoised = true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// (50f) Point-light drop-outs: the moving test's interval, per-frame counts, history across a skipped trace
+// ---------------------------------------------------------------------------------------------
+
+void RayTracing::RecordMotionFrame()
+{
+	// The engine's FrameBuffer of this frame: its motion vectors are written (in this frame's G-buffer pass, after the prepass) as
+	// (-0.5, 0.5) x (CameraViewProjUnjittered x position - CameraPreviousViewProjUnjittered x previous position), the previous position
+	// relative to CameraPreviousPosAdjust (MotionBlur.hlsli, RunGrass.hlsl). Next frame's moving test reads exactly those vectors.
+	const std::uint32_t frame = globals::state->frameCount;
+	auto& r = motionFrames[frame & 1u];
+	if (r.frame == frame && frame != 0)
+		return;
+	const auto& fb = globals::game::frameBufferCached;
+	static_assert(sizeof(fb.GetCameraViewProjInverse(0)) == sizeof(r.invViewProj));
+	std::memcpy(r.invViewProj, &fb.GetCameraViewProjInverse(0), sizeof(r.invViewProj));
+	std::memcpy(r.viewProjUnjittered, &fb.GetCameraViewProjUnjittered(0), sizeof(r.viewProjUnjittered));
+	std::memcpy(r.prevViewProjUnjittered, &fb.GetCameraPreviousViewProjUnjittered(0), sizeof(r.prevViewProjUnjittered));
+	const float4 posNow = fb.GetCameraPosAdjust(0), posPrev = fb.GetCameraPreviousPosAdjust(0);
+	r.camera[0] = posNow.x;
+	r.camera[1] = posNow.y;
+	r.camera[2] = posNow.z;
+	r.prevCamera[0] = posPrev.x;  // (w holds fDRClampOffset)
+	r.prevCamera[1] = posPrev.y;
+	r.prevCamera[2] = posPrev.z;
+	r.frame = frame;
+}
+
+bool RayTracing::FillCleanMotion(PointDenoiseCB& a_cb) const
+{
+	// The motion vectors bound at t6 are the last rendered frame's: its record (made at its Prepass), or no moving test this frame.
+	const std::uint32_t frame = globals::state->frameCount;
+	const auto& r = motionFrames[(frame - 1u) & 1u];
+	if (r.frame == 0 || r.frame + 1u != frame)
+		return false;
+	std::copy_n(r.invViewProj, 16, a_cb.CleanPrevInv);
+	std::copy_n(r.viewProjUnjittered, 16, a_cb.CleanPrevCur);
+	// Its previous view-projection takes positions relative to its previous camera: folded in, so it takes positions relative to that frame's
+	// camera (position then = position now + camera - previous camera, as the game's previous world positions are for a static surface).
+	const double d[3] = { r.camera[0] - r.prevCamera[0], r.camera[1] - r.prevCamera[1], r.camera[2] - r.prevCamera[2] };
+	for (int row = 0; row < 4; ++row) {
+		const float* m = r.prevViewProjUnjittered + row * 4;
+		a_cb.CleanPrevPrev[row * 4 + 0] = m[0];
+		a_cb.CleanPrevPrev[row * 4 + 1] = m[1];
+		a_cb.CleanPrevPrev[row * 4 + 2] = m[2];
+		a_cb.CleanPrevPrev[row * 4 + 3] = static_cast<float>(static_cast<double>(m[3]) + m[0] * d[0] + m[1] * d[1] + m[2] * d[2]);
+	}
+	for (int i = 0; i < 3; ++i)
+		a_cb.CleanParams[i] = static_cast<float>(pending.camera[i] - r.camera[i]);
+	// HistDist (last denoise's distances) is that frame's only when that frame was denoised.
+	const std::uint32_t flags = pointHistoryValid && prevCameraValid && pointHistFrame + 1u == frame ? kCleanHistIsPrev : 0u;
+	std::memcpy(&a_cb.CleanParams[3], &flags, sizeof(float));
+	return true;
+}
+
+ID3D11UnorderedAccessView* RayTracing::PointCleanCounterBegin()
+{
+	if (!pointCleanCounter && !pointCleanCounterFailed) {
+		auto* device = globals::d3d::device;
+		D3D11_BUFFER_DESC desc{};
+		desc.ByteWidth = 16;
+		desc.Usage = D3D11_USAGE_DEFAULT;
+		desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+		desc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+		HRESULT hr = device->CreateBuffer(&desc, nullptr, pointCleanCounter.put());
+		if (SUCCEEDED(hr)) {
+			D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+			uavDesc.Format = DXGI_FORMAT_R32_TYPELESS;
+			uavDesc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+			uavDesc.Buffer.NumElements = 4;
+			uavDesc.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+			hr = device->CreateUnorderedAccessView(pointCleanCounter.get(), &uavDesc, pointCleanCounterUAV.put());
+		}
+		D3D11_BUFFER_DESC stagingDesc{};
+		stagingDesc.ByteWidth = 16;
+		stagingDesc.Usage = D3D11_USAGE_STAGING;
+		stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		for (auto& staging : pointCleanStaging)
+			if (SUCCEEDED(hr))
+				hr = device->CreateBuffer(&stagingDesc, nullptr, staging.put());
+		if (FAILED(hr)) {
+			ReleasePointCleanCounter();
+			pointCleanCounterFailed = true;  // the denoiser runs as before, only its counts are missing
+			logger::warn("[RayTracing] Point lights: could not create the moving-pixel counter (0x{:08X}); F7 rt_pl_moving_pct stays -1",
+				static_cast<std::uint32_t>(hr));
+			return nullptr;
+		}
+	}
+	if (!pointCleanCounterUAV)
+		return nullptr;
+	const UINT zero[4]{};
+	globals::d3d::context->ClearUnorderedAccessViewUint(pointCleanCounterUAV.get(), zero);
+	return pointCleanCounterUAV.get();
+}
+
+void RayTracing::PointCleanCounterEnd()
+{
+	const std::uint32_t slot = pointCleanCursor % kPointCleanRing;
+	if (!pointCleanCounter || !pointCleanStaging[slot])
+		return;
+	globals::d3d::context->CopyResource(pointCleanStaging[slot].get(), pointCleanCounter.get());
+	pointCleanStagingFrame[slot] = std::max(globals::state->frameCount, 1u);
+	pointCleanCursor = (pointCleanCursor + 1) % kPointCleanRing;
+}
+
+void RayTracing::ReadPointCleanStats()
+{
+	// The oldest written copy that is at least two frames old, without waiting (as ReadShadeStats).
+	pointCleanStatsNew = false;
+	auto* context = globals::d3d::context;
+	const std::uint32_t frame = globals::state->frameCount;
+	for (std::uint32_t i = 0; i < kPointCleanRing; ++i) {
+		const std::uint32_t slot = (pointCleanCursor + i) % kPointCleanRing;
+		if (pointCleanStagingFrame[slot] == 0 || frame - pointCleanStagingFrame[slot] < 2 || !pointCleanStaging[slot])
+			continue;
+		D3D11_MAPPED_SUBRESOURCE mapped{};
+		if (context->Map(pointCleanStaging[slot].get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped) != S_OK || !mapped.pData)
+			continue;
+		std::memcpy(pointCleanStats, mapped.pData, sizeof(pointCleanStats));
+		context->Unmap(pointCleanStaging[slot].get(), 0);
+		pointCleanStatsFrame = pointCleanStagingFrame[slot];
+		pointCleanStagingFrame[slot] = 0;
+		pointCleanStatsNew = true;
+		break;
+	}
+}
+
+void RayTracing::ReleasePointCleanCounter()
+{
+	pointCleanCounterUAV = nullptr;
+	pointCleanCounter = nullptr;
+	for (auto& staging : pointCleanStaging)
+		staging = nullptr;
+	pointCleanStagingFrame.fill(0);
+	pointCleanCursor = 0;
+}
+
+void RayTracing::NotePointTrace(const RayTracingRT::FrameInput& a_input, bool a_traced, std::uint32_t a_busyBefore, std::uint32_t a_skinBefore)
+{
+	const auto& st = backend.GetStats();
+	if (st.earlySkinMismatchFrames != a_skinBefore)
+		pointEarlySkin = true;
+	if (!a_input.pointLights)
+		return;  // nothing prepared (pointDrop says why)
+	if (!a_traced) {
+		pointDrop = st.skippedFramesBusy != a_busyBefore ? kPLDropBusy : kPLDropNotTraced;
+		// Nothing of the denoiser's history was touched and FinishFrame will not run (prevViewProj stays the history's camera): the history
+		// stays valid into the next frame, with this selection's slot motion carried.
+		if (!backend.HasFailed()) {
+			CarrySkippedMotion();
+			pointSkippedTrace = true;
+		}
+		return;
+	}
+	if (st.pointTracedLastFrame) {
+		CommitPointTraceState();
+		pointTraceFrames[st.pointTracesSubmitted % pointTraceFrames.size()] = { st.pointTracesSubmitted, globals::state->frameCount };
+	}
+}
+
+void RayTracing::CarrySkippedMotion()
+{
+	const auto& motion = pointSelector.SlotMotion();
+	for (std::size_t s = 0; s < motion.size(); ++s)
+		pointMotionCarry[s] = pointMotionCarryOn ? static_cast<std::uint8_t>(std::min(255u, static_cast<std::uint32_t>(pointMotionCarry[s]) + motion[s])) : motion[s];
+	pointMotionCarryOn = true;
+}
+
+void RayTracing::FillPointMotion(PointDenoiseCB& a_cb) const
+{
+	// (46d) Moving / new sources drop their history in proportion; (50f) summed (saturating) with the selections made since the last denoise.
+	const auto& motion = pointSelector.SlotMotion();
+	for (std::uint32_t s = 0; s < RayTracingPointLights::kMaxSources; ++s) {
+		std::uint32_t m = motion[s];
+		if (pointMotionCarryOn)
+			m = std::min(255u, m + pointMotionCarry[s]);
+		a_cb.Motion[s / 4] |= m << ((s % 4) * 8);
+	}
+}
+
+void RayTracing::CommitPointTraceState()
+{
+	std::copy_n(pointNextViewProj, 16, pointPrevViewProj);
+	pointPrevJitter[0] = pointNextJitter[0];
+	pointPrevJitter[1] = pointNextJitter[1];
+	std::copy_n(pointNextCamera, 3, pointPrevCamera);
+	pointPrevValid = true;
+	pointWideTraced = pointNextWide;
+}
+
+void RayTracing::NotePointOutcome()
+{
+	if (pumpThisFrame)
+		return;  // a loading-screen frame: no world rendered
+	if (pointDenoised)
+		pointDrop = pointEarlySkin ? kPLDropEarlySkin : (pointHistoryUsed ? kPLDropOk : kPLDropNoHistory);
+	const bool dropped = !pointDenoised && pointDrop >= kPLDropNotTraced;
+	if (pointDenoised) {
+		if (pointGoodLast && pointDropRun > 0 && pointDropRun <= 3) {
+			// 1 - 3 frames without the point-light result between denoised frames: one line (at most every 2 s; the others counted).
+			++pointShortDrops;
+			const std::int64_t now = Qpc();
+			if (pointDropLogQpc == 0 || static_cast<double>(now - pointDropLogQpc) * QpcMs() > 2000.0) {
+				static constexpr const char* kReasons[] = { "ok", "not traced", "D3D12 busy", "early-prep skin mismatch", "no light selected / resources",
+					"FinishFrame early-out", "denoiser early-out", "no history" };
+				std::string reasons;
+				for (std::uint32_t i = 0; i < pointDropRun; ++i)
+					reasons += std::format("{}{}", i ? ", " : "", kReasons[std::clamp(pointDropRunReasons[i], 0, 7)]);
+				logger::info("[RayTracing] Point-light shadows missing for {} frame(s) between denoised frames ({}); this frame {} history; {} such gaps so far ({} not logged)",
+					pointDropRun, reasons, pointHistoryUsed ? "kept the" : "without", pointShortDrops, pointShortDrops - 1 - pointShortDropsLogged);
+				++pointShortDropsLogged;
+				pointDropLogQpc = now;
+			}
+		}
+		pointDropRun = 0;
+		pointGoodLast = true;
+	} else if (dropped && pointGoodLast) {
+		if (pointDropRun < 3)
+			pointDropRunReasons[pointDropRun] = pointDrop;
+		++pointDropRun;
+	} else if (!dropped) {
+		pointGoodLast = false;  // not wanted this frame: no gap to report
+		pointDropRun = 0;
+	}
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -8132,6 +8442,9 @@ void RayTracing::RunInteriorFrame()
 			SwitchOffPointLights(std::format("exception in the light selection: {}", e.what()));
 		}
 		pointCpuMs = static_cast<float>(static_cast<double>(Qpc() - pointStart) * QpcMs());
+		// (50f) F7 rt_pl_drop_reason: nothing selected (or no resources), or prepared (not traced until the trace goes out).
+		if (PointLightsOn())
+			pointDrop = input.pointLights ? kPLDropNotTraced : kPLDropPrepare;
 	}
 	// (46h) RTAO indoors: its own list right behind the point lights, its own fence (as outdoors). Traced whether or not a
 	// light is in view (else the AO would switch between RT and SSGI as lights come and go).
@@ -8211,7 +8524,9 @@ void RayTracing::RunInteriorFrame()
 	const std::int64_t executeStart = Qpc();
 	cpuLast.d3d11 = static_cast<float>(static_cast<double>(executeStart - d3d11Start) * QpcMs());
 	PrepareFogInput(input, input.sun);  // (49b)
+	const std::uint32_t busyBefore = backend.GetStats().skippedFramesBusy, skinBefore = backend.GetStats().earlySkinMismatchFrames;  // (50f)
 	const bool traced = backend.ExecuteFrame(input);
+	NotePointTrace(input, traced, busyBefore, skinBefore);  // (50f)
 	NoteFogTraced(input, traced);  // (49b)
 	FlushDeferredAONormal();  // (47u)
 	cpuLast.execute = static_cast<float>(static_cast<double>(Qpc() - executeStart) * QpcMs());
@@ -8220,7 +8535,7 @@ void RayTracing::RunInteriorFrame()
 		return;
 	}
 	if (!traced) {
-		pointHistoryValid = false;
+		// (50f) The point history is decided in the next Prepass (kept when only the submission was missing: NotePointTrace).
 		++frameIndex;
 		return;
 	}
@@ -9385,6 +9700,9 @@ void RayTracing::DrawPointLightPage()
 				ImGui::Text("  smears trailing on legs and arms. Off: Penumbra v2 exactly as in 50d.");
 				ImGui::Text("Penumbra (the old denoiser) always has its own version of this. Debug View \"Point Lights: Moving Pixels\" shows");
 				ImGui::Text("  which pixels count as moving. Practically free.");
+				// (50f)
+				ImGui::Text("(50f) \"Moving\" compares the game's motion vectors with the camera's own motion over the same frame (50e mixed two");
+				ImGui::Text("  frames: an uneven frame time or a fast turn could mark the whole screen as moving and wash the shadows out for a frame).");
 				if (pointV2CleanFailed)
 					ImGui::Text("Not available this session (its shader did not compile): Penumbra v2 runs without it.");
 			}
@@ -10211,6 +10529,18 @@ void RayTracing::DrawDiagnostics()
 			if (rt.skippedFramesBusy || latchedWithoutTrace)
 				ImGui::Text("Frames without a trace (D3D12 busy): %u, of which with casters left out of the shadow map: %u (should be 0)",
 					rt.skippedFramesBusy, latchedWithoutTrace);
+			// (50f) Point-light drop-outs: frames traced without the characters (Early Prep), the D3D11 steps that left before binding the
+			// result, short gaps between denoised frames, and the newest per-frame counts (also F7 rt_pl_*).
+			ImGui::Text("Traced without characters (Early Prep mismatch): %u; point lights left early: FinishFrame %u, denoiser %u; short gaps %u",
+				rt.earlySkinMismatchFrames, finishFrameEarlyOuts, finishPointEarlyOuts, pointShortDrops);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("All should stay 0 (short gaps: 1 - 3 frames without the point-light result between two frames that had it; each is");
+				ImGui::Text("described in the log with its reason, at most one line every 2 s).");
+			}
+			if (pointCleanStatsFrame != 0)
+				ImGui::Text("Point lights, newest read-back: %u pixels with a traced light, moving-pixel test on %u, moving %u (%.1f %%)", pointCleanStats[0],
+					pointCleanStats[1], pointCleanStats[2],
+					pointCleanStats[1] ? 100.0 * static_cast<double>(pointCleanStats[2]) / static_cast<double>(pointCleanStats[1]) : 0.0);
 			if (ImGui::TreeNodeEx("Skipped objects")) {
 				ImGui::Text("Characters %u, markers/other %u, disabled/no 3D %u, tree-animated parts of static objects %u",
 					skip.actors, skip.markers, skip.disabled, skip.foliage);

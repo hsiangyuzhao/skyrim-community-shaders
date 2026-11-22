@@ -613,6 +613,9 @@ namespace RayTracingRT
 		std::uint64_t buildsTotal = 0;
 		std::uint64_t compactedSavedBytes = 0;
 		std::uint32_t skippedFramesBusy = 0;  // every command context still in flight
+		// (50f) Early Prep's skinning did not pair with the trace's character draws (45n dropped the whole frame then, uncounted): traced
+		// without the characters instead.
+		std::uint32_t earlySkinMismatchFrames = 0;
 		float lastGpuMs = 0.0f;               // trace + builds on our queue, from D3D12 timestamps
 		float smoothedGpuMs = 0.0f;
 		float lastPrepGpuMs = -1.0f;          // (45l) of which builds, skinning, TLAS (the part that does not wait for D3D11)
@@ -644,6 +647,13 @@ namespace RayTracingRT
 		// (48c) Extra Lights Where Crowded (RayCounter words 3 - 5, counted only on frames that ran it; -1 = not known): pixels with a traced
 		// light, of which with an extra rank traced, and pixels where an extra rank 4 - 5 passed its cut (needs the slot 4 - 5 textures).
 		std::int64_t pointTracedPixelsPerFrame = -1, pointExtraPixelsPerFrame = -1, pointExtraWideWantPerFrame = -1;
+		// (50f) Word 3 (pixels with a traced light) is counted on every point trace now. The newest read-back: the point trace it belongs to
+		// (PointLightInput serial, 0 = none yet) and how many traces it covered (1 = that trace's own count, contexts are collected in
+		// submission order); the latest point trace submitted; the newest trace whose read-back had an extra rank 4 - 5 wanting slots 4 - 5.
+		std::uint64_t pointCounterReadTrace = 0;
+		std::uint32_t pointCounterReadTraces = 0;
+		std::uint64_t pointTracesSubmitted = 0;
+		std::uint64_t pointExtraWideWantTrace = 0;
 		std::array<std::uint32_t, 64> beamTraced{}, beamBlocked{};
 		std::uint64_t beamSamples = 0;
 		// (47w) Adaptive skip: the last read-back's counts per engine shadow-map light (per frame), coverageSamples counts the read-backs.
@@ -1183,6 +1193,7 @@ namespace RayTracingRT
 			stats_.pointRaysPerFrame = -1;
 			stats_.pointWaterRaysPerFrame = -1;
 			stats_.pointTracedPixelsPerFrame = stats_.pointExtraPixelsPerFrame = stats_.pointExtraWideWantPerFrame = -1;  // (48c)
+			stats_.pointExtraWideWantTrace = 0;  // (50f)
 			stats_.aoRaysPerFrame = -1;
 			stats_.pointTracedLastFrame = false;
 			stats_.aoTracedLastFrame = false;
@@ -1706,6 +1717,7 @@ namespace RayTracingRT
 		void StopReleaseThread();
 		void ReleaseThreadMain();
 		void CollectRetired();
+		void CollectCompleted(std::uint64_t a_completed, std::uint64_t a_aoCompleted);  // (50f)
 		void CollectTimestamps(std::size_t a_index);
 		/// (46p) a_owner: the video-memory owner it is counted under (F7 vram_*).
 		ComPtr<ID3D12Resource> CreateBuffer(std::uint64_t a_bytes, D3D12_HEAP_TYPE a_heap, D3D12_RESOURCE_STATES a_state, bool a_uav,
